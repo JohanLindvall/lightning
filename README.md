@@ -72,9 +72,10 @@ paths (unescaped strings, integers, object keys).
 ## Supported types
 
 `string`, `bool`, every sized `int`/`uint` kind, `float32`/`float64`,
-`json.RawMessage` (and `RawValue`), nested named and anonymous structs, slices,
-maps with string keys, pointers, and `interface{}`/`any` (decoded into the usual
-Go representation of an arbitrary JSON value). Unknown object keys are skipped.
+`json.RawMessage` (and `RawValue`), `time.Time` (RFC 3339, like `encoding/json`),
+nested named and anonymous structs, slices, maps with string keys, pointers, and
+`interface{}`/`any` (decoded into the usual Go representation of an arbitrary
+JSON value). Unknown object keys are skipped.
 
 ## The `nocopy` tag option
 
@@ -93,6 +94,22 @@ type Log struct {
 `nocopy` propagates through slices, maps, and pointers, but stops at struct
 boundaries (each struct's own field tags govern). Strings containing escape
 sequences still allocate, since they can't be a slice of the raw input.
+
+## SIMD string scanning
+
+The scanner finds the next `"` or `\` inside a string in a single SIMD pass,
+instead of two `bytes.IndexByte` scans:
+
+- **amd64 (AVX2)** — 32 bytes/pass (`pkg/support/index_amd64.s`), selected via
+  `cpu.X86.HasAVX2`.
+- **arm64 (NEON/ASIMD)** — 16 bytes/pass (`pkg/support/index_arm64.s`), selected
+  via `cpu.ARM64.HasASIMD`.
+
+Detection is at run time (`golang.org/x/sys/cpu`); other platforms, CPUs without
+the feature, and strings shorter than the vector width fall back to the
+(already SIMD-optimized) `bytes.IndexByte` path. This speeds up string-heavy
+payloads — roughly 10–20% on the Cloudflare log case on amd64 — with no
+behavioral change. The arm64 path is correctness-tested under qemu.
 
 ## Benchmarks
 

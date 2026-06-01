@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"errors"
 	"strconv"
+	"time"
 	"unicode/utf16"
 	"unicode/utf8"
 	"unsafe"
@@ -37,14 +38,14 @@ func ReadKey(data []byte, i int) (string, int, error) {
 	}
 	i++
 	rest := data[i:]
-	q := bytes.IndexByte(rest, '"')
-	if q < 0 {
+	k := indexCloseOrEscape(rest)
+	if k == len(rest) {
 		return "", len(data), ErrTruncated
 	}
-	if bs := bytes.IndexByte(rest[:q], '\\'); bs >= 0 {
-		return decodeStringEscaped(data, i, i+bs)
+	if rest[k] == '\\' {
+		return decodeStringEscaped(data, i, i+k)
 	}
-	return unsafeStr(rest[:q]), i + q + 1, nil
+	return unsafeStr(rest[:k]), i + k + 1, nil
 }
 
 // ReadStringOrNull reads a JSON string (or null) at data[i], copying the bytes
@@ -62,14 +63,14 @@ func ReadStringOrNull(data []byte, i int) (string, int, error) {
 	}
 	i++
 	rest := data[i:]
-	q := bytes.IndexByte(rest, '"')
-	if q < 0 {
+	k := indexCloseOrEscape(rest)
+	if k == len(rest) {
 		return "", len(data), ErrTruncated
 	}
-	if bs := bytes.IndexByte(rest[:q], '\\'); bs >= 0 {
-		return decodeStringEscaped(data, i, i+bs)
+	if rest[k] == '\\' {
+		return decodeStringEscaped(data, i, i+k)
 	}
-	return string(rest[:q]), i + q + 1, nil
+	return string(rest[:k]), i + k + 1, nil
 }
 
 // ReadStringNoCopyOrNull is like ReadStringOrNull but, for strings without
@@ -90,14 +91,31 @@ func ReadStringNoCopyOrNull(data []byte, i int) (string, int, error) {
 	}
 	i++
 	rest := data[i:]
-	q := bytes.IndexByte(rest, '"')
-	if q < 0 {
+	k := indexCloseOrEscape(rest)
+	if k == len(rest) {
 		return "", len(data), ErrTruncated
 	}
-	if bs := bytes.IndexByte(rest[:q], '\\'); bs >= 0 {
-		return decodeStringEscaped(data, i, i+bs)
+	if rest[k] == '\\' {
+		return decodeStringEscaped(data, i, i+k)
 	}
-	return unsafeStr(rest[:q]), i + q + 1, nil
+	return unsafeStr(rest[:k]), i + k + 1, nil
+}
+
+// indexCloseOrEscapeScalar is the portable fallback for indexCloseOrEscape: it
+// returns the index of the first '"' or '\\' in b, or len(b) if neither is
+// present, using the runtime's (already SIMD-optimized) bytes.IndexByte.
+func indexCloseOrEscapeScalar(b []byte) int {
+	q := bytes.IndexByte(b, '"')
+	if q < 0 {
+		if bs := bytes.IndexByte(b, '\\'); bs >= 0 {
+			return bs
+		}
+		return len(b)
+	}
+	if bs := bytes.IndexByte(b[:q], '\\'); bs >= 0 {
+		return bs
+	}
+	return q
 }
 
 // decodeStringEscaped is the slow path for strings containing backslash
@@ -273,6 +291,13 @@ func ReadUint64OrNull(data []byte, i int) (uint64, int, error) {
 	return n, i, nil
 }
 
+// pow10exact holds the powers of ten that are exactly representable as a
+// float64 (10^0 .. 10^22). Used by the fast-path float parser.
+var pow10exact = [...]float64{
+	1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11,
+	1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
+}
+
 // ReadFloat64OrNull reads a JSON number (or null) at data[i] as a float64.
 func ReadFloat64OrNull(data []byte, i int) (float64, int, error) {
 	if i >= len(data) {
@@ -286,11 +311,122 @@ func ReadFloat64OrNull(data []byte, i int) (float64, int, error) {
 	if err != nil {
 		return 0, end, err
 	}
-	f, perr := strconv.ParseFloat(string(data[i:end]), 64)
+	if f, ok := fastFloat(data[i:end]); ok {
+		return f, end, nil
+	}
+	// unsafeStr avoids copying the token; ParseFloat does not retain it.
+	f, perr := strconv.ParseFloat(unsafeStr(data[i:end]), 64)
 	if perr != nil {
 		return 0, end, ErrBadNumber
 	}
 	return f, end, nil
+}
+
+// fastFloat parses a JSON number using the Clinger fast path: when the decimal
+// mantissa fits exactly in a float64 (< 2^53) and the decimal exponent is in
+// [-22, 22], a single float multiply or divide by an exact power of ten yields
+// the correctly rounded result. It returns ok=false for anything outside that
+// range (too many digits, large exponent, malformed token), which the caller
+// hands to strconv.ParseFloat. b is the already-validated numeric token.
+func fastFloat(b []byte) (float64, bool) {
+	n := len(b)
+	if n == 0 {
+		return 0, false
+	}
+	i := 0
+	neg := false
+	switch b[0] {
+	case '-':
+		neg = true
+		i++
+	case '+':
+		i++
+	}
+
+	var mant uint64
+	digits := 0
+	for i < n && b[i] >= '0' && b[i] <= '9' {
+		mant = mant*10 + uint64(b[i]-'0')
+		i++
+		digits++
+	}
+	exp := 0
+	if i < n && b[i] == '.' {
+		i++
+		for i < n && b[i] >= '0' && b[i] <= '9' {
+			mant = mant*10 + uint64(b[i]-'0')
+			i++
+			digits++
+			exp--
+		}
+	}
+	if digits == 0 || digits > 19 { // >19 digits may overflow the uint64 mantissa
+		return 0, false
+	}
+	if i < n && (b[i] == 'e' || b[i] == 'E') {
+		i++
+		esign := 1
+		if i < n && (b[i] == '+' || b[i] == '-') {
+			if b[i] == '-' {
+				esign = -1
+			}
+			i++
+		}
+		if i >= n || b[i] < '0' || b[i] > '9' {
+			return 0, false
+		}
+		eval := 0
+		for i < n && b[i] >= '0' && b[i] <= '9' {
+			eval = eval*10 + int(b[i]-'0')
+			if eval > 1000 {
+				return 0, false // huge exponent; let strconv handle over/underflow
+			}
+			i++
+		}
+		exp += esign * eval
+	}
+	if i != n || mant>>53 != 0 {
+		return 0, false
+	}
+
+	f := float64(mant)
+	switch {
+	case exp == 0:
+		// already exact
+	case exp > 0 && exp <= 22:
+		f *= pow10exact[exp]
+	case exp < 0 && exp >= -22:
+		f /= pow10exact[-exp]
+	default:
+		return 0, false
+	}
+	if neg {
+		f = -f
+	}
+	return f, true
+}
+
+// ReadTimeOrNull reads an RFC 3339 JSON string (or null) at data[i] as a
+// time.Time, matching how encoding/json decodes time.Time. The intermediate
+// string aliases data (time.Parse does not retain it), so this allocates only
+// the time.Time itself.
+func ReadTimeOrNull(data []byte, i int) (time.Time, int, error) {
+	if i >= len(data) {
+		return time.Time{}, i, ErrTruncated
+	}
+	if data[i] == 'n' {
+		end, err := ExpectNull(data, i)
+		return time.Time{}, end, err
+	}
+	s, end, err := ReadStringNoCopyOrNull(data, i)
+	if err != nil {
+		return time.Time{}, end, err
+	}
+	t, perr := time.Parse(time.RFC3339, s)
+	if perr != nil {
+		return time.Time{}, end, perr
+	}
+	return t, end, nil
 }
 
 // ReadBoolOrNull reads a JSON boolean (or null) at data[i].
@@ -359,18 +495,17 @@ func skipString(data []byte, i int) (int, error) {
 	i++
 	for {
 		rest := data[i:]
-		q := bytes.IndexByte(rest, '"')
-		if q < 0 {
+		k := indexCloseOrEscape(rest)
+		if k == len(rest) {
 			return len(data), ErrTruncated
 		}
-		bs := bytes.IndexByte(rest[:q], '\\')
-		if bs < 0 {
-			return i + q + 1, nil
+		if rest[k] == '"' {
+			return i + k + 1, nil
 		}
 		// Skip the escape sequence. For \uXXXX we only need to skip the
 		// backslash and the next char; subsequent bytes are processed on the
 		// next iteration.
-		i += bs + 2
+		i += k + 2
 		if i > len(data) {
 			return len(data), ErrTruncated
 		}
