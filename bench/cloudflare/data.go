@@ -3,13 +3,13 @@ package bench
 import json "encoding/json"
 
 type Log struct {
-	EdgeStartTimestamp json.RawMessage `json:"EdgeStartTimestamp"`
-	EventTimestampMs   int64           `json:"EventTimestampMs"`
-	Datetime           json.RawMessage `json:"Datetime"`
-	RayID              string          `json:"RayID"`
-	ParentRayID        string          `json:"ParentRayID"`
-	ClientRequestPath  string          `json:"ClientRequestPath"`
-	EdgeResponseStatus int64           `json:"EdgeResponseStatus"`
+	EdgeStartTimestamp *json.RawMessage `json:"EdgeStartTimestamp"`
+	EventTimestampMs   int64            `json:"EventTimestampMs"`
+	Datetime           json.RawMessage  `json:"Datetime"`
+	RayID              string           `json:"RayID"`
+	ParentRayID        string           `json:"ParentRayID"`
+	ClientRequestPath  string           `json:"ClientRequestPath"`
+	EdgeResponseStatus int64            `json:"EdgeResponseStatus"`
 	Event              struct {
 		RPCMethod string `json:"RPCMethod"`
 		RayID     string `json:"RayID"`
