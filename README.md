@@ -1,4 +1,4 @@
-# lightning
+# Lightning ⚡
 
 A small Go code generator that emits fast, allocation-light
 `json.Unmarshaler` implementations from your struct definitions.
