@@ -9,13 +9,45 @@ style `UnmarshalJSON` method plus the recursive decoders it needs. The decoders
 share a single set of scanning primitives in [`pkg/support`](pkg/support), so the
 generated files stay small.
 
+## Installation
+
+Run it straight from the module path (no clone needed):
+
+```sh
+go run github.com/JohanLindvall/lightning@latest path/to/data.go
+```
+
+`@latest` can be any version, branch, or commit (`@v1.0.0`, `@main`, `@<sha>`).
+Or install the binary once:
+
+```sh
+go install github.com/JohanLindvall/lightning@latest
+lightning path/to/data.go
+```
+
+The generated code imports `github.com/JohanLindvall/lightning/pkg/support`, so
+the module you generate into must depend on lightning:
+
+```sh
+go get github.com/JohanLindvall/lightning
+```
+
+A `go:generate` directive in the file that holds your structs works well:
+
+```go
+//go:generate go run github.com/JohanLindvall/lightning@latest $GOFILE
+```
+
 ## How it works
 
-Point the generator at a Go file containing one or more struct types:
+Point the generator at a Go file containing one or more struct types. From
+inside this repo:
 
 ```sh
 go run . path/to/data.go
 ```
+
+(`go run .` only works in this repo; elsewhere use the module path shown above.)
 
 For each input file `FOO.go` it writes `FOO_unmarshal.go` next to it, containing
 an `UnmarshalJSON` method for every top-level struct type. The generated code
