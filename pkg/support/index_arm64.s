@@ -71,3 +71,86 @@ notfound:
 tfound:
 	MOVD R2, ret+24(FP)
 	RET
+
+// func indexStructuralNEON(b []byte) int
+//
+// Returns the index of the first '{', '}', '[', ']' or '"' byte, or len(b).
+TEXT ·indexStructuralNEON(SB), NOSPLIT, $0-32
+	MOVD b_base+0(FP), R0
+	MOVD b_len+8(FP), R1
+	MOVD $0, R2
+	MOVD $0x7b, R3
+	VDUP R3, V0.B16              // '{'
+	MOVD $0x7d, R4
+	VDUP R4, V1.B16              // '}'
+	MOVD $0x5b, R5
+	VDUP R5, V20.B16             // '['
+	MOVD $0x5d, R6
+	VDUP R6, V21.B16             // ']'
+	MOVD $0x22, R12
+	VDUP R12, V22.B16            // '"'
+
+sloop:
+	SUB  R2, R1, R7
+	CMP  $16, R7
+	BLT  stail
+	ADD  R0, R2, R8
+	VLD1 (R8), [V2.B16]
+	VCMEQ V0.B16, V2.B16, V3.B16
+	VCMEQ V1.B16, V2.B16, V4.B16
+	VORR V4.B16, V3.B16, V3.B16
+	VCMEQ V20.B16, V2.B16, V4.B16
+	VORR V4.B16, V3.B16, V3.B16
+	VCMEQ V21.B16, V2.B16, V4.B16
+	VORR V4.B16, V3.B16, V3.B16
+	VCMEQ V22.B16, V2.B16, V4.B16
+	VORR V4.B16, V3.B16, V3.B16
+	VMOV V3.D[0], R9
+	VMOV V3.D[1], R10
+	CBNZ R9, slow8
+	CBNZ R10, shigh8
+	ADD  $16, R2
+	B    sloop
+
+slow8:
+	RBIT R9, R11
+	CLZ  R11, R11
+	LSR  $3, R11, R11
+	ADD  R2, R11, R11
+	MOVD R11, ret+24(FP)
+	RET
+
+shigh8:
+	RBIT R10, R11
+	CLZ  R11, R11
+	LSR  $3, R11, R11
+	ADD  $8, R11, R11
+	ADD  R2, R11, R11
+	MOVD R11, ret+24(FP)
+	RET
+
+stail:
+	CMP  R1, R2
+	BGE  snone
+stloop:
+	ADD   R0, R2, R8
+	MOVBU (R8), R9
+	CMP   $0x7b, R9
+	BEQ   stf
+	CMP   $0x7d, R9
+	BEQ   stf
+	CMP   $0x5b, R9
+	BEQ   stf
+	CMP   $0x5d, R9
+	BEQ   stf
+	CMP   $0x22, R9
+	BEQ   stf
+	ADD  $1, R2
+	CMP  R1, R2
+	BLT  stloop
+snone:
+	MOVD R1, ret+24(FP)
+	RET
+stf:
+	MOVD R2, ret+24(FP)
+	RET

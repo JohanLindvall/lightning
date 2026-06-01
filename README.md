@@ -95,21 +95,24 @@ type Log struct {
 boundaries (each struct's own field tags govern). Strings containing escape
 sequences still allocate, since they can't be a slice of the raw input.
 
-## SIMD string scanning
+## SIMD scanning
 
-The scanner finds the next `"` or `\` inside a string in a single SIMD pass,
-instead of two `bytes.IndexByte` scans:
+Two hot scan loops use a single vectorized pass instead of byte-at-a-time work
+— **amd64 (AVX2)**, 32 bytes/pass (`pkg/support/index_amd64.s`), and
+**arm64 (NEON/ASIMD)**, 16 bytes/pass (`pkg/support/index_arm64.s`):
 
-- **amd64 (AVX2)** — 32 bytes/pass (`pkg/support/index_amd64.s`), selected via
-  `cpu.X86.HasAVX2`.
-- **arm64 (NEON/ASIMD)** — 16 bytes/pass (`pkg/support/index_arm64.s`), selected
-  via `cpu.ARM64.HasASIMD`.
+- **next `"` or `\` in a string** — replaces two `bytes.IndexByte` scans; speeds
+  up string-heavy payloads (~10–20% on the Cloudflare case).
+- **next structural byte (`{`, `}`, `[`, `]`, `"`)** — lets `skipObject` /
+  `skipArray` jump over inert content (numbers, keys, whitespace) when skipping
+  unknown values. Skipping a large ignored array/object is dramatically faster
+  (the `skip-heavy` benchmark decodes at >20 GB/s, ~90× `encoding/json`).
 
-Detection is at run time (`golang.org/x/sys/cpu`); other platforms, CPUs without
-the feature, and strings shorter than the vector width fall back to the
-(already SIMD-optimized) `bytes.IndexByte` path. This speeds up string-heavy
-payloads — roughly 10–20% on the Cloudflare log case on amd64 — with no
-behavioral change. The arm64 path is correctness-tested under qemu.
+Feature detection is at run time (`golang.org/x/sys/cpu`); other platforms, CPUs
+without the feature, and inputs shorter than the vector width fall back to scalar
+(`bytes.IndexByte`-based) code. Behavior is identical across paths — verified by
+fuzzing each primitive against a reference and by `SkipValue`/decode round-trips
+vs `encoding/json`, on amd64 and on arm64 under qemu.
 
 ## Benchmarks
 

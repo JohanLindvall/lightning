@@ -69,3 +69,85 @@ tfound:
 	MOVQ DI, ret+24(FP)
 	VZEROUPPER
 	RET
+
+// func indexStructuralAVX2(b []byte) int
+//
+// Returns the index of the first '{', '}', '[', ']' or '"' byte in b, or
+// len(b) if none is present.
+TEXT ·indexStructuralAVX2(SB), NOSPLIT, $0-32
+	MOVQ b_base+0(FP), SI
+	MOVQ b_len+8(FP), CX
+	XORQ DI, DI
+	MOVQ $0x7b, AX
+	MOVQ AX, X0
+	VPBROADCASTB X0, Y0          // '{'
+	MOVQ $0x7d, AX
+	MOVQ AX, X1
+	VPBROADCASTB X1, Y1          // '}'
+	MOVQ $0x5b, AX
+	MOVQ AX, X2
+	VPBROADCASTB X2, Y2          // '['
+	MOVQ $0x5d, AX
+	MOVQ AX, X3
+	VPBROADCASTB X3, Y3          // ']'
+	MOVQ $0x22, AX
+	MOVQ AX, X4
+	VPBROADCASTB X4, Y4          // '"'
+
+loops:
+	CMPQ CX, $32
+	JL   tails
+	VMOVDQU (SI)(DI*1), Y5
+	VPCMPEQB Y0, Y5, Y6
+	VPCMPEQB Y1, Y5, Y7
+	VPOR     Y7, Y6, Y6
+	VPCMPEQB Y2, Y5, Y7
+	VPOR     Y7, Y6, Y6
+	VPCMPEQB Y3, Y5, Y7
+	VPOR     Y7, Y6, Y6
+	VPCMPEQB Y4, Y5, Y7
+	VPOR     Y7, Y6, Y6
+	VPMOVMSKB Y6, AX
+	TESTL    AX, AX
+	JNZ      founds
+	ADDQ     $32, DI
+	SUBQ     $32, CX
+	JMP      loops
+
+founds:
+	BSFL AX, AX
+	ADDQ DI, AX
+	MOVQ AX, ret+24(FP)
+	VZEROUPPER
+	RET
+
+tails:
+	TESTQ CX, CX
+	JZ    notfounds
+
+tailsloop:
+	MOVBLZX (SI)(DI*1), AX
+	CMPL    AX, $0x7b
+	JE      tfs
+	CMPL    AX, $0x7d
+	JE      tfs
+	CMPL    AX, $0x5b
+	JE      tfs
+	CMPL    AX, $0x5d
+	JE      tfs
+	CMPL    AX, $0x22
+	JE      tfs
+	INCQ    DI
+	DECQ    CX
+	JNZ     tailsloop
+
+notfounds:
+	MOVQ b_len+8(FP), AX
+	MOVQ AX, ret+24(FP)
+	VZEROUPPER
+	RET
+
+tfs:
+	MOVQ DI, ret+24(FP)
+	VZEROUPPER
+	RET

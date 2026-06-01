@@ -7,6 +7,9 @@ import "golang.org/x/sys/cpu"
 //go:noescape
 func indexQuoteOrBackslashAVX2(b []byte) int
 
+//go:noescape
+func indexStructuralAVX2(b []byte) int
+
 var useAVX2 = cpu.X86.HasAVX2
 
 // indexCloseOrEscape returns the index of the first '"' or '\\' byte in b, or
@@ -18,4 +21,13 @@ func indexCloseOrEscape(b []byte) int {
 		return indexQuoteOrBackslashAVX2(b)
 	}
 	return indexCloseOrEscapeScalar(b)
+}
+
+// indexStructural returns the index of the first '{', '}', '[', ']' or '"' byte
+// in b, or len(b) if none is present.
+func indexStructural(b []byte) int {
+	if useAVX2 && len(b) >= 32 {
+		return indexStructuralAVX2(b)
+	}
+	return indexStructuralScalar(b)
 }

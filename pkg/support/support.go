@@ -118,6 +118,18 @@ func indexCloseOrEscapeScalar(b []byte) int {
 	return q
 }
 
+// indexStructuralScalar is the portable fallback for indexStructural: it returns
+// the index of the first '{', '}', '[', ']' or '"' in b, or len(b) if none.
+func indexStructuralScalar(b []byte) int {
+	for i := 0; i < len(b); i++ {
+		switch b[i] {
+		case '{', '}', '[', ']', '"':
+			return i
+		}
+	}
+	return len(b)
+}
+
 // decodeStringEscaped is the slow path for strings containing backslash
 // escapes. It allocates a new buffer.
 func decodeStringEscaped(data []byte, start, i int) (string, int, error) {
@@ -534,19 +546,22 @@ func skipNumber(data []byte, i int) (int, error) {
 func skipObject(data []byte, i int) (int, error) {
 	// data[i] == '{'
 	i++
-	depth := 1
 	for i < len(data) {
-		c := data[i]
-		switch c {
-		case '{':
-			depth++
-			i++
+		// Jump to the next structural byte, skipping inert content (keys' inner
+		// chars, numbers, bools, whitespace) in one vectorized pass.
+		i += indexStructural(data[i:])
+		if i >= len(data) {
+			break
+		}
+		switch data[i] {
 		case '}':
-			depth--
-			i++
-			if depth == 0 {
-				return i, nil
+			return i + 1, nil
+		case '{':
+			end, err := skipObject(data, i)
+			if err != nil {
+				return end, err
 			}
+			i = end
 		case '[':
 			end, err := skipArray(data, i)
 			if err != nil {
@@ -559,7 +574,7 @@ func skipObject(data []byte, i int) (int, error) {
 				return end, err
 			}
 			i = end
-		default:
+		default: // stray ']' (only on malformed input); step over it
 			i++
 		}
 	}
@@ -569,19 +584,20 @@ func skipObject(data []byte, i int) (int, error) {
 func skipArray(data []byte, i int) (int, error) {
 	// data[i] == '['
 	i++
-	depth := 1
 	for i < len(data) {
-		c := data[i]
-		switch c {
-		case '[':
-			depth++
-			i++
+		i += indexStructural(data[i:])
+		if i >= len(data) {
+			break
+		}
+		switch data[i] {
 		case ']':
-			depth--
-			i++
-			if depth == 0 {
-				return i, nil
+			return i + 1, nil
+		case '[':
+			end, err := skipArray(data, i)
+			if err != nil {
+				return end, err
 			}
+			i = end
 		case '{':
 			end, err := skipObject(data, i)
 			if err != nil {
@@ -594,7 +610,7 @@ func skipArray(data []byte, i int) (int, error) {
 				return end, err
 			}
 			i = end
-		default:
+		default: // stray '}' (only on malformed input); step over it
 			i++
 		}
 	}

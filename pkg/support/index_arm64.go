@@ -7,6 +7,9 @@ import "golang.org/x/sys/cpu"
 //go:noescape
 func indexQuoteOrBackslashNEON(b []byte) int
 
+//go:noescape
+func indexStructuralNEON(b []byte) int
+
 var useNEON = cpu.ARM64.HasASIMD
 
 // indexCloseOrEscape returns the index of the first '"' or '\\' byte in b, or
@@ -18,4 +21,13 @@ func indexCloseOrEscape(b []byte) int {
 		return indexQuoteOrBackslashNEON(b)
 	}
 	return indexCloseOrEscapeScalar(b)
+}
+
+// indexStructural returns the index of the first '{', '}', '[', ']' or '"' byte
+// in b, or len(b) if none is present.
+func indexStructural(b []byte) int {
+	if useNEON && len(b) >= 16 {
+		return indexStructuralNEON(b)
+	}
+	return indexStructuralScalar(b)
 }
