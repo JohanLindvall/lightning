@@ -9,7 +9,7 @@ type Log struct {
 	RayID              string           `json:"RayID"`
 	ParentRayID        string           `json:"ParentRayID"`
 	ClientRequestPath  string           `json:"ClientRequestPath"`
-	EdgeResponseStatus int64            `json:"EdgeResponseStatus"`
+	EdgeResponseStatus int64            `json:"EdgeResponseStatus|AnotherField"`
 	Event              struct {
 		RPCMethod string `json:"RPCMethod"`
 		RayID     string `json:"RayID"`

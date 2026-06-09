@@ -95,6 +95,22 @@ type Log struct {
 boundaries (each struct's own field tags govern). Strings containing escape
 sequences still allocate, since they can't be a slice of the raw input.
 
+## Alternate field names
+
+A json tag may list several pipe-separated names. Any of them appearing in the
+input fills the field, which is handy when an upstream source renamed a key and
+you want to accept both spellings:
+
+```go
+type Log struct {
+    EdgeResponseStatus int64 `json:"EdgeResponseStatus|AnotherField"`
+}
+```
+
+Comma-separated options still follow the name as usual, so names and `nocopy`
+combine freely — `json:"Name|Title,nocopy"` accepts both `Name` and `Title`,
+zero-copy.
+
 ## String escaping and unescaping
 
 The [`pkg/json`](pkg/json) package exposes the scanner's string codec on its

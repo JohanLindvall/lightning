@@ -16,6 +16,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/format"
@@ -83,6 +84,9 @@ func generate(inPath string) error {
 	for _, name := range g.order {
 		methods = append(methods, g.genUnmarshal(name))
 	}
+	if len(g.errs) > 0 {
+		return errors.Join(g.errs...)
+	}
 
 	src := g.assemble(inPath, methods)
 	formatted, ferr := format.Source([]byte(src))
@@ -112,6 +116,7 @@ type gen struct {
 	memo map[string]string // type-key -> decoder function name (dedupe)
 
 	decoders []string // generated decoder functions, in creation order
+	errs     []error  // generation errors; reported together after the walk
 
 	needBool, needUint, needFloat, needAny, needJSON, needNoCopyStr, needTime bool
 }
@@ -192,12 +197,13 @@ func (g *gen) anonStruct(t *ast.StructType, hint string) string {
 
 func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
 	var cases strings.Builder
+	seen := map[string]bool{} // json keys already claimed within this struct
 	for _, f := range st.Fields.List {
 		if len(f.Names) == 0 {
 			fmt.Fprintf(os.Stderr, "warning: skipping embedded field %s\n", g.typeStr(f.Type))
 			continue
 		}
-		tagName, skip, nocopy := jsonTag(f.Tag)
+		tagNames, skip, nocopy := jsonTag(f.Tag)
 		if skip {
 			continue
 		}
@@ -206,12 +212,20 @@ func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
 			if !ast.IsExported(field) {
 				continue
 			}
-			key := field
-			if tagName != "" {
-				key = tagName
+			keys := tagNames
+			if len(keys) == 0 {
+				keys = []string{field}
+			}
+			quoted := make([]string, len(keys))
+			for i, k := range keys {
+				if seen[k] {
+					g.errs = append(g.errs, fmt.Errorf("%s: json name %q is mapped more than once", strings.TrimPrefix(paramType, "*"), k))
+				}
+				seen[k] = true
+				quoted[i] = strconv.Quote(k)
 			}
 			code := g.field("v."+field, f.Type, field, nocopy)
-			fmt.Fprintf(&cases, "\tcase %q:\n%s\n", key, code)
+			fmt.Fprintf(&cases, "\tcase %s:\n%s\n", strings.Join(quoted, ", "), code)
 		}
 	}
 
@@ -694,31 +708,40 @@ func (g *gen) assemble(inPath string, methods []string) string {
 	return b.String()
 }
 
-// jsonTag returns the JSON key from a struct tag, whether the field is excluded
-// (`json:"-"`), and whether the "nocopy" option is present. nocopy makes string
-// and raw fields alias the input bytes instead of copying them.
-func jsonTag(tag *ast.BasicLit) (name string, skip, nocopy bool) {
+// jsonTag returns the JSON key(s) from a struct tag, whether the field is
+// excluded (`json:"-"`), and whether the "nocopy" option is present. The name
+// field may list several pipe-separated names (`json:"Status|EdgeResponseStatus"`),
+// each of which maps the same field; any of them in the input fills the field.
+// Comma-separated options follow the name, as in encoding/json; the recognized
+// option "nocopy" makes string and raw fields alias the input bytes instead of
+// copying them.
+func jsonTag(tag *ast.BasicLit) (names []string, skip, nocopy bool) {
 	if tag == nil {
-		return "", false, false
+		return nil, false, false
 	}
 	s, err := strconv.Unquote(tag.Value)
 	if err != nil {
-		return "", false, false
+		return nil, false, false
 	}
 	v := reflect.StructTag(s).Get("json")
 	if v == "" {
-		return "", false, false
+		return nil, false, false
 	}
 	parts := strings.Split(v, ",")
 	if parts[0] == "-" && len(parts) == 1 {
-		return "", true, false
+		return nil, true, false
 	}
 	for _, o := range parts[1:] {
 		if o == "nocopy" {
 			nocopy = true
 		}
 	}
-	return parts[0], false, nocopy
+	for _, n := range strings.Split(parts[0], "|") {
+		if n != "" {
+			names = append(names, n)
+		}
+	}
+	return names, false, nocopy
 }
 
 func cap1(s string) string {
