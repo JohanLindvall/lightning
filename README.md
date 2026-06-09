@@ -72,10 +72,11 @@ paths (unescaped strings, integers, object keys).
 ## Supported types
 
 `string`, `bool`, every sized `int`/`uint` kind, `float32`/`float64`,
-`json.RawMessage` (and `RawValue`), `time.Time` (RFC 3339, like `encoding/json`),
-nested named and anonymous structs, slices, maps with string keys, pointers, and
-`interface{}`/`any` (decoded into the usual Go representation of an arbitrary
-JSON value). Unknown object keys are skipped.
+`json.RawMessage` (and `RawValue`), `time.Time` (RFC 3339, like `encoding/json`;
+the [`lax`](#the-lax-tag-option) option also accepts a space separator and Unix
+timestamps), nested named and anonymous structs, slices, maps with string keys,
+pointers, and `interface{}`/`any` (decoded into the usual Go representation of an
+arbitrary JSON value). Unknown object keys are skipped.
 
 ## The `nocopy` tag option
 
@@ -130,6 +131,15 @@ skipped but a broken one cannot. `lax` works for every field type, including
 nested structs, slices, and maps, where a decode error anywhere in the value
 leaves the whole field unset. It combines with the other options and with
 alternate names — `json:"Name|Title,nocopy,lax"`.
+
+On a `time.Time` field, `lax` additionally widens what counts as a valid
+timestamp. Besides strict RFC 3339, it accepts a space in place of the `T`
+date/time separator and a Unix timestamp given as a JSON number or numeric
+string, inferring seconds, milliseconds, or microseconds from the magnitude; the
+result is normalized to UTC. An unrecognized timestamp is skipped and the field
+left unset, like any other lax mismatch. As with `nocopy`, the lenient parser
+propagates through slices, maps, and pointers (e.g. `[]time.Time`) but stops at
+struct boundaries.
 
 ## String escaping and unescaping
 

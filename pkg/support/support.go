@@ -27,7 +27,12 @@ var (
 	ErrExpectColon  = errors.New("json: expected ':'")
 	ErrExpectObject = errors.New("json: expected '{'")
 	ErrExpectArray  = errors.New("json: expected '['")
+	ErrBadTime      = errors.New("json: invalid time")
 )
+
+// rfc3339NanoSpaceLayout is RFC 3339 with the date and time separated by a space
+// instead of a 'T', a common variant emitted by databases and log pipelines.
+const rfc3339NanoSpaceLayout = "2006-01-02 15:04:05.999999999Z07:00"
 
 // ReadKey reads a JSON object key (a quoted string) at data[i] without
 // allocating. Keys are assumed not to contain backslash escapes; if they do,
@@ -532,6 +537,78 @@ func ReadTimeOrNull(data []byte, i int) (time.Time, int, error) {
 		return time.Time{}, end, perr
 	}
 	return t, end, nil
+}
+
+// ReadTimeLaxOrNull reads a time.Time at data[i], accepting more shapes than
+// ReadTimeOrNull: an RFC 3339 string with either a 'T' or a space separator and
+// optional fractional seconds, or a Unix timestamp (in seconds, milliseconds, or
+// microseconds) given as a JSON number or a numeric string. The result is
+// normalized to UTC. Anything it cannot interpret returns ErrBadTime, which the
+// "lax" decode path turns into a skipped value and an unset field.
+func ReadTimeLaxOrNull(data []byte, i int) (time.Time, int, error) {
+	if i >= len(data) {
+		return time.Time{}, i, ErrTruncated
+	}
+	switch data[i] {
+	case 'n':
+		end, err := ExpectNull(data, i)
+		return time.Time{}, end, err
+	case '"':
+		s, end, err := ReadStringNoCopyOrNull(data, i)
+		if err != nil {
+			return time.Time{}, end, err
+		}
+		if t, ok := parseJSONTS(s); ok {
+			return t, end, nil
+		}
+		if t, ok := parseNumTS(s); ok { // numeric timestamp encoded as a string
+			return t, end, nil
+		}
+		return time.Time{}, end, ErrBadTime
+	default:
+		end, err := skipNumber(data, i)
+		if err != nil {
+			return time.Time{}, end, err
+		}
+		if t, ok := parseNumTS(unsafeStr(data[i:end])); ok {
+			return t, end, nil
+		}
+		return time.Time{}, end, ErrBadTime
+	}
+}
+
+// parseJSONTS parses an RFC 3339 timestamp, tolerating a space in place of the
+// 'T' date/time separator, and normalizes the result to UTC.
+func parseJSONTS(ts string) (time.Time, bool) {
+	pattern := time.RFC3339Nano
+	if len(ts) > 11 && ts[10] == ' ' {
+		pattern = rfc3339NanoSpaceLayout
+	}
+	t, err := time.Parse(pattern, ts)
+	if err == nil {
+		t = t.UTC()
+	}
+	return t, err == nil
+}
+
+// parseNumTS parses a Unix timestamp expressed as a decimal integer, inferring
+// the unit (seconds, milliseconds, or microseconds) from its magnitude. Values
+// outside the recognized ranges are rejected.
+func parseNumTS(ts string) (time.Time, bool) {
+	val, err := strconv.ParseInt(ts, 10, 64)
+	if err != nil {
+		return time.Time{}, false
+	}
+	if val > 1_000_000_000_000_000 && val < 10_000_000_000_000_000 {
+		return time.UnixMicro(val).UTC(), true
+	}
+	if val > 1_000_000_000_000 && val < 10_000_000_000_000 {
+		return time.UnixMilli(val).UTC(), true
+	}
+	if val > 1_000_000_000 && val < 10_000_000_000 {
+		return time.Unix(val, 0).UTC(), true
+	}
+	return time.Time{}, false
 }
 
 // ReadBoolOrNull reads a JSON boolean (or null) at data[i].

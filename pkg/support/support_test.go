@@ -383,6 +383,63 @@ func TestReadTimeOrNull(t *testing.T) {
 	})
 }
 
+// --- ReadTimeLaxOrNull -----------------------------------------------------
+
+func TestReadTimeLaxOrNull(t *testing.T) {
+	utc := func(s string) time.Time {
+		ts, err := time.Parse(time.RFC3339, s)
+		if err != nil {
+			t.Fatalf("setup parse %q: %v", s, err)
+		}
+		return ts.UTC()
+	}
+
+	tests := []struct {
+		name string
+		in   string
+		want time.Time
+	}{
+		{"rfc3339 T", `"2023-01-02T15:04:05Z"`, utc("2023-01-02T15:04:05Z")},
+		{"rfc3339 nanos", `"2023-01-02T15:04:05.123456789Z"`, utc("2023-01-02T15:04:05.123456789Z")},
+		{"rfc3339 offset", `"2023-01-02T15:04:05+02:00"`, utc("2023-01-02T15:04:05+02:00")},
+		{"space separator", `"2023-01-02 15:04:05Z"`, utc("2023-01-02T15:04:05Z")},
+		{"unix seconds", `1700000000`, time.Unix(1700000000, 0).UTC()},
+		{"unix millis", `1700000000000`, time.UnixMilli(1700000000000).UTC()},
+		{"unix micros", `1700000000000000`, time.UnixMicro(1700000000000000).UTC()},
+		{"numeric string", `"1700000000"`, time.Unix(1700000000, 0).UTC()},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, end, err := ReadTimeLaxOrNull([]byte(tt.in), 0)
+			if err != nil {
+				t.Fatalf("unexpected err: %v", err)
+			}
+			if !got.Equal(tt.want) {
+				t.Errorf("got %v, want %v", got, tt.want)
+			}
+			if end != len(tt.in) {
+				t.Errorf("end = %d, want %d", end, len(tt.in))
+			}
+		})
+	}
+
+	t.Run("null", func(t *testing.T) {
+		got, end, err := ReadTimeLaxOrNull([]byte(`null`), 0)
+		if err != nil || !got.IsZero() || end != 4 {
+			t.Fatalf("got %v, end %d, err %v", got, end, err)
+		}
+	})
+
+	// Values it cannot interpret return ErrBadTime (which lax decoding swallows).
+	for _, in := range []string{`"not-a-time"`, `"99"`, `42`, `999999999999999999999`} {
+		t.Run("bad "+in, func(t *testing.T) {
+			if _, _, err := ReadTimeLaxOrNull([]byte(in), 0); !errors.Is(err, ErrBadTime) {
+				t.Fatalf("err = %v, want ErrBadTime", err)
+			}
+		})
+	}
+}
+
 // --- ExpectNull ------------------------------------------------------------
 
 func TestExpectNull(t *testing.T) {

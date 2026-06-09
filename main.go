@@ -228,7 +228,7 @@ func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
 			if lax {
 				code = g.laxField("v."+field, f.Type, field, nocopy)
 			} else {
-				code = g.field("v."+field, f.Type, field, nocopy)
+				code = g.field("v."+field, f.Type, field, nocopy, false)
 			}
 			fmt.Fprintf(&cases, "\tcase %s:\n%s\n", strings.Join(quoted, ", "), code)
 		}
@@ -293,12 +293,13 @@ func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
 // field returns the code that decodes a JSON value at data[i] into the Go
 // lvalue dest, advancing i and returning (end, err) on failure. hint suggests a
 // name for any decoder this value needs. nocopy requests that string/raw leaves
-// alias the input bytes; it propagates through slices, maps and pointers but
-// stops at struct boundaries, where each field's own tag governs.
-func (g *gen) field(dest string, expr ast.Expr, hint string, nocopy bool) string {
+// alias the input bytes; lax requests the lenient time parser for time.Time
+// leaves. Both propagate through slices, maps and pointers but stop at struct
+// boundaries, where each field's own tag governs.
+func (g *gen) field(dest string, expr ast.Expr, hint string, nocopy, lax bool) string {
 	switch t := expr.(type) {
 	case *ast.ParenExpr:
-		return g.field(dest, t.X, hint, nocopy)
+		return g.field(dest, t.X, hint, nocopy, lax)
 
 	case *ast.StarExpr:
 		// new(T) spells the pointee type, so its package must be imported.
@@ -308,7 +309,7 @@ func (g *gen) field(dest string, expr ast.Expr, hint string, nocopy bool) string
 		if isRaw(t.X) {
 			g.needJSON = true
 		}
-		inner := g.field("(*"+dest+")", t.X, hint, nocopy)
+		inner := g.field("(*"+dest+")", t.X, hint, nocopy, lax)
 		return fmt.Sprintf(`if data[i] == 'n' {
 	end, err := support.ExpectNull(data, i)
 	if err != nil {
@@ -326,7 +327,7 @@ func (g *gen) field(dest string, expr ast.Expr, hint string, nocopy bool) string
 			return g.scalar(dest, t.Name, nocopy)
 		}
 		if _, ok := g.structTypes[t.Name]; ok {
-			// A struct's own field tags govern its nocopy behavior.
+			// A struct's own field tags govern its nocopy/lax behavior.
 			return g.callDecoder(dest, g.namedStruct(t.Name))
 		}
 		if t.Name == "any" {
@@ -340,7 +341,7 @@ func (g *gen) field(dest string, expr ast.Expr, hint string, nocopy bool) string
 			return g.rawMessage(dest, nocopy)
 		}
 		if isTime(t) {
-			return g.timeRead(dest)
+			return g.timeRead(dest, lax)
 		}
 		fmt.Fprintf(os.Stderr, "warning: unsupported type %s for %s; value skipped\n", g.typeStr(t), dest)
 		return g.skipEmit()
@@ -353,10 +354,10 @@ func (g *gen) field(dest string, expr ast.Expr, hint string, nocopy bool) string
 			fmt.Fprintf(os.Stderr, "warning: fixed-size array for %s; value skipped\n", dest)
 			return g.skipEmit()
 		}
-		return g.callDecoder(dest, g.sliceDecoder(t.Elt, hint, nocopy))
+		return g.callDecoder(dest, g.sliceDecoder(t.Elt, hint, nocopy, lax))
 
 	case *ast.MapType:
-		fn := g.mapDecoder(t.Key, t.Value, hint, nocopy)
+		fn := g.mapDecoder(t.Key, t.Value, hint, nocopy, lax)
 		if fn == "" {
 			return g.skipEmit()
 		}
@@ -386,7 +387,7 @@ i = end`, fn, dest)
 // JSON value of the wrong type is skippable while genuinely malformed JSON is
 // not, only type mismatches are swallowed: a syntax error still propagates.
 func (g *gen) laxField(dest string, expr ast.Expr, hint string, nocopy bool) string {
-	fn := g.valueDecoder(expr, hint, nocopy)
+	fn := g.valueDecoder(expr, hint, nocopy, true)
 	if fn == "" {
 		// Unsupported type: skipping already leaves the field unset.
 		return g.skipEmit()
@@ -409,7 +410,7 @@ i = end`, g.typeStr(expr), fn, dest)
 // existing decoders; everything else gets a thin wrapper around the inline field
 // code so a lax field can decode into a scratch value. It returns "" for types
 // whose value would otherwise be skipped (e.g. an unsupported map key type).
-func (g *gen) valueDecoder(expr ast.Expr, hint string, nocopy bool) string {
+func (g *gen) valueDecoder(expr ast.Expr, hint string, nocopy, lax bool) string {
 	switch t := unparen(expr).(type) {
 	case *ast.Ident:
 		if _, ok := g.structTypes[t.Name]; ok {
@@ -419,14 +420,17 @@ func (g *gen) valueDecoder(expr ast.Expr, hint string, nocopy bool) string {
 		return g.anonStruct(t, hint)
 	case *ast.ArrayType:
 		if t.Len == nil {
-			return g.sliceDecoder(t.Elt, hint, nocopy)
+			return g.sliceDecoder(t.Elt, hint, nocopy, lax)
 		}
 	case *ast.MapType:
-		return g.mapDecoder(t.Key, t.Value, hint, nocopy)
+		return g.mapDecoder(t.Key, t.Value, hint, nocopy, lax)
 	}
 	suffix := ""
 	if nocopy {
 		suffix = "NoCopy"
+	}
+	if lax {
+		suffix += "Lax"
 	}
 	key := "value:" + suffix + ":" + g.typeStr(expr)
 	if fn, ok := g.memo[key]; ok {
@@ -440,7 +444,7 @@ func (g *gen) valueDecoder(expr ast.Expr, hint string, nocopy bool) string {
 	if isTime(expr) {
 		g.needTime = true
 	}
-	inner := g.field("(*v)", expr, hint, nocopy)
+	inner := g.field("(*v)", expr, hint, nocopy, lax)
 	body := fmt.Sprintf(`func %[1]s(v *%[2]s, data []byte, i int) (int, error) {
 	%[3]s
 	return i, nil
@@ -532,13 +536,18 @@ if data[start] != 'n' {
 i = end`, assign)
 }
 
-func (g *gen) timeRead(dest string) string {
-	return fmt.Sprintf(`t, end, err := support.ReadTimeOrNull(data, i)
+func (g *gen) timeRead(dest string, lax bool) string {
+	reader := "support.ReadTimeOrNull"
+	if lax {
+		// lax accepts RFC 3339 (with 'T' or space) and numeric Unix timestamps.
+		reader = "support.ReadTimeLaxOrNull"
+	}
+	return fmt.Sprintf(`t, end, err := %s(data, i)
 if err != nil {
 	return end, err
 }
 %s = t
-i = end`, dest)
+i = end`, reader, dest)
 }
 
 func (g *gen) anyValue(dest string) string {
@@ -561,10 +570,13 @@ if err != nil {
 i = end`
 }
 
-func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy bool) string {
+func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax bool) string {
 	suffix := ""
 	if nocopy {
 		suffix = "NoCopy"
+	}
+	if lax {
+		suffix += "Lax"
 	}
 	key := "slice:" + suffix + ":" + g.typeStr(elt)
 	if fn, ok := g.memo[key]; ok {
@@ -584,7 +596,7 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy bool) string {
 		g.needTime = true
 	}
 	eltStr := g.typeStr(elt)
-	inner := g.field("el", elt, singular(hint)+"Entry", nocopy)
+	inner := g.field("el", elt, singular(hint)+"Entry", nocopy, lax)
 	body := fmt.Sprintf(`func %[1]s(out *[]%[2]s, data []byte, i int) (int, error) {
 	if i >= len(data) {
 		return i, support.ErrTruncated
@@ -629,7 +641,7 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy bool) string {
 	return fn
 }
 
-func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy bool) string {
+func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy, lax bool) string {
 	if g.typeStr(keyExpr) != "string" {
 		fmt.Fprintf(os.Stderr, "warning: map key type %s unsupported for %s; value skipped\n", g.typeStr(keyExpr), hint)
 		return ""
@@ -637,6 +649,9 @@ func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy bool) st
 	suffix := ""
 	if nocopy {
 		suffix = "NoCopy"
+	}
+	if lax {
+		suffix += "Lax"
 	}
 	key := "map:" + suffix + ":" + g.typeStr(valExpr)
 	if fn, ok := g.memo[key]; ok {
@@ -651,7 +666,7 @@ func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy bool) st
 		g.needTime = true
 	}
 	valStr := g.typeStr(valExpr)
-	inner := g.field("val", valExpr, hint+"Value", nocopy)
+	inner := g.field("val", valExpr, hint+"Value", nocopy, lax)
 	body := fmt.Sprintf(`func %[1]s(out *map[string]%[2]s, data []byte, i int) (int, error) {
 	if i >= len(data) {
 		return i, support.ErrTruncated
