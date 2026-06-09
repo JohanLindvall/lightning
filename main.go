@@ -203,7 +203,7 @@ func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
 			fmt.Fprintf(os.Stderr, "warning: skipping embedded field %s\n", g.typeStr(f.Type))
 			continue
 		}
-		tagNames, skip, nocopy := jsonTag(f.Tag)
+		tagNames, skip, nocopy, lax := jsonTag(f.Tag)
 		if skip {
 			continue
 		}
@@ -224,7 +224,12 @@ func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
 				seen[k] = true
 				quoted[i] = strconv.Quote(k)
 			}
-			code := g.field("v."+field, f.Type, field, nocopy)
+			var code string
+			if lax {
+				code = g.laxField("v."+field, f.Type, field, nocopy)
+			} else {
+				code = g.field("v."+field, f.Type, field, nocopy)
+			}
 			fmt.Fprintf(&cases, "\tcase %s:\n%s\n", strings.Join(quoted, ", "), code)
 		}
 	}
@@ -373,6 +378,75 @@ if err != nil {
 	return end, err
 }
 i = end`, fn, dest)
+}
+
+// laxField emits the decode for a field carrying the "lax" tag option. The value
+// is decoded into a scratch variable; on success it is committed to dest, and on
+// any error the input value is skipped and dest left unset. Because a well-formed
+// JSON value of the wrong type is skippable while genuinely malformed JSON is
+// not, only type mismatches are swallowed: a syntax error still propagates.
+func (g *gen) laxField(dest string, expr ast.Expr, hint string, nocopy bool) string {
+	fn := g.valueDecoder(expr, hint, nocopy)
+	if fn == "" {
+		// Unsupported type: skipping already leaves the field unset.
+		return g.skipEmit()
+	}
+	return fmt.Sprintf(`var lax %[1]s
+end, err := %[2]s(&lax, data, i)
+if err != nil {
+	end, err = support.SkipValue(data, i)
+	if err != nil {
+		return end, err
+	}
+} else {
+	%[3]s = lax
+}
+i = end`, g.typeStr(expr), fn, dest)
+}
+
+// valueDecoder returns the name of a function decoding the JSON value at data[i]
+// into *T, where T is the field type. Struct, slice and map types reuse their
+// existing decoders; everything else gets a thin wrapper around the inline field
+// code so a lax field can decode into a scratch value. It returns "" for types
+// whose value would otherwise be skipped (e.g. an unsupported map key type).
+func (g *gen) valueDecoder(expr ast.Expr, hint string, nocopy bool) string {
+	switch t := unparen(expr).(type) {
+	case *ast.Ident:
+		if _, ok := g.structTypes[t.Name]; ok {
+			return g.namedStruct(t.Name)
+		}
+	case *ast.StructType:
+		return g.anonStruct(t, hint)
+	case *ast.ArrayType:
+		if t.Len == nil {
+			return g.sliceDecoder(t.Elt, hint, nocopy)
+		}
+	case *ast.MapType:
+		return g.mapDecoder(t.Key, t.Value, hint, nocopy)
+	}
+	suffix := ""
+	if nocopy {
+		suffix = "NoCopy"
+	}
+	key := "value:" + suffix + ":" + g.typeStr(expr)
+	if fn, ok := g.memo[key]; ok {
+		return fn
+	}
+	fn := g.uniq("decode" + g.baseName(expr) + suffix + "Value")
+	g.memo[key] = fn
+	if isRaw(expr) {
+		g.needJSON = true
+	}
+	if isTime(expr) {
+		g.needTime = true
+	}
+	inner := g.field("(*v)", expr, hint, nocopy)
+	body := fmt.Sprintf(`func %[1]s(v *%[2]s, data []byte, i int) (int, error) {
+	%[3]s
+	return i, nil
+}`, fn, g.typeStr(expr), inner)
+	g.decoders = append(g.decoders, body)
+	return fn
 }
 
 func (g *gen) scalar(dest, name string, nocopy bool) string {
@@ -709,31 +783,36 @@ func (g *gen) assemble(inPath string, methods []string) string {
 }
 
 // jsonTag returns the JSON key(s) from a struct tag, whether the field is
-// excluded (`json:"-"`), and whether the "nocopy" option is present. The name
-// field may list several pipe-separated names (`json:"Status|EdgeResponseStatus"`),
-// each of which maps the same field; any of them in the input fills the field.
-// Comma-separated options follow the name, as in encoding/json; the recognized
-// option "nocopy" makes string and raw fields alias the input bytes instead of
-// copying them.
-func jsonTag(tag *ast.BasicLit) (names []string, skip, nocopy bool) {
+// excluded (`json:"-"`), and whether the "nocopy" and "lax" options are present.
+// The name field may list several pipe-separated names
+// (`json:"Status|EdgeResponseStatus"`), each of which maps the same field; any
+// of them in the input fills the field. Comma-separated options follow the name,
+// as in encoding/json; the recognized options are "nocopy", which makes string
+// and raw fields alias the input bytes instead of copying them, and "lax", which
+// makes a type mismatch on the field's value a no-op (the value is skipped and
+// the field left unset) rather than an error.
+func jsonTag(tag *ast.BasicLit) (names []string, skip, nocopy, lax bool) {
 	if tag == nil {
-		return nil, false, false
+		return nil, false, false, false
 	}
 	s, err := strconv.Unquote(tag.Value)
 	if err != nil {
-		return nil, false, false
+		return nil, false, false, false
 	}
 	v := reflect.StructTag(s).Get("json")
 	if v == "" {
-		return nil, false, false
+		return nil, false, false, false
 	}
 	parts := strings.Split(v, ",")
 	if parts[0] == "-" && len(parts) == 1 {
-		return nil, true, false
+		return nil, true, false, false
 	}
 	for _, o := range parts[1:] {
-		if o == "nocopy" {
+		switch o {
+		case "nocopy":
 			nocopy = true
+		case "lax":
+			lax = true
 		}
 	}
 	for _, n := range strings.Split(parts[0], "|") {
@@ -741,7 +820,7 @@ func jsonTag(tag *ast.BasicLit) (names []string, skip, nocopy bool) {
 			names = append(names, n)
 		}
 	}
-	return names, false, nocopy
+	return names, false, nocopy, lax
 }
 
 func cap1(s string) string {
@@ -761,6 +840,17 @@ func singular(s string) string {
 		return s[:len(s)-1]
 	}
 	return s
+}
+
+// unparen strips any enclosing parentheses from a type expression.
+func unparen(expr ast.Expr) ast.Expr {
+	for {
+		p, ok := expr.(*ast.ParenExpr)
+		if !ok {
+			return expr
+		}
+		expr = p.X
+	}
 }
 
 func isRaw(expr ast.Expr) bool {

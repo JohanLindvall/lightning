@@ -111,6 +111,26 @@ Comma-separated options still follow the name as usual, so names and `nocopy`
 combine freely — `json:"Name|Title,nocopy"` accepts both `Name` and `Title`,
 zero-copy.
 
+## The `lax` tag option
+
+By default a value of the wrong type fails the whole decode: a string where a
+number is expected returns an error. Add `lax` to the json tag to make such a
+mismatch a no-op instead — the offending value is skipped and the field left at
+its zero value, while the rest of the object decodes normally:
+
+```go
+type Log struct {
+    Status int64 `json:"Status,lax"` // a non-number Status is ignored, leaving 0
+}
+```
+
+Only type mismatches are tolerated; genuinely malformed JSON (a syntax error in
+the value) still fails, since a well-formed value of the wrong type can be
+skipped but a broken one cannot. `lax` works for every field type, including
+nested structs, slices, and maps, where a decode error anywhere in the value
+leaves the whole field unset. It combines with the other options and with
+alternate names — `json:"Name|Title,nocopy,lax"`.
+
 ## String escaping and unescaping
 
 The [`pkg/json`](pkg/json) package exposes the scanner's string codec on its
