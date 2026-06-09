@@ -130,22 +130,86 @@ func indexStructuralScalar(b []byte) int {
 	return len(b)
 }
 
-// decodeStringEscaped is the slow path for strings containing backslash
-// escapes. It allocates a new buffer.
+// UnescapeString decodes the body of a JSON string (the bytes that sit between
+// the surrounding quotes, with escape sequences such as \n, \" and \uXXXX still
+// present) into the Go string it represents. When in contains no escapes the
+// returned string aliases in directly without copying, so the caller must keep
+// in unchanged while the result is in use; when escapes are present a new
+// string is allocated. It shares its slow path with the JSON scanner.
+func UnescapeString(in []byte) (string, error) {
+	k := bytes.IndexByte(in, '\\')
+	if k < 0 {
+		return unsafeStr(in), nil
+	}
+	s, _, err := decodeEscaped(make([]byte, 0, len(in)), in, 0, k, false)
+	return s, err
+}
+
+// UnescapeStringInPlace is like UnescapeString but decodes the escapes into in
+// itself instead of allocating: because unescaping never lengthens a string,
+// the decoded bytes always fit in the space the escaped bytes occupied. It
+// allocates nothing. The returned string aliases in and in's contents are
+// overwritten, so the caller must not rely on in's original (escaped) bytes
+// afterwards and must keep in unchanged while the result is in use.
+func UnescapeStringInPlace(in []byte) (string, error) {
+	k := bytes.IndexByte(in, '\\')
+	if k < 0 {
+		return unsafeStr(in), nil
+	}
+	// buf aliases in; writing decoded bytes back into in is safe because the
+	// write cursor never overtakes the read cursor (each escape consumes at
+	// least as many bytes as it produces) and append uses an overlap-safe
+	// memmove.
+	s, _, err := decodeEscaped(in[:0], in, 0, k, false)
+	return s, err
+}
+
+// decodeStringEscaped is the slow path for quoted strings containing backslash
+// escapes, terminated by the closing quote in data. It allocates a new buffer.
 func decodeStringEscaped(data []byte, start, i int) (string, int, error) {
-	buf := make([]byte, 0, len(data)-start)
+	return decodeEscaped(make([]byte, 0, len(data)-start), data, start, i, true)
+}
+
+// decodeEscaped decodes a backslash-escaped string body, starting from the
+// already-validated prefix data[start:i], appending the decoded bytes to buf.
+// With quoted=true it stops at the first unescaped '"' and returns the index
+// just past it (the JSON scanner path); with quoted=false the whole of data is
+// the body and decoding runs to len(data) (the UnescapeString path). buf may
+// alias data (decode in place) provided it starts empty at offset 0.
+//
+// Literal runs between escapes are copied in bulk: a vectorized scan locates
+// the next escape (or, when quoted, the closing quote) so the common case of
+// long stretches of ordinary characters costs one memmove rather than a
+// per-byte append.
+func decodeEscaped(buf, data []byte, start, i int, quoted bool) (string, int, error) {
 	buf = append(buf, data[start:i]...)
 	for i < len(data) {
-		c := data[i]
-		if c == '"' {
-			return string(buf), i + 1, nil
+		// Bulk-copy the literal run up to the next escape (quoted mode also
+		// stops at the closing quote) in a single vectorized pass.
+		rest := data[i:]
+		var k int
+		if quoted {
+			k = indexCloseOrEscape(rest)
+			if k == len(rest) {
+				break // unterminated string
+			}
+			buf = append(buf, rest[:k]...)
+			i += k
+			if data[i] == '"' {
+				return string(buf), i + 1, nil
+			}
+			i++ // step over the backslash
+		} else {
+			j := i
+			for j < len(data) && data[j] != '\\' {
+				j++
+			}
+			buf = append(buf, data[i:j]...)
+			if j >= len(data) {
+				break
+			}
+			i = j + 1 // step over the backslash
 		}
-		if c != '\\' {
-			buf = append(buf, c)
-			i++
-			continue
-		}
-		i++
 		if i >= len(data) {
 			return "", i, ErrTruncated
 		}
@@ -197,7 +261,12 @@ func decodeStringEscaped(data []byte, start, i int) (string, int, error) {
 			return "", i, ErrBadEscape
 		}
 	}
-	return "", i, ErrTruncated
+	if quoted {
+		return "", i, ErrTruncated
+	}
+	// buf is freshly allocated and never mutated after this point, so it can be
+	// handed out as a string without the extra copy string(buf) would make.
+	return unsafeStr(buf), i, nil
 }
 
 func readUnicodeEscape(data []byte, i int) (rune, int, error) {

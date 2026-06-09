@@ -95,6 +95,23 @@ type Log struct {
 boundaries (each struct's own field tags govern). Strings containing escape
 sequences still allocate, since they can't be a slice of the raw input.
 
+## String unescaping
+
+The [`pkg/lightning`](pkg/lightning) package exposes the scanner's string
+decoder on its own, for when you have a JSON string body (the bytes between the
+quotes, escapes intact) and just want the decoded value:
+
+- `UnescapeString(in []byte) (string, error)` — decodes the escapes in `in`. If
+  `in` contains no escapes the result aliases `in` with no copy; otherwise a new
+  string is allocated. `in` is left unchanged.
+- `UnescapeStringInPlace(in []byte) (string, error)` — same, but decodes into
+  `in` itself and allocates nothing (unescaping never lengthens a string, so the
+  result always fits). It overwrites `in` and returns a string that aliases it,
+  so the caller must not rely on `in`'s original bytes afterwards.
+
+Both return a string that aliases a buffer, so keep that buffer unchanged while
+the result is in use.
+
 ## SIMD scanning
 
 Two hot scan loops use a single vectorized pass instead of byte-at-a-time work
@@ -147,6 +164,7 @@ Representative numbers for a 1.8 KB Cloudflare log (Go 1.26, amd64):
 |---|---|
 | [`main.go`](main.go) | the generator (`package main`) |
 | [`pkg/support`](pkg/support) | shared JSON scanning primitives used by generated code |
+| [`pkg/lightning`](pkg/lightning) | small public API over the scanner (e.g. `UnescapeString`) |
 | [`bench/`](bench) | benchmark module: hand-written `data.go` + `input.json` per case, plus the generated decoders, harness, and results |
 
 Generated files (`*_unmarshal.go`, `bench/*/bench_test.go`, `bench/*/ej/`, and
