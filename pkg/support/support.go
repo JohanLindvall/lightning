@@ -410,6 +410,23 @@ func ReadFloat64OrNull(data []byte, i int) (float64, int, error) {
 	return f, end, nil
 }
 
+// ParseFloat parses the JSON number in b as a float64. It takes the same Clinger
+// fast path as the scanner — an exact mantissa with a small decimal exponent is
+// converted with a single multiply or divide — and falls back to
+// strconv.ParseFloat for everything else. b must be exactly one number with no
+// surrounding whitespace; trailing bytes or an empty input yield ErrBadNumber.
+func ParseFloat(b []byte) (float64, error) {
+	if f, ok := fastFloat(b); ok {
+		return f, nil
+	}
+	// unsafeStr avoids copying the token; ParseFloat does not retain it.
+	f, err := strconv.ParseFloat(unsafeStr(b), 64)
+	if err != nil {
+		return 0, ErrBadNumber
+	}
+	return f, nil
+}
+
 // fastFloat parses a JSON number using the Clinger fast path: when the decimal
 // mantissa fits exactly in a float64 (< 2^53) and the decimal exponent is in
 // [-22, 22], a single float multiply or divide by an exact power of ten yields

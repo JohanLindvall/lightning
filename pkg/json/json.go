@@ -30,3 +30,12 @@ func UnescapeString(in []byte) (string, error) {
 func UnescapeStringInto(in, out []byte) (string, error) {
 	return support.UnescapeStringInto(in, out)
 }
+
+// ParseFloat parses the JSON number in b as a float64. It takes the scanner's
+// Clinger fast path — an exact mantissa with a small decimal exponent becomes a
+// single multiply or divide — and falls back to strconv.ParseFloat for the rest.
+// b must be exactly one number with no surrounding whitespace; trailing bytes or
+// an empty input yield an error.
+func ParseFloat(b []byte) (float64, error) {
+	return support.ParseFloat(b)
+}

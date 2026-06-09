@@ -167,6 +167,17 @@ the result is in use.
 Clean runs are skipped eight bytes at a time (SWAR), so strings that need little
 or no escaping cost roughly one `memcpy`.
 
+## Number parsing
+
+The [`pkg/json`](pkg/json) package also exposes the scanner's float parser:
+
+- `ParseFloat(b []byte) (float64, error)` — parses the JSON number in `b` as a
+  `float64`. It takes the scanner's Clinger fast path — when the mantissa is
+  exact and the decimal exponent is small, the result is a single multiply or
+  divide by a power of ten — and falls back to `strconv.ParseFloat` for the rest.
+  `b` must be exactly one number with no surrounding whitespace; trailing bytes
+  or an empty input return an error. Nothing is retained or copied.
+
 ## SIMD scanning
 
 Two hot scan loops use a single vectorized pass instead of byte-at-a-time work
