@@ -97,17 +97,20 @@ sequences still allocate, since they can't be a slice of the raw input.
 
 ## String unescaping
 
-The [`pkg/lightning`](pkg/lightning) package exposes the scanner's string
+The [`pkg/json`](pkg/json) package exposes the scanner's string
 decoder on its own, for when you have a JSON string body (the bytes between the
 quotes, escapes intact) and just want the decoded value:
 
 - `UnescapeString(in []byte) (string, error)` — decodes the escapes in `in`. If
   `in` contains no escapes the result aliases `in` with no copy; otherwise a new
   string is allocated. `in` is left unchanged.
-- `UnescapeStringInPlace(in []byte) (string, error)` — same, but decodes into
-  `in` itself and allocates nothing (unescaping never lengthens a string, so the
-  result always fits). It overwrites `in` and returns a string that aliases it,
-  so the caller must not rely on `in`'s original bytes afterwards.
+- `UnescapeStringInto(in, out []byte) (string, error)` — same, but writes the
+  decoded bytes into `out` instead of allocating (mirroring the `Unescape(in,
+  out)` convention of [buger/jsonparser](https://github.com/buger/jsonparser)).
+  With no escapes the result aliases `in`; otherwise it aliases `out` and
+  allocates nothing when `cap(out) >= len(in)`, since unescaping never lengthens
+  a string. Pass `out == in` (e.g. `in[:0]`) to decode truly in place,
+  overwriting `in`.
 
 Both return a string that aliases a buffer, so keep that buffer unchanged while
 the result is in use.
@@ -164,7 +167,7 @@ Representative numbers for a 1.8 KB Cloudflare log (Go 1.26, amd64):
 |---|---|
 | [`main.go`](main.go) | the generator (`package main`) |
 | [`pkg/support`](pkg/support) | shared JSON scanning primitives used by generated code |
-| [`pkg/lightning`](pkg/lightning) | small public API over the scanner (e.g. `UnescapeString`) |
+| [`pkg/json`](pkg/json) | small public API over the scanner (e.g. `UnescapeString`) |
 | [`bench/`](bench) | benchmark module: hand-written `data.go` + `input.json` per case, plus the generated decoders, harness, and results |
 
 Generated files (`*_unmarshal.go`, `bench/*/bench_test.go`, `bench/*/ej/`, and

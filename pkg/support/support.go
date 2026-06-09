@@ -145,22 +145,29 @@ func UnescapeString(in []byte) (string, error) {
 	return s, err
 }
 
-// UnescapeStringInPlace is like UnescapeString but decodes the escapes into in
-// itself instead of allocating: because unescaping never lengthens a string,
-// the decoded bytes always fit in the space the escaped bytes occupied. It
-// allocates nothing. The returned string aliases in and in's contents are
-// overwritten, so the caller must not rely on in's original (escaped) bytes
-// afterwards and must keep in unchanged while the result is in use.
-func UnescapeStringInPlace(in []byte) (string, error) {
+// UnescapeStringInto decodes the body of a JSON string like UnescapeString,
+// but writes the decoded bytes into out instead of allocating its own buffer,
+// mirroring the Unescape(in, out) convention of github.com/buger/jsonparser:
+//
+//   - if in contains no escapes, the returned string aliases in and out is
+//     untouched;
+//   - otherwise the decode is written into out and the returned string aliases
+//     out. When cap(out) >= len(in) this allocates nothing (unescaping never
+//     lengthens a string, so the result always fits); a shorter out is grown,
+//     which allocates.
+//
+// Pass out == in (e.g. in[:0]) to decode truly in place: that is safe because
+// the write cursor never overtakes the read cursor (each escape consumes at
+// least as many bytes as it produces) and append uses an overlap-safe memmove.
+// Either way the returned string aliases the buffer it was built in, which the
+// caller must keep unchanged while the result is in use; when out aliases in,
+// in's original (escaped) bytes are overwritten.
+func UnescapeStringInto(in, out []byte) (string, error) {
 	k := bytes.IndexByte(in, '\\')
 	if k < 0 {
 		return unsafeStr(in), nil
 	}
-	// buf aliases in; writing decoded bytes back into in is safe because the
-	// write cursor never overtakes the read cursor (each escape consumes at
-	// least as many bytes as it produces) and append uses an overlap-safe
-	// memmove.
-	s, _, err := decodeEscaped(in[:0], in, 0, k, false)
+	s, _, err := decodeEscaped(out[:0], in, 0, k, false)
 	return s, err
 }
 

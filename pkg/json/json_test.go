@@ -1,7 +1,7 @@
-package lightning
+package json
 
 import (
-	"encoding/json"
+	stdjson "encoding/json"
 	"strings"
 	"testing"
 )
@@ -45,7 +45,7 @@ func TestUnescapeString(t *testing.T) {
 	}
 }
 
-func TestUnescapeStringInPlace(t *testing.T) {
+func TestUnescapeStringInto(t *testing.T) {
 	tests := []struct {
 		name    string
 		in      string
@@ -69,8 +69,8 @@ func TestUnescapeStringInPlace(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			buf := []byte(tt.in) // copy: the call mutates its argument
-			got, err := UnescapeStringInPlace(buf)
+			buf := []byte(tt.in)        // copy: decoding in place mutates it
+			got, err := UnescapeStringInto(buf, buf) // out == in: true in place
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("err = %v, wantErr = %v", err, tt.wantErr)
 			}
@@ -81,9 +81,9 @@ func TestUnescapeStringInPlace(t *testing.T) {
 	}
 }
 
-// TestUnescapeStringInPlaceMatchesUnescapeString runs both decoders over the
+// TestUnescapeStringIntoMatchesUnescapeString runs both decoders over the
 // same inputs and requires identical results.
-func TestUnescapeStringInPlaceMatchesUnescapeString(t *testing.T) {
+func TestUnescapeStringIntoMatchesUnescapeString(t *testing.T) {
 	inputs := []string{
 		"",
 		"no escapes here",
@@ -98,9 +98,10 @@ func TestUnescapeStringInPlaceMatchesUnescapeString(t *testing.T) {
 		if err != nil {
 			t.Fatalf("UnescapeString(%q): %v", s, err)
 		}
-		got, err := UnescapeStringInPlace([]byte(s))
+		buf := []byte(s)
+		got, err := UnescapeStringInto(buf, buf)
 		if err != nil {
-			t.Fatalf("UnescapeStringInPlace(%q): %v", s, err)
+			t.Fatalf("UnescapeStringInto(%q): %v", s, err)
 		}
 		if got != want {
 			t.Fatalf("input %q: in-place got %q, want %q", s, got, want)
@@ -121,7 +122,7 @@ func TestUnescapeStringMatchesStdlib(t *testing.T) {
 	}
 	for _, body := range bodies {
 		var want string
-		if err := json.Unmarshal([]byte(`"`+body+`"`), &want); err != nil {
+		if err := stdjson.Unmarshal([]byte(`"`+body+`"`), &want); err != nil {
 			t.Fatalf("stdlib rejected %q: %v", body, err)
 		}
 		got, err := UnescapeString([]byte(body))
@@ -170,20 +171,18 @@ func BenchmarkUnescapeString(b *testing.B) {
 	}
 }
 
-// BenchmarkUnescapeStringInPlace measures the allocation-free in-place decoder.
-// Each iteration first copies the (destructible) input into a reusable scratch
-// buffer, since the call overwrites it; that copy is the price of reusing one
-// buffer across iterations, not of the decode itself, which allocates nothing.
-func BenchmarkUnescapeStringInPlace(b *testing.B) {
+// BenchmarkUnescapeStringInto measures the allocation-free decoder writing into
+// a reusable out buffer (sized once with cap >= len(in)). in is left unchanged,
+// so no per-iteration restore is needed.
+func BenchmarkUnescapeStringInto(b *testing.B) {
 	for _, bc := range benchCases {
 		b.Run(bc.name, func(b *testing.B) {
-			scratch := make([]byte, len(bc.in))
+			out := make([]byte, len(bc.in))
 			b.SetBytes(int64(len(bc.in)))
 			b.ReportAllocs()
 			var sink string
 			for i := 0; i < b.N; i++ {
-				copy(scratch, bc.in)
-				s, err := UnescapeStringInPlace(scratch)
+				s, err := UnescapeStringInto(bc.in, out)
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -205,7 +204,7 @@ func BenchmarkUnescapeStringVsStdlib(b *testing.B) {
 			b.ReportAllocs()
 			var sink string
 			for i := 0; i < b.N; i++ {
-				if err := json.Unmarshal(quoted, &sink); err != nil {
+				if err := stdjson.Unmarshal(quoted, &sink); err != nil {
 					b.Fatal(err)
 				}
 			}
