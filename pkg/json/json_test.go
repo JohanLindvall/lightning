@@ -6,33 +6,40 @@ import (
 	"testing"
 )
 
-func TestUnescapeString(t *testing.T) {
-	tests := []struct {
-		name    string
-		in      string
-		want    string
-		wantErr bool
-	}{
-		{"empty", "", "", false},
-		{"plain", "hello world", "hello world", false},
-		{"quote", `say \"hi\"`, `say "hi"`, false},
-		{"backslash", `a\\b`, `a\b`, false},
-		{"slash", `a\/b`, "a/b", false},
-		{"controls", `tab\tnl\ncr\r`, "tab\tnl\ncr\r", false},
-		{"backspace formfeed", `\b\f`, "\b\f", false},
-		{"unicode", `Aé`, "Aé", false},
-		{"surrogate pair", `😀`, "\U0001F600", false},
-		{"escape at end", `abc\n`, "abc\n", false},
-		{"escape at start", `\nabc`, "\nabc", false},
-		{"long unescaped", strings.Repeat("x", 256), strings.Repeat("x", 256), false},
-		{"long with one escape", strings.Repeat("x", 256) + `\n`, strings.Repeat("x", 256) + "\n", false},
+// unescapeCases is the shared corpus of UnescapeString inputs: in is a JSON
+// string body (escapes intact), want is its decoded form, and wantErr marks
+// malformed input. Test_unit_EscapeString reuses the valid cases to check the
+// escaper and to round-trip escape against unescape over these inputs.
+var unescapeCases = []struct {
+	name    string
+	in      string
+	want    string
+	wantErr bool
+}{
+	{"empty", "", "", false},
+	{"plain", "hello world", "hello world", false},
+	{"quote", `say \"hi\"`, `say "hi"`, false},
+	{"backslash", `a\\b`, `a\b`, false},
+	{"slash", `a\/b`, "a/b", false},
+	{"controls", `tab\tnl\ncr\r`, "tab\tnl\ncr\r", false},
+	{"backspace formfeed", `\b\f`, "\b\f", false},
+	{"unicode", `Aé`, "Aé", false},
+	{"surrogate pair", `😀`, "\U0001F600", false},
+	{"escape at end", `abc\n`, "abc\n", false},
+	{"escape at start", `\nabc`, "\nabc", false},
+	{"escaped quote at start", `\"xyz`, `"xyz`, false},
+	{"escaped backslash", `\\n`, `\n`, false},
+	{"long unescaped", strings.Repeat("x", 256), strings.Repeat("x", 256), false},
+	{"long with one escape", strings.Repeat("x", 256) + `\n`, strings.Repeat("x", 256) + "\n", false},
 
-		{"bad escape", `a\xb`, "", true},
-		{"truncated escape", `abc\`, "", true},
-		{"bad unicode", `\u00zz`, "", true},
-		{"truncated unicode", `\u00`, "", true},
-	}
-	for _, tt := range tests {
+	{"bad escape", `a\xb`, "", true},
+	{"truncated escape", `abc\`, "", true},
+	{"bad unicode", `\u00zz`, "", true},
+	{"truncated unicode", `\u00`, "", true},
+}
+
+func TestUnescapeString(t *testing.T) {
+	for _, tt := range unescapeCases {
 		t.Run(tt.name, func(t *testing.T) {
 			got, err := UnescapeString([]byte(tt.in))
 			if (err != nil) != tt.wantErr {
@@ -69,7 +76,7 @@ func TestUnescapeStringInto(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			buf := []byte(tt.in)        // copy: decoding in place mutates it
+			buf := []byte(tt.in)                     // copy: decoding in place mutates it
 			got, err := UnescapeStringInto(buf, buf) // out == in: true in place
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("err = %v, wantErr = %v", err, tt.wantErr)

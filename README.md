@@ -95,11 +95,13 @@ type Log struct {
 boundaries (each struct's own field tags govern). Strings containing escape
 sequences still allocate, since they can't be a slice of the raw input.
 
-## String unescaping
+## String escaping and unescaping
 
-The [`pkg/json`](pkg/json) package exposes the scanner's string
-decoder on its own, for when you have a JSON string body (the bytes between the
-quotes, escapes intact) and just want the decoded value:
+The [`pkg/json`](pkg/json) package exposes the scanner's string codec on its
+own, for when you have a JSON string body (the bytes between the quotes) and
+just want to decode or encode it.
+
+**Unescaping** (escaped body → decoded value):
 
 - `UnescapeString(in []byte) (string, error)` — decodes the escapes in `in`. If
   `in` contains no escapes the result aliases `in` with no copy; otherwise a new
@@ -114,6 +116,20 @@ quotes, escapes intact) and just want the decoded value:
 
 Both return a string that aliases a buffer, so keep that buffer unchanged while
 the result is in use.
+
+**Escaping** (raw value → escaped body, escaping `"`, `\`, and control bytes;
+`/` is left as-is and `\b`/`\f` are written in `\u00XX` form):
+
+- `EscapeString(s []byte, out *strings.Builder)` — writes the escaped form of
+  `s` to `out`. The common no-escape case is detected with a vectorized scan and
+  written straight to the builder, with no scratch buffer or copy.
+- `EscapeStringInto(s, out []byte) []byte` — appends the escaped form of `s` to
+  `out` and returns the extended slice, allocating nothing when `out` has room
+  (escaping can grow a string up to 6× for control bytes). Pass `out[:0]` to
+  reuse a buffer across calls.
+
+Clean runs are skipped eight bytes at a time (SWAR), so strings that need little
+or no escaping cost roughly one `memcpy`.
 
 ## SIMD scanning
 
