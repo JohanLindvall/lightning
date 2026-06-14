@@ -401,11 +401,11 @@ func ReadFloat64OrNull(data []byte, i int) (float64, int, error) {
 		end, err := ExpectNull(data, i)
 		return 0, end, err
 	}
-	end, err := skipNumber(data, i)
-	if err != nil {
-		return 0, end, err
+	f, end, fast, ok := scanFloat(data, i)
+	if !ok {
+		return 0, end, ErrBadNumber
 	}
-	if f, ok := fastFloat(data[i:end]); ok {
+	if fast {
 		return f, end, nil
 	}
 	// unsafeStr avoids copying the token; ParseFloat does not retain it.
@@ -422,7 +422,11 @@ func ReadFloat64OrNull(data []byte, i int) (float64, int, error) {
 // strconv.ParseFloat for everything else. b must be exactly one number with no
 // surrounding whitespace; trailing bytes or an empty input yield ErrBadNumber.
 func ParseFloat(b []byte) (float64, error) {
-	if f, ok := fastFloat(b); ok {
+	f, end, fast, ok := scanFloat(b, 0)
+	if !ok || end != len(b) {
+		return 0, ErrBadNumber
+	}
+	if fast {
 		return f, nil
 	}
 	// unsafeStr avoids copying the token; ParseFloat does not retain it.
@@ -433,74 +437,106 @@ func ParseFloat(b []byte) (float64, error) {
 	return f, nil
 }
 
-// fastFloat parses a JSON number using the Clinger fast path: when the decimal
-// mantissa fits exactly in a float64 (< 2^53) and the decimal exponent is in
-// [-22, 22], a single float multiply or divide by an exact power of ten yields
-// the correctly rounded result. It returns ok=false for anything outside that
-// range (too many digits, large exponent, malformed token), which the caller
-// hands to strconv.ParseFloat. b is the already-validated numeric token.
-func fastFloat(b []byte) (float64, bool) {
-	n := len(b)
-	if n == 0 {
-		return 0, false
-	}
-	i := 0
+// scanFloat scans the JSON number token beginning at data[i] in a single pass,
+// returning the index just past it and, when the value lies on the Clinger fast
+// path (an exactly representable mantissa < 2^53 with a decimal exponent in
+// [-22, 22]), the parsed value with fast=true. Otherwise fast=false and the
+// caller parses data[i:end] with strconv.ParseFloat. ok=false marks a token with
+// no digits (or an exponent marker with no digits), in which case end points at
+// the offending byte.
+//
+// Folding the token scan and the fast-path parse into one pass spares the
+// separate skipNumber scan the previous two-call form made; and because the scan
+// always runs to the end of the token, the slow path no longer pays for the
+// fast-path parser's full rescan-then-reject before handing off to strconv.
+func scanFloat(data []byte, i int) (f float64, end int, fast, ok bool) {
+	n := len(data)
 	neg := false
-	switch b[0] {
-	case '-':
-		neg = true
-		i++
-	case '+':
-		i++
+	if i < n {
+		switch data[i] {
+		case '-':
+			neg = true
+			i++
+		case '+':
+			i++
+		}
 	}
 
+	// Accumulate up to 19 significant digits (the most that always fit a uint64)
+	// into mant; count every digit so a longer mantissa is recognized and routed
+	// to strconv rather than silently truncated.
 	var mant uint64
-	digits := 0
-	for i < n && b[i] >= '0' && b[i] <= '9' {
-		mant = mant*10 + uint64(b[i]-'0')
+	digits, mdigits := 0, 0
+	for i < n && data[i] >= '0' && data[i] <= '9' {
+		if mdigits < 19 {
+			mant = mant*10 + uint64(data[i]-'0')
+			mdigits++
+		}
 		i++
 		digits++
 	}
 	exp := 0
-	if i < n && b[i] == '.' {
+	if i < n && data[i] == '.' {
 		i++
-		for i < n && b[i] >= '0' && b[i] <= '9' {
-			mant = mant*10 + uint64(b[i]-'0')
+		for i < n && data[i] >= '0' && data[i] <= '9' {
+			if mdigits < 19 {
+				mant = mant*10 + uint64(data[i]-'0')
+				mdigits++
+				exp--
+			}
 			i++
 			digits++
-			exp--
 		}
 	}
-	if digits == 0 || digits > 19 { // >19 digits may overflow the uint64 mantissa
-		return 0, false
-	}
-	if i < n && (b[i] == 'e' || b[i] == 'E') {
+	overflow := digits > mdigits // more digits than the uint64 mantissa holds
+	if i < n && (data[i] == 'e' || data[i] == 'E') {
 		i++
 		esign := 1
-		if i < n && (b[i] == '+' || b[i] == '-') {
-			if b[i] == '-' {
+		if i < n && (data[i] == '+' || data[i] == '-') {
+			if data[i] == '-' {
 				esign = -1
 			}
 			i++
 		}
-		if i >= n || b[i] < '0' || b[i] > '9' {
-			return 0, false
-		}
-		eval := 0
-		for i < n && b[i] >= '0' && b[i] <= '9' {
-			eval = eval*10 + int(b[i]-'0')
-			if eval > 1000 {
-				return 0, false // huge exponent; let strconv handle over/underflow
+		ed, eval := 0, 0
+		for i < n && data[i] >= '0' && data[i] <= '9' {
+			if eval < 1<<30 { // clamp; an exponent this large can never be exact
+				eval = eval*10 + int(data[i]-'0')
 			}
 			i++
+			ed++
+		}
+		if ed == 0 {
+			return 0, i, false, false // exponent marker with no digits
 		}
 		exp += esign * eval
 	}
-	if i != n || mant>>53 != 0 {
-		return 0, false
+	end = i
+	if digits == 0 {
+		return 0, end, false, false
+	}
+	// A well-formed number ends here. A trailing number-continuation byte means a
+	// malformed token such as "1.2.3" or "1e2e3"; consume the rest of the run (as
+	// skipNumber would) and reject, so the reported end and error match the slow
+	// path rather than silently accepting the leading "1.2".
+	if end < n {
+		if c := data[end]; c == '.' || c == 'e' || c == 'E' || (c >= '0' && c <= '9') {
+			for end < n {
+				c = data[end]
+				if (c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-' {
+					end++
+					continue
+				}
+				break
+			}
+			return 0, end, false, false
+		}
+	}
+	if overflow || mant>>53 != 0 {
+		return 0, end, false, true // hand the exact token to strconv
 	}
 
-	f := float64(mant)
+	f = float64(mant)
 	switch {
 	case exp == 0:
 		// already exact
@@ -509,12 +545,12 @@ func fastFloat(b []byte) (float64, bool) {
 	case exp < 0 && exp >= -22:
 		f /= pow10exact[-exp]
 	default:
-		return 0, false
+		return 0, end, false, true
 	}
 	if neg {
 		f = -f
 	}
-	return f, true
+	return f, end, true, true
 }
 
 // ReadTimeOrNull reads an RFC 3339 JSON string (or null) at data[i] as a
@@ -533,11 +569,117 @@ func ReadTimeOrNull(data []byte, i int) (time.Time, int, error) {
 	if err != nil {
 		return time.Time{}, end, err
 	}
+	if t, ok := parseRFC3339(s, false); ok {
+		return t, end, nil
+	}
 	t, perr := time.Parse(time.RFC3339, s)
 	if perr != nil {
 		return time.Time{}, end, perr
 	}
 	return t, end, nil
+}
+
+// parseRFC3339 parses an RFC 3339 timestamp on the fast path shared by the time
+// decoders, returning the same instant as time.Parse(time.RFC3339Nano, s). It
+// returns ok=false — so the caller falls back to time.Parse — for any shape it
+// does not handle exactly: a wrong-length or malformed token, an out-of-range
+// field, or a timezone that is neither 'Z' nor ±HH:MM. allowSpace additionally
+// permits a space in place of the 'T' date/time separator (the lax variant).
+//
+// It sidesteps time.Parse's reference-layout machinery, which dominates decoding
+// of timestamp-heavy documents, by reading the fixed-offset fields directly.
+func parseRFC3339(s string, allowSpace bool) (time.Time, bool) {
+	// Shortest accepted form is "2006-01-02T15:04:05Z" (20 bytes).
+	if len(s) < 20 {
+		return time.Time{}, false
+	}
+	if sep := s[10]; sep != 'T' && !(allowSpace && sep == ' ') {
+		return time.Time{}, false
+	}
+	if s[4] != '-' || s[7] != '-' || s[13] != ':' || s[16] != ':' {
+		return time.Time{}, false
+	}
+	year, ok0 := atoiN(s, 0, 4)
+	month, ok1 := atoiN(s, 5, 2)
+	day, ok2 := atoiN(s, 8, 2)
+	hour, ok3 := atoiN(s, 11, 2)
+	min, ok4 := atoiN(s, 14, 2)
+	sec, ok5 := atoiN(s, 17, 2)
+	if !(ok0 && ok1 && ok2 && ok3 && ok4 && ok5) {
+		return time.Time{}, false
+	}
+	// Reject out-of-range fields so leap seconds and the like defer to time.Parse.
+	if month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || min > 59 || sec > 59 {
+		return time.Time{}, false
+	}
+
+	i := 19
+	nsec := 0
+	if s[i] == '.' {
+		i++
+		fd := 0
+		for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+			if fd < 9 { // nanosecond precision; extra digits are ignored
+				nsec = nsec*10 + int(s[i]-'0')
+				fd++
+			}
+			i++
+		}
+		if fd == 0 {
+			return time.Time{}, false
+		}
+		for ; fd < 9; fd++ {
+			nsec *= 10
+		}
+	}
+
+	if i >= len(s) {
+		return time.Time{}, false
+	}
+	var loc *time.Location
+	switch s[i] {
+	case 'Z':
+		if i+1 != len(s) {
+			return time.Time{}, false
+		}
+		loc = time.UTC
+	case '+', '-':
+		if i+6 != len(s) || s[i+3] != ':' {
+			return time.Time{}, false
+		}
+		oh, oka := atoiN(s, i+1, 2)
+		om, okb := atoiN(s, i+4, 2)
+		if !oka || !okb || oh > 23 || om > 59 {
+			return time.Time{}, false
+		}
+		off := (oh*60 + om) * 60
+		if s[i] == '-' {
+			off = -off
+		}
+		if off == 0 {
+			loc = time.UTC
+		} else {
+			loc = time.FixedZone("", off)
+		}
+	default:
+		return time.Time{}, false
+	}
+	return time.Date(year, time.Month(month), day, hour, min, sec, nsec, loc), true
+}
+
+// atoiN parses exactly n decimal digits of s starting at off into a non-negative
+// int, returning false if any of those bytes is not an ASCII digit. The caller
+// guarantees off+n <= len(s).
+func atoiN(s string, off, n int) (int, bool) {
+	v := 0
+	for k := 0; k < n; k++ {
+		d := s[off+k] - '0'
+		if d > 9 {
+			return 0, false
+		}
+		v = v*10 + int(d)
+	}
+	return v, true
 }
 
 // ReadTimeLaxOrNull reads a time.Time at data[i], accepting more shapes than
@@ -581,6 +723,9 @@ func ReadTimeLaxOrNull(data []byte, i int) (time.Time, int, error) {
 // parseJSONTS parses an RFC 3339 timestamp, tolerating a space in place of the
 // 'T' date/time separator, and normalizes the result to UTC.
 func parseJSONTS(ts string) (time.Time, bool) {
+	if t, ok := parseRFC3339(ts, true); ok {
+		return t.UTC(), true
+	}
 	pattern := time.RFC3339Nano
 	if len(ts) > 11 && ts[10] == ' ' {
 		pattern = rfc3339NanoSpaceLayout
@@ -643,6 +788,77 @@ func ExpectNull(data []byte, i int) (int, error) {
 	}
 	return i + 4, nil
 }
+
+// CountArrayElements returns the number of top-level elements in the JSON array
+// beginning at data[i] (data[i] must be '['), so a destination slice can be
+// allocated once instead of grown by repeated append. It makes a single pass,
+// descending into nested arrays/objects and skipping string contents so that
+// commas inside them are not miscounted. It returns 0 for an empty array or when
+// the count cannot be determined cheaply (a truncated or malformed array); the
+// caller then simply falls back to append-driven growth, so an imperfect count
+// is only ever a missed optimization, never a correctness problem.
+func CountArrayElements(data []byte, i int) int {
+	if i >= len(data) || data[i] != '[' {
+		return 0
+	}
+	i = SkipWS(data, i+1)
+	if i >= len(data) || data[i] == ']' {
+		return 0
+	}
+	n := 1
+	depth := 0
+	for i < len(data) {
+		switch data[i] {
+		case '"':
+			end, err := skipString(data, i)
+			if err != nil {
+				return 0
+			}
+			i = end
+			continue
+		case '[', '{':
+			depth++
+		case ']':
+			if depth == 0 {
+				return n
+			}
+			depth--
+		case '}':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 {
+				n++
+			}
+		}
+		i++
+	}
+	return 0 // unterminated; let the caller grow on demand
+}
+
+// CountArrayScalars counts the elements of a JSON array of scalar values
+// (numbers, booleans, or null) beginning at data[i] (data[i] must be '['). Such
+// elements never contain a quote, comma, or bracket, so the closing ']' is the
+// first ']' in the input and the element count is one more than the number of
+// commas before it — both found with vectorized byte scans. It is therefore much
+// cheaper than CountArrayElements but valid only when the element type is known
+// (by the generator) to be a scalar. It returns 0 for an empty array.
+func CountArrayScalars(data []byte, i int) int {
+	rb := bytes.IndexByte(data[i+1:], ']')
+	if rb < 0 {
+		return 0
+	}
+	seg := data[i+1 : i+1+rb]
+	for _, c := range seg {
+		if c != ' ' && c != '\t' && c != '\n' && c != '\r' {
+			return bytes.Count(seg, commaByte) + 1
+		}
+	}
+	return 0 // empty (whitespace-only) array
+}
+
+var commaByte = []byte{','}
 
 // SkipValue advances past any JSON value starting at data[i].
 func SkipValue(data []byte, i int) (int, error) {

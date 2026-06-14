@@ -236,9 +236,14 @@ func TestReadFloat64OrNull(t *testing.T) {
 	}
 }
 
-// fastFloat is exercised indirectly above, but verify it agrees with the slow
-// path and correctly declines out-of-range tokens.
+// scanFloat's fast path is exercised indirectly above, but verify it agrees with
+// the slow path and correctly declines out-of-range tokens. A token is "taken"
+// on the fast path when fast=true and the whole input was consumed.
 func TestFastFloat(t *testing.T) {
+	fastFloat := func(b []byte) (float64, bool) {
+		f, end, fast, ok := scanFloat(b, 0)
+		return f, ok && fast && end == len(b)
+	}
 	okCases := map[string]float64{
 		"0":      0,
 		"1":      1,
@@ -270,7 +275,7 @@ func TestFastFloat(t *testing.T) {
 		"12345678901234567890", // 20 digits, > 19
 		"1e99999",              // huge exponent
 		".",                    // no digits
-		"1x",                   // trailing junk -> i != n
+		"1x",                   // trailing junk -> not fully consumed
 	}
 	for _, in := range declined {
 		if _, ok := fastFloat([]byte(in)); ok {

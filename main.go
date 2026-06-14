@@ -597,6 +597,7 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax bool) string {
 	}
 	eltStr := g.typeStr(elt)
 	inner := g.field("el", elt, singular(hint)+"Entry", nocopy, lax)
+	presize := g.slicePresize(elt, eltStr)
 	body := fmt.Sprintf(`func %[1]s(out *[]%[2]s, data []byte, i int) (int, error) {
 	if i >= len(data) {
 		return i, support.ErrTruncated
@@ -612,7 +613,7 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax bool) string {
 	if data[i] != '[' {
 		return i, support.ErrExpectArray
 	}
-	i++
+%[4]s	i++
 	for {
 		i = support.SkipWS(data, i)
 		if i >= len(data) {
@@ -636,9 +637,47 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax bool) string {
 		}
 		i++
 	}
-}`, fn, eltStr, inner)
+}`, fn, eltStr, inner, presize)
 	g.decoders = append(g.decoders, body)
 	return fn
+}
+
+// slicePresize returns the code that allocates out to the array's element count
+// before the decode loop, sparing the repeated reallocation that append-driven
+// growth incurs. It presizes only when out is nil (so decoding into a reused
+// slice keeps appending) and only for element types where counting is cheap
+// relative to decoding: scalars (numbers/booleans) get the vectorized
+// CountArrayScalars; strings, time.Time, raw messages and nested structs/slices,
+// whose per-element decode is costly enough to amortize a structural pass, get
+// the general CountArrayElements. Tiny fixed-cost elements where a counting scan
+// would not pay for itself get no presize (an empty string keeps the loop as-is).
+func (g *gen) slicePresize(elt ast.Expr, eltStr string) string {
+	counter := ""
+	switch t := unparen(elt).(type) {
+	case *ast.Ident:
+		switch {
+		case t.Name == "bool" || t.Name == "float32" || t.Name == "float64" ||
+			intKinds[t.Name] || uintKinds[t.Name]:
+			counter = "support.CountArrayScalars"
+		case t.Name == "string":
+			counter = "support.CountArrayElements"
+		}
+	case *ast.StructType, *ast.ArrayType, *ast.MapType:
+		counter = "support.CountArrayElements"
+	case *ast.SelectorExpr:
+		if isTime(t) || isRaw(t) {
+			counter = "support.CountArrayElements"
+		}
+	}
+	if counter == "" {
+		return ""
+	}
+	return fmt.Sprintf(`	if *out == nil {
+		if n := %s(data, i); n > 0 {
+			*out = make([]%s, 0, n)
+		}
+	}
+`, counter, eltStr)
 }
 
 func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy, lax bool) string {

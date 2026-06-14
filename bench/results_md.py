@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Convert the `go test -bench` output in results.txt into results.md."""
+"""Convert the `go test -bench` output in results.txt into the markdown summary.
+
+Usage: results_md.py <src results.txt> <dst .md>. run_bench.sh passes an
+architecture-specific destination (results_<goarch>.md)."""
 import re
 import sys
 

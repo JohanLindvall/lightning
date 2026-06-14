@@ -214,7 +214,9 @@ dependency on [easyjson](https://github.com/mailru/easyjson) stays out of the
 main module). It benchmarks the same payload decoded three ways — lightning,
 `encoding/json`, and easyjson — across each `bench/<case>/` folder.
 
-**See [`bench/results.md`](bench/results.md) for the full, current results.**
+**See the per-architecture results for the full, current numbers:
+[`bench/results_amd64.md`](bench/results_amd64.md) and
+[`bench/results_arm64.md`](bench/results_arm64.md).**
 
 Run them yourself with:
 
@@ -223,7 +225,8 @@ Run them yourself with:
 ```
 
 which (re)generates each case's deserializers and writes `bench/results.txt`
-and `bench/results.md`.
+and an architecture-specific `bench/results_<goarch>.md` (so runs on different
+CPUs do not overwrite each other's committed results).
 
 Representative numbers for a 1.8 KB Cloudflare log (Go 1.26, amd64):
 
