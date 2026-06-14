@@ -1,7 +1,7 @@
 # JSON Deserialization Benchmarks
 
-- generated 2026-06-14T16:03:10Z
-- go version go1.26.4 linux/amd64
+- generated 2026-06-14T17:53:38Z
+- go version go1.26.3 linux/amd64
 
 Lower ns/op is better; throughput (MB/s) and allocations are reported by `-benchmem`. **Speedup** is relative to the `encoding/json` (Stdlib) baseline.
 
@@ -9,62 +9,62 @@ Lower ns/op is better; throughput (MB/s) and allocations are reported by `-bench
 
 | Decoder | ns/op | Throughput | B/op | allocs/op | Speedup |
 |---|--:|--:|--:|--:|--:|
-| Lightning | 894 | 2026.06 MB/s | 144 | 10 | 10.3× |
-| Easyjson | 1732 | 1045.93 MB/s | 144 | 10 | 5.3× |
-| Stdlib | 9204 | 196.87 MB/s | 920 | 17 | 1.0× |
+| Lightning | 1086 | 1669.11 MB/s | 144 | 10 | 10.5× |
+| Easyjson | 2408 | 752.55 MB/s | 144 | 10 | 4.7× |
+| Stdlib | 11430 | 158.54 MB/s | 920 | 17 | 1.0× |
 
 ## bench/cloudflare-compact — 1812 byte input
 
 | Decoder | ns/op | Throughput | B/op | allocs/op | Speedup |
 |---|--:|--:|--:|--:|--:|
-| Lightning | 613 | 2957.29 MB/s | 0 | 0 | 15.4× |
-| Easyjson | 1608 | 1126.92 MB/s | 24 | 1 | 5.9× |
-| Stdlib | 9440 | 191.95 MB/s | 928 | 16 | 1.0× |
+| Lightning | 849 | 2133.85 MB/s | 0 | 0 | 13.6× |
+| Easyjson | 2184 | 829.65 MB/s | 24 | 1 | 5.3× |
+| Stdlib | 11579 | 156.49 MB/s | 928 | 16 | 1.0× |
 
 ## bench/cloudflare-nocopy — 1812 byte input
 
 | Decoder | ns/op | Throughput | B/op | allocs/op | Speedup |
 |---|--:|--:|--:|--:|--:|
-| Lightning | 664 | 2729.72 MB/s | 0 | 0 | 13.9× |
-| Easyjson | 1605 | 1128.64 MB/s | 24 | 1 | 5.8× |
-| Stdlib | 9241 | 196.08 MB/s | 928 | 16 | 1.0× |
+| Lightning | 900 | 2013.55 MB/s | 0 | 0 | 13.2× |
+| Easyjson | 2208 | 820.77 MB/s | 24 | 1 | 5.4× |
+| Stdlib | 11849 | 152.93 MB/s | 928 | 16 | 1.0× |
 
 ## bench/float-array — 230 byte input
 
 | Decoder | ns/op | Throughput | B/op | allocs/op | Speedup |
 |---|--:|--:|--:|--:|--:|
-| Lightning | 340 | 675.68 MB/s | 160 | 1 | 8.4× |
-| Easyjson | 1038 | 221.54 MB/s | 448 | 3 | 2.8× |
-| Stdlib | 2860 | 80.41 MB/s | 760 | 12 | 1.0× |
+| Lightning | 374 | 614.14 MB/s | 160 | 1 | 9.0× |
+| Easyjson | 1340 | 171.61 MB/s | 448 | 3 | 2.5× |
+| Stdlib | 3364 | 68.37 MB/s | 760 | 12 | 1.0× |
 
 ## bench/float-array-slow — 494 byte input
 
 | Decoder | ns/op | Throughput | B/op | allocs/op | Speedup |
 |---|--:|--:|--:|--:|--:|
-| Lightning | 1312 | 376.45 MB/s | 160 | 1 | 3.0× |
-| Easyjson | 1568 | 315.06 MB/s | 448 | 3 | 2.5× |
-| Stdlib | 3982 | 124.07 MB/s | 760 | 12 | 1.0× |
+| Lightning | 1075 | 459.60 MB/s | 160 | 1 | 4.4× |
+| Easyjson | 1958 | 252.35 MB/s | 448 | 3 | 2.4× |
+| Stdlib | 4711 | 104.85 MB/s | 760 | 12 | 1.0× |
 
 ## bench/pretty — 2191 byte input
 
 | Decoder | ns/op | Throughput | B/op | allocs/op | Speedup |
 |---|--:|--:|--:|--:|--:|
-| Lightning | 840 | 2608.39 MB/s | 0 | 0 | 12.6× |
-| Easyjson | 1955 | 1120.95 MB/s | 24 | 1 | 5.4× |
-| Stdlib | 10561 | 207.45 MB/s | 928 | 16 | 1.0× |
+| Lightning | 1125 | 1947.00 MB/s | 0 | 0 | 11.9× |
+| Easyjson | 2657 | 824.57 MB/s | 24 | 1 | 5.0× |
+| Stdlib | 13393 | 163.60 MB/s | 928 | 16 | 1.0× |
 
 ## bench/skip-heavy — 19789 byte input
 
 | Decoder | ns/op | Throughput | B/op | allocs/op | Speedup |
 |---|--:|--:|--:|--:|--:|
-| Lightning | 512 | 38647.41 MB/s | 0 | 0 | 147.0× |
-| Easyjson | 47174 | 419.49 MB/s | 0 | 0 | 1.6× |
-| Stdlib | 75286 | 262.85 MB/s | 240 | 6 | 1.0× |
+| Lightning | 514 | 38496.65 MB/s | 0 | 0 | 221.1× |
+| Easyjson | 79834 | 247.88 MB/s | 0 | 0 | 1.4× |
+| Stdlib | 113658 | 174.11 MB/s | 240 | 6 | 1.0× |
 
 ## bench/time-array — 549 byte input
 
 | Decoder | ns/op | Throughput | B/op | allocs/op | Speedup |
 |---|--:|--:|--:|--:|--:|
-| Lightning | 732 | 749.76 MB/s | 480 | 1 | 5.3× |
-| Easyjson | 1608 | 341.42 MB/s | 1616 | 5 | 2.4× |
-| Stdlib | 3906 | 140.56 MB/s | 1896 | 12 | 1.0× |
+| Lightning | 906 | 606.22 MB/s | 480 | 1 | 5.2× |
+| Easyjson | 1725 | 318.17 MB/s | 1616 | 5 | 2.7× |
+| Stdlib | 4712 | 116.51 MB/s | 1896 | 12 | 1.0× |

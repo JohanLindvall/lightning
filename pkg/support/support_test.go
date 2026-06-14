@@ -661,7 +661,7 @@ func TestDecodeValue(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected err: %v", err)
 		}
-		m, ok := v.(map[string]interface{})
+		m, ok := v.(map[string]any)
 		if !ok {
 			t.Fatalf("got %T, want map", v)
 		}
@@ -678,7 +678,7 @@ func TestDecodeValue(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected err: %v", err)
 		}
-		m := v.(map[string]interface{})
+		m := v.(map[string]any)
 		if len(m) != 0 || end != 2 {
 			t.Errorf("got %v, end %d", m, end)
 		}
@@ -689,7 +689,7 @@ func TestDecodeValue(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected err: %v", err)
 		}
-		m := v.(map[string]interface{})
+		m := v.(map[string]any)
 		if m["a"] != float64(1) || m["b"] != float64(2) {
 			t.Errorf("unexpected map: %v", m)
 		}
@@ -700,18 +700,18 @@ func TestDecodeValue(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected err: %v", err)
 		}
-		a := v.([]interface{})
+		a := v.([]any)
 		if len(a) != 4 {
 			t.Fatalf("len = %d, want 4", len(a))
 		}
 		if a[0] != float64(1) || a[1] != "two" {
 			t.Errorf("unexpected array head: %v", a)
 		}
-		inner := a[2].([]interface{})
+		inner := a[2].([]any)
 		if inner[0] != float64(3) || inner[1] != float64(4) {
 			t.Errorf("unexpected inner array: %v", inner)
 		}
-		obj := a[3].(map[string]interface{})
+		obj := a[3].(map[string]any)
 		if obj["k"] != float64(5) {
 			t.Errorf("unexpected inner object: %v", obj)
 		}
@@ -722,7 +722,7 @@ func TestDecodeValue(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected err: %v", err)
 		}
-		if len(v.([]interface{})) != 0 || end != 2 {
+		if len(v.([]any)) != 0 || end != 2 {
 			t.Errorf("got %v, end %d", v, end)
 		}
 	})

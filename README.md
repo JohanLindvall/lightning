@@ -181,6 +181,51 @@ path and the top-level type — so generating decoders for several types into on
 package never produces colliding helper names. No annotation is needed; the
 prefix is automatic.
 
+## Key lookups
+
+When you only need a few values out of a document and don't want to generate (or
+decode into) a struct, the [`pkg/json`](pkg/json) package exposes the scanner's
+key-lookup primitives. They walk the input with the same allocation-free
+`Skip`/`ReadKey` machinery the generated decoders use, and every value they
+return aliases the input `[]byte` (keep it unchanged while the result is in
+use). A returned value follows the same conventions throughout: a string keeps
+its surrounding quotes with escapes intact, an object or array spans the whole
+`{`…`}` or `[`…`]`, and a scalar is the literal token.
+
+- `Get(data []byte, keys ...string) ([]byte, int, error)` — walks the object-key
+  path `keys` one level per key and returns the value's raw bytes (and the offset
+  it starts at), modeled on [buger/jsonparser](https://github.com/buger/jsonparser)'s
+  `Get`. With no keys it returns the whole root value; a missing key returns
+  `ErrKeyNotFound`.
+- `GetMany(data []byte, keys []string, out [][]byte) ([][]byte, error)` — looks up
+  several *top-level* keys in a **single pass** over the object, where N separate
+  `Get` calls would rescan it N times. Results are written into `out[:0]` (pass a
+  slice to reuse across calls, allocation-free; a `nil` reuses nothing) and
+  returned with `len == len(keys)`: `out[n]` is the value for `keys[n]`, or `nil`
+  if that key is absent. A missing key is reported by the `nil` slot, not an
+  error (a present key whose value is JSON `null` yields the bytes `"null"`,
+  distinct from absent); a non-object root or malformed JSON returns an error.
+- `ObjectEach(data []byte, fn func(key string, value []byte) error, keys ...string) error`
+  — calls `fn` for every member of the object reached by the path `keys` (the
+  root object with no keys). If `fn` returns an error, iteration stops and
+  returns it.
+
+```go
+// Pull a few fields out of a log record in one pass, reusing a scratch slice.
+keys := []string{"ClientIP", "EdgeResponseStatus", "RayID"}
+vals, err := json.GetMany(data, keys, scratch[:0])
+// vals[0] == []byte(`"203.0.113.23"`), vals[1] == []byte("599"), …
+```
+
+Each function has a **compact counterpart** — `GetCompact`, `GetManyCompact`,
+`ObjectEachCompact` — with the identical signature and result. Like the
+[`//lightning:compact`](#lightningcompact) directive, they assume the input has
+no whitespace *between* tokens (the form `encoding/json`'s `Marshal` and most
+wire protocols emit) and skip the inter-token `SkipWS` scans, running about 10%
+faster; whitespace surrounding the whole document is still tolerated. Feed one
+input that does contain inter-token whitespace and it may return an error, so use
+them only for sources guaranteed compact.
+
 ## String escaping and unescaping
 
 The [`pkg/json`](pkg/json) package exposes the scanner's string codec on its
@@ -286,7 +331,7 @@ Representative numbers for a 1.8 KB Cloudflare log (Go 1.26, amd64):
 |---|---|
 | [`main.go`](main.go) | the generator (`package main`) |
 | [`pkg/support`](pkg/support) | shared JSON scanning primitives used by generated code |
-| [`pkg/json`](pkg/json) | small public API over the scanner (e.g. `UnescapeString`) |
+| [`pkg/json`](pkg/json) | small public API over the scanner (`Get`/`GetMany`/`ObjectEach`, `UnescapeString`, `ParseFloat`) |
 | [`bench/`](bench) | benchmark module: hand-written `data.go` + `input.json` per case, plus the generated decoders, harness, and results |
 
 Generated files (`*_unmarshal.go`, `bench/*/bench_test.go`, `bench/*/ej/`, and

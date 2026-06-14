@@ -58,6 +58,163 @@ func TestGet(t *testing.T) {
 	}
 }
 
+func TestGetMany(t *testing.T) {
+	doc := []byte(`{
+		"a": 1,
+		"name": "widget",
+		"obj": {"x": [1, 2]},
+		"flag": true,
+		"nil": null,
+		"s": "hi\n"
+	}`)
+
+	t.Run("order, miss, null vs missing", func(t *testing.T) {
+		keys := []string{"name", "nope", "a", "nil", "obj", "s"}
+		out, err := GetMany(doc, keys, nil)
+		if err != nil {
+			t.Fatalf("GetMany: %v", err)
+		}
+		if len(out) != len(keys) {
+			t.Fatalf("len(out) = %d, want %d", len(out), len(keys))
+		}
+		want := []string{`"widget"`, "", `1`, `null`, `{"x": [1, 2]}`, `"hi\n"`}
+		for n := range keys {
+			if keys[n] == "nope" {
+				if out[n] != nil {
+					t.Fatalf("missing key %q: got %q, want nil", keys[n], out[n])
+				}
+				continue
+			}
+			if string(out[n]) != want[n] {
+				t.Fatalf("key %q: got %q, want %q", keys[n], out[n], want[n])
+			}
+		}
+	})
+
+	t.Run("scratch reuse does not allocate", func(t *testing.T) {
+		keys := []string{"a", "name", "flag"}
+		scratch := make([][]byte, 0, len(keys))
+		out, err := GetMany(doc, keys, scratch)
+		if err != nil {
+			t.Fatalf("GetMany: %v", err)
+		}
+		allocs := testing.AllocsPerRun(100, func() {
+			out, _ = GetMany(doc, keys, out)
+		})
+		if allocs != 0 {
+			t.Fatalf("GetMany reusing scratch allocated %.0f times, want 0", allocs)
+		}
+	})
+
+	t.Run("duplicate requested key filled in both slots", func(t *testing.T) {
+		out, err := GetMany(doc, []string{"a", "a"}, nil)
+		if err != nil {
+			t.Fatalf("GetMany: %v", err)
+		}
+		if string(out[0]) != "1" || string(out[1]) != "1" {
+			t.Fatalf("duplicate key: got %q and %q, want both 1", out[0], out[1])
+		}
+	})
+
+	t.Run("no keys", func(t *testing.T) {
+		out, err := GetMany(doc, nil, nil)
+		if err != nil || len(out) != 0 {
+			t.Fatalf("GetMany(nil keys) = %v, %v; want empty, nil", out, err)
+		}
+	})
+
+	t.Run("non-object root errors", func(t *testing.T) {
+		if _, err := GetMany([]byte(`[1, 2]`), []string{"a"}, nil); err == nil {
+			t.Fatal("expected an error for a non-object root")
+		}
+	})
+
+	t.Run("malformed json errors", func(t *testing.T) {
+		if _, err := GetMany([]byte(`{"a": 1, "b":`), []string{"x"}, nil); err == nil {
+			t.Fatal("expected an error for truncated input")
+		}
+	})
+}
+
+// TestCompactVariants checks that GetCompact, GetManyCompact and
+// ObjectEachCompact agree with their non-compact counterparts on whitespace-free
+// input, descend nested paths, and still tolerate leading framing whitespace.
+func TestCompactVariants(t *testing.T) {
+	// No whitespace between tokens (the form a compact serializer emits).
+	compact := []byte(`{"a":{"b":{"c":42,"s":"hi"}},"name":"widget","flag":true,"nums":[1,2,3]}`)
+
+	t.Run("GetCompact matches Get", func(t *testing.T) {
+		paths := [][]string{nil, {"name"}, {"flag"}, {"nums"}, {"a", "b"}, {"a", "b", "c"}, {"a", "b", "s"}}
+		for _, keys := range paths {
+			want, woff, werr := Get(compact, keys...)
+			got, goff, gerr := GetCompact(compact, keys...)
+			if werr != nil {
+				t.Fatalf("%v: Get returned error %v", keys, werr)
+			}
+			if gerr != nil || goff != woff || string(got) != string(want) {
+				t.Fatalf("%v: GetCompact=(%q,%d,%v), want (%q,%d,nil)", keys, got, goff, gerr, want, woff)
+			}
+		}
+		// Missing key path still reports ErrKeyNotFound.
+		if _, _, err := GetCompact(compact, "nope"); !errors.Is(err, ErrKeyNotFound) {
+			t.Fatalf("GetCompact missing key: err=%v, want ErrKeyNotFound", err)
+		}
+	})
+
+	t.Run("GetManyCompact matches GetMany", func(t *testing.T) {
+		keys := []string{"name", "nope", "flag", "nums"}
+		want, werr := GetMany(compact, keys, nil)
+		got, gerr := GetManyCompact(compact, keys, nil)
+		if werr != nil || gerr != nil {
+			t.Fatalf("GetMany err=%v, GetManyCompact err=%v", werr, gerr)
+		}
+		for n := range keys {
+			if string(got[n]) != string(want[n]) {
+				t.Fatalf("key %q: GetManyCompact %q, GetMany %q", keys[n], got[n], want[n])
+			}
+		}
+	})
+
+	t.Run("ObjectEachCompact matches ObjectEach", func(t *testing.T) {
+		collect := func(each func([]byte, func(string, []byte) error, ...string) error, keys ...string) []string {
+			var out []string
+			if err := each(compact, func(k string, v []byte) error {
+				out = append(out, k+"="+string(v))
+				return nil
+			}, keys...); err != nil {
+				t.Fatalf("%v: ObjectEach* error: %v", keys, err)
+			}
+			return out
+		}
+		for _, keys := range [][]string{nil, {"a", "b"}} {
+			want := collect(ObjectEach, keys...)
+			got := collect(ObjectEachCompact, keys...)
+			if len(got) != len(want) {
+				t.Fatalf("%v: got %d members, want %d", keys, len(got), len(want))
+			}
+			for n := range got {
+				if got[n] != want[n] {
+					t.Fatalf("%v member %d: got %q, want %q", keys, n, got[n], want[n])
+				}
+			}
+		}
+	})
+
+	t.Run("leading whitespace tolerated", func(t *testing.T) {
+		framed := append([]byte("\n\t  "), compact...)
+		if v, _, err := GetCompact(framed, "name"); err != nil || string(v) != `"widget"` {
+			t.Fatalf("GetCompact framed: %q, %v", v, err)
+		}
+		if out, err := GetManyCompact(framed, []string{"flag"}, nil); err != nil || string(out[0]) != "true" {
+			t.Fatalf("GetManyCompact framed: %q, %v", out, err)
+		}
+		n := 0
+		if err := ObjectEachCompact(framed, func(string, []byte) error { n++; return nil }); err != nil || n == 0 {
+			t.Fatalf("ObjectEachCompact framed: n=%d, %v", n, err)
+		}
+	})
+}
+
 // TestGetObjectCheck demonstrates the jsonparser.Get(... ) != Object idiom
 // rebuilt on Get: navigate to the parent path and confirm it is an object.
 func TestGetObjectCheck(t *testing.T) {

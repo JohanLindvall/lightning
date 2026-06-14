@@ -62,6 +62,36 @@ func Get(data []byte, keys ...string) ([]byte, int, error) {
 	return support.Get(data, keys...)
 }
 
+// GetCompact is Get for compact JSON — input with no whitespace between tokens,
+// as compact serializers emit. It skips the inter-token whitespace scans Get
+// makes while descending the key path (leading whitespace at the document start
+// is still tolerated), so it is faster on compact input but may report an error
+// if the input actually contains inter-token whitespace.
+func GetCompact(data []byte, keys ...string) ([]byte, int, error) {
+	return support.GetCompact(data, keys...)
+}
+
+// GetMany looks up several top-level members of the JSON object in data at once,
+// in a single pass, returning their raw value bytes in the same order as keys —
+// the batch form of Get for pulling a handful of fields out of one record. The
+// results are written into out[:0] (pass a slice to reuse across calls; a nil
+// out allocates) and out is returned with length len(keys): out[n] is the value
+// for keys[n], aliasing data and following Get's conventions, or nil if that key
+// is absent. A missing key is reported by the nil slot, not an error; a
+// non-object root or malformed JSON returns a non-nil error.
+func GetMany(data []byte, keys []string, out [][]byte) ([][]byte, error) {
+	return support.GetMany(data, keys, out)
+}
+
+// GetManyCompact is GetMany for compact JSON — input with no whitespace between
+// tokens, as compact serializers emit. It skips GetMany's inter-token whitespace
+// scans (leading whitespace at the document start is still tolerated), so it is
+// faster on compact input but may report an error if the input actually contains
+// inter-token whitespace.
+func GetManyCompact(data []byte, keys []string, out [][]byte) ([][]byte, error) {
+	return support.GetManyCompact(data, keys, out)
+}
+
 // ObjectEach calls fn once for every member of the JSON object reached by the
 // object-key path keys in data, modeled on github.com/buger/jsonparser's
 // ObjectEach but without reporting a value type. fn receives the member's
@@ -77,4 +107,13 @@ func Get(data []byte, keys ...string) ([]byte, int, error) {
 // primitives, so members are visited without allocating.
 func ObjectEach(data []byte, fn func(key string, value []byte) error, keys ...string) error {
 	return support.ObjectEach(data, fn, keys...)
+}
+
+// ObjectEachCompact is ObjectEach for compact JSON — input with no whitespace
+// between tokens, as compact serializers emit. It skips ObjectEach's inter-token
+// whitespace scans (leading whitespace at the document start is still
+// tolerated), so it is faster on compact input but may report an error if the
+// input actually contains inter-token whitespace.
+func ObjectEachCompact(data []byte, fn func(key string, value []byte) error, keys ...string) error {
+	return support.ObjectEachCompact(data, fn, keys...)
 }
