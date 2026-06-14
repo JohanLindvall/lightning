@@ -141,6 +141,46 @@ left unset, like any other lax mismatch. As with `nocopy`, the lenient parser
 propagates through slices, maps, and pointers (e.g. `[]time.Time`) but stops at
 struct boundaries.
 
+## Comment directives
+
+Some behavior is selected with a `//lightning:<name>` comment on the struct type
+(or its declaration), separate from the per-field json tags above.
+
+### `//lightning:compact`
+
+By default a decoder calls `SkipWS` around every token so it accepts JSON with
+any whitespace. Mark a type `//lightning:compact` to assert the input has no
+whitespace *between* tokens — the form `encoding/json`'s `Marshal` and most wire
+protocols emit — and the generator drops those inter-token `SkipWS` calls,
+decoding tokens back-to-back:
+
+```go
+//lightning:compact
+type Log struct {
+    RayID  string `json:"RayID"`
+    Status int64  `json:"Status"`
+}
+```
+
+This runs about 10% faster on object-heavy payloads (see the `cloudflare-compact`
+benchmark). Whitespace surrounding the whole document is still tolerated — a
+trailing newline is fine — so only *inter-token* whitespace is assumed absent.
+
+The directive is an assertion you make about the input: a compact decoder fed
+input that does contain inter-token whitespace (for example the same document
+pretty-printed) returns an error instead of parsing it. Use it only for sources
+that are guaranteed compact. The directive applies to the whole type graph it
+roots, including nested structs, slices, and maps.
+
+## Generated function names
+
+The `UnmarshalJSON` methods keep their exact name (the `json.Unmarshaler`
+interface requires it). The unexported decoder helpers they call are named
+`lightning<ImportPath><Type>decode…` — a prefix derived from the package's import
+path and the top-level type — so generating decoders for several types into one
+package never produces colliding helper names. No annotation is needed; the
+prefix is automatic.
+
 ## String escaping and unescaping
 
 The [`pkg/json`](pkg/json) package exposes the scanner's string codec on its
@@ -190,16 +230,19 @@ The [`pkg/json`](pkg/json) package also exposes the scanner's float parser:
 
 ## SIMD scanning
 
-Two hot scan loops use a single vectorized pass instead of byte-at-a-time work
-— **amd64 (AVX2)**, 32 bytes/pass (`pkg/support/index_amd64.s`), and
-**arm64 (NEON/ASIMD)**, 16 bytes/pass (`pkg/support/index_arm64.s`):
+Two hot scan loops use a single vectorized pass instead of byte-at-a-time work,
+with kernels in `pkg/support/index_amd64.s` and `pkg/support/index_arm64.s`
+(arm64 uses NEON/ASIMD, 16 bytes/pass, for both):
 
 - **next `"` or `\` in a string** — replaces two `bytes.IndexByte` scans; speeds
-  up string-heavy payloads (~10–20% on the Cloudflare case).
-- **next structural byte (`{`, `}`, `[`, `]`, `"`)** — lets `skipObject` /
-  `skipArray` jump over inert content (numbers, keys, whitespace) when skipping
-  unknown values. Skipping a large ignored array/object is dramatically faster
-  (the `skip-heavy` benchmark decodes at >20 GB/s, ~90× `encoding/json`).
+  up string-heavy payloads. On amd64 it uses SSE2 (16-byte vectors, two compares
+  per 32-byte step), which avoids the `VZEROUPPER` an AVX2 routine must run on
+  every call — pure overhead for the short keys and values typical of JSON.
+- **next structural byte (`{`, `}`, `[`, `]`, `"`)** — AVX2 on amd64, 32
+  bytes/pass, lets `skipObject` / `skipArray` jump over inert content (numbers,
+  keys, whitespace) when skipping unknown values. Skipping a large ignored
+  array/object is dramatically faster (the `skip-heavy` benchmark decodes at
+  >20 GB/s, ~90× `encoding/json`).
 
 Feature detection is at run time (`golang.org/x/sys/cpu`); other platforms, CPUs
 without the feature, and inputs shorter than the vector width fall back to scalar
