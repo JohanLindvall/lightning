@@ -465,11 +465,18 @@ func scanFloat(data []byte, i int) (f float64, end int, fast, ok bool) {
 	// Accumulate up to 19 significant digits (the most that always fit a uint64)
 	// into mant; count every digit so a longer mantissa is recognized and routed
 	// to strconv rather than silently truncated.
+	// The digit loops test each byte with the unsigned trick d := c-'0'; d > 9,
+	// which is one comparison rather than the two a '0' <= c <= '9' range needs
+	// (a byte below '0' underflows to a large value, so it also fails d > 9).
 	var mant uint64
 	digits, mdigits := 0, 0
-	for i < n && data[i] >= '0' && data[i] <= '9' {
+	for i < n {
+		d := data[i] - '0'
+		if d > 9 {
+			break
+		}
 		if mdigits < 19 {
-			mant = mant*10 + uint64(data[i]-'0')
+			mant = mant*10 + uint64(d)
 			mdigits++
 		}
 		i++
@@ -478,9 +485,13 @@ func scanFloat(data []byte, i int) (f float64, end int, fast, ok bool) {
 	exp := 0
 	if i < n && data[i] == '.' {
 		i++
-		for i < n && data[i] >= '0' && data[i] <= '9' {
+		for i < n {
+			d := data[i] - '0'
+			if d > 9 {
+				break
+			}
 			if mdigits < 19 {
-				mant = mant*10 + uint64(data[i]-'0')
+				mant = mant*10 + uint64(d)
 				mdigits++
 				exp--
 			}
@@ -499,9 +510,13 @@ func scanFloat(data []byte, i int) (f float64, end int, fast, ok bool) {
 			i++
 		}
 		ed, eval := 0, 0
-		for i < n && data[i] >= '0' && data[i] <= '9' {
+		for i < n {
+			d := data[i] - '0'
+			if d > 9 {
+				break
+			}
 			if eval < 1<<30 { // clamp; an exponent this large can never be exact
-				eval = eval*10 + int(data[i]-'0')
+				eval = eval*10 + int(d)
 			}
 			i++
 			ed++
@@ -599,12 +614,12 @@ func parseRFC3339(s string, allowSpace bool) (time.Time, bool) {
 	if s[4] != '-' || s[7] != '-' || s[13] != ':' || s[16] != ':' {
 		return time.Time{}, false
 	}
-	year, ok0 := atoiN(s, 0, 4)
-	month, ok1 := atoiN(s, 5, 2)
-	day, ok2 := atoiN(s, 8, 2)
-	hour, ok3 := atoiN(s, 11, 2)
-	min, ok4 := atoiN(s, 14, 2)
-	sec, ok5 := atoiN(s, 17, 2)
+	year, ok0 := atoi4(s, 0)
+	month, ok1 := atoi2(s, 5)
+	day, ok2 := atoi2(s, 8)
+	hour, ok3 := atoi2(s, 11)
+	min, ok4 := atoi2(s, 14)
+	sec, ok5 := atoi2(s, 17)
 	if !(ok0 && ok1 && ok2 && ok3 && ok4 && ok5) {
 		return time.Time{}, false
 	}
@@ -647,8 +662,8 @@ func parseRFC3339(s string, allowSpace bool) (time.Time, bool) {
 		if i+6 != len(s) || s[i+3] != ':' {
 			return time.Time{}, false
 		}
-		oh, oka := atoiN(s, i+1, 2)
-		om, okb := atoiN(s, i+4, 2)
+		oh, oka := atoi2(s, i+1)
+		om, okb := atoi2(s, i+4)
 		if !oka || !okb || oh > 23 || om > 59 {
 			return time.Time{}, false
 		}
@@ -667,19 +682,25 @@ func parseRFC3339(s string, allowSpace bool) (time.Time, bool) {
 	return time.Date(year, time.Month(month), day, hour, min, sec, nsec, loc), true
 }
 
-// atoiN parses exactly n decimal digits of s starting at off into a non-negative
-// int, returning false if any of those bytes is not an ASCII digit. The caller
-// guarantees off+n <= len(s).
-func atoiN(s string, off, n int) (int, bool) {
-	v := 0
-	for k := 0; k < n; k++ {
-		d := s[off+k] - '0'
-		if d > 9 {
-			return 0, false
-		}
-		v = v*10 + int(d)
-	}
-	return v, true
+// atoi2 parses exactly two decimal digits of s at off into a non-negative int,
+// returning false if either byte is not an ASCII digit. The branchless digit
+// test and the absence of a loop (n is fixed) make it noticeably cheaper than a
+// general atoiN on the RFC 3339 fast path, which parses six such fields per
+// timestamp. The caller guarantees off+2 <= len(s).
+func atoi2(s string, off int) (int, bool) {
+	d0 := s[off] - '0'
+	d1 := s[off+1] - '0'
+	return int(d0)*10 + int(d1), d0 <= 9 && d1 <= 9
+}
+
+// atoi4 parses exactly four decimal digits of s at off (the RFC 3339 year).
+// The caller guarantees off+4 <= len(s).
+func atoi4(s string, off int) (int, bool) {
+	d0 := s[off] - '0'
+	d1 := s[off+1] - '0'
+	d2 := s[off+2] - '0'
+	d3 := s[off+3] - '0'
+	return int(d0)*1000 + int(d1)*100 + int(d2)*10 + int(d3), d0 <= 9 && d1 <= 9 && d2 <= 9 && d3 <= 9
 }
 
 // ReadTimeLaxOrNull reads a time.Time at data[i], accepting more shapes than
@@ -1004,15 +1025,18 @@ func skipArray(data []byte, i int) (int, error) {
 	return i, ErrTruncated
 }
 
+// isWS is a lookup table of the four JSON whitespace bytes (space, tab, newline,
+// carriage return). A single indexed load replaces the four-way comparison
+// chain; since the index is a byte it is provably in range, so the load carries
+// no bounds check. This is the hottest classification in the scanner — SkipWS
+// runs before and after every value — and the table form is faster on the common
+// compact case (the next byte is structural, so the loop exits immediately).
+var isWS = [256]bool{' ': true, '\t': true, '\n': true, '\r': true}
+
 // SkipWS advances past JSON whitespace at data[i].
 func SkipWS(data []byte, i int) int {
-	for i < len(data) {
-		c := data[i]
-		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
-			i++
-			continue
-		}
-		return i
+	for i < len(data) && isWS[data[i]] {
+		i++
 	}
 	return i
 }

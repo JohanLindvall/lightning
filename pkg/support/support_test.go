@@ -386,6 +386,39 @@ func TestReadTimeOrNull(t *testing.T) {
 			t.Fatal("expected parse error, got nil")
 		}
 	})
+
+	// The fast path (parseRFC3339 with atoi2/atoi4) must agree with time.Parse on
+	// every shape, including malformed numeric fields that must be rejected so the
+	// result still matches the standard library (which the decoder falls back to).
+	t.Run("matches time.Parse", func(t *testing.T) {
+		cases := []string{
+			"2023-01-02T15:04:05Z",
+			"2023-01-02T15:04:05.5Z",
+			"2023-01-02T15:04:05.123456789Z",
+			"2023-12-31T23:59:59Z",
+			"2024-02-29T00:00:00Z", // leap day
+			"2023-01-02T15:04:05+02:00",
+			"2023-01-02T15:04:05-11:30",
+			"2023-01-02T15:04:05.250+00:00",
+			"0001-01-01T00:00:00Z",
+			"2023-1x-02T15:04:05Z",  // non-digit in month
+			"2023-01-02T15:04:6zZ",  // non-digit in seconds
+			"2023-13-02T15:04:05Z",  // month out of range
+			"2023-01-02T15:04:05X",  // bad zone
+			"2023-01-02T15:04:05+2:00", // malformed offset
+			"not-a-time",
+		}
+		for _, ts := range cases {
+			want, werr := time.Parse(time.RFC3339, ts)
+			got, _, gerr := ReadTimeOrNull([]byte(`"`+ts+`"`), 0)
+			if (werr == nil) != (gerr == nil) {
+				t.Fatalf("%q: stdlib err=%v, ours err=%v", ts, werr, gerr)
+			}
+			if werr == nil && !got.Equal(want) {
+				t.Fatalf("%q: got %v, want %v", ts, got, want)
+			}
+		}
+	})
 }
 
 // --- ReadTimeLaxOrNull -----------------------------------------------------
