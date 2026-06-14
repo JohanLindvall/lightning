@@ -2,33 +2,14 @@
 
 // 16-byte constant of byte indices is not needed; we recover the position with
 // scalar RBIT/CLZ on the comparison mask moved into general registers.
-
-// Precomputed 16-byte splats of the search bytes, laid out contiguously so a
-// single multi-register VLD1 fills all the comparison vectors at once. This
-// hoists the per-call constant setup (a MOVD + VDUP for each byte) out of the
-// hot functions: instead of rebuilding the splats on every call — wasteful when
-// the routine returns after a single 16-byte block, the common case for
-// token-dense JSON — they are loaded once from RODATA.
 //
-// qbMask holds '"' then '\\' (indexQuoteOrBackslashNEON, 32 bytes).
-DATA qbMask<>+0(SB)/8, $0x2222222222222222
-DATA qbMask<>+8(SB)/8, $0x2222222222222222
-DATA qbMask<>+16(SB)/8, $0x5c5c5c5c5c5c5c5c
-DATA qbMask<>+24(SB)/8, $0x5c5c5c5c5c5c5c5c
-GLOBL qbMask<>(SB), RODATA|NOPTR, $32
-
-// structMask holds '{', '}', '[', ']' then '"' (indexStructuralNEON, 80 bytes).
-DATA structMask<>+0(SB)/8, $0x7b7b7b7b7b7b7b7b
-DATA structMask<>+8(SB)/8, $0x7b7b7b7b7b7b7b7b
-DATA structMask<>+16(SB)/8, $0x7d7d7d7d7d7d7d7d
-DATA structMask<>+24(SB)/8, $0x7d7d7d7d7d7d7d7d
-DATA structMask<>+32(SB)/8, $0x5b5b5b5b5b5b5b5b
-DATA structMask<>+40(SB)/8, $0x5b5b5b5b5b5b5b5b
-DATA structMask<>+48(SB)/8, $0x5d5d5d5d5d5d5d5d
-DATA structMask<>+56(SB)/8, $0x5d5d5d5d5d5d5d5d
-DATA structMask<>+64(SB)/8, $0x2222222222222222
-DATA structMask<>+72(SB)/8, $0x2222222222222222
-GLOBL structMask<>(SB), RODATA|NOPTR, $80
+// The comparison splats are built per call with MOVD-immediate + VDUP rather
+// than loaded from a RODATA table. On amd64 the equivalent constants are kept in
+// RODATA because building them inline needs VPBROADCASTB, whose GP→XMM domain
+// crossing dominates when the routine early-exits after a single block; arm64's
+// VDUP-from-GPR has no such penalty, so the inline form is cheaper than a VLD1
+// load (no load-use latency, no memory dependency) and measures ~2% faster on
+// the get benchmark. See index_amd64.s for the contrasting choice.
 
 // func indexQuoteOrBackslashNEON(b []byte) int
 //
@@ -38,8 +19,10 @@ TEXT ·indexQuoteOrBackslashNEON(SB), NOSPLIT, $0-32
 	MOVD b_base+0(FP), R0
 	MOVD b_len+8(FP), R1
 	MOVD $0, R2                  // R2 = current offset
-	MOVD $qbMask<>(SB), R3
-	VLD1 (R3), [V0.B16, V1.B16]  // V0 = '"' x16, V1 = '\\' x16
+	MOVD $0x22, R3
+	VDUP R3, V0.B16              // V0 = '"' x16
+	MOVD $0x5c, R3
+	VDUP R3, V1.B16              // V1 = '\\' x16
 
 loop16:
 	SUB  R2, R1, R7              // R7 = remaining = len - offset
@@ -104,10 +87,16 @@ TEXT ·indexStructuralNEON(SB), NOSPLIT, $0-32
 	MOVD b_base+0(FP), R0
 	MOVD b_len+8(FP), R1
 	MOVD $0, R2
-	MOVD $structMask<>(SB), R3
-	VLD1 (R3), [V0.B16, V1.B16, V2.B16, V3.B16] // '{', '}', '[', ']'
-	ADD  $64, R3, R3
-	VLD1 (R3), [V4.B16]                          // '"'
+	MOVD $0x7b, R3
+	VDUP R3, V0.B16   // '{'
+	MOVD $0x7d, R3
+	VDUP R3, V1.B16   // '}'
+	MOVD $0x5b, R3
+	VDUP R3, V2.B16   // '['
+	MOVD $0x5d, R3
+	VDUP R3, V3.B16   // ']'
+	MOVD $0x22, R3
+	VDUP R3, V4.B16   // '"'
 
 sloop:
 	SUB  R2, R1, R7
