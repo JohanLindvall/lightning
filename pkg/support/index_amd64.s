@@ -13,6 +13,36 @@ DATA bslashMask<>+16(SB)/8, $0x5c5c5c5c5c5c5c5c
 DATA bslashMask<>+24(SB)/8, $0x5c5c5c5c5c5c5c5c
 GLOBL bslashMask<>(SB), RODATA|NOPTR, $32
 
+// 32-byte constant vectors of the JSON structural bytes '{' (0x7b), '}' (0x7d),
+// '[' (0x5b), ']' (0x5d) and '"' (0x22). Precomputed in RODATA and loaded with
+// VMOVDQU so indexStructuralAVX2 does not rebuild them with VPBROADCASTB (and
+// the GP→XMM domain crossings that entails) on every call — that per-call setup
+// dominated when the routine early-exits after a single block, which is the
+// common case for token-dense JSON.
+DATA lbraceMask<>+0(SB)/8, $0x7b7b7b7b7b7b7b7b
+DATA lbraceMask<>+8(SB)/8, $0x7b7b7b7b7b7b7b7b
+DATA lbraceMask<>+16(SB)/8, $0x7b7b7b7b7b7b7b7b
+DATA lbraceMask<>+24(SB)/8, $0x7b7b7b7b7b7b7b7b
+GLOBL lbraceMask<>(SB), RODATA|NOPTR, $32
+
+DATA rbraceMask<>+0(SB)/8, $0x7d7d7d7d7d7d7d7d
+DATA rbraceMask<>+8(SB)/8, $0x7d7d7d7d7d7d7d7d
+DATA rbraceMask<>+16(SB)/8, $0x7d7d7d7d7d7d7d7d
+DATA rbraceMask<>+24(SB)/8, $0x7d7d7d7d7d7d7d7d
+GLOBL rbraceMask<>(SB), RODATA|NOPTR, $32
+
+DATA lbrackMask<>+0(SB)/8, $0x5b5b5b5b5b5b5b5b
+DATA lbrackMask<>+8(SB)/8, $0x5b5b5b5b5b5b5b5b
+DATA lbrackMask<>+16(SB)/8, $0x5b5b5b5b5b5b5b5b
+DATA lbrackMask<>+24(SB)/8, $0x5b5b5b5b5b5b5b5b
+GLOBL lbrackMask<>(SB), RODATA|NOPTR, $32
+
+DATA rbrackMask<>+0(SB)/8, $0x5d5d5d5d5d5d5d5d
+DATA rbrackMask<>+8(SB)/8, $0x5d5d5d5d5d5d5d5d
+DATA rbrackMask<>+16(SB)/8, $0x5d5d5d5d5d5d5d5d
+DATA rbrackMask<>+24(SB)/8, $0x5d5d5d5d5d5d5d5d
+GLOBL rbrackMask<>(SB), RODATA|NOPTR, $32
+
 // func indexQuoteOrBackslashAVX2(b []byte) int
 //
 // Returns the index of the first '"' or '\\' byte in b, or len(b) if neither
@@ -78,21 +108,11 @@ TEXT ·indexStructuralAVX2(SB), NOSPLIT, $0-32
 	MOVQ b_base+0(FP), SI
 	MOVQ b_len+8(FP), CX
 	XORQ DI, DI
-	MOVQ $0x7b, AX
-	MOVQ AX, X0
-	VPBROADCASTB X0, Y0          // '{'
-	MOVQ $0x7d, AX
-	MOVQ AX, X1
-	VPBROADCASTB X1, Y1          // '}'
-	MOVQ $0x5b, AX
-	MOVQ AX, X2
-	VPBROADCASTB X2, Y2          // '['
-	MOVQ $0x5d, AX
-	MOVQ AX, X3
-	VPBROADCASTB X3, Y3          // ']'
-	MOVQ $0x22, AX
-	MOVQ AX, X4
-	VPBROADCASTB X4, Y4          // '"'
+	VMOVDQU lbraceMask<>(SB), Y0 // '{'
+	VMOVDQU rbraceMask<>(SB), Y1 // '}'
+	VMOVDQU lbrackMask<>(SB), Y2 // '['
+	VMOVDQU rbrackMask<>(SB), Y3 // ']'
+	VMOVDQU quoteMask<>(SB), Y4  // '"'
 
 loops:
 	CMPQ CX, $32

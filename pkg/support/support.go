@@ -28,6 +28,7 @@ var (
 	ErrExpectObject = errors.New("json: expected '{'")
 	ErrExpectArray  = errors.New("json: expected '['")
 	ErrBadTime      = errors.New("json: invalid time")
+	ErrKeyNotFound  = errors.New("json: key path not found")
 )
 
 // rfc3339NanoSpaceLayout is RFC 3339 with the date and time separated by a space
@@ -805,6 +806,159 @@ func unsafeStr(b []byte) string {
 		return ""
 	}
 	return unsafe.String(unsafe.SliceData(b), len(b))
+}
+
+// Get walks the object-key path keys into the JSON document data and returns
+// the raw bytes of the value found at that path, mirroring
+// github.com/buger/jsonparser's Get without reporting a value type. The
+// returned slice aliases data — for a string it includes the surrounding
+// quotes (escapes left intact), for an object or array it spans the matching
+// '{'..'}' or '['..']', and for a scalar it is the literal token.
+//
+// Each key descends one level: at every step the current value must be a JSON
+// object that contains the key, or Get returns ErrKeyNotFound (and, for a
+// non-object where descent was attempted, the index is left at that value).
+// With no keys Get returns the whole value at the document root. The second
+// return value is the offset in data at which the returned value begins, and
+// leading whitespace is tolerated at every level.
+func Get(data []byte, keys ...string) ([]byte, int, error) {
+	i := SkipWS(data, 0)
+	for _, key := range keys {
+		var err error
+		i, err = objectField(data, i, key)
+		if err != nil {
+			return nil, i, err
+		}
+	}
+	end, err := SkipValue(data, i)
+	if err != nil {
+		return nil, i, err
+	}
+	return data[i:end], i, nil
+}
+
+// ObjectEach calls fn once for every member of the JSON object reached by the
+// object-key path keys in data, modeled on github.com/buger/jsonparser's
+// ObjectEach but without reporting a value type. fn receives the member's
+// decoded key and the raw bytes of its value; both alias data (so the caller
+// must keep data unchanged while they are in use), and the value follows the
+// same conventions as Get — quotes kept for strings, the full span for objects
+// and arrays, the literal token for scalars.
+//
+// With no keys ObjectEach iterates the document's root object; otherwise each
+// key descends one level and the value at the end of the path must itself be an
+// object (ErrExpectObject if not, ErrKeyNotFound if a key is missing). If fn
+// returns a non-nil error, iteration stops and that error is returned.
+// Non-target members along the path are skipped without allocating.
+func ObjectEach(data []byte, fn func(key string, value []byte) error, keys ...string) error {
+	i := SkipWS(data, 0)
+	for _, key := range keys {
+		var err error
+		i, err = objectField(data, i, key)
+		if err != nil {
+			return err
+		}
+	}
+	i = SkipWS(data, i)
+	if i >= len(data) {
+		return ErrTruncated
+	}
+	if data[i] != '{' {
+		return ErrExpectObject
+	}
+	i++
+	for {
+		i = SkipWS(data, i)
+		if i >= len(data) {
+			return ErrTruncated
+		}
+		if data[i] == '}' {
+			return nil
+		}
+		key, ni, err := ReadKey(data, i)
+		if err != nil {
+			return err
+		}
+		i = SkipWS(data, ni)
+		if i >= len(data) || data[i] != ':' {
+			return ErrExpectColon
+		}
+		i = SkipWS(data, i+1)
+		start := i
+		end, err := SkipValue(data, i)
+		if err != nil {
+			return err
+		}
+		if err := fn(key, data[start:end]); err != nil {
+			return err
+		}
+		i = SkipWS(data, end)
+		if i >= len(data) {
+			return ErrTruncated
+		}
+		switch data[i] {
+		case '}':
+			return nil
+		case ',':
+			i++
+		default:
+			return ErrInvalidJSON
+		}
+	}
+}
+
+// objectField scans the JSON object at data[i] (after any leading whitespace)
+// for the member named key and returns the index of its value, with the value's
+// own leading whitespace already skipped. It returns ErrExpectObject if data[i]
+// is not an object and ErrKeyNotFound if the object has no such key. It reuses
+// the scanner primitives (ReadKey, SkipValue, SkipWS) so non-target members are
+// skipped without allocating.
+func objectField(data []byte, i int, key string) (int, error) {
+	i = SkipWS(data, i)
+	if i >= len(data) {
+		return i, ErrTruncated
+	}
+	if data[i] != '{' {
+		return i, ErrExpectObject
+	}
+	i++
+	for {
+		i = SkipWS(data, i)
+		if i >= len(data) {
+			return i, ErrTruncated
+		}
+		if data[i] == '}' {
+			return i, ErrKeyNotFound
+		}
+		k, ni, err := ReadKey(data, i)
+		if err != nil {
+			return ni, err
+		}
+		i = SkipWS(data, ni)
+		if i >= len(data) || data[i] != ':' {
+			return i, ErrExpectColon
+		}
+		i = SkipWS(data, i+1)
+		if k == key {
+			return i, nil
+		}
+		end, err := SkipValue(data, i)
+		if err != nil {
+			return end, err
+		}
+		i = SkipWS(data, end)
+		if i >= len(data) {
+			return i, ErrTruncated
+		}
+		switch data[i] {
+		case '}':
+			return i, ErrKeyNotFound
+		case ',':
+			i++
+		default:
+			return i, ErrInvalidJSON
+		}
+	}
 }
 
 // DecodeValue decodes an arbitrary JSON value at data[i] into the standard Go

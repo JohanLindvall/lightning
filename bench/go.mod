@@ -7,12 +7,9 @@ go 1.25.0
 
 require (
 	github.com/JohanLindvall/lightning v0.0.0
-	github.com/mailru/easyjson v0.9.2
+	github.com/buger/jsonparser v1.2.0
 )
 
-require (
-	github.com/josharian/intern v1.0.0 // indirect
-	golang.org/x/sys v0.45.0 // indirect
-)
+require golang.org/x/sys v0.45.0 // indirect
 
 replace github.com/JohanLindvall/lightning => ../

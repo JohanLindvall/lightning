@@ -1,0 +1,84 @@
+{
+  "apiVersion": "v2",
+  "kind": "DeploymentStatus",
+  "metadata": {
+    "name": "checkout-service",
+    "namespace": "production",
+    "uid": "b3f1c2a4-5d6e-4f70-8a91-2c3d4e5f6071",
+    "generation": 47,
+    "labels": {
+      "app": "checkout",
+      "tier": "backend",
+      "team": "payments",
+      "version": "2.13.4"
+    },
+    "annotations": {
+      "deployment.kubernetes.io/revision": "47",
+      "kubectl.kubernetes.io/last-applied-configuration": "{\"spec\":{\"replicas\":6}}"
+    }
+  },
+  "spec": {
+    "replicas": 6,
+    "strategy": {
+      "type": "RollingUpdate",
+      "rollingUpdate": {
+        "maxSurge": "25%",
+        "maxUnavailable": "0%"
+      }
+    },
+    "template": {
+      "metadata": {
+        "labels": {
+          "app": "checkout",
+          "tier": "backend"
+        }
+      },
+      "spec": {
+        "containers": [
+          {
+            "name": "checkout",
+            "image": "registry.example.com/checkout:2.13.4",
+            "ports": [
+              {"containerPort": 8080, "protocol": "TCP"},
+              {"containerPort": 9090, "protocol": "TCP"}
+            ],
+            "resources": {
+              "requests": {"cpu": "500m", "memory": "512Mi"},
+              "limits": {"cpu": "2", "memory": "1Gi"}
+            },
+            "env": [
+              {"name": "LOG_LEVEL", "value": "info"},
+              {"name": "DB_HOST", "value": "postgres.production.svc"},
+              {"name": "FEATURE_FLAGS", "value": "a=1,b=0,c=1"}
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "status": {
+    "observedGeneration": 47,
+    "replicas": 6,
+    "updatedReplicas": 6,
+    "readyReplicas": 6,
+    "availableReplicas": 6,
+    "conditions": [
+      {
+        "type": "Available",
+        "status": "True",
+        "lastUpdateTime": "2026-06-14T09:12:33Z",
+        "lastTransitionTime": "2026-06-01T08:00:00Z",
+        "reason": "MinimumReplicasAvailable",
+        "message": "Deployment has minimum availability."
+      },
+      {
+        "type": "Progressing",
+        "status": "True",
+        "lastUpdateTime": "2026-06-14T09:12:40Z",
+        "lastTransitionTime": "2026-06-14T09:10:00Z",
+        "reason": "NewReplicaSetAvailable",
+        "message": "ReplicaSet \"checkout-service-7f9c8b\" has successfully progressed."
+      }
+    ]
+  }
+}
