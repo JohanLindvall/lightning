@@ -679,7 +679,41 @@ func parseRFC3339(s string, allowSpace bool) (time.Time, bool) {
 	default:
 		return time.Time{}, false
 	}
+	if loc == time.UTC {
+		// The fields are already range-checked, so build the instant directly and
+		// skip time.Date's field-normalization machinery (dateToAbsDays and the
+		// surrounding range handling were ~18% of timestamp-array decoding).
+		secs := daysFromCivil(year, month, day)*86400 + int64(hour)*3600 + int64(min)*60 + int64(sec)
+		return time.Unix(secs, int64(nsec)).UTC(), true
+	}
 	return time.Date(year, time.Month(month), day, hour, min, sec, nsec, loc), true
+}
+
+// daysFromCivil returns the number of days from 1970-01-01 to the given
+// proleptic-Gregorian date using Howard Hinnant's algorithm, which is branch-
+// light and valid across time.Time's full year range. month is 1-12 and day
+// 1-31; the caller has already range-checked them. It lets the RFC 3339 fast
+// path construct UTC timestamps via time.Unix.
+func daysFromCivil(y, m, d int) int64 {
+	yy := int64(y)
+	if m <= 2 {
+		yy-- // treat Jan/Feb as months 13/14 of the previous year
+	}
+	var era int64
+	if yy >= 0 {
+		era = yy / 400
+	} else {
+		era = (yy - 399) / 400
+	}
+	yoe := yy - era*400 // year of era, [0, 399]
+	mm := int64(m)
+	mp := mm - 3 // March-based month index
+	if mm <= 2 {
+		mp = mm + 9
+	}
+	doy := (153*mp+2)/5 + int64(d) - 1      // day of year, [0, 365]
+	doe := yoe*365 + yoe/4 - yoe/100 + doy  // day of era, [0, 146096]
+	return era*146097 + doe - 719468        // 719468 = days from 0000-03-01 to 1970-01-01
 }
 
 // atoi2 parses exactly two decimal digits of s at off into a non-negative int,

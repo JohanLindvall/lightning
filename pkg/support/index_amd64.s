@@ -43,61 +43,92 @@ DATA rbrackMask<>+16(SB)/8, $0x5d5d5d5d5d5d5d5d
 DATA rbrackMask<>+24(SB)/8, $0x5d5d5d5d5d5d5d5d
 GLOBL rbrackMask<>(SB), RODATA|NOPTR, $32
 
-// func indexQuoteOrBackslashAVX2(b []byte) int
+// func indexQuoteOrBackslashSSE2(b []byte) int
 //
 // Returns the index of the first '"' or '\\' byte in b, or len(b) if neither
-// is present. Scans 32 bytes per iteration with AVX2, then a scalar tail.
-TEXT ·indexQuoteOrBackslashAVX2(SB), NOSPLIT, $0-32
+// is present, then a scalar tail. It uses no 256-bit registers, so it needs no
+// VZEROUPPER — the AVX2 variant pays that on every call, which dominates for the
+// short keys and string values that make up most JSON. The dispatch routes
+// string scanning here. The main loop covers 32 bytes per iteration with two
+// 16-byte SSE2 compares so it matches AVX2's stride (a 17-32 byte string still
+// finishes in one iteration) without the VZEROUPPER, and the second 16-byte load
+// is skipped entirely when the match lands in the first half. A 16-byte loop
+// then handles a final 16-31 byte span before the scalar tail.
+TEXT ·indexQuoteOrBackslashSSE2(SB), NOSPLIT, $0-32
 	MOVQ b_base+0(FP), SI
 	MOVQ b_len+8(FP), CX
-	XORQ DI, DI                  // DI = current offset
-	VMOVDQU quoteMask<>(SB), Y0
-	VMOVDQU bslashMask<>(SB), Y1
+	XORQ DI, DI
+	MOVOU quoteMask<>(SB), X0    // low 16 bytes of the splat: '"' x16
+	MOVOU bslashMask<>(SB), X1   // '\\' x16
 
-loop:
+sse_loop32:
 	CMPQ CX, $32
-	JL   tail
-	VMOVDQU (SI)(DI*1), Y2
-	VPCMPEQB Y0, Y2, Y3          // Y3 = (chunk == '"')
-	VPCMPEQB Y1, Y2, Y4          // Y4 = (chunk == '\\')
-	VPOR     Y4, Y3, Y3          // Y3 = either
-	VPMOVMSKB Y3, AX             // 32-bit mask of matching lanes
+	JL   sse_loop16
+	MOVOU (SI)(DI*1), X2         // first 16 bytes
+	MOVOU X2, X3
+	PCMPEQB X0, X2
+	PCMPEQB X1, X3
+	POR     X3, X2
+	PMOVMSKB X2, AX
 	TESTL    AX, AX
-	JNZ      found
+	JNZ      sse_found
+	MOVOU 16(SI)(DI*1), X4       // second 16 bytes (only if first had no match)
+	MOVOU X4, X5
+	PCMPEQB X0, X4
+	PCMPEQB X1, X5
+	POR     X5, X4
+	PMOVMSKB X4, AX
+	TESTL    AX, AX
+	JNZ      sse_found16
 	ADDQ     $32, DI
 	SUBQ     $32, CX
-	JMP      loop
+	JMP      sse_loop32
 
-found:
-	BSFL AX, AX                  // first set bit = offset within chunk
+sse_loop16:
+	CMPQ CX, $16
+	JL   sse_tail
+	MOVOU (SI)(DI*1), X2
+	MOVOU X2, X3
+	PCMPEQB X0, X2
+	PCMPEQB X1, X3
+	POR     X3, X2
+	PMOVMSKB X2, AX
+	TESTL    AX, AX
+	JNZ      sse_found
+	ADDQ     $16, DI
+	SUBQ     $16, CX
+	JMP      sse_loop16
+
+sse_found16:
+	ADDQ $16, DI                 // match was in the second 16-byte half
+
+sse_found:
+	BSFL AX, AX
 	ADDQ DI, AX
 	MOVQ AX, ret+24(FP)
-	VZEROUPPER
 	RET
 
-tail:
+sse_tail:
 	TESTQ CX, CX
-	JZ    notfound
+	JZ    sse_notfound
 
-tailloop:
+sse_tailloop:
 	MOVBLZX (SI)(DI*1), AX
 	CMPL    AX, $0x22
-	JE      tfound
+	JE      sse_tfound
 	CMPL    AX, $0x5c
-	JE      tfound
+	JE      sse_tfound
 	INCQ    DI
 	DECQ    CX
-	JNZ     tailloop
+	JNZ     sse_tailloop
 
-notfound:
+sse_notfound:
 	MOVQ b_len+8(FP), AX
 	MOVQ AX, ret+24(FP)
-	VZEROUPPER
 	RET
 
-tfound:
+sse_tfound:
 	MOVQ DI, ret+24(FP)
-	VZEROUPPER
 	RET
 
 // func indexStructuralAVX2(b []byte) int

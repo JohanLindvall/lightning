@@ -2,6 +2,7 @@ package support
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -416,6 +417,27 @@ func TestReadTimeOrNull(t *testing.T) {
 			}
 			if werr == nil && !got.Equal(want) {
 				t.Fatalf("%q: got %v, want %v", ts, got, want)
+			}
+		}
+	})
+
+	// Fuzz the civil→Unix UTC fast path (daysFromCivil) across many dates,
+	// including every month, leap years, and century boundaries, against the
+	// standard library which it must reproduce exactly.
+	t.Run("daysFromCivil vs time.Parse", func(t *testing.T) {
+		for _, y := range []int{1, 1969, 1970, 1971, 2000, 2023, 2024, 2100, 2400, 9999} {
+			for m := 1; m <= 12; m++ {
+				for _, d := range []int{1, 15, 28} {
+					ts := fmt.Sprintf("%04d-%02d-%02dT13:14:15.500Z", y, m, d)
+					want, err := time.Parse(time.RFC3339, ts)
+					if err != nil {
+						t.Fatalf("stdlib rejected %q: %v", ts, err)
+					}
+					got, _, gerr := ReadTimeOrNull([]byte(`"`+ts+`"`), 0)
+					if gerr != nil || !got.Equal(want) || got.Location() != want.Location() {
+						t.Fatalf("%q: got %v (err=%v), want %v", ts, got, gerr, want)
+					}
+				}
 			}
 		}
 	})
