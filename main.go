@@ -359,7 +359,7 @@ func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
 			fmt.Fprintf(os.Stderr, "warning: skipping embedded field %s\n", g.typeStr(f.Type))
 			continue
 		}
-		tagNames, skip, nocopy, lax := jsonTag(f.Tag)
+		tagNames, skip, nocopy, lax, unwrap := jsonTag(f.Tag)
 		if skip {
 			continue
 		}
@@ -385,6 +385,9 @@ func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
 				code = g.laxField("v."+field, f.Type, field, nocopy)
 			} else {
 				code = g.field("v."+field, f.Type, field, nocopy, false)
+			}
+			if unwrap {
+				code = unwrapField(code)
 			}
 			fmt.Fprintf(&cases, "\tcase %s:\n%s\n", strings.Join(quoted, ", "), code)
 		}
@@ -726,6 +729,30 @@ if err != nil {
 i = end`
 }
 
+// unwrapField wraps a field's normal decode (inner) so it runs against the JSON
+// embedded in a string value (the "unwrap" option). support.Unwrap reads the
+// string, unescapes it, and base64-decodes it when needed; the embedded bytes
+// are then decoded by inner inside a closure that rebinds data and i to them, so
+// inner's own (int, error) returns stay scoped to the embedded document while the
+// outer cursor advances past the original string. A null or empty string leaves
+// the field at its zero value.
+func unwrapField(inner string) string {
+	return fmt.Sprintf(`body, bend, berr := support.Unwrap(data, i)
+if berr != nil {
+	return bend, berr
+}
+if len(body) > 0 {
+	if _, ierr := func(data []byte, i int) (int, error) {
+		i = support.SkipWS(data, i)
+%s
+		return i, nil
+	}(body, 0); ierr != nil {
+		return bend, ierr
+	}
+}
+i = bend`, inner)
+}
+
 func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax bool) string {
 	suffix := ""
 	if nocopy {
@@ -1001,21 +1028,21 @@ func (g *gen) assemble(inPath string, methods []string) string {
 // and raw fields alias the input bytes instead of copying them, and "lax", which
 // makes a type mismatch on the field's value a no-op (the value is skipped and
 // the field left unset) rather than an error.
-func jsonTag(tag *ast.BasicLit) (names []string, skip, nocopy, lax bool) {
+func jsonTag(tag *ast.BasicLit) (names []string, skip, nocopy, lax, unwrap bool) {
 	if tag == nil {
-		return nil, false, false, false
+		return nil, false, false, false, false
 	}
 	s, err := strconv.Unquote(tag.Value)
 	if err != nil {
-		return nil, false, false, false
+		return nil, false, false, false, false
 	}
 	v := reflect.StructTag(s).Get("json")
 	if v == "" {
-		return nil, false, false, false
+		return nil, false, false, false, false
 	}
 	parts := strings.Split(v, ",")
 	if parts[0] == "-" && len(parts) == 1 {
-		return nil, true, false, false
+		return nil, true, false, false, false
 	}
 	for _, o := range parts[1:] {
 		switch o {
@@ -1023,6 +1050,8 @@ func jsonTag(tag *ast.BasicLit) (names []string, skip, nocopy, lax bool) {
 			nocopy = true
 		case "lax":
 			lax = true
+		case "unwrap":
+			unwrap = true
 		}
 	}
 	for _, n := range strings.Split(parts[0], "|") {
@@ -1030,7 +1059,7 @@ func jsonTag(tag *ast.BasicLit) (names []string, skip, nocopy, lax bool) {
 			names = append(names, n)
 		}
 	}
-	return names, false, nocopy, lax
+	return names, false, nocopy, lax, unwrap
 }
 
 func cap1(s string) string {

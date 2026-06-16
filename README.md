@@ -141,6 +141,33 @@ left unset, like any other lax mismatch. As with `nocopy`, the lenient parser
 propagates through slices, maps, and pointers (e.g. `[]time.Time`) but stops at
 struct boundaries.
 
+## The `unwrap` tag option
+
+Some payloads carry a nested document as a *string* — JSON embedded in JSON,
+sometimes base64-encoded. Add `unwrap` to a field's json tag to decode through
+that wrapper: the field's value is read as a JSON string, its body unescaped,
+and the result decoded as JSON into the field.
+
+```go
+type Envelope struct {
+    Name    string  `json:"name"`
+    Payload Message `json:"payload,unwrap"` // value is a string holding JSON
+}
+```
+
+Both forms are accepted automatically. If the unescaped string is itself JSON
+(its first non-whitespace byte starts a JSON value) it is decoded directly;
+otherwise it is base64-decoded first (standard alphabet, with or without
+padding) and the decoded bytes are the JSON. So a `"payload"` of
+`"{\"id\":7}"` and of `"eyJpZCI6N30="` both fill `Payload`. A `null` or empty
+string leaves the field at its zero value.
+
+The field decodes with its normal rules, so `unwrap` composes with the field's
+type (struct, slice, map, scalar…) and with `nocopy` — a `nocopy` string inside
+the embedded document aliases the decoded buffer, which is retained for as long
+as the result is in use. The embedded document is parsed as a fresh input, so
+its own whitespace, escaping, and structure are independent of the outer JSON.
+
 ## Comment directives
 
 Some behavior is selected with a `//lightning:<name>` comment on the struct type

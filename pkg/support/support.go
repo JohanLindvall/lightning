@@ -9,6 +9,7 @@ package support
 
 import (
 	"bytes"
+	"encoding/base64"
 	"errors"
 	"strconv"
 	"time"
@@ -105,6 +106,73 @@ func ReadStringNoCopyOrNull(data []byte, i int) (string, int, error) {
 		return decodeStringEscaped(data, i, i+k)
 	}
 	return unsafeStr(rest[:k]), i + k + 1, nil
+}
+
+// Unwrap reads the JSON string at data[i] and returns the JSON document embedded
+// in it — the backing of the "unwrap" field option. The string body is
+// unescaped; if it is not itself JSON (its first non-whitespace byte is not the
+// start of a JSON value) it is base64-decoded first, standard alphabet, with or
+// without padding. A JSON null yields a nil document and no error, and the second
+// return value is the offset just past the consumed string. The returned slice
+// is freshly allocated and not retained by Unwrap, so values decoded out of it
+// may safely alias it (the "nocopy" option).
+func Unwrap(data []byte, i int) ([]byte, int, error) {
+	if i >= len(data) {
+		return nil, i, ErrTruncated
+	}
+	if data[i] == 'n' {
+		end, err := ExpectNull(data, i)
+		return nil, end, err
+	}
+	s, end, err := ReadStringOrNull(data, i)
+	if err != nil {
+		return nil, end, err
+	}
+	body := []byte(s)
+	if startsJSON(body) {
+		return body, end, nil
+	}
+	if dec, ok := decodeBase64(body); ok {
+		return dec, end, nil
+	}
+	// Neither plainly JSON nor valid base64; hand the body back so the caller's
+	// decode reports a meaningful error on it.
+	return body, end, nil
+}
+
+// startsJSON reports whether b begins, after any leading whitespace, with the
+// first byte of a JSON value. base64-encoded JSON never starts with one of these
+// bytes (it begins with an alphabetic base64 digit), so this cleanly tells an
+// embedded JSON document apart from a base64-encoded one for Unwrap.
+func startsJSON(b []byte) bool {
+	for _, c := range b {
+		switch c {
+		case ' ', '\t', '\n', '\r':
+			continue
+		case '{', '[', '"', '-', 't', 'f', 'n',
+			'0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
+			return true
+		default:
+			return false
+		}
+	}
+	return false
+}
+
+// decodeBase64 decodes b as standard-alphabet base64 and reports whether it
+// succeeded. Trailing '=' padding is stripped first so a single unpadded decode
+// (base64.RawStdEncoding) covers both the padded and unpadded forms — one
+// allocation and one pass, rather than attempting each encoding in turn.
+func decodeBase64(b []byte) ([]byte, bool) {
+	for len(b) > 0 && b[len(b)-1] == '=' {
+		b = b[:len(b)-1]
+	}
+	dst := make([]byte, base64.RawStdEncoding.DecodedLen(len(b)))
+	n, err := base64.RawStdEncoding.Decode(dst, b)
+	if err != nil {
+		return nil, false
+	}
+	return dst[:n], true
 }
 
 // indexCloseOrEscapeScalar is the portable fallback for indexCloseOrEscape: it
