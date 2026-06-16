@@ -1465,9 +1465,22 @@ func objectField(data []byte, i int, key string, compact bool) (int, error) {
 }
 
 // DecodeValue decodes an arbitrary JSON value at data[i] into the standard Go
-// representation (nil, bool, float64, string, []any,
-// map[string]any).
+// representation (nil, bool, float64, string, []any, map[string]any).
 func DecodeValue(data []byte, i int) (any, int, error) {
+	return decodeValue(data, i, false)
+}
+
+// DecodeValueCompact is DecodeValue for compact JSON — input with no whitespace
+// between tokens — skipping the inter-token whitespace scans DecodeValue makes
+// while walking objects and arrays. The generator routes the dynamic any/map
+// value path here for a //lightning:compact type. On compact input it behaves
+// identically to DecodeValue but faster; given inter-token whitespace it may
+// report an error.
+func DecodeValueCompact(data []byte, i int) (any, int, error) {
+	return decodeValue(data, i, true)
+}
+
+func decodeValue(data []byte, i int, compact bool) (any, int, error) {
 	if i >= len(data) {
 		return nil, i, ErrTruncated
 	}
@@ -1476,9 +1489,9 @@ func DecodeValue(data []byte, i int) (any, int, error) {
 		s, end, err := ReadStringOrNull(data, i)
 		return s, end, err
 	case '{':
-		return decodeAnyObject(data, i)
+		return decodeAnyObject(data, i, compact)
 	case '[':
-		return decodeAnyArray(data, i)
+		return decodeAnyArray(data, i, compact)
 	case 't', 'f':
 		b, end, err := ReadBoolOrNull(data, i)
 		return b, end, err
@@ -1491,12 +1504,12 @@ func DecodeValue(data []byte, i int) (any, int, error) {
 	}
 }
 
-func decodeAnyObject(data []byte, i int) (any, int, error) {
+func decodeAnyObject(data []byte, i int, compact bool) (any, int, error) {
 	// data[i] == '{'
 	i++
 	m := map[string]any{}
 	for {
-		i = SkipWS(data, i)
+		i = skipWSc(data, i, compact)
 		if i >= len(data) {
 			return nil, i, ErrTruncated
 		}
@@ -1507,17 +1520,17 @@ func decodeAnyObject(data []byte, i int) (any, int, error) {
 		if err != nil {
 			return nil, ni, err
 		}
-		i = SkipWS(data, ni)
+		i = skipWSc(data, ni, compact)
 		if i >= len(data) || data[i] != ':' {
 			return nil, i, ErrExpectColon
 		}
-		i = SkipWS(data, i+1)
-		val, end, err := DecodeValue(data, i)
+		i = skipWSc(data, i+1, compact)
+		val, end, err := decodeValue(data, i, compact)
 		if err != nil {
 			return nil, end, err
 		}
 		m[string([]byte(key))] = val
-		i = SkipWS(data, end)
+		i = skipWSc(data, end, compact)
 		if i >= len(data) {
 			return nil, i, ErrTruncated
 		}
@@ -1531,24 +1544,24 @@ func decodeAnyObject(data []byte, i int) (any, int, error) {
 	}
 }
 
-func decodeAnyArray(data []byte, i int) (any, int, error) {
+func decodeAnyArray(data []byte, i int, compact bool) (any, int, error) {
 	// data[i] == '['
 	i++
 	a := []any{}
 	for {
-		i = SkipWS(data, i)
+		i = skipWSc(data, i, compact)
 		if i >= len(data) {
 			return nil, i, ErrTruncated
 		}
 		if data[i] == ']' {
 			return a, i + 1, nil
 		}
-		val, end, err := DecodeValue(data, i)
+		val, end, err := decodeValue(data, i, compact)
 		if err != nil {
 			return nil, end, err
 		}
 		a = append(a, val)
-		i = SkipWS(data, end)
+		i = skipWSc(data, end, compact)
 		if i >= len(data) {
 			return nil, i, ErrTruncated
 		}

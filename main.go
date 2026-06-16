@@ -713,12 +713,16 @@ func (g *gen) anyValue(dest string) string {
 	g.needAny = true
 	g.needBool = true
 	g.needFloat = true
-	return fmt.Sprintf(`val, end, err := support.DecodeValue(data, i)
+	decode := "support.DecodeValue"
+	if g.compact {
+		decode = "support.DecodeValueCompact"
+	}
+	return fmt.Sprintf(`val, end, err := %s(data, i)
 if err != nil {
 	return end, err
 }
 %s = val
-i = end`, dest)
+i = end`, decode, dest)
 }
 
 func (g *gen) skipEmit() string {

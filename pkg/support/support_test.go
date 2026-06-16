@@ -3,6 +3,7 @@ package support
 import (
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -928,5 +929,30 @@ func TestCountArrayElements(t *testing.T) {
 		if got := CountArrayElements([]byte(tt.in), i); got != tt.want {
 			t.Errorf("CountArrayElements(%q) = %d, want %d", tt.in, got, tt.want)
 		}
+	}
+}
+
+// TestDecodeValueCompact checks the compact dynamic-decode path: on whitespace-
+// free input it must agree with DecodeValue (objects, arrays, and nesting), and
+// it still tolerates leading whitespace at the value itself (only inter-token
+// whitespace is assumed absent).
+func TestDecodeValueCompact(t *testing.T) {
+	compact := []byte(`{"a":1,"b":[true,null,"x"],"c":{"d":2.5}}`)
+	want, end1, err1 := DecodeValue(compact, 0)
+	got, end2, err2 := DecodeValueCompact(compact, 0)
+	if err1 != nil || err2 != nil {
+		t.Fatalf("DecodeValue err=%v, DecodeValueCompact err=%v", err1, err2)
+	}
+	if end1 != end2 {
+		t.Fatalf("end mismatch: %d vs %d", end1, end2)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("compact decode != non-compact\n got %#v\nwant %#v", got, want)
+	}
+	// Like DecodeValue, the compact variant assumes data[i] is the value start
+	// (the caller has skipped any leading whitespace), so both decode a bare
+	// scalar identically.
+	if v, _, err := DecodeValueCompact([]byte(`42`), 0); err != nil || v != 42.0 {
+		t.Fatalf("scalar: got %v, %v", v, err)
 	}
 }
