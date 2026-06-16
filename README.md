@@ -141,6 +141,118 @@ left unset, like any other lax mismatch. As with `nocopy`, the lenient parser
 propagates through slices, maps, and pointers (e.g. `[]time.Time`) but stops at
 struct boundaries.
 
+## The `unwrap` tag option
+
+Some payloads carry a nested document as a *string* — JSON embedded in JSON,
+sometimes base64-encoded. Add `unwrap` to a field's json tag to decode through
+that wrapper: the field's value is read as a JSON string, its body unescaped,
+and the result decoded as JSON into the field.
+
+```go
+type Envelope struct {
+    Name    string  `json:"name"`
+    Payload Message `json:"payload,unwrap"` // value is a string holding JSON
+}
+```
+
+Both forms are accepted automatically. If the unescaped string is itself JSON
+(its first non-whitespace byte starts a JSON value) it is decoded directly;
+otherwise it is base64-decoded first (standard alphabet, with or without
+padding) and the decoded bytes are the JSON. So a `"payload"` of
+`"{\"id\":7}"` and of `"eyJpZCI6N30="` both fill `Payload`. A `null` or empty
+string leaves the field at its zero value.
+
+The field decodes with its normal rules, so `unwrap` composes with the field's
+type (struct, slice, map, scalar…) and with `nocopy` — a `nocopy` string inside
+the embedded document aliases the decoded buffer, which is retained for as long
+as the result is in use. The embedded document is parsed as a fresh input, so
+its own whitespace, escaping, and structure are independent of the outer JSON.
+
+## Comment directives
+
+Some behavior is selected with a `//lightning:<name>` comment on the struct type
+(or its declaration), separate from the per-field json tags above.
+
+### `//lightning:compact`
+
+By default a decoder calls `SkipWS` around every token so it accepts JSON with
+any whitespace. Mark a type `//lightning:compact` to assert the input has no
+whitespace *between* tokens — the form `encoding/json`'s `Marshal` and most wire
+protocols emit — and the generator drops those inter-token `SkipWS` calls,
+decoding tokens back-to-back:
+
+```go
+//lightning:compact
+type Log struct {
+    RayID  string `json:"RayID"`
+    Status int64  `json:"Status"`
+}
+```
+
+This runs about 10% faster on object-heavy payloads (see the `cloudflare-compact`
+benchmark). Whitespace surrounding the whole document is still tolerated — a
+trailing newline is fine — so only *inter-token* whitespace is assumed absent.
+
+The directive is an assertion you make about the input: a compact decoder fed
+input that does contain inter-token whitespace (for example the same document
+pretty-printed) returns an error instead of parsing it. Use it only for sources
+that are guaranteed compact. The directive applies to the whole type graph it
+roots, including nested structs, slices, and maps.
+
+## Generated function names
+
+The `UnmarshalJSON` methods keep their exact name (the `json.Unmarshaler`
+interface requires it). The unexported decoder helpers they call are named
+`lightning<ImportPath><Type>decode…` — a prefix derived from the package's import
+path and the top-level type — so generating decoders for several types into one
+package never produces colliding helper names. No annotation is needed; the
+prefix is automatic.
+
+## Key lookups
+
+When you only need a few values out of a document and don't want to generate (or
+decode into) a struct, the [`pkg/json`](pkg/json) package exposes the scanner's
+key-lookup primitives. They walk the input with the same allocation-free
+`Skip`/`ReadKey` machinery the generated decoders use, and every value they
+return aliases the input `[]byte` (keep it unchanged while the result is in
+use). A returned value follows the same conventions throughout: a string keeps
+its surrounding quotes with escapes intact, an object or array spans the whole
+`{`…`}` or `[`…`]`, and a scalar is the literal token.
+
+- `Get(data []byte, keys ...string) ([]byte, int, error)` — walks the object-key
+  path `keys` one level per key and returns the value's raw bytes (and the offset
+  it starts at), modeled on [buger/jsonparser](https://github.com/buger/jsonparser)'s
+  `Get`. With no keys it returns the whole root value; a missing key returns
+  `ErrKeyNotFound`.
+- `GetMany(data []byte, keys []string, out [][]byte) ([][]byte, error)` — looks up
+  several *top-level* keys in a **single pass** over the object, where N separate
+  `Get` calls would rescan it N times. Results are written into `out[:0]` (pass a
+  slice to reuse across calls, allocation-free; a `nil` reuses nothing) and
+  returned with `len == len(keys)`: `out[n]` is the value for `keys[n]`, or `nil`
+  if that key is absent. A missing key is reported by the `nil` slot, not an
+  error (a present key whose value is JSON `null` yields the bytes `"null"`,
+  distinct from absent); a non-object root or malformed JSON returns an error.
+- `ObjectEach(data []byte, fn func(key string, value []byte) error, keys ...string) error`
+  — calls `fn` for every member of the object reached by the path `keys` (the
+  root object with no keys). If `fn` returns an error, iteration stops and
+  returns it.
+
+```go
+// Pull a few fields out of a log record in one pass, reusing a scratch slice.
+keys := []string{"ClientIP", "EdgeResponseStatus", "RayID"}
+vals, err := json.GetMany(data, keys, scratch[:0])
+// vals[0] == []byte(`"203.0.113.23"`), vals[1] == []byte("599"), …
+```
+
+Each function has a **compact counterpart** — `GetCompact`, `GetManyCompact`,
+`ObjectEachCompact` — with the identical signature and result. Like the
+[`//lightning:compact`](#lightningcompact) directive, they assume the input has
+no whitespace *between* tokens (the form `encoding/json`'s `Marshal` and most
+wire protocols emit) and skip the inter-token `SkipWS` scans, running about 10%
+faster; whitespace surrounding the whole document is still tolerated. Feed one
+input that does contain inter-token whitespace and it may return an error, so use
+them only for sources guaranteed compact.
+
 ## String escaping and unescaping
 
 The [`pkg/json`](pkg/json) package exposes the scanner's string codec on its
@@ -190,16 +302,19 @@ The [`pkg/json`](pkg/json) package also exposes the scanner's float parser:
 
 ## SIMD scanning
 
-Two hot scan loops use a single vectorized pass instead of byte-at-a-time work
-— **amd64 (AVX2)**, 32 bytes/pass (`pkg/support/index_amd64.s`), and
-**arm64 (NEON/ASIMD)**, 16 bytes/pass (`pkg/support/index_arm64.s`):
+Two hot scan loops use a single vectorized pass instead of byte-at-a-time work,
+with kernels in `pkg/support/index_amd64.s` and `pkg/support/index_arm64.s`
+(arm64 uses NEON/ASIMD, 16 bytes/pass, for both):
 
 - **next `"` or `\` in a string** — replaces two `bytes.IndexByte` scans; speeds
-  up string-heavy payloads (~10–20% on the Cloudflare case).
-- **next structural byte (`{`, `}`, `[`, `]`, `"`)** — lets `skipObject` /
-  `skipArray` jump over inert content (numbers, keys, whitespace) when skipping
-  unknown values. Skipping a large ignored array/object is dramatically faster
-  (the `skip-heavy` benchmark decodes at >20 GB/s, ~90× `encoding/json`).
+  up string-heavy payloads. On amd64 it uses SSE2 (16-byte vectors, two compares
+  per 32-byte step), which avoids the `VZEROUPPER` an AVX2 routine must run on
+  every call — pure overhead for the short keys and values typical of JSON.
+- **next structural byte (`{`, `}`, `[`, `]`, `"`)** — AVX2 on amd64, 32
+  bytes/pass, lets `skipObject` / `skipArray` jump over inert content (numbers,
+  keys, whitespace) when skipping unknown values. Skipping a large ignored
+  array/object is dramatically faster (the `skip-heavy` benchmark decodes at
+  >20 GB/s, ~90× `encoding/json`).
 
 Feature detection is at run time (`golang.org/x/sys/cpu`); other platforms, CPUs
 without the feature, and inputs shorter than the vector width fall back to scalar
@@ -214,7 +329,9 @@ dependency on [easyjson](https://github.com/mailru/easyjson) stays out of the
 main module). It benchmarks the same payload decoded three ways — lightning,
 `encoding/json`, and easyjson — across each `bench/<case>/` folder.
 
-**See [`bench/results.md`](bench/results.md) for the full, current results.**
+**See the per-architecture results for the full, current numbers:
+[`bench/results_amd64.md`](bench/results_amd64.md) and
+[`bench/results_arm64.md`](bench/results_arm64.md).**
 
 Run them yourself with:
 
@@ -223,7 +340,8 @@ Run them yourself with:
 ```
 
 which (re)generates each case's deserializers and writes `bench/results.txt`
-and `bench/results.md`.
+and an architecture-specific `bench/results_<goarch>.md` (so runs on different
+CPUs do not overwrite each other's committed results).
 
 Representative numbers for a 1.8 KB Cloudflare log (Go 1.26, amd64):
 
@@ -240,7 +358,7 @@ Representative numbers for a 1.8 KB Cloudflare log (Go 1.26, amd64):
 |---|---|
 | [`main.go`](main.go) | the generator (`package main`) |
 | [`pkg/support`](pkg/support) | shared JSON scanning primitives used by generated code |
-| [`pkg/json`](pkg/json) | small public API over the scanner (e.g. `UnescapeString`) |
+| [`pkg/json`](pkg/json) | small public API over the scanner (`Get`/`GetMany`/`ObjectEach`, `UnescapeString`, `ParseFloat`) |
 | [`bench/`](bench) | benchmark module: hand-written `data.go` + `input.json` per case, plus the generated decoders, harness, and results |
 
 Generated files (`*_unmarshal.go`, `bench/*/bench_test.go`, `bench/*/ej/`, and

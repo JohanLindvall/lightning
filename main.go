@@ -24,6 +24,7 @@ import (
 	"go/printer"
 	"go/token"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -45,21 +46,37 @@ func main() {
 
 func generate(inPath string) error {
 	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, inPath, nil, parser.SkipObjectResolution)
+	file, err := parser.ParseFile(fset, inPath, nil, parser.SkipObjectResolution|parser.ParseComments)
 	if err != nil {
 		return err
 	}
 
 	g := &gen{
-		fset:        fset,
-		pkg:         file.Name.Name,
-		structTypes: map[string]*ast.StructType{},
-		order:       nil,
-		used:        map[string]bool{},
-		memo:        map[string]string{},
+		fset:         fset,
+		pkg:          file.Name.Name,
+		structTypes:  map[string]*ast.StructType{},
+		order:        nil,
+		used:         map[string]bool{},
+		memo:         map[string]string{},
+		compactTypes: map[string]bool{},
 	}
 
-	// Collect every top-level struct type, in source order.
+	// Generated helper functions are named "lightning<ImportPath><Type>decode...",
+	// a system-derived prefix that makes them unique across files and packages so
+	// decoders for several types can share one package without their helpers
+	// colliding — no manual annotation needed. The import path is resolved from
+	// the enclosing go.mod; if that fails (e.g. GOPATH mode) the package name
+	// stands in. The UnmarshalJSON methods keep their exact name (json.Unmarshaler
+	// requires it) and never collide, being keyed by their receiver type.
+	if ip, ok := importPathFor(inPath); ok {
+		g.pathFrag = sanitizeIdent(ip)
+	} else {
+		g.pathFrag = sanitizeIdent(file.Name.Name)
+	}
+
+	// Collect every top-level struct type, in source order. A type carrying the
+	// //lightning:compact directive (on the type or its declaration) gets a
+	// decoder that omits the inter-token SkipWS calls; see (*gen).skipWS.
 	for _, d := range file.Decls {
 		gd, ok := d.(*ast.GenDecl)
 		if !ok || gd.Tok != token.TYPE {
@@ -73,6 +90,9 @@ func generate(inPath string) error {
 			if st, ok := ts.Type.(*ast.StructType); ok {
 				g.structTypes[ts.Name.Name] = st
 				g.order = append(g.order, ts.Name.Name)
+				if hasCompactDirective(gd.Doc, ts.Doc) {
+					g.compactTypes[ts.Name.Name] = true
+				}
 			}
 		}
 	}
@@ -82,6 +102,8 @@ func generate(inPath string) error {
 
 	var methods []string
 	for _, name := range g.order {
+		g.compact = g.compactTypes[name]
+		g.prefix = "lightning" + g.pathFrag + name
 		methods = append(methods, g.genUnmarshal(name))
 	}
 	if len(g.errs) > 0 {
@@ -115,6 +137,11 @@ type gen struct {
 	used map[string]bool   // reserved decoder function names
 	memo map[string]string // type-key -> decoder function name (dedupe)
 
+	compactTypes map[string]bool // top-level types tagged //lightning:compact
+	compact      bool            // whether the type currently being generated is compact
+	pathFrag     string          // import path sanitized into an identifier fragment
+	prefix       string          // current per-type prefix for generated function names
+
 	decoders []string // generated decoder functions, in creation order
 	errs     []error  // generation errors; reported together after the walk
 
@@ -134,6 +161,135 @@ func (g *gen) uniq(base string) string {
 	}
 	g.used[name] = true
 	return name
+}
+
+// hasCompactDirective reports whether any of the given doc-comment groups
+// carries the //lightning:compact directive.
+func hasCompactDirective(groups ...*ast.CommentGroup) bool {
+	for _, cg := range groups {
+		if cg == nil {
+			continue
+		}
+		for _, c := range cg.List {
+			if strings.TrimSpace(strings.TrimPrefix(c.Text, "//")) == "lightning:compact" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// importPathFor resolves the Go import path of the package that inPath belongs
+// to by finding the enclosing go.mod and joining its module path with the
+// directory's path relative to the module root. It reports false when no go.mod
+// is found (e.g. GOPATH mode), so the caller can fall back to the package name.
+func importPathFor(inPath string) (string, bool) {
+	abs, err := filepath.Abs(inPath)
+	if err != nil {
+		return "", false
+	}
+	dir := filepath.Dir(abs)
+	for d := dir; ; {
+		if data, err := os.ReadFile(filepath.Join(d, "go.mod")); err == nil {
+			mod := modulePath(data)
+			if mod == "" {
+				return "", false
+			}
+			rel, err := filepath.Rel(d, dir)
+			if err != nil {
+				return "", false
+			}
+			if rel = filepath.ToSlash(rel); rel == "." {
+				return mod, true
+			}
+			return mod + "/" + rel, true
+		}
+		parent := filepath.Dir(d)
+		if parent == d { // reached the filesystem root without a go.mod
+			return "", false
+		}
+		d = parent
+	}
+}
+
+// modulePath returns the module path from the "module" line of a go.mod file's
+// contents, or "" if absent.
+func modulePath(goMod []byte) string {
+	for _, line := range strings.Split(string(goMod), "\n") {
+		if rest, ok := strings.CutPrefix(strings.TrimSpace(line), "module "); ok {
+			return strings.TrimSpace(rest)
+		}
+	}
+	return ""
+}
+
+// sanitizeIdent folds an arbitrary string (an import path or package name) into
+// a camel-cased run of [A-Za-z0-9], so it can sit inside a generated identifier.
+// Each maximal alphanumeric segment is capitalized: "github.com/foo/bar-baz"
+// becomes "GithubComFooBarBaz".
+func sanitizeIdent(s string) string {
+	var b strings.Builder
+	upNext := true
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9':
+			if upNext {
+				b.WriteRune(unicode.ToUpper(r))
+				upNext = false
+			} else {
+				b.WriteRune(r)
+			}
+		default:
+			upNext = true
+		}
+	}
+	return b.String()
+}
+
+// decFn applies the current per-type prefix to a generated decoder function's
+// name, yielding the system-unique "lightning<ImportPath><Type>decode..." form.
+func (g *gen) decFn(name string) string { return g.prefix + name }
+
+// skipWSExpr returns the expression giving the first non-whitespace index at or
+// after src. For a //lightning:compact type the input is asserted to hold no
+// whitespace between tokens (the form compact JSON serializers emit), so it
+// collapses to src itself; otherwise it is the support.SkipWS call the generator
+// has always emitted. Only the per-key/element calls inside objects, arrays and
+// maps are elided this way; UnmarshalJSON keeps its leading/trailing SkipWS so a
+// document framed with surrounding whitespace (e.g. a trailing newline) still
+// decodes.
+func (g *gen) skipWSExpr(src string) string {
+	if g.compact {
+		return src
+	}
+	return "support.SkipWS(data, " + src + ")"
+}
+
+// skipWS returns the statement assigning dst the first non-whitespace index at
+// or after src. In compact mode it becomes a plain dst = src, or nothing when
+// dst and src are identical (the assignment would be a no-op).
+func (g *gen) skipWS(dst, src string) string {
+	if g.compact && dst == src {
+		return ""
+	}
+	return dst + " = " + g.skipWSExpr(src)
+}
+
+// cmark and csuf distinguish a compact decoder from its non-compact counterpart
+// in, respectively, memo keys and generated function names, so the same type
+// reached from both a compact and a non-compact root yields two decoders.
+func (g *gen) cmark() string {
+	if g.compact {
+		return "compact:"
+	}
+	return ""
+}
+
+func (g *gen) csuf() string {
+	if g.compact {
+		return "Compact"
+	}
+	return ""
 }
 
 // genUnmarshal emits the UnmarshalJSON method for a named struct type and makes
@@ -171,11 +327,11 @@ func (v *%[1]s) UnmarshalJSON(data []byte) error {
 
 // namedStruct returns (generating on first use) the decoder for a named struct.
 func (g *gen) namedStruct(name string) string {
-	key := "named:" + name
+	key := g.prefix + g.cmark() + "named:" + name
 	if fn, ok := g.memo[key]; ok {
 		return fn
 	}
-	fn := "decode" + name
+	fn := g.decFn("decode" + name + g.csuf())
 	g.used[fn] = true
 	g.memo[key] = fn // set before body so recursive types terminate
 	g.genStructBody(fn, "*"+name, g.structTypes[name])
@@ -185,11 +341,11 @@ func (g *gen) namedStruct(name string) string {
 // anonStruct returns the decoder for an anonymous struct type, named after the
 // field it was first reached through.
 func (g *gen) anonStruct(t *ast.StructType, hint string) string {
-	key := "anon:" + g.typeStr(t)
+	key := g.prefix + g.cmark() + "anon:" + g.typeStr(t)
 	if fn, ok := g.memo[key]; ok {
 		return fn
 	}
-	fn := g.uniq("decode" + cap1(hint))
+	fn := g.uniq(g.decFn("decode" + cap1(hint) + g.csuf()))
 	g.memo[key] = fn
 	g.genStructBody(fn, "*"+g.typeStr(t), t)
 	return fn
@@ -203,7 +359,7 @@ func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
 			fmt.Fprintf(os.Stderr, "warning: skipping embedded field %s\n", g.typeStr(f.Type))
 			continue
 		}
-		tagNames, skip, nocopy, lax := jsonTag(f.Tag)
+		tagNames, skip, nocopy, lax, unwrap := jsonTag(f.Tag)
 		if skip {
 			continue
 		}
@@ -230,6 +386,9 @@ func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
 			} else {
 				code = g.field("v."+field, f.Type, field, nocopy, false)
 			}
+			if unwrap {
+				code = unwrapField(code)
+			}
 			fmt.Fprintf(&cases, "\tcase %s:\n%s\n", strings.Join(quoted, ", "), code)
 		}
 	}
@@ -246,7 +405,7 @@ func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
 	}
 	i++
 	for {
-		i = support.SkipWS(data, i)
+		%[4]s
 		if i >= len(data) {
 			return i, support.ErrTruncated
 		}
@@ -257,11 +416,11 @@ func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
 		if err != nil {
 			return ni, err
 		}
-		i = support.SkipWS(data, ni)
+		%[5]s
 		if i >= len(data) || data[i] != ':' {
 			return i, support.ErrExpectColon
 		}
-		i = support.SkipWS(data, i+1)
+		%[6]s
 		if i >= len(data) {
 			return i, support.ErrTruncated
 		}
@@ -274,7 +433,7 @@ func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
 			}
 			i = end
 		}
-		i = support.SkipWS(data, i)
+		%[7]s
 		if i >= len(data) {
 			return i, support.ErrTruncated
 		}
@@ -286,7 +445,7 @@ func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
 		}
 		i++
 	}
-}`, fn, paramType, cases.String())
+}`, fn, paramType, cases.String(), g.skipWS("i", "i"), g.skipWS("i", "ni"), g.skipWS("i", "i+1"), g.skipWS("i", "i"))
 	g.decoders = append(g.decoders, body)
 }
 
@@ -570,6 +729,30 @@ if err != nil {
 i = end`
 }
 
+// unwrapField wraps a field's normal decode (inner) so it runs against the JSON
+// embedded in a string value (the "unwrap" option). support.Unwrap reads the
+// string, unescapes it, and base64-decodes it when needed; the embedded bytes
+// are then decoded by inner inside a closure that rebinds data and i to them, so
+// inner's own (int, error) returns stay scoped to the embedded document while the
+// outer cursor advances past the original string. A null or empty string leaves
+// the field at its zero value.
+func unwrapField(inner string) string {
+	return fmt.Sprintf(`body, bend, berr := support.Unwrap(data, i)
+if berr != nil {
+	return bend, berr
+}
+if len(body) > 0 {
+	if _, ierr := func(data []byte, i int) (int, error) {
+		i = support.SkipWS(data, i)
+%s
+		return i, nil
+	}(body, 0); ierr != nil {
+		return bend, ierr
+	}
+}
+i = bend`, inner)
+}
+
 func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax bool) string {
 	suffix := ""
 	if nocopy {
@@ -578,15 +761,15 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax bool) string {
 	if lax {
 		suffix += "Lax"
 	}
-	key := "slice:" + suffix + ":" + g.typeStr(elt)
+	key := g.prefix + g.cmark() + "slice:" + suffix + ":" + g.typeStr(elt)
 	if fn, ok := g.memo[key]; ok {
 		return fn
 	}
 	var fn string
 	if g.isStruct(elt) {
-		fn = g.uniq("decode" + cap1(hint) + suffix)
+		fn = g.uniq(g.decFn("decode" + cap1(hint) + suffix + g.csuf()))
 	} else {
-		fn = g.uniq("decode" + g.baseName(elt) + suffix + "Slice")
+		fn = g.uniq(g.decFn("decode" + g.baseName(elt) + suffix + "Slice" + g.csuf()))
 	}
 	g.memo[key] = fn
 	if isRaw(elt) {
@@ -597,6 +780,7 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax bool) string {
 	}
 	eltStr := g.typeStr(elt)
 	inner := g.field("el", elt, singular(hint)+"Entry", nocopy, lax)
+	presize := g.slicePresize(elt, eltStr)
 	body := fmt.Sprintf(`func %[1]s(out *[]%[2]s, data []byte, i int) (int, error) {
 	if i >= len(data) {
 		return i, support.ErrTruncated
@@ -612,9 +796,9 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax bool) string {
 	if data[i] != '[' {
 		return i, support.ErrExpectArray
 	}
-	i++
+%[4]s	i++
 	for {
-		i = support.SkipWS(data, i)
+		%[5]s
 		if i >= len(data) {
 			return i, support.ErrTruncated
 		}
@@ -624,7 +808,7 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax bool) string {
 		var el %[2]s
 		%[3]s
 		*out = append(*out, el)
-		i = support.SkipWS(data, i)
+		%[5]s
 		if i >= len(data) {
 			return i, support.ErrTruncated
 		}
@@ -636,9 +820,47 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax bool) string {
 		}
 		i++
 	}
-}`, fn, eltStr, inner)
+}`, fn, eltStr, inner, presize, g.skipWS("i", "i"))
 	g.decoders = append(g.decoders, body)
 	return fn
+}
+
+// slicePresize returns the code that allocates out to the array's element count
+// before the decode loop, sparing the repeated reallocation that append-driven
+// growth incurs. It presizes only when out is nil (so decoding into a reused
+// slice keeps appending) and only for element types where counting is cheap
+// relative to decoding: scalars (numbers/booleans) get the vectorized
+// CountArrayScalars; strings, time.Time, raw messages and nested structs/slices,
+// whose per-element decode is costly enough to amortize a structural pass, get
+// the general CountArrayElements. Tiny fixed-cost elements where a counting scan
+// would not pay for itself get no presize (an empty string keeps the loop as-is).
+func (g *gen) slicePresize(elt ast.Expr, eltStr string) string {
+	counter := ""
+	switch t := unparen(elt).(type) {
+	case *ast.Ident:
+		switch {
+		case t.Name == "bool" || t.Name == "float32" || t.Name == "float64" ||
+			intKinds[t.Name] || uintKinds[t.Name]:
+			counter = "support.CountArrayScalars"
+		case t.Name == "string":
+			counter = "support.CountArrayElements"
+		}
+	case *ast.StructType, *ast.ArrayType, *ast.MapType:
+		counter = "support.CountArrayElements"
+	case *ast.SelectorExpr:
+		if isTime(t) || isRaw(t) {
+			counter = "support.CountArrayElements"
+		}
+	}
+	if counter == "" {
+		return ""
+	}
+	return fmt.Sprintf(`	if *out == nil {
+		if n := %s(data, i); n > 0 {
+			*out = make([]%s, 0, n)
+		}
+	}
+`, counter, eltStr)
 }
 
 func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy, lax bool) string {
@@ -653,11 +875,11 @@ func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy, lax boo
 	if lax {
 		suffix += "Lax"
 	}
-	key := "map:" + suffix + ":" + g.typeStr(valExpr)
+	key := g.prefix + g.cmark() + "map:" + suffix + ":" + g.typeStr(valExpr)
 	if fn, ok := g.memo[key]; ok {
 		return fn
 	}
-	fn := g.uniq("decode" + cap1(hint) + suffix + "Map")
+	fn := g.uniq(g.decFn("decode" + cap1(hint) + suffix + "Map" + g.csuf()))
 	g.memo[key] = fn
 	if isRaw(valExpr) {
 		g.needJSON = true
@@ -688,7 +910,7 @@ func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy, lax boo
 		m = make(map[string]%[2]s)
 	}
 	for {
-		i = support.SkipWS(data, i)
+		%[4]s
 		if i >= len(data) {
 			return i, support.ErrTruncated
 		}
@@ -700,18 +922,18 @@ func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy, lax boo
 		if err != nil {
 			return ni, err
 		}
-		i = support.SkipWS(data, ni)
+		%[5]s
 		if i >= len(data) || data[i] != ':' {
 			return i, support.ErrExpectColon
 		}
-		i = support.SkipWS(data, i+1)
+		%[6]s
 		if i >= len(data) {
 			return i, support.ErrTruncated
 		}
 		var val %[2]s
 		%[3]s
 		m[string([]byte(key))] = val
-		i = support.SkipWS(data, i)
+		%[4]s
 		if i >= len(data) {
 			return i, support.ErrTruncated
 		}
@@ -724,7 +946,7 @@ func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy, lax boo
 		}
 		i++
 	}
-}`, fn, valStr, inner)
+}`, fn, valStr, inner, g.skipWS("i", "i"), g.skipWS("i", "ni"), g.skipWS("i", "i+1"))
 	g.decoders = append(g.decoders, body)
 	return fn
 }
@@ -806,21 +1028,21 @@ func (g *gen) assemble(inPath string, methods []string) string {
 // and raw fields alias the input bytes instead of copying them, and "lax", which
 // makes a type mismatch on the field's value a no-op (the value is skipped and
 // the field left unset) rather than an error.
-func jsonTag(tag *ast.BasicLit) (names []string, skip, nocopy, lax bool) {
+func jsonTag(tag *ast.BasicLit) (names []string, skip, nocopy, lax, unwrap bool) {
 	if tag == nil {
-		return nil, false, false, false
+		return nil, false, false, false, false
 	}
 	s, err := strconv.Unquote(tag.Value)
 	if err != nil {
-		return nil, false, false, false
+		return nil, false, false, false, false
 	}
 	v := reflect.StructTag(s).Get("json")
 	if v == "" {
-		return nil, false, false, false
+		return nil, false, false, false, false
 	}
 	parts := strings.Split(v, ",")
 	if parts[0] == "-" && len(parts) == 1 {
-		return nil, true, false, false
+		return nil, true, false, false, false
 	}
 	for _, o := range parts[1:] {
 		switch o {
@@ -828,6 +1050,8 @@ func jsonTag(tag *ast.BasicLit) (names []string, skip, nocopy, lax bool) {
 			nocopy = true
 		case "lax":
 			lax = true
+		case "unwrap":
+			unwrap = true
 		}
 	}
 	for _, n := range strings.Split(parts[0], "|") {
@@ -835,7 +1059,7 @@ func jsonTag(tag *ast.BasicLit) (names []string, skip, nocopy, lax bool) {
 			names = append(names, n)
 		}
 	}
-	return names, false, nocopy, lax
+	return names, false, nocopy, lax, unwrap
 }
 
 func cap1(s string) string {

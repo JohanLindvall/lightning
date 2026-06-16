@@ -2,6 +2,14 @@
 
 // 16-byte constant of byte indices is not needed; we recover the position with
 // scalar RBIT/CLZ on the comparison mask moved into general registers.
+//
+// The comparison splats are built per call with MOVD-immediate + VDUP rather
+// than loaded from a RODATA table. On amd64 the equivalent constants are kept in
+// RODATA because building them inline needs VPBROADCASTB, whose GP→XMM domain
+// crossing dominates when the routine early-exits after a single block; arm64's
+// VDUP-from-GPR has no such penalty, so the inline form is cheaper than a VLD1
+// load (no load-use latency, no memory dependency) and measures ~2% faster on
+// the get benchmark. See index_amd64.s for the contrasting choice.
 
 // func indexQuoteOrBackslashNEON(b []byte) int
 //
@@ -13,8 +21,8 @@ TEXT ·indexQuoteOrBackslashNEON(SB), NOSPLIT, $0-32
 	MOVD $0, R2                  // R2 = current offset
 	MOVD $0x22, R3
 	VDUP R3, V0.B16              // V0 = '"' x16
-	MOVD $0x5c, R4
-	VDUP R4, V1.B16              // V1 = '\\' x16
+	MOVD $0x5c, R3
+	VDUP R3, V1.B16              // V1 = '\\' x16
 
 loop16:
 	SUB  R2, R1, R7              // R7 = remaining = len - offset
@@ -80,33 +88,33 @@ TEXT ·indexStructuralNEON(SB), NOSPLIT, $0-32
 	MOVD b_len+8(FP), R1
 	MOVD $0, R2
 	MOVD $0x7b, R3
-	VDUP R3, V0.B16              // '{'
-	MOVD $0x7d, R4
-	VDUP R4, V1.B16              // '}'
-	MOVD $0x5b, R5
-	VDUP R5, V20.B16             // '['
-	MOVD $0x5d, R6
-	VDUP R6, V21.B16             // ']'
-	MOVD $0x22, R12
-	VDUP R12, V22.B16            // '"'
+	VDUP R3, V0.B16   // '{'
+	MOVD $0x7d, R3
+	VDUP R3, V1.B16   // '}'
+	MOVD $0x5b, R3
+	VDUP R3, V2.B16   // '['
+	MOVD $0x5d, R3
+	VDUP R3, V3.B16   // ']'
+	MOVD $0x22, R3
+	VDUP R3, V4.B16   // '"'
 
 sloop:
 	SUB  R2, R1, R7
 	CMP  $16, R7
 	BLT  stail
 	ADD  R0, R2, R8
-	VLD1 (R8), [V2.B16]
-	VCMEQ V0.B16, V2.B16, V3.B16
-	VCMEQ V1.B16, V2.B16, V4.B16
-	VORR V4.B16, V3.B16, V3.B16
-	VCMEQ V20.B16, V2.B16, V4.B16
-	VORR V4.B16, V3.B16, V3.B16
-	VCMEQ V21.B16, V2.B16, V4.B16
-	VORR V4.B16, V3.B16, V3.B16
-	VCMEQ V22.B16, V2.B16, V4.B16
-	VORR V4.B16, V3.B16, V3.B16
-	VMOV V3.D[0], R9
-	VMOV V3.D[1], R10
+	VLD1 (R8), [V5.B16]          // chunk
+	VCMEQ V0.B16, V5.B16, V6.B16
+	VCMEQ V1.B16, V5.B16, V7.B16
+	VORR V7.B16, V6.B16, V6.B16
+	VCMEQ V2.B16, V5.B16, V7.B16
+	VORR V7.B16, V6.B16, V6.B16
+	VCMEQ V3.B16, V5.B16, V7.B16
+	VORR V7.B16, V6.B16, V6.B16
+	VCMEQ V4.B16, V5.B16, V7.B16
+	VORR V7.B16, V6.B16, V6.B16
+	VMOV V6.D[0], R9
+	VMOV V6.D[1], R10
 	CBNZ R9, slow8
 	CBNZ R10, shigh8
 	ADD  $16, R2

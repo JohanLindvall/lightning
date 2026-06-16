@@ -8,7 +8,8 @@
 #      (separate package so its UnmarshalJSON does not clash with lightning's),
 #   3. write a benchmark that decodes input.json with lightning, encoding/json
 #      and easyjson,
-#   4. run the benchmark and append the results to results.txt (+ results.md).
+#   4. run the benchmark and append the results to results.txt, then render an
+#      architecture-specific summary (results_<goarch>.md).
 #
 # The bench module keeps the easyjson dependency out of the main module.
 #
@@ -19,6 +20,10 @@ cd "$(dirname "$0")"       # the bench module root
 ROOT=".."                  # the parent (lightning) module root
 
 RESULTS="results.txt"
+# The rendered markdown is per-architecture (results_<goarch>.md) so runs on
+# different CPUs — whose SIMD paths and absolute timings differ — do not clobber
+# each other's committed results.
+RESULTSMD="results_$(go env GOARCH).md"
 MODULE=$(go list -m)       # github.com/JohanLindvall/lightning/bench
 
 # Locate (or install) the easyjson code generator.
@@ -138,7 +143,7 @@ func BenchmarkEasyjson(b *testing.B) {
 	}
 }
 EOF
-	sed -i "s#__EJ_IMPORT__#${ejimport}#" "${dir}bench_test.go"
+	perl -i -pe "s#__EJ_IMPORT__#${ejimport}#" "${dir}bench_test.go"
 
 	# 4. Run the benchmarks and record the output.
 	{
@@ -157,9 +162,9 @@ done
 
 # Render a markdown summary alongside the raw results.
 if command -v python3 >/dev/null 2>&1; then
-	python3 results_md.py "$RESULTS" results.md || true
+	python3 results_md.py "$RESULTS" "$RESULTSMD" || true
 fi
 
 echo
-echo "results written to bench/${RESULTS} and bench/results.md"
+echo "results written to bench/${RESULTS} and bench/${RESULTSMD}"
 exit $status

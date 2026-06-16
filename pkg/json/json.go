@@ -5,6 +5,10 @@ package json
 
 import "github.com/JohanLindvall/lightning/pkg/support"
 
+// ErrKeyNotFound is returned by Get when the requested key path does not exist
+// in the document (or descends through a value that is not an object).
+var ErrKeyNotFound = support.ErrKeyNotFound
+
 // UnescapeString decodes the body of a JSON string (the bytes that sit between
 // the surrounding quotes, with escape sequences such as \n, \" and \uXXXX still
 // present) into the Go string it represents.
@@ -38,4 +42,78 @@ func UnescapeStringInto(in, out []byte) (string, error) {
 // an empty input yield an error.
 func ParseFloat(b []byte) (float64, error) {
 	return support.ParseFloat(b)
+}
+
+// Get walks the object-key path keys into the JSON document data and returns
+// the raw bytes of the value found at that path, modeled on
+// github.com/buger/jsonparser's Get but without reporting a value type. It is
+// built on the scanner primitives, so non-target object members are skipped
+// without allocating and the returned slice aliases data (the caller must keep
+// data unchanged while the result is in use).
+//
+// For a string the result includes the surrounding quotes with escapes intact;
+// for an object or array it spans the whole '{'..'}' or '['..']'; for a scalar
+// it is the literal token. The returned int is the offset in data at which the
+// value begins. Each key must name a member of the object at the current level,
+// otherwise Get returns ErrKeyNotFound; with no keys it returns the document's
+// root value. To replicate jsonparser's "value exists and is an object" check
+// without inspecting a type, test err == nil and that the first byte is '{'.
+func Get(data []byte, keys ...string) ([]byte, int, error) {
+	return support.Get(data, keys...)
+}
+
+// GetCompact is Get for compact JSON — input with no whitespace between tokens,
+// as compact serializers emit. It skips the inter-token whitespace scans Get
+// makes while descending the key path (leading whitespace at the document start
+// is still tolerated), so it is faster on compact input but may report an error
+// if the input actually contains inter-token whitespace.
+func GetCompact(data []byte, keys ...string) ([]byte, int, error) {
+	return support.GetCompact(data, keys...)
+}
+
+// GetMany looks up several top-level members of the JSON object in data at once,
+// in a single pass, returning their raw value bytes in the same order as keys —
+// the batch form of Get for pulling a handful of fields out of one record. The
+// results are written into out[:0] (pass a slice to reuse across calls; a nil
+// out allocates) and out is returned with length len(keys): out[n] is the value
+// for keys[n], aliasing data and following Get's conventions, or nil if that key
+// is absent. A missing key is reported by the nil slot, not an error; a
+// non-object root or malformed JSON returns a non-nil error.
+func GetMany(data []byte, keys []string, out [][]byte) ([][]byte, error) {
+	return support.GetMany(data, keys, out)
+}
+
+// GetManyCompact is GetMany for compact JSON — input with no whitespace between
+// tokens, as compact serializers emit. It skips GetMany's inter-token whitespace
+// scans (leading whitespace at the document start is still tolerated), so it is
+// faster on compact input but may report an error if the input actually contains
+// inter-token whitespace.
+func GetManyCompact(data []byte, keys []string, out [][]byte) ([][]byte, error) {
+	return support.GetManyCompact(data, keys, out)
+}
+
+// ObjectEach calls fn once for every member of the JSON object reached by the
+// object-key path keys in data, modeled on github.com/buger/jsonparser's
+// ObjectEach but without reporting a value type. fn receives the member's
+// decoded key and the raw bytes of its value (both aliasing data, so the caller
+// must keep data unchanged while they are in use); the value follows the same
+// conventions as Get — quotes kept for strings, the full span for objects and
+// arrays, the literal token for scalars.
+//
+// With no keys ObjectEach iterates the document's root object; otherwise each
+// key descends one level and the value at the end of the path must itself be an
+// object (ErrKeyNotFound if a key is missing). If fn returns a non-nil error,
+// iteration stops and that error is returned. It is built on the scanner
+// primitives, so members are visited without allocating.
+func ObjectEach(data []byte, fn func(key string, value []byte) error, keys ...string) error {
+	return support.ObjectEach(data, fn, keys...)
+}
+
+// ObjectEachCompact is ObjectEach for compact JSON — input with no whitespace
+// between tokens, as compact serializers emit. It skips ObjectEach's inter-token
+// whitespace scans (leading whitespace at the document start is still
+// tolerated), so it is faster on compact input but may report an error if the
+// input actually contains inter-token whitespace.
+func ObjectEachCompact(data []byte, fn func(key string, value []byte) error, keys ...string) error {
+	return support.ObjectEachCompact(data, fn, keys...)
 }

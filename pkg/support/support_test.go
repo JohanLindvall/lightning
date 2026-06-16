@@ -2,6 +2,7 @@ package support
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -109,6 +110,38 @@ func TestReadStringOrNull(t *testing.T) {
 				if end != tt.wantEnd {
 					t.Errorf("%s: end = %d, want %d", fn.label, end, tt.wantEnd)
 				}
+			}
+		})
+	}
+}
+
+// --- Unwrap ----------------------------------------------------------------
+
+func TestUnwrap(t *testing.T) {
+	tests := []struct {
+		name    string
+		in      string // a JSON string value (the outer quotes included)
+		want    string // the embedded JSON it should yield
+		wantErr error
+	}{
+		{"plain object", `"{\"x\":1}"`, `{"x":1}`, nil},
+		{"plain array", `"[1,2,3]"`, `[1,2,3]`, nil},
+		{"plain with leading ws", `"  {\"x\":1}"`, `  {"x":1}`, nil},
+		{"plain scalar", `"42"`, `42`, nil},
+		{"base64 padded", `"eyJ4IjoxfQ=="`, `{"x":1}`, nil},          // base64({"x":1})
+		{"base64 unpadded", `"eyJ4IjoxfQ"`, `{"x":1}`, nil},          // RawStd
+		{"base64 array", `"WzEsMiwzXQ=="`, `[1,2,3]`, nil},           // base64([1,2,3])
+		{"null", `null`, "", nil},                                   // nil document
+		{"not a string", `42`, "", ErrInvalidJSON},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, _, err := Unwrap([]byte(tt.in), 0)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("err = %v, want %v", err, tt.wantErr)
+			}
+			if tt.wantErr == nil && string(got) != tt.want {
+				t.Fatalf("got %q, want %q", got, tt.want)
 			}
 		})
 	}
@@ -236,9 +269,14 @@ func TestReadFloat64OrNull(t *testing.T) {
 	}
 }
 
-// fastFloat is exercised indirectly above, but verify it agrees with the slow
-// path and correctly declines out-of-range tokens.
+// scanFloat's fast path is exercised indirectly above, but verify it agrees with
+// the slow path and correctly declines out-of-range tokens. A token is "taken"
+// on the fast path when fast=true and the whole input was consumed.
 func TestFastFloat(t *testing.T) {
+	fastFloat := func(b []byte) (float64, bool) {
+		f, end, fast, ok := scanFloat(b, 0)
+		return f, ok && fast && end == len(b)
+	}
 	okCases := map[string]float64{
 		"0":      0,
 		"1":      1,
@@ -270,7 +308,7 @@ func TestFastFloat(t *testing.T) {
 		"12345678901234567890", // 20 digits, > 19
 		"1e99999",              // huge exponent
 		".",                    // no digits
-		"1x",                   // trailing junk -> i != n
+		"1x",                   // trailing junk -> not fully consumed
 	}
 	for _, in := range declined {
 		if _, ok := fastFloat([]byte(in)); ok {
@@ -379,6 +417,60 @@ func TestReadTimeOrNull(t *testing.T) {
 		_, _, err := ReadTimeOrNull([]byte(`"not-a-time"`), 0)
 		if err == nil {
 			t.Fatal("expected parse error, got nil")
+		}
+	})
+
+	// The fast path (parseRFC3339 with atoi2/atoi4) must agree with time.Parse on
+	// every shape, including malformed numeric fields that must be rejected so the
+	// result still matches the standard library (which the decoder falls back to).
+	t.Run("matches time.Parse", func(t *testing.T) {
+		cases := []string{
+			"2023-01-02T15:04:05Z",
+			"2023-01-02T15:04:05.5Z",
+			"2023-01-02T15:04:05.123456789Z",
+			"2023-12-31T23:59:59Z",
+			"2024-02-29T00:00:00Z", // leap day
+			"2023-01-02T15:04:05+02:00",
+			"2023-01-02T15:04:05-11:30",
+			"2023-01-02T15:04:05.250+00:00",
+			"0001-01-01T00:00:00Z",
+			"2023-1x-02T15:04:05Z",  // non-digit in month
+			"2023-01-02T15:04:6zZ",  // non-digit in seconds
+			"2023-13-02T15:04:05Z",  // month out of range
+			"2023-01-02T15:04:05X",  // bad zone
+			"2023-01-02T15:04:05+2:00", // malformed offset
+			"not-a-time",
+		}
+		for _, ts := range cases {
+			want, werr := time.Parse(time.RFC3339, ts)
+			got, _, gerr := ReadTimeOrNull([]byte(`"`+ts+`"`), 0)
+			if (werr == nil) != (gerr == nil) {
+				t.Fatalf("%q: stdlib err=%v, ours err=%v", ts, werr, gerr)
+			}
+			if werr == nil && !got.Equal(want) {
+				t.Fatalf("%q: got %v, want %v", ts, got, want)
+			}
+		}
+	})
+
+	// Fuzz the civil→Unix UTC fast path (daysFromCivil) across many dates,
+	// including every month, leap years, and century boundaries, against the
+	// standard library which it must reproduce exactly.
+	t.Run("daysFromCivil vs time.Parse", func(t *testing.T) {
+		for _, y := range []int{1, 1969, 1970, 1971, 2000, 2023, 2024, 2100, 2400, 9999} {
+			for m := 1; m <= 12; m++ {
+				for _, d := range []int{1, 15, 28} {
+					ts := fmt.Sprintf("%04d-%02d-%02dT13:14:15.500Z", y, m, d)
+					want, err := time.Parse(time.RFC3339, ts)
+					if err != nil {
+						t.Fatalf("stdlib rejected %q: %v", ts, err)
+					}
+					got, _, gerr := ReadTimeOrNull([]byte(`"`+ts+`"`), 0)
+					if gerr != nil || !got.Equal(want) || got.Location() != want.Location() {
+						t.Fatalf("%q: got %v (err=%v), want %v", ts, got, gerr, want)
+					}
+				}
+			}
 		}
 	})
 }
@@ -601,7 +693,7 @@ func TestDecodeValue(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected err: %v", err)
 		}
-		m, ok := v.(map[string]interface{})
+		m, ok := v.(map[string]any)
 		if !ok {
 			t.Fatalf("got %T, want map", v)
 		}
@@ -618,7 +710,7 @@ func TestDecodeValue(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected err: %v", err)
 		}
-		m := v.(map[string]interface{})
+		m := v.(map[string]any)
 		if len(m) != 0 || end != 2 {
 			t.Errorf("got %v, end %d", m, end)
 		}
@@ -629,7 +721,7 @@ func TestDecodeValue(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected err: %v", err)
 		}
-		m := v.(map[string]interface{})
+		m := v.(map[string]any)
 		if m["a"] != float64(1) || m["b"] != float64(2) {
 			t.Errorf("unexpected map: %v", m)
 		}
@@ -640,18 +732,18 @@ func TestDecodeValue(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected err: %v", err)
 		}
-		a := v.([]interface{})
+		a := v.([]any)
 		if len(a) != 4 {
 			t.Fatalf("len = %d, want 4", len(a))
 		}
 		if a[0] != float64(1) || a[1] != "two" {
 			t.Errorf("unexpected array head: %v", a)
 		}
-		inner := a[2].([]interface{})
+		inner := a[2].([]any)
 		if inner[0] != float64(3) || inner[1] != float64(4) {
 			t.Errorf("unexpected inner array: %v", inner)
 		}
-		obj := a[3].(map[string]interface{})
+		obj := a[3].(map[string]any)
 		if obj["k"] != float64(5) {
 			t.Errorf("unexpected inner object: %v", obj)
 		}
@@ -662,7 +754,7 @@ func TestDecodeValue(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected err: %v", err)
 		}
-		if len(v.([]interface{})) != 0 || end != 2 {
+		if len(v.([]any)) != 0 || end != 2 {
 			t.Errorf("got %v, end %d", v, end)
 		}
 	})

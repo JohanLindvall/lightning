@@ -7,6 +7,7 @@ go 1.25.0
 
 require (
 	github.com/JohanLindvall/lightning v0.0.0
+	github.com/buger/jsonparser v1.2.0
 	github.com/mailru/easyjson v0.9.2
 )
 
