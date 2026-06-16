@@ -491,6 +491,13 @@ func ReadFloat64OrNull(data []byte, i int) (float64, int, error) {
 	if fast {
 		return f, end, nil
 	}
+	// Eisel-Lemire converts the token directly from its mantissa and exponent,
+	// avoiding strconv's decimal machinery for numbers that only miss the Clinger
+	// fast path; it declines (and we fall back to strconv) for the rare ambiguous
+	// or >19-digit cases.
+	if v, ok := eiselLemireParse(data[i:end]); ok {
+		return v, end, nil
+	}
 	// unsafeStr avoids copying the token; ParseFloat does not retain it.
 	f, perr := strconv.ParseFloat(unsafeStr(data[i:end]), 64)
 	if perr != nil {
@@ -511,6 +518,9 @@ func ParseFloat(b []byte) (float64, error) {
 	}
 	if fast {
 		return f, nil
+	}
+	if v, ok := eiselLemireParse(b); ok {
+		return v, nil
 	}
 	// unsafeStr avoids copying the token; ParseFloat does not retain it.
 	f, err := strconv.ParseFloat(unsafeStr(b), 64)
@@ -929,12 +939,18 @@ func ExpectNull(data []byte, i int) (int, error) {
 
 // CountArrayElements returns the number of top-level elements in the JSON array
 // beginning at data[i] (data[i] must be '['), so a destination slice can be
-// allocated once instead of grown by repeated append. It makes a single pass,
-// descending into nested arrays/objects and skipping string contents so that
-// commas inside them are not miscounted. It returns 0 for an empty array or when
-// the count cannot be determined cheaply (a truncated or malformed array); the
-// caller then simply falls back to append-driven growth, so an imperfect count
-// is only ever a missed optimization, never a correctness problem.
+// allocated once instead of grown by repeated append. It returns 0 for an empty
+// array or when the count cannot be determined cheaply (a truncated or malformed
+// array); the caller then simply falls back to append-driven growth, so an
+// imperfect count is only ever a missed optimization, never a correctness
+// problem.
+//
+// Each element is skipped whole with SkipValue rather than walked byte by byte:
+// SkipValue uses the SIMD indexStructural scanner for nested arrays/objects and
+// indexCloseOrEscape for strings, so a structurally dense element — a nested
+// coordinate array of many numbers, say — is jumped over in vectorized strides
+// instead of one byte at a time. This is what makes presizing slices of arrays,
+// objects, or strings cheap.
 func CountArrayElements(data []byte, i int) int {
 	if i >= len(data) || data[i] != '[' {
 		return 0
@@ -944,35 +960,28 @@ func CountArrayElements(data []byte, i int) int {
 		return 0
 	}
 	n := 1
-	depth := 0
-	for i < len(data) {
+	for {
+		end, err := SkipValue(data, i)
+		if err != nil {
+			return 0
+		}
+		i = SkipWS(data, end)
+		if i >= len(data) {
+			return 0
+		}
 		switch data[i] {
-		case '"':
-			end, err := skipString(data, i)
-			if err != nil {
+		case ']':
+			return n
+		case ',':
+			n++
+			i = SkipWS(data, i+1)
+			if i >= len(data) {
 				return 0
 			}
-			i = end
-			continue
-		case '[', '{':
-			depth++
-		case ']':
-			if depth == 0 {
-				return n
-			}
-			depth--
-		case '}':
-			if depth > 0 {
-				depth--
-			}
-		case ',':
-			if depth == 0 {
-				n++
-			}
+		default:
+			return 0 // malformed; let the caller grow on demand
 		}
-		i++
 	}
-	return 0 // unterminated; let the caller grow on demand
 }
 
 // CountArrayScalars counts the elements of a JSON array of scalar values

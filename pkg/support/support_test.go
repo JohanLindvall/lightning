@@ -894,3 +894,39 @@ func TestErrorSentinels(t *testing.T) {
 		}
 	}
 }
+
+// TestCountArrayElements covers the SkipValue-based element counter: nested
+// arrays, strings with structural bytes inside, objects, whitespace, and the
+// malformed/empty cases that must return 0 (so the caller falls back to append).
+func TestCountArrayElements(t *testing.T) {
+	tests := []struct {
+		in   string
+		want int
+	}{
+		{`[]`, 0},
+		{`[1]`, 1},
+		{`[1,2,3]`, 3},
+		{` [ 1 , 2 , 3 ] `, 3}, // leading ws before '[' is not consumed by the caller; data[i]=='['
+		{`["a","b"]`, 2},
+		{`["a,b","c]d"]`, 2},        // commas/brackets inside strings are not counted
+		{`[{"x":1},{"y":[2,3]}]`, 2}, // object elements
+		{`[[1,2],[3,4],[5,6]]`, 3},   // nested arrays (the coordinate shape)
+		{`[[[1,2],[3,4]]]`, 1},       // one outer element
+		{`[null,true,false]`, 3},
+		{`[`, 0},        // truncated
+		{`[1,2`, 0},     // unterminated
+		{`[1,2,]`, 0},   // trailing comma -> bail to append
+		{`{}`, 0},       // not an array
+		{``, 0},         // empty input
+	}
+	for _, tt := range tests {
+		// The caller positions i at '[' (after its own SkipWS); mirror that.
+		i := 0
+		for i < len(tt.in) && (tt.in[i] == ' ' || tt.in[i] == '\t') {
+			i++
+		}
+		if got := CountArrayElements([]byte(tt.in), i); got != tt.want {
+			t.Errorf("CountArrayElements(%q) = %d, want %d", tt.in, got, tt.want)
+		}
+	}
+}

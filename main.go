@@ -845,8 +845,20 @@ func (g *gen) slicePresize(elt ast.Expr, eltStr string) string {
 		case t.Name == "string":
 			counter = "support.CountArrayElements"
 		}
-	case *ast.StructType, *ast.ArrayType, *ast.MapType:
+	case *ast.StructType, *ast.MapType:
 		counter = "support.CountArrayElements"
+	case *ast.ArrayType:
+		// elt is itself a slice/array. Presize this level only when its element
+		// is a leaf (a scalar slice like []float64, or a slice of structs/
+		// strings) — there the count is the number of inner slices and presizing
+		// avoids real reallocation. For a slice *of slices of slices*, the outer
+		// dimension is typically small, yet counting it would deep-scan every
+		// element that the inner decoders then re-scan; skip presize there so the
+		// outer slice just appends (a handful of elements, no measurable realloc)
+		// instead of paying for a full structural pass.
+		if _, nested := unparen(t.Elt).(*ast.ArrayType); !nested {
+			counter = "support.CountArrayElements"
+		}
 	case *ast.SelectorExpr:
 		if isTime(t) || isRaw(t) {
 			counter = "support.CountArrayElements"

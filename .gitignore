@@ -15,5 +15,14 @@ bench/*/ej/
 # Benchmark output (machine-specific timings; regenerated each run)
 bench/results.txt
 
+# The large-json input is the ~8 MB SF citylots GeoJSON, too big to commit;
+# run_bench.sh downloads it from the committed bench/large-json/input.url when
+# absent. (Other cases' input.json files are small and stay tracked.)
+bench/large-json/input.json
+
 # Compiled generator binary, if `go build .` is ever run without -o /dev/null
 /lightning
+
+# Compiled Go test binaries (`go test -c`), e.g. the ones the A/B bench harness
+# builds into bench/ — never artifacts to commit.
+*.test

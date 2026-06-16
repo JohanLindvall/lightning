@@ -295,11 +295,17 @@ or no escaping cost roughly one `memcpy`.
 The [`pkg/json`](pkg/json) package also exposes the scanner's float parser:
 
 - `ParseFloat(b []byte) (float64, error)` — parses the JSON number in `b` as a
-  `float64`. It takes the scanner's Clinger fast path — when the mantissa is
+  `float64`. It takes the scanner's Clinger fast path first — when the mantissa is
   exact and the decimal exponent is small, the result is a single multiply or
-  divide by a power of ten — and falls back to `strconv.ParseFloat` for the rest.
-  `b` must be exactly one number with no surrounding whitespace; trailing bytes
-  or an empty input return an error. Nothing is retained or copied.
+  divide by a power of ten. Numbers that miss it (a mantissa ≥ 2^53 or a larger
+  exponent, e.g. high-precision coordinates) take an Eisel-Lemire pass that
+  converts the extracted mantissa and exponent with a 128-bit multiply, the same
+  fast path `strconv.ParseFloat` uses internally but without re-scanning the
+  digits; only the rare ambiguous or >19-digit cases fall back to
+  `strconv.ParseFloat`. The Eisel-Lemire result is bit-for-bit identical to
+  `strconv` (verified by a differential fuzz test). `b` must be exactly one number
+  with no surrounding whitespace; trailing bytes or an empty input return an
+  error. Nothing is retained or copied.
 
 ## SIMD scanning
 
@@ -326,9 +332,10 @@ vs `encoding/json`, on amd64 and on arm64 under qemu.
 ## Benchmarks
 
 The [`bench/`](bench) directory is a separate module (so its benchmark-only
-dependency on [easyjson](https://github.com/mailru/easyjson) stays out of the
-main module). It benchmarks the same payload decoded three ways — lightning,
-`encoding/json`, and easyjson — across each `bench/<case>/` folder.
+dependencies on [easyjson](https://github.com/mailru/easyjson) and
+[sonic](https://github.com/bytedance/sonic) stay out of the main module). It
+benchmarks the same payload decoded four ways — lightning, `encoding/json`,
+easyjson, and bytedance/sonic — across each `bench/<case>/` folder.
 
 **See the per-architecture results for the full, current numbers:
 [`bench/results_amd64.md`](bench/results_amd64.md) and
@@ -351,6 +358,7 @@ Representative numbers for a 1.8 KB Cloudflare log (Go 1.26, amd64):
 | lightning (`nocopy`) | ~660 | 0 | 0 | ~13× |
 | lightning (default)  | ~800 | 144 | 10 | ~10× |
 | easyjson             | ~1600–1770 | 24–144 | 1–10 | ~5× |
+| sonic                | ~4600 | 3380 | 40 | ~1.9× |
 | `encoding/json`      | ~8250 | 920 | 17 | 1.0× |
 
 ## Layout
