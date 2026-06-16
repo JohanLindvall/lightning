@@ -1143,11 +1143,121 @@ func SkipWS(data []byte, i int) int {
 	return i
 }
 
+// skipWSc is the inter-token whitespace skip used by the compact-aware Get,
+// GetMany and ObjectEach. In compact mode the input is asserted to carry no
+// whitespace between tokens (the form compact JSON serializers emit), so it
+// returns i unchanged; otherwise it is SkipWS. This mirrors the generator's
+// //lightning:compact decoders, which elide exactly these inter-token skips.
+func skipWSc(data []byte, i int, compact bool) int {
+	if compact {
+		return i
+	}
+	return SkipWS(data, i)
+}
+
 func unsafeStr(b []byte) string {
 	if len(b) == 0 {
 		return ""
 	}
 	return unsafe.String(unsafe.SliceData(b), len(b))
+}
+
+// GetMany looks up several top-level members of the JSON object in data at once,
+// in a single pass over the object, and returns their raw value bytes in the
+// same order as keys. Where Get walks one key path and N separate Get calls
+// would rescan the object N times, GetMany scans it once and distributes each
+// member to the matching requested key, so extracting a handful of fields from a
+// wide record costs one walk rather than one per field.
+//
+// The results are written into out[:0] — pass a slice to reuse (a nil out
+// allocates) — and out is returned with length len(keys): out[n] is the value
+// for keys[n], or nil if that key is absent from the object. Each value aliases
+// data and follows Get's conventions (quotes kept for strings, the full span for
+// objects and arrays, the literal token for scalars); a present member whose
+// value is JSON null yields the four bytes "null", distinct from a missing key's
+// nil. A duplicate key in the document takes its first occurrence; a key in keys
+// not present in the object stays nil without being an error.
+//
+// A missing key is not an error — that is what the nil slot reports. Any other
+// failure (a non-object root, malformed or truncated JSON) returns a non-nil
+// error together with out as filled so far. Like Get, GetMany returns as soon as
+// every requested key has been found and does not validate the rest of the
+// object.
+func GetMany(data []byte, keys []string, out [][]byte) ([][]byte, error) {
+	return getMany(data, keys, out, false)
+}
+
+// GetManyCompact is GetMany for compact JSON — input with no whitespace between
+// tokens, as compact serializers emit — skipping the inter-token whitespace
+// scans GetMany makes (leading whitespace at the document start is still
+// tolerated). On such input it behaves identically to GetMany but faster; given
+// input that does contain inter-token whitespace it may report an error.
+func GetManyCompact(data []byte, keys []string, out [][]byte) ([][]byte, error) {
+	return getMany(data, keys, out, true)
+}
+
+func getMany(data []byte, keys []string, out [][]byte, compact bool) ([][]byte, error) {
+	out = out[:0]
+	for range keys {
+		out = append(out, nil)
+	}
+	i := SkipWS(data, 0)
+	if i >= len(data) {
+		return out, ErrTruncated
+	}
+	if data[i] != '{' {
+		return out, ErrExpectObject
+	}
+	i++
+	found := 0
+	for {
+		i = skipWSc(data, i, compact)
+		if i >= len(data) {
+			return out, ErrTruncated
+		}
+		if data[i] == '}' {
+			return out, nil
+		}
+		key, ni, err := ReadKey(data, i)
+		if err != nil {
+			return out, err
+		}
+		i = skipWSc(data, ni, compact)
+		if i >= len(data) || data[i] != ':' {
+			return out, ErrExpectColon
+		}
+		i = skipWSc(data, i+1, compact)
+		start := i
+		end, err := SkipValue(data, i)
+		if err != nil {
+			return out, err
+		}
+		// Distribute this member to every requested key it matches that is still
+		// unset, so the first occurrence in the document wins and duplicate
+		// entries in keys are all filled. Key sets are small, so the linear scan
+		// is cheaper than building a map.
+		for n, k := range keys {
+			if out[n] == nil && k == key {
+				out[n] = data[start:end]
+				found++
+			}
+		}
+		if found == len(keys) {
+			return out, nil // every requested key found; skip the rest
+		}
+		i = skipWSc(data, end, compact)
+		if i >= len(data) {
+			return out, ErrTruncated
+		}
+		switch data[i] {
+		case '}':
+			return out, nil
+		case ',':
+			i++
+		default:
+			return out, ErrInvalidJSON
+		}
+	}
 }
 
 // Get walks the object-key path keys into the JSON document data and returns
@@ -1164,10 +1274,23 @@ func unsafeStr(b []byte) string {
 // return value is the offset in data at which the returned value begins, and
 // leading whitespace is tolerated at every level.
 func Get(data []byte, keys ...string) ([]byte, int, error) {
+	return get(data, false, keys...)
+}
+
+// GetCompact is Get for compact JSON — input with no whitespace between tokens,
+// as compact serializers emit — skipping the inter-token whitespace scans Get
+// makes while descending the key path (leading whitespace at the document start
+// is still tolerated). On such input it behaves identically to Get but faster;
+// given input that does contain inter-token whitespace it may report an error.
+func GetCompact(data []byte, keys ...string) ([]byte, int, error) {
+	return get(data, true, keys...)
+}
+
+func get(data []byte, compact bool, keys ...string) ([]byte, int, error) {
 	i := SkipWS(data, 0)
 	for _, key := range keys {
 		var err error
-		i, err = objectField(data, i, key)
+		i, err = objectField(data, i, key, compact)
 		if err != nil {
 			return nil, i, err
 		}
@@ -1193,15 +1316,29 @@ func Get(data []byte, keys ...string) ([]byte, int, error) {
 // returns a non-nil error, iteration stops and that error is returned.
 // Non-target members along the path are skipped without allocating.
 func ObjectEach(data []byte, fn func(key string, value []byte) error, keys ...string) error {
+	return objectEach(data, fn, false, keys...)
+}
+
+// ObjectEachCompact is ObjectEach for compact JSON — input with no whitespace
+// between tokens, as compact serializers emit — skipping the inter-token
+// whitespace scans ObjectEach makes (leading whitespace at the document start is
+// still tolerated). On such input it behaves identically to ObjectEach but
+// faster; given input that does contain inter-token whitespace it may report an
+// error.
+func ObjectEachCompact(data []byte, fn func(key string, value []byte) error, keys ...string) error {
+	return objectEach(data, fn, true, keys...)
+}
+
+func objectEach(data []byte, fn func(key string, value []byte) error, compact bool, keys ...string) error {
 	i := SkipWS(data, 0)
 	for _, key := range keys {
 		var err error
-		i, err = objectField(data, i, key)
+		i, err = objectField(data, i, key, compact)
 		if err != nil {
 			return err
 		}
 	}
-	i = SkipWS(data, i)
+	i = skipWSc(data, i, compact)
 	if i >= len(data) {
 		return ErrTruncated
 	}
@@ -1210,7 +1347,7 @@ func ObjectEach(data []byte, fn func(key string, value []byte) error, keys ...st
 	}
 	i++
 	for {
-		i = SkipWS(data, i)
+		i = skipWSc(data, i, compact)
 		if i >= len(data) {
 			return ErrTruncated
 		}
@@ -1221,11 +1358,11 @@ func ObjectEach(data []byte, fn func(key string, value []byte) error, keys ...st
 		if err != nil {
 			return err
 		}
-		i = SkipWS(data, ni)
+		i = skipWSc(data, ni, compact)
 		if i >= len(data) || data[i] != ':' {
 			return ErrExpectColon
 		}
-		i = SkipWS(data, i+1)
+		i = skipWSc(data, i+1, compact)
 		start := i
 		end, err := SkipValue(data, i)
 		if err != nil {
@@ -1234,7 +1371,7 @@ func ObjectEach(data []byte, fn func(key string, value []byte) error, keys ...st
 		if err := fn(key, data[start:end]); err != nil {
 			return err
 		}
-		i = SkipWS(data, end)
+		i = skipWSc(data, end, compact)
 		if i >= len(data) {
 			return ErrTruncated
 		}
@@ -1255,8 +1392,8 @@ func ObjectEach(data []byte, fn func(key string, value []byte) error, keys ...st
 // is not an object and ErrKeyNotFound if the object has no such key. It reuses
 // the scanner primitives (ReadKey, SkipValue, SkipWS) so non-target members are
 // skipped without allocating.
-func objectField(data []byte, i int, key string) (int, error) {
-	i = SkipWS(data, i)
+func objectField(data []byte, i int, key string, compact bool) (int, error) {
+	i = skipWSc(data, i, compact)
 	if i >= len(data) {
 		return i, ErrTruncated
 	}
@@ -1265,7 +1402,7 @@ func objectField(data []byte, i int, key string) (int, error) {
 	}
 	i++
 	for {
-		i = SkipWS(data, i)
+		i = skipWSc(data, i, compact)
 		if i >= len(data) {
 			return i, ErrTruncated
 		}
@@ -1276,11 +1413,11 @@ func objectField(data []byte, i int, key string) (int, error) {
 		if err != nil {
 			return ni, err
 		}
-		i = SkipWS(data, ni)
+		i = skipWSc(data, ni, compact)
 		if i >= len(data) || data[i] != ':' {
 			return i, ErrExpectColon
 		}
-		i = SkipWS(data, i+1)
+		i = skipWSc(data, i+1, compact)
 		if k == key {
 			return i, nil
 		}
@@ -1288,7 +1425,7 @@ func objectField(data []byte, i int, key string) (int, error) {
 		if err != nil {
 			return end, err
 		}
-		i = SkipWS(data, end)
+		i = skipWSc(data, end, compact)
 		if i >= len(data) {
 			return i, ErrTruncated
 		}
@@ -1304,9 +1441,9 @@ func objectField(data []byte, i int, key string) (int, error) {
 }
 
 // DecodeValue decodes an arbitrary JSON value at data[i] into the standard Go
-// representation (nil, bool, float64, string, []interface{},
-// map[string]interface{}).
-func DecodeValue(data []byte, i int) (interface{}, int, error) {
+// representation (nil, bool, float64, string, []any,
+// map[string]any).
+func DecodeValue(data []byte, i int) (any, int, error) {
 	if i >= len(data) {
 		return nil, i, ErrTruncated
 	}
@@ -1330,10 +1467,10 @@ func DecodeValue(data []byte, i int) (interface{}, int, error) {
 	}
 }
 
-func decodeAnyObject(data []byte, i int) (interface{}, int, error) {
+func decodeAnyObject(data []byte, i int) (any, int, error) {
 	// data[i] == '{'
 	i++
-	m := map[string]interface{}{}
+	m := map[string]any{}
 	for {
 		i = SkipWS(data, i)
 		if i >= len(data) {
@@ -1370,10 +1507,10 @@ func decodeAnyObject(data []byte, i int) (interface{}, int, error) {
 	}
 }
 
-func decodeAnyArray(data []byte, i int) (interface{}, int, error) {
+func decodeAnyArray(data []byte, i int) (any, int, error) {
 	// data[i] == '['
 	i++
-	a := []interface{}{}
+	a := []any{}
 	for {
 		i = SkipWS(data, i)
 		if i >= len(data) {
