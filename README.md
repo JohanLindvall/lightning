@@ -189,8 +189,9 @@ type Log struct {
 }
 ```
 
-This runs about 10% faster on object-heavy payloads (see the `cloudflare-compact`
-benchmark). Whitespace surrounding the whole document is still tolerated — a
+This runs a few percent faster on object-heavy payloads (the `cloudflare-compact`
+benchmark beats `cloudflare-nocopy`, its non-compact equivalent, by ~4%).
+Whitespace surrounding the whole document is still tolerated — a
 trailing newline is fine — so only *inter-token* whitespace is assumed absent.
 
 The directive is an assertion you make about the input: a compact decoder fed
@@ -314,7 +315,7 @@ with kernels in `pkg/support/index_amd64.s` and `pkg/support/index_arm64.s`
   bytes/pass, lets `skipObject` / `skipArray` jump over inert content (numbers,
   keys, whitespace) when skipping unknown values. Skipping a large ignored
   array/object is dramatically faster (the `skip-heavy` benchmark decodes at
-  >20 GB/s, ~90× `encoding/json`).
+  >50 GB/s, ~230× `encoding/json`).
 
 Feature detection is at run time (`golang.org/x/sys/cpu`); other platforms, CPUs
 without the feature, and inputs shorter than the vector width fall back to scalar
@@ -347,10 +348,10 @@ Representative numbers for a 1.8 KB Cloudflare log (Go 1.26, amd64):
 
 | Decoder | ns/op | B/op | allocs/op | vs stdlib |
 |---|--:|--:|--:|--:|
-| lightning (`nocopy`) | ~950 | 0 | 0 | ~9.9× |
-| lightning (default)  | ~1090 | 120 | 9 | ~9.5× |
-| easyjson             | ~1570–1800 | 24–120 | 1–9 | ~6× |
-| `encoding/json`      | ~9400 | 928 | 16 | 1.0× |
+| lightning (`nocopy`) | ~660 | 0 | 0 | ~13× |
+| lightning (default)  | ~800 | 144 | 10 | ~10× |
+| easyjson             | ~1600–1770 | 24–144 | 1–10 | ~5× |
+| `encoding/json`      | ~8250 | 920 | 17 | 1.0× |
 
 ## Layout
 

@@ -141,9 +141,24 @@ func Unwrap(data []byte, i int) ([]byte, int, error) {
 }
 
 // startsJSON reports whether b begins, after any leading whitespace, with the
-// first byte of a JSON value. base64-encoded JSON never starts with one of these
-// bytes (it begins with an alphabetic base64 digit), so this cleanly tells an
-// embedded JSON document apart from a base64-encoded one for Unwrap.
+// first byte of a JSON value ('{', '[', '"', '-', a digit, or 't'/'f'/'n' for
+// true/false/null). Unwrap uses it to tell an embedded JSON document apart from
+// a base64-encoded one, and for that the test is exact: the base64 of a JSON
+// document can never start with one of these bytes.
+//
+// A base64 string's first character is the top six bits of the first input byte
+// (byte0 >> 2). A JSON value always starts with an ASCII byte (< 0x80), so that
+// index is <= 31, which base64 always renders as a letter in A-Z or a-f. Of the
+// bytes startsJSON accepts, base64 cannot emit '{', '[', '"' or '-' at all, and
+// the digits 0-9 would need byte0 >= 0xD0; the sole overlap is 'f' (index 31),
+// which needs byte0 in 0x7C..0x7F ('|', '}', '~', DEL) — none of which can begin
+// a JSON value. So no base64-encoded JSON document ever trips this test.
+//
+// Plenty of *other* base64 strings do start with a digit or t/f/n and so return
+// true here, but those decode to a non-ASCII leading byte (not JSON), which is
+// outside Unwrap's "the body is JSON or base64-encoded JSON" contract; on such
+// input Unwrap still degrades gracefully by handing the body back for the
+// caller's decode to reject.
 func startsJSON(b []byte) bool {
 	for _, c := range b {
 		switch c {
