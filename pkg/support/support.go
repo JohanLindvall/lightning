@@ -491,13 +491,9 @@ func ReadFloat64OrNull(data []byte, i int) (float64, int, error) {
 	if fast {
 		return f, end, nil
 	}
-	// Eisel-Lemire converts the token directly from its mantissa and exponent,
-	// avoiding strconv's decimal machinery for numbers that only miss the Clinger
-	// fast path; it declines (and we fall back to strconv) for the rare ambiguous
-	// or >19-digit cases.
-	if v, ok := eiselLemireParse(data[i:end]); ok {
-		return v, end, nil
-	}
+	// scanFloat already tried Eisel-Lemire on the mantissa it extracted; reaching
+	// here means the value is genuinely one only strconv resolves (an ambiguous
+	// rounding or a mantissa of more than 19 significant digits).
 	// unsafeStr avoids copying the token; ParseFloat does not retain it.
 	f, perr := strconv.ParseFloat(unsafeStr(data[i:end]), 64)
 	if perr != nil {
@@ -519,9 +515,6 @@ func ParseFloat(b []byte) (float64, error) {
 	if fast {
 		return f, nil
 	}
-	if v, ok := eiselLemireParse(b); ok {
-		return v, nil
-	}
 	// unsafeStr avoids copying the token; ParseFloat does not retain it.
 	f, err := strconv.ParseFloat(unsafeStr(b), 64)
 	if err != nil {
@@ -531,14 +524,18 @@ func ParseFloat(b []byte) (float64, error) {
 }
 
 // scanFloat scans the JSON number token beginning at data[i] in a single pass,
-// returning the index just past it and, when the value lies on the Clinger fast
-// path (an exactly representable mantissa < 2^53 with a decimal exponent in
-// [-22, 22]), the parsed value with fast=true. Otherwise fast=false and the
-// caller parses data[i:end] with strconv.ParseFloat. ok=false marks a token with
-// no digits (or an exponent marker with no digits), in which case end points at
-// the offending byte.
+// returning the index just past it and, when it can resolve the value exactly,
+// the parsed result with fast=true. Two fast paths run on the mantissa and
+// exponent the scan extracts, so no rescan is needed: the Clinger path (an
+// exactly representable mantissa < 2^53 with a decimal exponent in [-22, 22],
+// converted with one multiply or divide) and, for an exact mantissa that misses
+// Clinger, Eisel-Lemire (a 128-bit multiply — see eiselLemire64). Only a mantissa
+// of more than 19 significant digits or a value Eisel-Lemire finds ambiguous
+// returns fast=false, leaving the caller to parse data[i:end] with
+// strconv.ParseFloat. ok=false marks a token with no digits (or an exponent
+// marker with no digits), in which case end points at the offending byte.
 //
-// Folding the token scan and the fast-path parse into one pass spares the
+// Folding the token scan and both fast-path parses into one pass spares the
 // separate skipNumber scan the previous two-call form made; and because the scan
 // always runs to the end of the token, the slow path no longer pays for the
 // fast-path parser's full rescan-then-reject before handing off to strconv.
@@ -641,6 +638,11 @@ func scanFloat(data []byte, i int) (f float64, end int, fast, ok bool) {
 		}
 	}
 	if overflow || mant>>53 != 0 {
+		if !overflow {
+			if v, ok := eiselLemire64(mant, exp, neg); ok {
+				return v, end, true, true
+			}
+		}
 		return 0, end, false, true // hand the exact token to strconv
 	}
 
@@ -653,6 +655,9 @@ func scanFloat(data []byte, i int) (f float64, end int, fast, ok bool) {
 	case exp < 0 && exp >= -22:
 		f /= pow10exact[-exp]
 	default:
+		if v, ok := eiselLemire64(mant, exp, neg); ok {
+			return v, end, true, true
+		}
 		return 0, end, false, true
 	}
 	if neg {

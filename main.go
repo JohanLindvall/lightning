@@ -849,7 +849,18 @@ func (g *gen) slicePresize(elt ast.Expr, eltStr string) string {
 		case t.Name == "string":
 			counter = "support.CountArrayElements"
 		}
-	case *ast.StructType, *ast.MapType:
+	case *ast.StructType:
+		// Presize a slice of structs unless the struct carries a multi-dimensional
+		// array — the citylots Feature, say, whose geometry holds a [][][]float64
+		// of coordinates. Counting such a slice to presize it must skip every
+		// element's full coordinate contents, which costs far more than the few
+		// reallocations presize avoids (and those barely affect the allocation
+		// count), so let it append. A record of scalars and strings (a Cloudflare
+		// log line) is cheap to count and keeps its presize.
+		if !g.hasMultiDimSlice(t) {
+			counter = "support.CountArrayElements"
+		}
+	case *ast.MapType:
 		counter = "support.CountArrayElements"
 	case *ast.ArrayType:
 		// elt is itself a slice/array. Presize this level only when its element
@@ -976,6 +987,53 @@ func (g *gen) isStruct(expr ast.Expr) bool {
 	case *ast.Ident:
 		_, ok := g.structTypes[t.Name]
 		return ok
+	}
+	return false
+}
+
+// hasMultiDimSlice reports whether expr (transitively, descending through
+// structs, pointers, named struct types, and the element/value of slices and
+// maps) contains a multi-dimensional slice or array — a slice whose element is
+// itself a slice or array, such as the [][][]float64 of GeoJSON coordinates.
+//
+// slicePresize uses it to decide whether presizing a slice of this element type
+// pays off. A multi-dimensional array holds the bulk of an element's bytes far
+// from its struct header, so counting a slice of such elements for presize must
+// structurally skip every element's full contents — far more work than the
+// handful of backing-array reallocations the presize would save (and those barely
+// move the allocation count, only ~log2(n) extra). Strings and one-dimensional
+// slices ([]string, []float64) are cheap to skip with the SIMD scanners, so a
+// record built from those — a Cloudflare log line, say — does not trip this and
+// keeps its presize.
+func (g *gen) hasMultiDimSlice(expr ast.Expr) bool {
+	return g.hasMultiDimSliceSeen(expr, map[string]bool{})
+}
+
+func (g *gen) hasMultiDimSliceSeen(expr ast.Expr, seen map[string]bool) bool {
+	switch t := unparen(expr).(type) {
+	case *ast.ArrayType:
+		if _, ok := unparen(t.Elt).(*ast.ArrayType); ok {
+			return true // a slice/array of slices/arrays
+		}
+		return g.hasMultiDimSliceSeen(t.Elt, seen) // e.g. []Struct that nests one
+	case *ast.MapType:
+		return g.hasMultiDimSliceSeen(t.Value, seen)
+	case *ast.StarExpr:
+		return g.hasMultiDimSliceSeen(t.X, seen)
+	case *ast.StructType:
+		for _, f := range t.Fields.List {
+			if g.hasMultiDimSliceSeen(f.Type, seen) {
+				return true
+			}
+		}
+	case *ast.Ident:
+		if seen[t.Name] {
+			return false
+		}
+		seen[t.Name] = true
+		if st, ok := g.structTypes[t.Name]; ok {
+			return g.hasMultiDimSliceSeen(st, seen)
+		}
 	}
 	return false
 }
