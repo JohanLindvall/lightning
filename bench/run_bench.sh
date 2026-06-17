@@ -123,6 +123,7 @@ import (
 
 	"github.com/bytedance/sonic"
 	jsonv2 "github.com/go-json-experiment/json"
+	gojson "github.com/goccy/go-json"
 	ej "__EJ_IMPORT__"
 )
 
@@ -183,6 +184,32 @@ func BenchmarkSonic(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		var v logStd
 		if err := sonic.Unmarshal(benchInput, &v); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkSonicFastest is BenchmarkSonic with sonic's ConfigFastest, which trades
+// strict validation (UTF-8 and duplicate-key checks) for speed.
+func BenchmarkSonicFastest(b *testing.B) {
+	b.SetBytes(int64(len(benchInput)))
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		var v logStd
+		if err := sonic.ConfigFastest.Unmarshal(benchInput, &v); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkGoccy measures goccy/go-json, a fast pure-Go drop-in for encoding/json
+// (no JIT or codegen). It decodes into logStd, like the other third-party cases.
+func BenchmarkGoccy(b *testing.B) {
+	b.SetBytes(int64(len(benchInput)))
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		var v logStd
+		if err := gojson.Unmarshal(benchInput, &v); err != nil {
 			b.Fatal(err)
 		}
 	}

@@ -1039,7 +1039,7 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax bool) string {
 		g.needTime = true
 	}
 	eltStr := g.typeStr(elt)
-	inner := g.field("el", elt, singular(hint)+"Entry", nocopy, lax)
+	inner := g.field("(*out)[len(*out)-1]", elt, singular(hint)+"Entry", nocopy, lax)
 	presize := g.slicePresize(elt, eltStr)
 	body := fmt.Sprintf(`func %[1]s(out *[]%[2]s, data []byte, i int) (int, error) {
 	if i >= len(data) {
@@ -1065,9 +1065,12 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax bool) string {
 		if data[i] == ']' {
 			return i + 1, nil
 		}
-		var el %[2]s
+		// Grow the slice by one zero element and decode in place into the new
+		// slot, so the element never lives in an escaping local (which would
+		// cost a heap allocation per element for slices of structs/pointers).
+		var zero %[2]s
+		*out = append(*out, zero)
 		%[3]s
-		*out = append(*out, el)
 		%[5]s
 		if i >= len(data) {
 			return i, support.ErrTruncated

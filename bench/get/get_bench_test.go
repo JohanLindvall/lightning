@@ -1,16 +1,18 @@
 // Package bench (get) compares lightning's json.Get key-path lookup against
-// github.com/buger/jsonparser's Get over a realistic nested document. Both walk
-// an object-key path and return the raw value bytes; lightning is built on the
-// scanner's allocation-free Skip/ReadKey primitives.
+// github.com/buger/jsonparser's Get and github.com/tidwall/gjson over a realistic
+// nested document. All walk an object-key path and return the raw value bytes;
+// lightning is built on the scanner's allocation-free Skip/ReadKey primitives.
 package bench
 
 import (
 	"bytes"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/JohanLindvall/lightning/pkg/json"
 	"github.com/buger/jsonparser"
+	"github.com/tidwall/gjson"
 )
 
 var benchInput = func() []byte {
@@ -119,6 +121,21 @@ func BenchmarkJSONParserGet(b *testing.B) {
 					b.Fatal(err)
 				}
 				sink = v
+			}
+			_ = sink
+		})
+	}
+}
+
+func BenchmarkGjsonGet(b *testing.B) {
+	for _, p := range paths {
+		path := strings.Join(p.keys, ".") // gjson uses dot-separated paths
+		b.Run(p.name, func(b *testing.B) {
+			b.SetBytes(int64(len(benchInput)))
+			b.ReportAllocs()
+			var sink int
+			for i := 0; i < b.N; i++ {
+				sink += len(gjson.GetBytes(benchInput, path).Raw)
 			}
 			_ = sink
 		})
@@ -257,6 +274,32 @@ func BenchmarkJSONParserGetCloudflare(b *testing.B) {
 				b.Fatal(err)
 			}
 			sink += len(v)
+		}
+	}
+	_ = sink
+}
+
+func BenchmarkGjsonGetCloudflare(b *testing.B) {
+	b.SetBytes(int64(len(cloudflareInput)))
+	b.ReportAllocs()
+	var sink int
+	for i := 0; i < b.N; i++ {
+		for _, key := range cloudflareTopKeys {
+			sink += len(gjson.GetBytes(cloudflareInput, key).Raw)
+		}
+	}
+	_ = sink
+}
+
+// BenchmarkGjsonGetManyCloudflare is gjson's batch lookup (GetManyBytes), the peer
+// of lightning's GetMany: it pulls the same six fields in one call.
+func BenchmarkGjsonGetManyCloudflare(b *testing.B) {
+	b.SetBytes(int64(len(cloudflareInput)))
+	b.ReportAllocs()
+	var sink int
+	for i := 0; i < b.N; i++ {
+		for _, r := range gjson.GetManyBytes(cloudflareInput, cloudflareTopKeys...) {
+			sink += len(r.Raw)
 		}
 	}
 	_ = sink
