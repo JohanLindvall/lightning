@@ -12,7 +12,7 @@ type (
 			} `json:"properties"`
 			Geometry struct {
 				Type        string        `json:"type"`
-				Coordinates [][][]float64 `json:"coordinates"`
+				Coordinates [][][2]float64 `json:"coordinates"`
 			} `json:"geometry"`
 		} `json:"features"`
 	}

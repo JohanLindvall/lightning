@@ -132,17 +132,19 @@ func generate(inPath string) error {
 	}
 
 	src := g.assemble(inPath, methods)
-	formatted, ferr := format.Source([]byte(src))
-	out := formatted
+	out, ferr := format.Source([]byte(src))
 	if ferr != nil {
-		// Emit the unformatted source so the failure can be inspected.
-		out = []byte(src)
-		fmt.Fprintf(os.Stderr, "%s: gofmt failed (writing unformatted): %v\n", inPath, ferr)
+		out = []byte(src) // unformatted, for inspecting the malformed output
 	}
 
 	outPath := strings.TrimSuffix(inPath, ".go") + "_unmarshal.go"
 	if err := os.WriteFile(outPath, out, 0o644); err != nil {
 		return err
+	}
+	if ferr != nil {
+		// Unparseable output means a generator bug; fail (the file is written
+		// above so it can be inspected).
+		return fmt.Errorf("generated code did not parse, wrote unformatted %s: %w", outPath, ferr)
 	}
 	fmt.Fprintf(os.Stderr, "wrote %s\n", outPath)
 	return nil
@@ -372,46 +374,196 @@ func (g *gen) anonStruct(t *ast.StructType, hint string) string {
 	return fn
 }
 
-func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
-	var cases strings.Builder
-	seen := map[string]bool{} // json keys already claimed within this struct
+// fieldInfo describes one decodable field reached while walking a struct and its
+// embedded structs: the JSON name(s) it answers to, the Go lvalue to decode into
+// (e.g. "v.A" or the promoted "v.Inner.B"), its type and tag options, the
+// embedding depth (0 for a direct field), whether it carries an explicit JSON
+// name, and the pointer-embed allocation guards that must run before the lvalue
+// is usable.
+type fieldInfo struct {
+	keys   []string
+	dest   string
+	typ    ast.Expr
+	nocopy bool
+	lax    bool
+	unwrap bool
+	tagged bool
+	depth  int
+	allocs []string
+}
+
+// collectFields appends to out the decodable fields of st, flattening embedded
+// structs per Go's field promotion: an embedded struct's exported fields are
+// promoted into the parent (an embedded *struct is allocated on demand via an
+// allocs guard), an embedded field with an explicit JSON tag name is a plain
+// named field rather than promoted, and an embedded non-struct (or a type whose
+// definition isn't visible, e.g. from another package) is keyed by its type
+// name. prefix is the Go access prefix ("v.", "v.Inner."), depth the embedding
+// depth, and seen guards against the (illegal-in-Go, but cheap to defend) cycle.
+func (g *gen) collectFields(st *ast.StructType, prefix string, depth int, allocs []string, seen map[string]bool, out *[]fieldInfo) {
 	for _, f := range st.Fields.List {
-		if len(f.Names) == 0 {
-			fmt.Fprintf(os.Stderr, "warning: skipping embedded field %s\n", g.typeStr(f.Type))
-			continue
-		}
 		tagNames, skip, nocopy, lax, unwrap := jsonTag(f.Tag)
 		if skip {
 			continue
 		}
+		if len(f.Names) == 0 { // embedded (anonymous) field
+			name := embeddedName(f.Type)
+			if name == "" {
+				g.errs = append(g.errs, fmt.Errorf("unsupported embedded field %s", g.typeStr(f.Type)))
+				continue
+			}
+			if len(tagNames) == 0 {
+				if est, pointee, isPtr, ok := g.embeddedStruct(f.Type); ok {
+					child := allocs
+					if isPtr {
+						child = append(append([]string(nil), allocs...),
+							fmt.Sprintf("if %[1]s == nil {\n%[1]s = new(%[2]s)\n}", prefix+name, pointee))
+					}
+					if k := g.typeStr(f.Type); !seen[k] {
+						seen[k] = true
+						g.collectFields(est, prefix+name+".", depth+1, child, seen, out)
+						delete(seen, k)
+					}
+					continue
+				}
+			}
+			// Tagged embed, or a non-struct/opaque embed: a plain named field
+			// keyed by the tag name(s) or, lacking those, the embedded type name.
+			keys := tagNames
+			if len(keys) == 0 {
+				keys = []string{name}
+			}
+			*out = append(*out, fieldInfo{keys: keys, dest: prefix + name, typ: f.Type,
+				nocopy: nocopy, lax: lax, unwrap: unwrap, tagged: len(tagNames) > 0, depth: depth, allocs: allocs})
+			continue
+		}
 		for _, nm := range f.Names {
-			field := nm.Name
-			if !ast.IsExported(field) {
+			if !ast.IsExported(nm.Name) {
 				continue
 			}
 			keys := tagNames
 			if len(keys) == 0 {
-				keys = []string{field}
+				keys = []string{nm.Name}
 			}
-			quoted := make([]string, len(keys))
-			for i, k := range keys {
-				if seen[k] {
-					g.errs = append(g.errs, fmt.Errorf("%s: json name %q is mapped more than once", strings.TrimPrefix(paramType, "*"), k))
-				}
-				seen[k] = true
-				quoted[i] = strconv.Quote(k)
-			}
-			var code string
-			if lax {
-				code = g.laxField("v."+field, f.Type, field, nocopy)
-			} else {
-				code = g.field("v."+field, f.Type, field, nocopy, false)
-			}
-			if unwrap {
-				code = unwrapField(code)
-			}
-			fmt.Fprintf(&cases, "\tcase %s:\n%s\n", strings.Join(quoted, ", "), code)
+			*out = append(*out, fieldInfo{keys: keys, dest: prefix + nm.Name, typ: f.Type,
+				nocopy: nocopy, lax: lax, unwrap: unwrap, tagged: len(tagNames) > 0, depth: depth, allocs: allocs})
 		}
+	}
+}
+
+// embeddedName returns the Go selector for an embedded field — the unqualified
+// name of its type (Inner, *Inner, pkg.Inner all select v.Inner) — or "" for a
+// shape that cannot be embedded.
+func embeddedName(expr ast.Expr) string {
+	switch t := unparen(expr).(type) {
+	case *ast.Ident:
+		return t.Name
+	case *ast.StarExpr:
+		return embeddedName(t.X)
+	case *ast.SelectorExpr:
+		return t.Sel.Name
+	}
+	return ""
+}
+
+// embeddedStruct resolves an embedded field's type to the struct whose fields
+// should be promoted, reporting the pointee type name (for new()) and whether the
+// embed is a pointer. It returns ok=false when the type is not a struct defined
+// in this file (a scalar, or a type from another package whose fields aren't
+// visible), in which case the embed is handled as a plain named field.
+func (g *gen) embeddedStruct(expr ast.Expr) (st *ast.StructType, pointee string, isPtr, ok bool) {
+	e := unparen(expr)
+	if star, isStar := e.(*ast.StarExpr); isStar {
+		isPtr = true
+		e = unparen(star.X)
+	}
+	switch t := e.(type) {
+	case *ast.Ident:
+		if s, found := g.structTypes[t.Name]; found {
+			return s, t.Name, isPtr, true
+		}
+	case *ast.StructType:
+		return t, g.typeStr(t), isPtr, true
+	}
+	return nil, "", false, false
+}
+
+func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
+	var fields []fieldInfo
+	g.collectFields(st, "v.", 0, nil, map[string]bool{}, &fields)
+
+	// Resolve each JSON name to its dominant field by Go's promotion rules: the
+	// shallowest field wins; a tie at the shallowest depth is broken only by a
+	// single tagged field, otherwise the name is ambiguous. An ambiguous clash
+	// among the struct's own (depth-0) fields is a user error; a deeper one is
+	// dropped silently, as encoding/json does.
+	type cand struct {
+		idx, depth int
+		tagged     bool
+	}
+	byKey := map[string][]cand{}
+	for i, f := range fields {
+		for _, k := range f.keys {
+			byKey[k] = append(byKey[k], cand{i, f.depth, f.tagged})
+		}
+	}
+	winner := map[string]int{}
+	for k, cs := range byKey {
+		min := cs[0].depth
+		for _, c := range cs {
+			if c.depth < min {
+				min = c.depth
+			}
+		}
+		var atMin, taggedAtMin []cand
+		for _, c := range cs {
+			if c.depth == min {
+				atMin = append(atMin, c)
+				if c.tagged {
+					taggedAtMin = append(taggedAtMin, c)
+				}
+			}
+		}
+		switch {
+		case len(atMin) == 1:
+			winner[k] = atMin[0].idx
+		case len(taggedAtMin) == 1:
+			winner[k] = taggedAtMin[0].idx
+		case min == 0:
+			g.errs = append(g.errs, fmt.Errorf("%s: json name %q is mapped more than once", strings.TrimPrefix(paramType, "*"), k))
+		}
+	}
+
+	// Emit one case per field, in collection order, listing the names it won.
+	var cases strings.Builder
+	for i, f := range fields {
+		var won []string
+		for _, k := range f.keys {
+			if w, ok := winner[k]; ok && w == i {
+				won = append(won, k)
+			}
+		}
+		if len(won) == 0 {
+			continue
+		}
+		quoted := make([]string, len(won))
+		for j, k := range won {
+			quoted[j] = strconv.Quote(k)
+		}
+		hint := f.dest[strings.LastIndexByte(f.dest, '.')+1:]
+		var code string
+		if f.lax {
+			code = g.laxField(f.dest, f.typ, hint, f.nocopy)
+		} else {
+			code = g.field(f.dest, f.typ, hint, f.nocopy, false)
+		}
+		if f.unwrap {
+			code = unwrapField(code)
+		}
+		if len(f.allocs) > 0 {
+			code = strings.Join(f.allocs, "\n") + "\n" + code
+		}
+		fmt.Fprintf(&cases, "\tcase %s:\n%s\n", strings.Join(quoted, ", "), code)
 	}
 
 	body := fmt.Sprintf(`func %[1]s(v %[2]s, data []byte, i int) (int, error) {
@@ -513,8 +665,7 @@ func (g *gen) field(dest string, expr ast.Expr, hint string, nocopy, lax bool) s
 		if t.Name == "any" {
 			return g.anyValue(dest)
 		}
-		fmt.Fprintf(os.Stderr, "warning: unknown type %q for %s; value skipped\n", t.Name, dest)
-		return g.skipEmit()
+		return g.unsupportedf("unknown type %q for %s", t.Name, dest)
 
 	case *ast.SelectorExpr:
 		if t.Sel.Name == "RawMessage" || t.Sel.Name == "RawValue" {
@@ -523,16 +674,14 @@ func (g *gen) field(dest string, expr ast.Expr, hint string, nocopy, lax bool) s
 		if isTime(t) {
 			return g.timeRead(dest, lax)
 		}
-		fmt.Fprintf(os.Stderr, "warning: unsupported type %s for %s; value skipped\n", g.typeStr(t), dest)
-		return g.skipEmit()
+		return g.unsupportedf("unsupported type %s for %s", g.typeStr(t), dest)
 
 	case *ast.StructType:
 		return g.callDecoder(dest, g.anonStruct(t, hint))
 
 	case *ast.ArrayType:
 		if t.Len != nil {
-			fmt.Fprintf(os.Stderr, "warning: fixed-size array for %s; value skipped\n", dest)
-			return g.skipEmit()
+			return g.callDecoder(dest, g.arrayDecoder(t, hint, nocopy, lax))
 		}
 		return g.callDecoder(dest, g.sliceDecoder(t.Elt, hint, nocopy, lax))
 
@@ -547,8 +696,7 @@ func (g *gen) field(dest string, expr ast.Expr, hint string, nocopy, lax bool) s
 		return g.anyValue(dest)
 
 	default:
-		fmt.Fprintf(os.Stderr, "warning: unsupported type %s for %s; value skipped\n", g.typeStr(expr), dest)
-		return g.skipEmit()
+		return g.unsupportedf("unsupported type %s for %s", g.typeStr(expr), dest)
 	}
 }
 
@@ -559,6 +707,16 @@ if err != nil {
 	return end, err
 }
 i = end`, fn, dest)
+}
+
+// unsupportedf records a generation error for a type the generator cannot decode
+// and returns skip code so the walk can continue and surface every such field at
+// once. Because generate() returns the joined g.errs (and writes no output) when
+// any are present, an unsupported field fails the run with a non-zero exit rather
+// than silently producing a decoder that drops it.
+func (g *gen) unsupportedf(format string, args ...any) string {
+	g.errs = append(g.errs, fmt.Errorf(format, args...))
+	return g.skipEmit()
 }
 
 // laxField emits the decode for a field carrying the "lax" tag option. The value
@@ -602,6 +760,7 @@ func (g *gen) valueDecoder(expr ast.Expr, hint string, nocopy, lax bool) string 
 		if t.Len == nil {
 			return g.sliceDecoder(t.Elt, hint, nocopy, lax)
 		}
+		return g.arrayDecoder(t, hint, nocopy, lax)
 	case *ast.MapType:
 		return g.mapDecoder(t.Key, t.Value, hint, nocopy, lax)
 	}
@@ -778,6 +937,82 @@ if len(body) > 0 {
 i = bend`, inner)
 }
 
+// arrayDecoder returns (generating on first use) the decoder for a fixed-size
+// array type t (t.Len != nil). It mirrors sliceDecoder but writes elements by
+// index instead of appending: the array is zeroed, up to len(out) elements are
+// decoded, and any beyond that are discarded. This matches encoding/json — fill
+// the leading elements, leave a short JSON array's tail zero, drop a long JSON
+// array's extras — and, like it, leaves the array untouched on a JSON null.
+func (g *gen) arrayDecoder(t *ast.ArrayType, hint string, nocopy, lax bool) string {
+	suffix := ""
+	if nocopy {
+		suffix = "NoCopy"
+	}
+	if lax {
+		suffix += "Lax"
+	}
+	arrType := g.typeStr(t)
+	key := g.prefix + g.cmark() + "array:" + suffix + ":" + arrType
+	if fn, ok := g.memo[key]; ok {
+		return fn
+	}
+	fn := g.uniq(g.decFn("decode" + cap1(hint) + suffix + "Array" + g.csuf()))
+	g.memo[key] = fn
+	if isRaw(t.Elt) {
+		g.needJSON = true
+	}
+	if isTime(t.Elt) {
+		g.needTime = true
+	}
+	elem := g.field("(*out)[idx]", t.Elt, hint, nocopy, lax)
+	body := fmt.Sprintf(`func %[1]s(out *%[2]s, data []byte, i int) (int, error) {
+	if i >= len(data) {
+		return i, support.ErrTruncated
+	}
+	if data[i] == 'n' {
+		return support.ExpectNull(data, i)
+	}
+	if data[i] != '[' {
+		return i, support.ErrExpectArray
+	}
+	*out = %[2]s{}
+	i++
+	idx := 0
+	for {
+		%[3]s
+		if i >= len(data) {
+			return i, support.ErrTruncated
+		}
+		if data[i] == ']' {
+			return i + 1, nil
+		}
+		if idx < len(out) {
+			%[4]s
+		} else {
+			end, err := support.SkipValue(data, i)
+			if err != nil {
+				return end, err
+			}
+			i = end
+		}
+		idx++
+		%[3]s
+		if i >= len(data) {
+			return i, support.ErrTruncated
+		}
+		if data[i] == ']' {
+			return i + 1, nil
+		}
+		if data[i] != ',' {
+			return i, support.ErrInvalidJSON
+		}
+		i++
+	}
+}`, fn, arrType, g.skipWS("i", "i"), elem)
+	g.decoders = append(g.decoders, body)
+	return fn
+}
+
 func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax bool) string {
 	suffix := ""
 	if nocopy {
@@ -914,7 +1149,7 @@ func (g *gen) slicePresize(elt ast.Expr, eltStr string) string {
 
 func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy, lax bool) string {
 	if g.typeStr(keyExpr) != "string" {
-		fmt.Fprintf(os.Stderr, "warning: map key type %s unsupported for %s; value skipped\n", g.typeStr(keyExpr), hint)
+		g.errs = append(g.errs, fmt.Errorf("unsupported map key type %s for %s", g.typeStr(keyExpr), hint))
 		return ""
 	}
 	suffix := ""

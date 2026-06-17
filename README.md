@@ -74,9 +74,23 @@ paths (unescaped strings, integers, object keys).
 `string`, `bool`, every sized `int`/`uint` kind, `float32`/`float64`,
 `json.RawMessage` (and `RawValue`), `time.Time` (RFC 3339, like `encoding/json`;
 the [`lax`](#the-lax-tag-option) option also accepts a space separator and Unix
-timestamps), nested named and anonymous structs, slices, maps with string keys,
-pointers, and `interface{}`/`any` (decoded into the usual Go representation of an
-arbitrary JSON value). Unknown object keys are skipped.
+timestamps), nested named and anonymous structs, slices, fixed-size arrays
+(`[N]T`), maps with string keys, pointers, and `interface{}`/`any` (decoded into
+the usual Go representation of an arbitrary JSON value). Unknown object keys are
+skipped.
+
+A fixed-size array follows `encoding/json`: the leading elements are filled, a
+shorter JSON array leaves the remaining elements zero, and a longer one's extras
+are discarded.
+
+Embedded struct fields are promoted like `encoding/json`: an embedded struct's
+exported fields decode as if they were the outer struct's own (an embedded
+pointer is allocated on demand), a name present on both the outer struct and an
+embed is resolved by Go's shallower-wins rule, an equal-depth clash is dropped
+unless a single field is tagged, and an embedded field with its own JSON tag name
+is a plain named field rather than promoted. Embedding a type from another
+package, whose fields aren't visible to the generator, is the one gap — it is
+decoded as a single named field instead of being flattened.
 
 ## The `nocopy` tag option
 
