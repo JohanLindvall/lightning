@@ -414,22 +414,21 @@ func ReadInt64OrNull(data []byte, i int) (int64, int, error) {
 			return 0, i, ErrBadNumber
 		}
 	}
-	c := data[i]
-	if c < '0' || c > '9' {
+	if data[i]-'0' > 9 { // unsigned: a byte below '0' wraps high, so one compare
 		return 0, i, ErrBadNumber
 	}
 	var n int64
 	for i < len(data) {
-		c = data[i]
-		if c < '0' || c > '9' {
+		d := data[i] - '0'
+		if d > 9 {
 			break
 		}
-		n = n*10 + int64(c-'0')
+		n = n*10 + int64(d)
 		i++
 	}
 	if i < len(data) && (data[i] == '.' || data[i] == 'e' || data[i] == 'E') {
 		for i < len(data) {
-			c = data[i]
+			c := data[i]
 			if (c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-' {
 				i++
 				continue
@@ -452,22 +451,21 @@ func ReadUint64OrNull(data []byte, i int) (uint64, int, error) {
 		end, err := ExpectNull(data, i)
 		return 0, end, err
 	}
-	c := data[i]
-	if c < '0' || c > '9' {
+	if data[i]-'0' > 9 { // unsigned: a byte below '0' wraps high, so one compare
 		return 0, i, ErrBadNumber
 	}
 	var n uint64
 	for i < len(data) {
-		c = data[i]
-		if c < '0' || c > '9' {
+		d := data[i] - '0'
+		if d > 9 {
 			break
 		}
-		n = n*10 + uint64(c-'0')
+		n = n*10 + uint64(d)
 		i++
 	}
 	if i < len(data) && (data[i] == '.' || data[i] == 'e' || data[i] == 'E') {
 		for i < len(data) {
-			c = data[i]
+			c := data[i]
 			if (c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-' {
 				i++
 				continue
@@ -538,11 +536,11 @@ func ParseFloat(b []byte) (float64, error) {
 // the parsed result with fast=true. Two fast paths run on the mantissa and
 // exponent the scan extracts, so no rescan is needed: the Clinger path (an
 // exactly representable mantissa < 2^53 with a decimal exponent in [-22, 22],
-	// converted with one multiply or divide) and, for an exact mantissa that misses
-	// Clinger, Eisel-Lemire (a 128-bit multiply — see eiselLemire64). Values with a
-	// mantissa of more than 19 significant digits, ambiguous rounding, subnormal/
-	// overflow results, or an exponent outside the powers-of-ten table return
-	// fast=false, leaving the caller to parse data[i:end] with strconv.ParseFloat.
+// converted with one multiply or divide) and, for an exact mantissa that misses
+// Clinger, Eisel-Lemire (a 128-bit multiply — see eiselLemire64). Values with a
+// mantissa of more than 19 significant digits, ambiguous rounding, subnormal/
+// overflow results, or an exponent outside the powers-of-ten table return
+// fast=false, leaving the caller to parse data[i:end] with strconv.ParseFloat.
 // marker with no digits), in which case end points at the offending byte.
 //
 // Folding the token scan and both fast-path parses into one pass spares the
@@ -819,9 +817,9 @@ func daysFromCivil(y, m, d int) int64 {
 	if mm <= 2 {
 		mp = mm + 9
 	}
-	doy := (153*mp+2)/5 + int64(d) - 1      // day of year, [0, 365]
-	doe := yoe*365 + yoe/4 - yoe/100 + doy  // day of era, [0, 146096]
-	return era*146097 + doe - 719468        // 719468 = days from 0000-03-01 to 1970-01-01
+	doy := (153*mp+2)/5 + int64(d) - 1     // day of year, [0, 365]
+	doe := yoe*365 + yoe/4 - yoe/100 + doy // day of era, [0, 146096]
+	return era*146097 + doe - 719468       // 719468 = days from 0000-03-01 to 1970-01-01
 }
 
 // atoi2 parses exactly two decimal digits of s at off into a non-negative int,
@@ -1166,17 +1164,20 @@ func skipArray(data []byte, i int) (int, error) {
 	return i, ErrTruncated
 }
 
-// isWS is a lookup table of the four JSON whitespace bytes (space, tab, newline,
-// carriage return). A single indexed load replaces the four-way comparison
-// chain; since the index is a byte it is provably in range, so the load carries
-// no bounds check. This is the hottest classification in the scanner — SkipWS
-// runs before and after every value — and the table form is faster on the common
-// compact case (the next byte is structural, so the loop exits immediately).
-var isWS = [256]bool{' ': true, '\t': true, '\n': true, '\r': true}
-
-// SkipWS advances past JSON whitespace at data[i].
+// SkipWS advances past JSON whitespace at data[i]. The four JSON whitespace
+// bytes (space, tab, newline, carriage return) are all <= ' ' (0x20), so a single
+// compare classifies a byte with no memory load — measurably faster than a lookup
+// table on every shape from a compact exit to a deep indent run. This is the
+// hottest classification in the scanner, running before and after every value.
+//
+// The compare also treats the other control bytes (0x00..0x1f) as whitespace.
+// Those are never valid JSON between tokens, so on well-formed input the result
+// is identical to matching the four bytes exactly; on malformed input SkipWS
+// skips such a byte rather than stopping on it, leaving the value parser to
+// reject the next real token. SkipWS is not called inside strings, so control
+// bytes within string contents are unaffected.
 func SkipWS(data []byte, i int) int {
-	for i < len(data) && isWS[data[i]] {
+	for i < len(data) && data[i] <= ' ' {
 		i++
 	}
 	return i
