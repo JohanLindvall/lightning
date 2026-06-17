@@ -3,13 +3,16 @@ package json
 import (
 	"bytes"
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
 // origDefaults / origKeep reproduce the hardcoded lists from the imported
-// default-stripping pass so we can verify the parameterized port matches it.
+// default-stripping pass so we can verify the parameterized port matches it. The
+// empty entry reproduces its isEmpty case len==0: now that isDefault treats empty
+// as default only when "" is listed, the empty token must be opted in explicitly.
 var origDefaults = [][]byte{
-	[]byte("0"), []byte("00"), []byte("none"),
+	[]byte(""), []byte("0"), []byte("00"), []byte("none"),
 	[]byte("false"), []byte("unknown"), []byte("noRecord"),
 }
 var origKeep = [][]byte{
@@ -19,7 +22,7 @@ var origKeep = [][]byte{
 
 func strip(t *testing.T, in string) string {
 	t.Helper()
-	return string(StripDefaults([]byte(in), nil, origDefaults, origKeep, false))
+	return string(StripDefaults([]byte(in), nil, origDefaults, origKeep, RemoveWhitespace))
 }
 
 func TestStripDefaults(t *testing.T) {
@@ -55,7 +58,7 @@ func TestStripDefaults(t *testing.T) {
 func TestStripDefaultsDoesNotMutateInput(t *testing.T) {
 	in := []byte(`{"a":0,"b":2}`)
 	orig := append([]byte(nil), in...)
-	out := StripDefaults(in, make([]byte, 0, 64), origDefaults, origKeep, false)
+	out := StripDefaults(in, make([]byte, 0, 64), origDefaults, origKeep, RemoveWhitespace)
 	if !bytes.Equal(in, orig) {
 		t.Fatalf("input mutated: got %q want %q", in, orig)
 	}
@@ -66,7 +69,7 @@ func TestStripDefaultsDoesNotMutateInput(t *testing.T) {
 
 func TestStripDefaultsInPlace(t *testing.T) {
 	in := []byte(`{"a":0,"b":2,"c":0}`)
-	out := StripDefaults(in, in[:0], origDefaults, origKeep, false)
+	out := StripDefaults(in, in[:0], origDefaults, origKeep, RemoveWhitespace)
 	if string(out) != `{"b":2}` {
 		t.Fatalf("in-place out = %q", out)
 	}
@@ -74,7 +77,7 @@ func TestStripDefaultsInPlace(t *testing.T) {
 
 func TestStripDefaultsGrowsOutput(t *testing.T) {
 	in := []byte(`{"a":1,"b":2}`)
-	out := StripDefaults(in, make([]byte, 0, 2), origDefaults, origKeep, false) // too small -> allocates
+	out := StripDefaults(in, make([]byte, 0, 2), origDefaults, origKeep, RemoveWhitespace) // too small -> allocates
 	if string(out) != `{"a":1,"b":2}` {
 		t.Fatalf("out = %q", out)
 	}
@@ -91,16 +94,76 @@ var cfLogLine = []byte(`{"Cookies":{"clientid":"00000000-0000-4000-8000-00000000
 // inter-token whitespace skipping on or off. A reusable output buffer sized to
 // the input means no per-op allocation (StripDefaults never lengthens the document)
 // and input is left unmodified, so the same input drives every iteration.
-func benchmarkStripDefaults(b *testing.B, compact bool) {
+func benchmarkStripDefaults(b *testing.B, ws WhitespaceMode) {
 	out := make([]byte, 0, len(cfLogLine))
 	b.SetBytes(int64(len(cfLogLine)))
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		out = StripDefaults(cfLogLine, out[:0], origDefaults, origKeep, compact)
+		out = StripDefaults(cfLogLine, out[:0], origDefaults, origKeep, ws)
 	}
 	_ = out
 }
 
-func BenchmarkStripDefaults(b *testing.B)        { benchmarkStripDefaults(b, false) }
-func BenchmarkStripDefaultsCompact(b *testing.B) { benchmarkStripDefaults(b, true) }
+func BenchmarkStripDefaults(b *testing.B)        { benchmarkStripDefaults(b, RemoveWhitespace) }
+func BenchmarkStripDefaultsCompact(b *testing.B) { benchmarkStripDefaults(b, AssumeCompact) }
+
+// TestStripDefaultsWhitespaceModes checks the three WhitespaceMode behaviors on
+// pretty-printed input: AssumeCompact misreads it (documented), RemoveWhitespace
+// yields compact output, and PreserveWhitespace keeps the formatting while
+// stripping the same fields. The oracle: PreserveWhitespace output must be valid
+// JSON, must still contain whitespace, and must compact to exactly the
+// RemoveWhitespace result (same data, same fields dropped).
+func TestStripDefaultsWhitespaceModes(t *testing.T) {
+	pretty := []byte("{\n  \"a\": 1,\n  \"b\": 0,\n  \"c\": {\n    \"d\": 0,\n    \"e\": 5\n  },\n  \"f\": [ 0, 7, 0 ]\n}")
+
+	rw := string(StripDefaults(pretty, nil, origDefaults, origKeep, RemoveWhitespace))
+	if !json.Valid([]byte(rw)) {
+		t.Fatalf("RemoveWhitespace output invalid: %s", rw)
+	}
+	if strings.ContainsAny(rw, " \n\t") {
+		t.Errorf("RemoveWhitespace output still has whitespace: %q", rw)
+	}
+
+	pw := StripDefaults(pretty, nil, origDefaults, origKeep, PreserveWhitespace)
+	if !json.Valid(pw) {
+		t.Fatalf("PreserveWhitespace output invalid: %s", pw)
+	}
+	if !bytes.ContainsAny(pw, "\n") {
+		t.Errorf("PreserveWhitespace output lost its formatting: %q", pw)
+	}
+	// Oracle: compacting the preserved output must equal the compact strip.
+	var compacted bytes.Buffer
+	if err := json.Compact(&compacted, pw); err != nil {
+		t.Fatalf("preserved output not compactable: %v", err)
+	}
+	if compacted.String() != rw {
+		t.Errorf("preserve vs remove differ in data:\n  preserve(compacted)=%q\n  remove           =%q", compacted.String(), rw)
+	}
+	t.Logf("RemoveWhitespace:   %s", rw)
+	t.Logf("PreserveWhitespace: %q", pw)
+}
+
+// TestStripDefaultsWhitespaceOnly verifies that with empty defaults/keep nothing
+// is treated as default — so RemoveWhitespace only strips inter-token whitespace
+// and the result equals encoding/json's own compaction. The inputs include "" and
+// 0 to confirm the updated isDefault keeps them when they aren't in defaults
+// (empty values are no longer unconditionally stripped). Empty {}/[] are omitted
+// because the empty-container rule drops those regardless of defaults.
+func TestStripDefaultsWhitespaceOnly(t *testing.T) {
+	inputs := []string{
+		`{ "a" : 1 , "b" : "x" , "z" : 0 , "e" : "" , "c" : [ 1 , 2 , 3 ] , "d" : { "k" : true } }`,
+		"{\n  \"name\": \"value\",\n  \"zero\": 0,\n  \"blank\": \"\",\n  \"nums\": [ 1, 2, 3 ],\n  \"nested\": { \"x\": false }\n}",
+		`  [ 1 , "two" , { "k" : 3.5 } , "" , 0 ]  `,
+	}
+	for _, in := range inputs {
+		got := StripDefaults([]byte(in), nil, nil, nil, RemoveWhitespace)
+		var want bytes.Buffer
+		if err := json.Compact(&want, []byte(in)); err != nil {
+			t.Fatalf("json.Compact(%q): %v", in, err)
+		}
+		if string(got) != want.String() {
+			t.Errorf("StripDefaults(%q, RemoveWhitespace) =\n  %q\nwant\n  %q", in, got, want.String())
+		}
+	}
+}

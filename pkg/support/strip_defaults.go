@@ -2,6 +2,25 @@ package support
 
 import "bytes"
 
+// WhitespaceMode selects how StripDefaults treats inter-token whitespace in the
+// input. The zero value, RemoveWhitespace, is the safe default: it tolerates any
+// whitespace and produces compact output.
+type WhitespaceMode int
+
+const (
+	// RemoveWhitespace scans past inter-token whitespace and drops it: the output
+	// is compact regardless of how the input was formatted.
+	RemoveWhitespace WhitespaceMode = iota
+	// AssumeCompact asserts the input has no inter-token whitespace (the form
+	// compact serializers emit) and skips the whitespace scans entirely — faster,
+	// but it misreads input that actually contains whitespace. Output is compact.
+	AssumeCompact
+	// PreserveWhitespace keeps the input's inter-token whitespace around surviving
+	// content, so a pretty-printed document stays pretty-printed; only the dropped
+	// members (and their whitespace) are removed.
+	PreserveWhitespace
+)
+
 // StripDefaults copies the JSON document in input to output, dropping every object
 // member whose value is a "default" — empty, or byte-equal to one of defaults
 // (compared against the bare token: the unquoted contents for a string value,
@@ -19,15 +38,9 @@ import "bytes"
 // byte it cannot make sense of it copies the remainder of input through verbatim
 // rather than failing.
 //
-// Empty arrays and objects already present in input are dropped, as are members
-// whose value becomes empty after stripping; string values keep their surrounding
-// quotes and escapes, scalars keep their literal token.
-//
-// Set compact when the input carries no whitespace between tokens — the form
-// compact JSON serializers emit — to elide the inter-token whitespace skips,
-// matching GetCompact/ObjectEachCompact. Leading whitespace at the document start
-// is still tolerated; whitespace anywhere else makes compact misread the input.
-func StripDefaults(input, output []byte, defaults, keep [][]byte, compact bool) []byte {
+// String values keep their surrounding quotes and escapes, scalars keep their
+// literal token. ws controls inter-token whitespace handling — see WhitespaceMode.
+func StripDefaults(input, output []byte, defaults, keep [][]byte, ws WhitespaceMode) []byte {
 	if cap(output) < len(input) {
 		output = make([]byte, len(input))
 	} else {
@@ -40,26 +53,20 @@ func StripDefaults(input, output []byte, defaults, keep [][]byte, compact bool) 
 		keep:        keep,
 		defaultLens: lenSet(defaults),
 		keepLens:    lenSet(keep),
-		compact:     compact,
+		ws:          ws,
 	}
-	// The unconditional skip here tolerates leading whitespace at the document
-	// start even in compact mode; handle's own skips honor the compact flag.
-	_, write := s.handle(SkipWS(input, 0), 0)
+	// Whitespace at the document start is tolerated (and preserved when asked) for
+	// every mode; handle's own skips honor ws thereafter.
+	start := SkipWS(input, 0)
+	write := 0
+	if ws == PreserveWhitespace {
+		write = copy(output, input[:start])
+	}
+	read, write := s.handle(start, write)
+	if ws == PreserveWhitespace {
+		write += copy(output[write:], input[read:]) // trailing whitespace
+	}
 	return output[:write]
-}
-
-// stripper carries the read buffer (in), write buffer (out) and the caller's
-// default-value and keep-key lists through the recursive walk in handle.
-// defaultLens/keepLens summarize the candidate lengths (see lenSet) so a token
-// of non-matching length skips the scan.
-type stripper struct {
-	in          []byte
-	out         []byte
-	defaults    [][]byte
-	keep        [][]byte
-	defaultLens uint64
-	keepLens    uint64
-	compact     bool
 }
 
 // lenSet returns a bitmask with bit n set for every entry of items whose length
@@ -87,16 +94,33 @@ func hasLen(m uint64, n int) bool {
 	return m&(uint64(1)<<n) != 0
 }
 
+// stripper carries the read buffer (in), write buffer (out) and the caller's
+// default-value and keep-key lists through the recursive walk in handle.
+// defaultLens/keepLens summarize the candidate lengths (see lenSet) so a token
+// of non-matching length skips the scan.
+type stripper struct {
+	in          []byte
+	out         []byte
+	defaults    [][]byte
+	keep        [][]byte
+	defaultLens uint64
+	keepLens    uint64
+	ws          WhitespaceMode
+}
+
 // isDefault reports whether a scalar value should be dropped: an empty token, or
 // one byte-equal to a caller-supplied default.
 func (s *stripper) isDefault(value []byte) bool {
 	n := len(value)
-	if n == 0 {
-		return true
-	}
+
 	if !hasLen(s.defaultLens, n) {
 		return false
 	}
+
+	if n == 0 {
+		return true
+	}
+
 	for _, d := range s.defaults {
 		if len(d) == n && bytes.Equal(value, d) {
 			return true
@@ -124,13 +148,17 @@ func (s *stripper) keepKey(key []byte) bool {
 	return false
 }
 
-// emitField appends the member in[keyStart:keyEnd] + ':' + in[valStart:valEnd] to
-// out at write and returns the new write. colonPos is where the ':' sits in the
-// input; when the key, colon and value are adjacent there (no whitespace between
-// them — always so for compact input) the whole "key":value span is moved in one
-// copy, otherwise the key and value are copied separately with a synthesized ':'.
-func (s *stripper) emitField(write, keyStart, keyEnd, colonPos, valStart, valEnd int) int {
+// emitField appends a kept object member to out at write and returns the new
+// write. In PreserveWhitespace mode it copies the verbatim span in[wsStart:valEnd]
+// — leading whitespace, key, the ':' and any whitespace around it, and the value
+// — so the input's formatting survives. Otherwise it emits compact "key":value:
+// one copy of the whole span when key, colon and value are already adjacent (the
+// usual compact case), else key + a synthesized ':' + value.
+func (s *stripper) emitField(write, wsStart, keyStart, keyEnd, colonPos, valStart, valEnd int) int {
 	in, out := s.in, s.out
+	if s.ws == PreserveWhitespace {
+		return write + copy(out[write:], in[wsStart:valEnd])
+	}
 	if colonPos == keyEnd && valStart == keyEnd+1 {
 		return write + copy(out[write:], in[keyStart:valEnd])
 	}
@@ -145,7 +173,11 @@ func (s *stripper) emitField(write, keyStart, keyEnd, colonPos, valStart, valEnd
 // strips away to nothing leaves write unchanged, which is how callers detect a
 // dropped member or an emptied container.
 func (s *stripper) handle(read, write int) (int, int) {
-	in, out, compact := s.in, s.out, s.compact
+	in, out := s.in, s.out
+	// compact: don't scan for whitespace (input asserted to have none).
+	// preserve: copy surviving inter-token whitespace through to the output.
+	compact := s.ws == AssumeCompact
+	preserve := s.ws == PreserveWhitespace
 	dataLen := len(in)
 	read = skipWSc(in, read, compact)
 	if read == dataLen {
@@ -173,7 +205,7 @@ func (s *stripper) handle(read, write int) (int, int) {
 				out[write] = ','
 				write++
 			}
-			// Parse the key — always a quoted string.
+			wsStart := read
 			read = skipWSc(in, read, compact)
 			if read >= dataLen || in[read] != '"' {
 				return eject()
@@ -206,25 +238,29 @@ func (s *stripper) handle(read, write int) (int, int) {
 					}
 					if !s.isDefault(in[read+1 : valEnd-1]) {
 						valueEmpty = false
-						write = s.emitField(write, keyStart, keyEnd, colonPos, read, valEnd)
+						write = s.emitField(write, wsStart, keyStart, keyEnd, colonPos, read, valEnd)
 					}
 					read = valEnd
 				case '{', '[':
-					// Detect an empty {} or [] without recursing.
 					closeBrace := byte('}')
 					if in[read] == '[' {
 						closeBrace = ']'
 					}
 					if peek := skipWSc(in, read+1, compact); peek < dataLen && in[peek] == closeBrace {
-						read = peek + 1
+						read = peek + 1 // empty nested container — drop the member
 						break
 					}
-					// Non-empty nested value: write key + colon, then recurse.
-					write += copy(out[write:], in[keyStart:keyEnd])
-					out[write] = ':'
-					write++
+					// Non-empty nested value: write key + colon (or the verbatim
+					// "ws key : ws" prefix when preserving), then recurse.
+					if preserve {
+						write += copy(out[write:], in[wsStart:read])
+					} else {
+						write += copy(out[write:], in[keyStart:keyEnd])
+						out[write] = ':'
+						write++
+					}
 					tmpWrite := write
-					read, write = s.handle(tmpRead, write)
+					read, write = s.handle(read, write)
 					if tmpWrite != write {
 						valueEmpty = false
 					} else {
@@ -234,22 +270,22 @@ func (s *stripper) handle(read, write int) (int, int) {
 					end := findDelimiter(in, read)
 					if !s.isDefault(in[read:end]) {
 						valueEmpty = false
-						write = s.emitField(write, keyStart, keyEnd, colonPos, read, end)
+						write = s.emitField(write, wsStart, keyStart, keyEnd, colonPos, read, end)
 					}
 					read = end
 				}
 			}
 			if valueEmpty {
 				if !s.keepKey(in[keyStart:keyEnd]) {
-					write = localStartWrite // rewind to before the comma
+					write = localStartWrite // rewind: drop the member (and its whitespace/comma)
 				} else {
-					// Keep a default-valued member: key + colon + its raw value.
-					write = s.emitField(write, keyStart, keyEnd, colonPos, tmpRead, read)
+					write = s.emitField(write, wsStart, keyStart, keyEnd, colonPos, tmpRead, read)
 					written = true
 				}
 			} else {
 				written = true
 			}
+			wsBeforeDelim := read
 			read = skipWSc(in, read, compact)
 			if read == dataLen {
 				return eject()
@@ -258,13 +294,15 @@ func (s *stripper) handle(read, write int) (int, int) {
 			case ',':
 				read++
 			case '}':
-				read++
 				if write == startWrite+1 {
-					return read, startWrite // object emptied
+					return read + 1, startWrite // object emptied
+				}
+				if preserve {
+					write += copy(out[write:], in[wsBeforeDelim:read])
 				}
 				out[write] = '}'
 				write++
-				return read, write
+				return read + 1, write
 			default:
 				return eject()
 			}
@@ -284,6 +322,11 @@ func (s *stripper) handle(read, write int) (int, int) {
 				out[write] = ','
 				write++
 			}
+			wsStart := read
+			read = skipWSc(in, read, compact)
+			if preserve {
+				write += copy(out[write:], in[wsStart:read]) // element's leading whitespace
+			}
 			tmpWrite := write
 			read, write = s.handle(read, write)
 			if tmpWrite == write {
@@ -291,6 +334,7 @@ func (s *stripper) handle(read, write int) (int, int) {
 			} else {
 				written = true
 			}
+			wsBeforeDelim := read
 			read = skipWSc(in, read, compact)
 			if read == dataLen {
 				return eject()
@@ -299,13 +343,15 @@ func (s *stripper) handle(read, write int) (int, int) {
 			case ',':
 				read++
 			case ']':
-				read++
 				if write == startWrite+1 {
-					return read, startWrite // array emptied
+					return read + 1, startWrite // array emptied
+				}
+				if preserve {
+					write += copy(out[write:], in[wsBeforeDelim:read])
 				}
 				out[write] = ']'
 				write++
-				return read, write
+				return read + 1, write
 			default:
 				return eject()
 			}

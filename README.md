@@ -328,30 +328,38 @@ pass, dropping object members whose value is a "default" — useful for shrinkin
 verbose, mostly-default records (Cloudflare HTTP logs, say) before storing or
 forwarding them:
 
-- `StripDefaults(input, output []byte, defaults, keep [][]byte, compact bool) []byte`
+- `StripDefaults(input, output []byte, defaults, keep [][]byte, ws WhitespaceMode) []byte`
   — copies `input` to `output`, dropping every object member whose value is a
   default and then dropping any object or array that this leaves empty. A value
-  is a default when it is empty or byte-equal to one of `defaults` (compared
-  against the bare token — the unquoted contents for a string, the literal token
-  for a number or keyword, e.g. `[]byte("none")`, `[]byte("false")`). A member is
-  kept despite a default value when its unquoted key is byte-equal to one of
-  `keep` (e.g. `[]byte("WallTimeMs")`). String values keep their surrounding
-  quotes and escapes; scalars keep their literal token.
+  is a default when it is byte-equal to one of `defaults`, compared against the
+  bare token — the unquoted contents for a string, the literal token for a number
+  or keyword (e.g. `[]byte("none")`, `[]byte("false")`). Empty values are *not*
+  special-cased: to drop empty strings (and other empty tokens) include an empty
+  entry `[]byte("")` in `defaults`. A member is kept despite a default value when
+  its unquoted key is byte-equal to one of `keep` (e.g. `[]byte("WallTimeMs")`).
+  String values keep their surrounding quotes and escapes; scalars keep their
+  literal token. (Empty `{}`/`[]` are always dropped, independent of `defaults`.)
 
 `output` is filled from the front and the populated prefix is returned; `input`
 is never modified. StripDefaults never lengthens the document, so `output` is grown
 (allocated) only when `cap(output) < len(input)` — pass `input[:0]` to strip in
 place, or a reused buffer to run allocation-free. It is best effort and copies
-malformed input through unchanged. Set `compact` when the input has no whitespace
-between tokens (as [`GetCompact`](#key-lookups) does) to skip the inter-token
-`SkipWS` scans.
+malformed input through unchanged.
+
+`ws` chooses how inter-token whitespace is handled:
+- `RemoveWhitespace` (the zero value) — tolerate any whitespace; output is compact.
+- `AssumeCompact` — assert the input has no inter-token whitespace and skip the
+  `SkipWS` scans (faster, as [`GetCompact`](#key-lookups) does); misreads spaced input.
+- `PreserveWhitespace` — keep the input's whitespace around surviving content, so a
+  pretty-printed document stays pretty-printed; only dropped members are removed.
 
 ```go
-defaults := [][]byte{[]byte("0"), []byte("none"), []byte("false"), []byte("unknown")}
+// "" opts empty strings in; "0"/"none"/"false"/"unknown" are the non-empty defaults.
+defaults := [][]byte{[]byte(""), []byte("0"), []byte("none"), []byte("false"), []byte("unknown")}
 keep := [][]byte{[]byte("WallTimeMs")} // retained even when their value is a default
 var scratch []byte
-scratch = json.StripDefaults(record, scratch[:0], defaults, keep, true)
-// {"a":0,"b":"x","WallTimeMs":0}  ->  {"b":"x","WallTimeMs":0}
+scratch = json.StripDefaults(record, scratch[:0], defaults, keep, json.AssumeCompact)
+// {"a":0,"b":"x","e":"","WallTimeMs":0}  ->  {"b":"x","WallTimeMs":0}
 ```
 
 Matching is length-pre-filtered so a value or key longer than any candidate
