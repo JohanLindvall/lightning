@@ -22,11 +22,12 @@ const (
 )
 
 // StripDefaults copies the JSON document in input to output, dropping every object
-// member whose value is a "default" — empty, or byte-equal to one of defaults
-// (compared against the bare token: the unquoted contents for a string value,
-// the literal token for a number/keyword) — and then dropping any object or
-// array that this leaves empty. A member is kept despite a default value when
-// its (unquoted) key is byte-equal to one of keep.
+// member whose value is a "default" — byte-equal to one of defaults, compared
+// against the bare token: the unquoted contents for a string value, the literal
+// token for a number/keyword — and then dropping any object or array that this
+// leaves empty. Empty values are not special-cased: list an empty entry ("") in
+// defaults to drop them. A member is kept despite a default value when its
+// (unquoted) key is byte-equal to one of keep.
 //
 // output is filled from the front and the populated prefix is returned; input is
 // not modified. StripDefaults never lengthens the document, so output needs room
@@ -108,8 +109,9 @@ type stripper struct {
 	ws          WhitespaceMode
 }
 
-// isDefault reports whether a scalar value should be dropped: an empty token, or
-// one byte-equal to a caller-supplied default.
+// isDefault reports whether a scalar value should be dropped: one byte-equal to a
+// caller-supplied default. The empty token counts only when "" is among defaults
+// (the length pre-filter rejects it otherwise), so empties are opt-in.
 func (s *stripper) isDefault(value []byte) bool {
 	n := len(value)
 

@@ -136,10 +136,11 @@ const (
 
 // StripDefaults copies the JSON document in input to output, dropping every object
 // member whose value is a "default" and then dropping any object or array left
-// empty as a result. A value is a default when it is empty or byte-equal to one
-// of defaults (compared against the bare token — the unquoted contents for a
-// string, the literal token for a number or keyword); a member is kept despite a
-// default value when its unquoted key is byte-equal to one of keep.
+// empty as a result. A value is a default when it is byte-equal to one of
+// defaults (compared against the bare token — the unquoted contents for a string,
+// the literal token for a number or keyword); empty values are dropped only when
+// an empty entry ("") is listed in defaults. A member is kept despite a default
+// value when its unquoted key is byte-equal to one of keep.
 //
 // output is filled from the front and the populated prefix is returned; input is
 // not modified. StripDefaults never lengthens the document, so output is grown
