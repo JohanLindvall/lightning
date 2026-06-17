@@ -31,8 +31,8 @@ type Log struct {
 			OddEven   string `json:"ODD_EVEN,nocopy"`
 		} `json:"properties"`
 		Geometry struct {
-			Type        string        `json:"type"`
-			Coordinates [][][]float64 `json:"coordinates"`
+			Type        string         `json:"type"`
+			Coordinates [][][3]float64 `json:"coordinates"`
 		} `json:"geometry"`
 	} `json:"features"`
 }

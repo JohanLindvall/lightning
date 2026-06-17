@@ -26,6 +26,13 @@ RESULTS="results.txt"
 RESULTSMD="results_$(go env GOARCH).md"
 MODULE=$(go list -m)       # github.com/JohanLindvall/lightning/bench
 
+# Each benchmark runs for BENCHTIME of wall clock (Go's -benchtime) and is
+# repeated BENCHCOUNT times (Go's -count). Both default to Go's own defaults
+# (1s, one run); override for steadier numbers, e.g. BENCHTIME=30s BENCHCOUNT=6
+# run_bench.sh, which gives benchstat enough samples to estimate variance.
+BENCHTIME="${BENCHTIME:-1s}"
+BENCHCOUNT="${BENCHCOUNT:-1}"
+
 # Locate (or install) the easyjson code generator.
 EJBIN="$(command -v easyjson || true)"
 if [ -z "$EJBIN" ] && [ -x "$(go env GOPATH)/bin/easyjson" ]; then
@@ -204,7 +211,7 @@ EOF
 		echo "bench/${dir}  (input.json: $(wc -c < "${dir}input.json") bytes)"
 		echo "================================================================"
 	} >> "$RESULTS"
-	if go test -mod=mod -run='^$' -bench=. -benchmem "./${dir}" >> "$RESULTS" 2>&1; then
+	if go test -mod=mod -run='^$' -bench=. -benchmem -benchtime="$BENCHTIME" -count="$BENCHCOUNT" "./${dir}" >> "$RESULTS" 2>&1; then
 		echo "  ok"
 	else
 		echo "  benchmark failed (see ${RESULTS})" >&2
