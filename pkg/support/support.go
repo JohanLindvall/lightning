@@ -235,8 +235,7 @@ func UnescapeString(in []byte) (string, error) {
 }
 
 // UnescapeStringInto decodes the body of a JSON string like UnescapeString,
-// but writes the decoded bytes into out instead of allocating its own buffer,
-// mirroring the Unescape(in, out) convention of github.com/buger/jsonparser:
+// but writes the decoded bytes into out instead of allocating its own buffer:
 //
 //   - if in contains no escapes, the returned string aliases in and out is
 //     untouched;
@@ -714,7 +713,7 @@ func parseRFC3339(s string, allowSpace bool) (time.Time, bool) {
 	if len(s) < 20 {
 		return time.Time{}, false
 	}
-	if sep := s[10]; sep != 'T' && !(allowSpace && sep == ' ') {
+	if sep := s[10]; sep != 'T' && (!allowSpace || sep != ' ') {
 		return time.Time{}, false
 	}
 	if s[4] != '-' || s[7] != '-' || s[13] != ':' || s[16] != ':' {
@@ -726,7 +725,8 @@ func parseRFC3339(s string, allowSpace bool) (time.Time, bool) {
 	hour, ok3 := atoi2(s, 11)
 	min, ok4 := atoi2(s, 14)
 	sec, ok5 := atoi2(s, 17)
-	if !(ok0 && ok1 && ok2 && ok3 && ok4 && ok5) {
+	ok := ok0 && ok1 && ok2 && ok3 && ok4 && ok5
+	if !ok {
 		return time.Time{}, false
 	}
 	// Reject out-of-range fields so leap seconds and the like defer to time.Parse.
@@ -1301,9 +1301,8 @@ func getMany(data []byte, keys []string, out [][]byte, compact bool) ([][]byte, 
 }
 
 // Get walks the object-key path keys into the JSON document data and returns
-// the raw bytes of the value found at that path, mirroring
-// github.com/buger/jsonparser's Get without reporting a value type. The
-// returned slice aliases data — for a string it includes the surrounding
+// the raw bytes of the value found at that path, without reporting a value type.
+// The returned slice aliases data — for a string it includes the surrounding
 // quotes (escapes left intact), for an object or array it spans the matching
 // '{'..'}' or '['..']', and for a scalar it is the literal token.
 //
@@ -1343,9 +1342,8 @@ func get(data []byte, compact bool, keys ...string) ([]byte, int, error) {
 }
 
 // ObjectEach calls fn once for every member of the JSON object reached by the
-// object-key path keys in data, modeled on github.com/buger/jsonparser's
-// ObjectEach but without reporting a value type. fn receives the member's
-// decoded key and the raw bytes of its value; both alias data (so the caller
+// object-key path keys in data, without reporting a value type. fn receives the
+// member's decoded key and the raw bytes of its value; both alias data (so the caller
 // must keep data unchanged while they are in use), and the value follows the
 // same conventions as Get — quotes kept for strings, the full span for objects
 // and arrays, the literal token for scalars.
@@ -1478,6 +1476,128 @@ func objectField(data []byte, i int, key string, compact bool) (int, error) {
 			return i, ErrInvalidJSON
 		}
 	}
+}
+
+// Set returns the JSON document in with the value at the object-key path keys
+// replaced by the raw JSON value rawVal, written into out. When the path does
+// not exist it is created: a missing member is inserted into its parent object,
+// and any missing intermediate object — or a non-object value found where the
+// path still needs to descend — is created as nested objects. With no keys the
+// whole document is replaced by rawVal.
+//
+// rawVal is inserted verbatim and must be a single well-formed JSON value. Newly
+// created keys are written as JSON strings without escaping, so they should not
+// contain characters that need escaping. Inter-token whitespace in in is
+// tolerated and preserved outside the edited span.
+//
+// out is filled from out[:0] and returned; pass a reusable buffer to avoid
+// allocation (a nil out allocates). out must not alias in.
+func Set(in, out, rawVal []byte, keys []string) []byte {
+	start, end, insert := setSpan(in, rawVal, keys)
+	out = append(out[:0], in[:start]...)
+	out = append(out, insert...)
+	return append(out, in[end:]...)
+}
+
+// setSpan locates the edit Set must make: the half-open byte span [start, end)
+// of in to replace and the bytes to put there. It walks keys from the root,
+// descending through existing objects; on the leaf it targets the existing value
+// (replace) or the insertion point in its parent object (create), and on a
+// missing or non-object intermediate it builds the remaining path as nested
+// objects.
+func setSpan(in, rawVal []byte, keys []string) (start, end int, insert []byte) {
+	i := SkipWS(in, 0)
+	for level := 0; level < len(keys); level++ {
+		j := SkipWS(in, i)
+		if j >= len(in) || in[j] != '{' {
+			// The path still needs to descend but there is no object here: replace
+			// this value with the remaining keys built as nested objects.
+			return i, skipValueOrEnd(in, i), nestValue(keys[level:], rawVal)
+		}
+		afterBrace := j + 1
+		p := SkipWS(in, afterBrace)
+		empty := p >= len(in) || in[p] == '}'
+		found, valStart, valEnd := false, 0, 0
+		lastValEnd := afterBrace // end of the last member's value, for appending
+		for p < len(in) && in[p] != '}' {
+			k, np, err := ReadKey(in, p)
+			if err != nil {
+				break
+			}
+			p = SkipWS(in, np)
+			if p >= len(in) || in[p] != ':' {
+				break
+			}
+			p = SkipWS(in, p+1)
+			vs := p
+			ve := skipValueOrEnd(in, p)
+			lastValEnd = ve
+			if k == keys[level] {
+				found, valStart, valEnd = true, vs, ve
+				break
+			}
+			p = SkipWS(in, ve)
+			if p < len(in) && in[p] == ',' {
+				p = SkipWS(in, p+1)
+				continue
+			}
+			break
+		}
+		if found {
+			if level == len(keys)-1 {
+				return valStart, valEnd, rawVal
+			}
+			i = valStart // descend into the existing value
+			continue
+		}
+		// Key absent at this level: create the member. Into an empty object it
+		// goes right after '{'; otherwise it is appended after the last member.
+		if empty {
+			return afterBrace, afterBrace, appendMember(nil, keys[level:], rawVal)
+		}
+		return lastValEnd, lastValEnd, appendMember([]byte{','}, keys[level:], rawVal)
+	}
+	// No keys: replace the whole document value.
+	return i, skipValueOrEnd(in, i), rawVal
+}
+
+// nestValue builds the JSON value for a key path: rawVal itself when keys is
+// empty, otherwise rawVal wrapped in one object per key, outermost first
+// (["a","b"] -> {"a":{"b":rawVal}}).
+func nestValue(keys []string, rawVal []byte) []byte {
+	if len(keys) == 0 {
+		return rawVal
+	}
+	out := make([]byte, 0, len(rawVal)+len(keys)*8)
+	for _, k := range keys {
+		out = append(out, '{', '"')
+		out = append(out, k...)
+		out = append(out, '"', ':')
+	}
+	out = append(out, rawVal...)
+	for range keys {
+		out = append(out, '}')
+	}
+	return out
+}
+
+// appendMember appends the object member `"keys[0]":<nestValue(keys[1:])>` used
+// when inserting a fresh key into an existing object.
+func appendMember(dst []byte, keys []string, rawVal []byte) []byte {
+	dst = append(dst, '"')
+	dst = append(dst, keys[0]...)
+	dst = append(dst, '"', ':')
+	return append(dst, nestValue(keys[1:], rawVal)...)
+}
+
+// skipValueOrEnd is SkipValue but tolerant: on a malformed value it returns the
+// end of input rather than an error, keeping Set best-effort like the rest of
+// the scanning helpers.
+func skipValueOrEnd(data []byte, i int) int {
+	if e, err := SkipValue(data, i); err == nil {
+		return e
+	}
+	return len(data)
 }
 
 // DecodeValue decodes an arbitrary JSON value at data[i] into the standard Go

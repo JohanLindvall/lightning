@@ -173,7 +173,7 @@ type gen struct {
 
 func (g *gen) typeStr(e ast.Expr) string {
 	var b strings.Builder
-	printer.Fprint(&b, g.fset, e)
+	_ = printer.Fprint(&b, g.fset, e) // writing to a strings.Builder never fails
 	return b.String()
 }
 

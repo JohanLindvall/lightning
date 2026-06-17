@@ -215,8 +215,8 @@ func TestCompactVariants(t *testing.T) {
 	})
 }
 
-// TestGetObjectCheck demonstrates the jsonparser.Get(... ) != Object idiom
-// rebuilt on Get: navigate to the parent path and confirm it is an object.
+// TestGetObjectCheck demonstrates the "value exists and is an object" idiom on
+// Get: navigate to the parent path and confirm err == nil and it starts with '{'.
 func TestGetObjectCheck(t *testing.T) {
 	doc := []byte(`{"parent": {"child": 1}, "leaf": 5}`)
 

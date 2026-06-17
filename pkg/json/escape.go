@@ -38,7 +38,13 @@ func swarHasByte(v uint64, b byte) uint64 {
 	return (x - swarLo) & ^x & swarHi
 }
 
-// EscapeString escapes the string onto the given builder. See https://github.com/mailru/easyjson/blob/master/jwriter/writer.go
+// EscapeString writes the JSON-escaped form of s to out — the string body only,
+// without the surrounding quotes. The bytes JSON requires escaped (control bytes
+// below 0x20, '"' and '\\') are replaced by their escape sequences: the short
+// forms \t, \r, \n, \" and \\ where defined, and \u00XX for the remaining control
+// bytes. It is the inverse of UnescapeString. A clean prefix — the common case of
+// a string with no escapes — is written straight to out, with neither a scratch
+// buffer nor a rescan.
 func EscapeString(s []byte, out *strings.Builder) {
 	pos := firstEscape(s)
 	if pos == len(s) {
@@ -72,7 +78,12 @@ func firstEscape(s []byte) int {
 	return i
 }
 
-// EscapeStringInto escapes json as bytes. See https://github.com/mailru/easyjson/blob/master/jwriter/writer.go
+// EscapeStringInto appends the JSON-escaped form of s to out and returns the
+// extended slice; out may be nil or a buffer reused across calls to avoid
+// allocation (escaping can lengthen the input, so out still grows when its
+// capacity is exceeded). It escapes the same bytes as EscapeString — control
+// bytes below 0x20, '"' and '\\' — and writes the string body only, without the
+// surrounding quotes, mirroring the in/out convention of UnescapeStringInto.
 func EscapeStringInto(s []byte, out []byte) []byte {
 	n := len(s)
 	p := 0 // start of the current run of bytes that need no escaping
