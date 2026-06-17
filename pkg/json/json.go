@@ -118,7 +118,7 @@ func ObjectEachCompact(data []byte, fn func(key string, value []byte) error, key
 	return support.ObjectEachCompact(data, fn, keys...)
 }
 
-// Cleanup copies the JSON document in input to output, dropping every object
+// StripDefaults copies the JSON document in input to output, dropping every object
 // member whose value is a "default" and then dropping any object or array left
 // empty as a result. A value is a default when it is empty or byte-equal to one
 // of defaults (compared against the bare token — the unquoted contents for a
@@ -126,14 +126,14 @@ func ObjectEachCompact(data []byte, fn func(key string, value []byte) error, key
 // default value when its unquoted key is byte-equal to one of keep.
 //
 // output is filled from the front and the populated prefix is returned; input is
-// not modified. Cleanup never lengthens the document, so output is grown
+// not modified. StripDefaults never lengthens the document, so output is grown
 // (allocated) only when cap(output) < len(input); pass output == input[:0] to
 // clean in place. The returned slice aliases whichever buffer was written.
-// Cleanup is best effort and copies malformed input through unchanged.
+// StripDefaults is best effort and copies malformed input through unchanged.
 //
 // Set compact when the input has no whitespace between tokens (the form compact
 // serializers emit) to skip the inter-token whitespace scans, as GetCompact does;
 // leading whitespace is still tolerated but whitespace elsewhere then misreads.
-func Cleanup(input, output []byte, defaults, keep [][]byte, compact bool) []byte {
-	return support.Cleanup(input, output, defaults, keep, compact)
+func StripDefaults(input, output []byte, defaults, keep [][]byte, compact bool) []byte {
+	return support.StripDefaults(input, output, defaults, keep, compact)
 }

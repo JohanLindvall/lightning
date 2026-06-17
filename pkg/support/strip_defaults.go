@@ -2,7 +2,7 @@ package support
 
 import "bytes"
 
-// Cleanup copies the JSON document in input to output, dropping every object
+// StripDefaults copies the JSON document in input to output, dropping every object
 // member whose value is a "default" — empty, or byte-equal to one of defaults
 // (compared against the bare token: the unquoted contents for a string value,
 // the literal token for a number/keyword) — and then dropping any object or
@@ -10,30 +10,30 @@ import "bytes"
 // its (unquoted) key is byte-equal to one of keep.
 //
 // output is filled from the front and the populated prefix is returned; input is
-// not modified. Cleanup never lengthens the document, so output needs room for
+// not modified. StripDefaults never lengthens the document, so output needs room for
 // at most len(input) bytes — it is grown (allocated) only when cap(output) is
-// smaller, mirroring UnescapeStringInto. Pass output == input[:0] to clean in
+// smaller, mirroring UnescapeStringInto. Pass output == input[:0] to strip in
 // place. The returned slice aliases whichever buffer was written.
 //
-// Cleanup is best effort and forgiving of malformed input: on the first byte it
+// StripDefaults is best effort and forgiving of malformed input: on the first byte it
 // cannot make sense of it copies the remainder of input through verbatim rather
 // than failing.
 //
 // Empty arrays and objects already present in input are dropped, as are members
-// whose value becomes empty after cleaning; string values keep their surrounding
+// whose value becomes empty after stripping; string values keep their surrounding
 // quotes and escapes, scalars keep their literal token.
 //
 // Set compact when the input carries no whitespace between tokens — the form
 // compact JSON serializers emit — to elide the inter-token whitespace skips,
 // matching GetCompact/ObjectEachCompact. Leading whitespace at the document start
 // is still tolerated; whitespace anywhere else makes compact misread the input.
-func Cleanup(input, output []byte, defaults, keep [][]byte, compact bool) []byte {
+func StripDefaults(input, output []byte, defaults, keep [][]byte, compact bool) []byte {
 	if cap(output) < len(input) {
 		output = make([]byte, len(input))
 	} else {
 		output = output[:len(input)]
 	}
-	c := cleaner{in: input, out: output, defaults: defaults, keep: keep, compact: compact}
+	c := stripper{in: input, out: output, defaults: defaults, keep: keep, compact: compact}
 	c.defaultLens = lenSet(defaults)
 	c.keepLens = lenSet(keep)
 	// The unconditional skip here tolerates leading whitespace at the document
@@ -67,11 +67,11 @@ func hasLen(m uint64, n int) bool {
 	return m&(uint64(1)<<uint(n)) != 0
 }
 
-// cleaner carries the read buffer (in), write buffer (out) and the caller's
+// stripper carries the read buffer (in), write buffer (out) and the caller's
 // default-value and keep-key lists through the recursive walk in handle.
 // defaultLens/keepLens summarize the candidate lengths (see lenSet) so a token
 // of non-matching length skips the scan.
-type cleaner struct {
+type stripper struct {
 	in          []byte
 	out         []byte
 	defaults    [][]byte
@@ -83,7 +83,7 @@ type cleaner struct {
 
 // isDefault reports whether a scalar value should be dropped: an empty token, or
 // one byte-equal to a caller-supplied default.
-func (c *cleaner) isDefault(value []byte) bool {
+func (c *stripper) isDefault(value []byte) bool {
 	n := len(value)
 	if n == 0 {
 		return true
@@ -102,7 +102,7 @@ func (c *cleaner) isDefault(value []byte) bool {
 // keepKey reports whether a member with a default value should be kept anyway.
 // key is the raw key token including its surrounding quotes; the comparison is
 // against the bare name, so keep entries are unquoted (e.g. []byte("WallTimeMs")).
-func (c *cleaner) keepKey(key []byte) bool {
+func (c *stripper) keepKey(key []byte) bool {
 	if len(key) >= 2 {
 		key = key[1 : len(key)-1]
 	}
@@ -123,7 +123,7 @@ func (c *cleaner) keepKey(key []byte) bool {
 // input; when the key, colon and value are adjacent there (no whitespace between
 // them — always so for compact input) the whole "key":value span is moved in one
 // copy, otherwise the key and value are copied separately with a synthesized ':'.
-func (c *cleaner) emitField(write, keyStart, keyEnd, colonPos, valStart, valEnd int) int {
+func (c *stripper) emitField(write, keyStart, keyEnd, colonPos, valStart, valEnd int) int {
 	out, in := c.out, c.in
 	if colonPos == keyEnd && valStart == keyEnd+1 {
 		return write + copy(out[write:], in[keyStart:valEnd])
@@ -134,11 +134,11 @@ func (c *cleaner) emitField(write, keyStart, keyEnd, colonPos, valStart, valEnd 
 	return write + copy(out[write:], in[valStart:valEnd])
 }
 
-// handle cleans the value beginning at in[read], appending the cleaned bytes at
+// handle strips the value beginning at in[read], appending the kept bytes at
 // out[write], and returns the read and write offsets just past it. A value that
-// cleans away to nothing leaves write unchanged, which is how callers detect a
+// strips away to nothing leaves write unchanged, which is how callers detect a
 // dropped member or an emptied container.
-func (c *cleaner) handle(key bool, read, write int) (int, int) {
+func (c *stripper) handle(key bool, read, write int) (int, int) {
 	in, out, compact := c.in, c.out, c.compact
 	datalen := len(in)
 	read = skipWSc(in, read, compact)
