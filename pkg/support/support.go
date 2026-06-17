@@ -1189,10 +1189,10 @@ func SkipWS(data []byte, i int) int {
 // returns i unchanged; otherwise it is SkipWS. This mirrors the generator's
 // //lightning:compact decoders, which elide exactly these inter-token skips.
 func skipWSc(data []byte, i int, compact bool) int {
-	if compact {
-		return i
+	for !compact && i < len(data) && data[i] <= ' ' {
+		i++
 	}
-	return SkipWS(data, i)
+	return i
 }
 
 func unsafeStr(b []byte) string {
