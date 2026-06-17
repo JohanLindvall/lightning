@@ -909,7 +909,7 @@ func TestCountArrayElements(t *testing.T) {
 		{`[]`, 0},
 		{`[1]`, 1},
 		{`[1,2,3]`, 3},
-		{` [ 1 , 2 , 3 ] `, 3}, // leading ws before '[' is not consumed by the caller; data[i]=='['
+		{` [ 1 , 2 , 3 ] `, 3}, // callers must position i at '[' (after their own whitespace skip)
 		{`["a","b"]`, 2},
 		{`["a,b","c]d"]`, 2},        // commas/brackets inside strings are not counted
 		{`[{"x":1},{"y":[2,3]}]`, 2}, // object elements
