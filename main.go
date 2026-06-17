@@ -273,29 +273,33 @@ func sanitizeIdent(s string) string {
 // name, yielding the system-unique "lightning<ImportPath><Type>decode..." form.
 func (g *gen) decFn(name string) string { return g.prefix + name }
 
-// skipWSExpr returns the expression giving the first non-whitespace index at or
-// after src. For a //lightning:compact type the input is asserted to hold no
-// whitespace between tokens (the form compact JSON serializers emit), so it
-// collapses to src itself; otherwise it is the support.SkipWS call the generator
-// has always emitted. Only the per-key/element calls inside objects, arrays and
-// maps are elided this way; UnmarshalJSON keeps its leading/trailing SkipWS so a
-// document framed with surrounding whitespace (e.g. a trailing newline) still
-// decodes.
-func (g *gen) skipWSExpr(src string) string {
-	if g.compact {
-		return src
-	}
-	return "support.SkipWS(data, " + src + ")"
-}
-
 // skipWS returns the statement assigning dst the first non-whitespace index at
 // or after src. In compact mode it becomes a plain dst = src, or nothing when
 // dst and src are identical (the assignment would be a no-op).
 func (g *gen) skipWS(dst, src string) string {
-	if g.compact && dst == src {
-		return ""
+	if g.compact {
+		if dst == src {
+			return ""
+		}
+		return dst + " = " + src
 	}
-	return dst + " = " + g.skipWSExpr(src)
+	// Skip inter-token whitespace inline. The 0- and 1-byte cases (a compact
+	// stream, or the single space after a token in lightly-spaced JSON) resolve
+	// with one or two compares and never call out; only a real run of two or more
+	// whitespace bytes — the indentation of pretty-printed input — is handed to
+	// the SWAR support.SkipWSRun, which eats it eight bytes at a time. Doing this
+	// at the call site rather than in support.SkipWS sidesteps the inliner budget
+	// that would otherwise force every skip through a function call.
+	set := ""
+	if dst != src {
+		set = dst + " = " + src + "\n\t"
+	}
+	return fmt.Sprintf(`%[1]sif %[2]s < len(data) && data[%[2]s] <= ' ' {
+		%[2]s++
+		if %[2]s < len(data) && data[%[2]s] <= ' ' {
+			%[2]s = support.SkipWSRun(data, %[2]s+1)
+		}
+	}`, set, dst)
 }
 
 // cmark and csuf distinguish a compact decoder from its non-compact counterpart
@@ -1123,16 +1127,23 @@ func (g *gen) slicePresize(elt ast.Expr, eltStr string) string {
 	case *ast.MapType:
 		counter = "support.CountArrayElements"
 	case *ast.ArrayType:
-		// elt is itself a slice/array. Presize this level only when its element
-		// is a leaf (a scalar slice like []float64, or a slice of structs/
-		// strings) — there the count is the number of inner slices and presizing
-		// avoids real reallocation. For a slice *of slices of slices*, the outer
-		// dimension is typically small, yet counting it would deep-scan every
-		// element that the inner decoders then re-scan; skip presize there so the
-		// outer slice just appends (a handful of elements, no measurable realloc)
-		// instead of paying for a full structural pass.
-		if _, nested := unparen(t.Elt).(*ast.ArrayType); !nested {
-			counter = "support.CountArrayElements"
+		// elt is itself a slice/array. A fixed-size array element ([N]T, e.g. a
+		// [3]float64 coordinate point) is skipped here: counting the outer slice
+		// means structurally descending through every element's N values, which
+		// the element decoders then re-parse — a full extra pass over the numbers,
+		// plus zeroing the presized backing — that costs more than the doubling
+		// growth it would save. Let that slice append instead.
+		//
+		// Otherwise presize only when the element is a leaf (a scalar slice like
+		// []float64, or a slice of structs/strings) — there the count is the
+		// number of inner slices and presizing avoids real reallocation. For a
+		// slice *of slices of slices*, the outer dimension is typically small, yet
+		// counting it would deep-scan every element that the inner decoders then
+		// re-scan; skip presize there too so the outer slice just appends.
+		if t.Len == nil {
+			if _, nested := unparen(t.Elt).(*ast.ArrayType); !nested {
+				counter = "support.CountArrayElements"
+			}
 		}
 	case *ast.SelectorExpr:
 		if isTime(t) || isRaw(t) {

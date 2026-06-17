@@ -10,7 +10,9 @@ package support
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/binary"
 	"errors"
+	"math/bits"
 	"strconv"
 	"time"
 	"unicode/utf16"
@@ -1177,6 +1179,38 @@ func skipArray(data []byte, i int) (int, error) {
 // reject the next real token. SkipWS is not called inside strings, so control
 // bytes within string contents are unaffected.
 func SkipWS(data []byte, i int) int {
+	for i < len(data) && data[i] <= ' ' {
+		i++
+	}
+	return i
+}
+
+// SkipWSRun advances past a whitespace run from data[i] (the caller has already
+// established that data[i-1] and data[i-2] were whitespace, i.e. this is a run of
+// at least two). It is the out-of-line continuation the generated decoders call
+// only for genuine indentation runs in pretty-printed input — short skips (zero
+// or one whitespace byte, the compact and single-space-after-token cases) are
+// handled inline at the call site so they never pay a call. Eight bytes are
+// classified per word: ws sets a lane's high bit exactly when that byte is <= ' '
+// (clearing each lane's top bit into w&^hi keeps the per-lane subtract g-... from
+// borrowing across lanes, so it is exact for every byte value, and &^ w rejects
+// the >= 0x80 bytes malformed input may carry). A full-whitespace word equals the
+// all-high mask and is skipped whole; the first word with a structural byte
+// locates it with one trailing-zeros count.
+func SkipWSRun(data []byte, i int) int {
+	const (
+		lo = ^uint64(0) / 255 // 0x0101...01
+		hi = lo << 7          // 0x8080...80
+		g  = lo*' ' | hi      // 0xA0...A0: ' ' with a per-lane borrow guard
+	)
+	for i+8 <= len(data) {
+		w := binary.LittleEndian.Uint64(data[i:])
+		ws := (g - w&^hi) &^ w & hi
+		if ws != hi {
+			return i + bits.TrailingZeros64(ws^hi)/8
+		}
+		i += 8
+	}
 	for i < len(data) && data[i] <= ' ' {
 		i++
 	}
