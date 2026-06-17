@@ -2,7 +2,8 @@ name: CI
 
 on:
   push:
-    tags-ignore: ['**'] # don't re-run CI for the tags this workflow pushes
+    branches: ['**'] # every branch; tag pushes don't trigger (so the tags this
+    # workflow creates don't re-run CI)
 
 permissions:
   contents: read
