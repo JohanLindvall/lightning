@@ -10,14 +10,14 @@ import "bytes"
 // its (unquoted) key is byte-equal to one of keep.
 //
 // output is filled from the front and the populated prefix is returned; input is
-// not modified. StripDefaults never lengthens the document, so output needs room for
-// at most len(input) bytes — it is grown (allocated) only when cap(output) is
+// not modified. StripDefaults never lengthens the document, so output needs room
+// for at most len(input) bytes — it is grown (allocated) only when cap(output) is
 // smaller, mirroring UnescapeStringInto. Pass output == input[:0] to strip in
 // place. The returned slice aliases whichever buffer was written.
 //
-// StripDefaults is best effort and forgiving of malformed input: on the first byte it
-// cannot make sense of it copies the remainder of input through verbatim rather
-// than failing.
+// StripDefaults is best effort and forgiving of malformed input: on the first
+// byte it cannot make sense of it copies the remainder of input through verbatim
+// rather than failing.
 //
 // Empty arrays and objects already present in input are dropped, as are members
 // whose value becomes empty after stripping; string values keep their surrounding
@@ -33,38 +33,19 @@ func StripDefaults(input, output []byte, defaults, keep [][]byte, compact bool) 
 	} else {
 		output = output[:len(input)]
 	}
-	c := stripper{in: input, out: output, defaults: defaults, keep: keep, compact: compact}
-	c.defaultLens = lenSet(defaults)
-	c.keepLens = lenSet(keep)
+	s := stripper{
+		in:          input,
+		out:         output,
+		defaults:    defaults,
+		keep:        keep,
+		defaultLens: lenSet(defaults),
+		keepLens:    lenSet(keep),
+		compact:     compact,
+	}
 	// The unconditional skip here tolerates leading whitespace at the document
-	// start even in compact mode; handle's own skips honor c.compact thereafter.
-	_, write := c.handle(false, SkipWS(input, 0), 0)
+	// start even in compact mode; handle's own skips honor the compact flag.
+	_, write := s.handle(SkipWS(input, 0), 0)
 	return output[:write]
-}
-
-// lenSet returns a bitmask with bit n set for every entry of items whose length
-// is n. Lengths >= 64 set the top bit, so a too-long token never short-circuits
-// (it falls through to the scan, which still compares correctly). Used to skip
-// the list scan for tokens whose length matches no candidate — the common case,
-// since most JSON values and keys are longer than any default or kept key.
-func lenSet(items [][]byte) uint64 {
-	var m uint64
-	for _, it := range items {
-		n := len(it)
-		if n >= 64 {
-			n = 63
-		}
-		m |= uint64(1) << uint(n)
-	}
-	return m
-}
-
-// hasLen reports whether n could match an entry summarized by mask m.
-func hasLen(m uint64, n int) bool {
-	if n >= 64 {
-		n = 63
-	}
-	return m&(uint64(1)<<uint(n)) != 0
 }
 
 // stripper carries the read buffer (in), write buffer (out) and the caller's
@@ -81,17 +62,42 @@ type stripper struct {
 	compact     bool
 }
 
+// lenSet returns a bitmask with bit n set for every entry of items whose length
+// is n. Lengths >= 64 set the top bit, so a too-long token never short-circuits
+// (it falls through to the scan, which still compares correctly). Used to skip
+// the list scan for tokens whose length matches no candidate — the common case,
+// since most JSON values and keys are longer than any default or kept key.
+func lenSet(items [][]byte) uint64 {
+	var m uint64
+	for _, it := range items {
+		n := len(it)
+		if n >= 64 {
+			n = 63
+		}
+		m |= uint64(1) << n
+	}
+	return m
+}
+
+// hasLen reports whether n could match an entry summarized by mask m.
+func hasLen(m uint64, n int) bool {
+	if n >= 64 {
+		n = 63
+	}
+	return m&(uint64(1)<<n) != 0
+}
+
 // isDefault reports whether a scalar value should be dropped: an empty token, or
 // one byte-equal to a caller-supplied default.
-func (c *stripper) isDefault(value []byte) bool {
+func (s *stripper) isDefault(value []byte) bool {
 	n := len(value)
 	if n == 0 {
 		return true
 	}
-	if !hasLen(c.defaultLens, n) {
+	if !hasLen(s.defaultLens, n) {
 		return false
 	}
-	for _, d := range c.defaults {
+	for _, d := range s.defaults {
 		if len(d) == n && bytes.Equal(value, d) {
 			return true
 		}
@@ -102,15 +108,15 @@ func (c *stripper) isDefault(value []byte) bool {
 // keepKey reports whether a member with a default value should be kept anyway.
 // key is the raw key token including its surrounding quotes; the comparison is
 // against the bare name, so keep entries are unquoted (e.g. []byte("WallTimeMs")).
-func (c *stripper) keepKey(key []byte) bool {
+func (s *stripper) keepKey(key []byte) bool {
 	if len(key) >= 2 {
 		key = key[1 : len(key)-1]
 	}
 	n := len(key)
-	if !hasLen(c.keepLens, n) {
+	if !hasLen(s.keepLens, n) {
 		return false
 	}
-	for _, k := range c.keep {
+	for _, k := range s.keep {
 		if len(k) == n && bytes.Equal(key, k) {
 			return true
 		}
@@ -123,8 +129,8 @@ func (c *stripper) keepKey(key []byte) bool {
 // input; when the key, colon and value are adjacent there (no whitespace between
 // them — always so for compact input) the whole "key":value span is moved in one
 // copy, otherwise the key and value are copied separately with a synthesized ':'.
-func (c *stripper) emitField(write, keyStart, keyEnd, colonPos, valStart, valEnd int) int {
-	out, in := c.out, c.in
+func (s *stripper) emitField(write, keyStart, keyEnd, colonPos, valStart, valEnd int) int {
+	in, out := s.in, s.out
 	if colonPos == keyEnd && valStart == keyEnd+1 {
 		return write + copy(out[write:], in[keyStart:valEnd])
 	}
@@ -138,25 +144,23 @@ func (c *stripper) emitField(write, keyStart, keyEnd, colonPos, valStart, valEnd
 // out[write], and returns the read and write offsets just past it. A value that
 // strips away to nothing leaves write unchanged, which is how callers detect a
 // dropped member or an emptied container.
-func (c *stripper) handle(key bool, read, write int) (int, int) {
-	in, out, compact := c.in, c.out, c.compact
-	datalen := len(in)
+func (s *stripper) handle(read, write int) (int, int) {
+	in, out, compact := s.in, s.out, s.compact
+	dataLen := len(in)
 	read = skipWSc(in, read, compact)
-	if read == datalen {
+	if read == dataLen {
 		return read, write
 	}
 	// eject copies the unconsumed remainder of input through verbatim, the
 	// best-effort response to a byte the walk cannot interpret.
 	eject := func() (int, int) {
-		copy(out[write:], in[read:])
-		write += datalen - read
-		return datalen, write
+		return dataLen, write + copy(out[write:], in[read:])
 	}
 
 	switch in[read] {
 	case '{':
 		read++
-		if read != datalen && in[read] == '}' {
+		if read != dataLen && in[read] == '}' {
 			return read + 1, write
 		}
 		startWrite := write
@@ -169,9 +173,9 @@ func (c *stripper) handle(key bool, read, write int) (int, int) {
 				out[write] = ','
 				write++
 			}
-			// Parse key position — keys are always quoted strings.
+			// Parse the key — always a quoted string.
 			read = skipWSc(in, read, compact)
-			if read >= datalen || in[read] != '"' {
+			if read >= dataLen || in[read] != '"' {
 				return eject()
 			}
 			keyStart := read
@@ -181,53 +185,46 @@ func (c *stripper) handle(key bool, read, write int) (int, int) {
 			}
 			read = skipWSc(in, keyEnd, compact)
 			colonPos := read
-			if read == datalen || in[read] != ':' {
-				// Missing ':' — copy key then eject.
+			if read == dataLen || in[read] != ':' {
+				// Missing ':' — copy the key, then eject.
 				write += copy(out[write:], in[keyStart:keyEnd])
 				return eject()
 			}
 			read++
 			tmpRead := read
 
-			// Parse value inline for common scalar types.
 			read = skipWSc(in, read, compact)
 			valueEmpty := true
-			if read < datalen {
+			if read < dataLen {
 				switch in[read] {
 				case '"':
 					valEnd, err := skipString(in, read)
 					if err != nil {
-						// Bad string, eject from original position.
-						read = tmpRead
-						write = localStartWrite
+						// Bad string: eject from the original position.
+						read, write = tmpRead, localStartWrite
 						return eject()
 					}
-					evalue := in[read+1 : valEnd-1]
-					if !c.isDefault(evalue) {
+					if !s.isDefault(in[read+1 : valEnd-1]) {
 						valueEmpty = false
-						write = c.emitField(write, keyStart, keyEnd, colonPos, read, valEnd)
+						write = s.emitField(write, keyStart, keyEnd, colonPos, read, valEnd)
 					}
 					read = valEnd
 				case '{', '[':
-					// Fast path: detect empty {} or [] without recursion.
+					// Detect an empty {} or [] without recursing.
 					closeBrace := byte('}')
 					if in[read] == '[' {
 						closeBrace = ']'
 					}
-					peek := skipWSc(in, read+1, compact)
-					if peek < datalen && in[peek] == closeBrace {
-						// Empty nested structure — drop the field.
+					if peek := skipWSc(in, read+1, compact); peek < dataLen && in[peek] == closeBrace {
 						read = peek + 1
 						break
 					}
-					// For nested structures, copy key+colon then recurse.
-					keyLen := keyEnd - keyStart
-					copy(out[write:], in[keyStart:keyEnd])
-					write += keyLen
+					// Non-empty nested value: write key + colon, then recurse.
+					write += copy(out[write:], in[keyStart:keyEnd])
 					out[write] = ':'
 					write++
 					tmpWrite := write
-					read, write = c.handle(false, tmpRead, write)
+					read, write = s.handle(tmpRead, write)
 					if tmpWrite != write {
 						valueEmpty = false
 					} else {
@@ -235,26 +232,26 @@ func (c *stripper) handle(key bool, read, write int) (int, int) {
 					}
 				default:
 					end := findDelimiter(in, read)
-					if !c.isDefault(in[read:end]) {
+					if !s.isDefault(in[read:end]) {
 						valueEmpty = false
-						write = c.emitField(write, keyStart, keyEnd, colonPos, read, end)
+						write = s.emitField(write, keyStart, keyEnd, colonPos, read, end)
 					}
 					read = end
 				}
 			}
 			if valueEmpty {
-				if c.keepKey(in[keyStart:keyEnd]) {
-					// Keep a default-valued member: key + colon + its raw value.
-					write = c.emitField(write, keyStart, keyEnd, colonPos, tmpRead, read)
-					written = true
+				if !s.keepKey(in[keyStart:keyEnd]) {
+					write = localStartWrite // rewind to before the comma
 				} else {
-					write = localStartWrite // rewind to before comma
+					// Keep a default-valued member: key + colon + its raw value.
+					write = s.emitField(write, keyStart, keyEnd, colonPos, tmpRead, read)
+					written = true
 				}
 			} else {
 				written = true
 			}
 			read = skipWSc(in, read, compact)
-			if read == datalen {
+			if read == dataLen {
 				return eject()
 			}
 			switch in[read] {
@@ -263,20 +260,18 @@ func (c *stripper) handle(key bool, read, write int) (int, int) {
 			case '}':
 				read++
 				if write == startWrite+1 {
-					// Empty
-					return read, startWrite
+					return read, startWrite // object emptied
 				}
 				out[write] = '}'
 				write++
 				return read, write
 			default:
-				// Bad delimiter
 				return eject()
 			}
 		}
 	case '[':
 		read++
-		if read != datalen && in[read] == ']' {
+		if read != dataLen && in[read] == ']' {
 			return read + 1, write
 		}
 		startWrite := write
@@ -290,15 +285,14 @@ func (c *stripper) handle(key bool, read, write int) (int, int) {
 				write++
 			}
 			tmpWrite := write
-			read, write = c.handle(false, read, write)
+			read, write = s.handle(read, write)
 			if tmpWrite == write {
-				write = localStartWrite // rewind
+				write = localStartWrite // element stripped away; rewind
 			} else {
 				written = true
 			}
 			read = skipWSc(in, read, compact)
-			if read == datalen {
-				// Bad JSON, no end.
+			if read == dataLen {
 				return eject()
 			}
 			switch in[read] {
@@ -307,43 +301,30 @@ func (c *stripper) handle(key bool, read, write int) (int, int) {
 			case ']':
 				read++
 				if write == startWrite+1 {
-					// Empty
-					return read, startWrite
+					return read, startWrite // array emptied
 				}
 				out[write] = ']'
 				write++
 				return read, write
 			default:
-				// Bad delimiter
 				return eject()
 			}
 		}
 	case '"':
 		send, err := skipString(in, read)
 		if err != nil {
-			// Bad string
 			return eject()
 		}
-		if !key {
-			evalue := in[read+1 : send-1]
-			if c.isDefault(evalue) {
-				return send, write
-			}
+		if s.isDefault(in[read+1 : send-1]) {
+			return send, write
 		}
-
-		value := in[read:send]
-		copy(out[write:], value)
-		write += len(value)
-		return send, write
+		return send, write + copy(out[write:], in[read:send])
 	default:
 		end := findDelimiter(in, read)
-		value := in[read:end]
-		if c.isDefault(value) {
+		if s.isDefault(in[read:end]) {
 			return end, write
 		}
-		copy(out[write:], value)
-		write += len(value)
-		return end, write
+		return end, write + copy(out[write:], in[read:end])
 	}
 }
 
@@ -353,11 +334,9 @@ var delimTable = func() (t [256]bool) {
 	for c := 0; c <= ' '; c++ {
 		t[c] = true
 	}
-	t['{'] = true
-	t['}'] = true
-	t['['] = true
-	t[']'] = true
-	t[','] = true
+	for _, c := range []byte{'{', '}', '[', ']', ','} {
+		t[c] = true
+	}
 	return
 }()
 
