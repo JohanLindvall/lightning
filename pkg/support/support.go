@@ -501,9 +501,9 @@ func ReadFloat64OrNull(data []byte, i int) (float64, int, error) {
 	if fast {
 		return f, end, nil
 	}
-	// scanFloat already tried Eisel-Lemire on the mantissa it extracted; reaching
-	// here means the value is genuinely one only strconv resolves (an ambiguous
-	// rounding or a mantissa of more than 19 significant digits).
+	// scanFloat already tried Eisel–Lemire on the extracted mantissa/exp10; reaching
+	// here means it declined (e.g. >19 significant digits, ambiguous rounding,
+	// subnormal/overflow, or exponent outside the table), so defer to strconv.
 	// unsafeStr avoids copying the token; ParseFloat does not retain it.
 	f, perr := strconv.ParseFloat(unsafeStr(data[i:end]), 64)
 	if perr != nil {
