@@ -9,7 +9,7 @@ import (
 )
 
 // TestParseFloatMatchesStrconv hammers the full float path (ParseFloat, which
-// runs scanFloat's Clinger fast path then eiselLemireParse before strconv)
+// runs scanFloat's Clinger fast path then eiselLemire64 before strconv)
 // against strconv.ParseFloat over many random and structured numbers, requiring
 // bit-for-bit equality. This guards the Eisel-Lemire fast path: whenever it
 // returns a value it must equal strconv's to the bit.
