@@ -3,6 +3,7 @@ package support
 import (
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -287,6 +288,9 @@ func TestFastFloat(t *testing.T) {
 		"12e2":   1200,
 		"12E2":   1200,
 		"1.5e-1": 0.15,
+		// Outside the Clinger exponent range [-22, 22] but an exact (<= 19 digit)
+		// mantissa, so scanFloat resolves it on the Eisel-Lemire fast path.
+		"1e-23": 1e-23,
 	}
 	for in, want := range okCases {
 		got, ok := fastFloat([]byte(in))
@@ -301,8 +305,7 @@ func TestFastFloat(t *testing.T) {
 
 	declined := []string{
 		"",                     // empty
-		"1e23",                 // exp above 22
-		"1e-23",                // exp below -22
+		"1e23",                 // exactly halfway: Eisel-Lemire declines, defers to strconv
 		"1e",                   // missing exp digits
 		"1e+",                  // missing exp digits after sign
 		"12345678901234567890", // 20 digits, > 19
@@ -892,5 +895,66 @@ func TestErrorSentinels(t *testing.T) {
 				t.Errorf("sentinel %d and %d compare equal", i, j)
 			}
 		}
+	}
+}
+
+// TestCountArrayElements covers the SkipValue-based element counter: nested
+// arrays, strings with structural bytes inside, objects, whitespace, and the
+// malformed/empty cases that must return 0 (so the caller falls back to append).
+func TestCountArrayElements(t *testing.T) {
+	tests := []struct {
+		in   string
+		want int
+	}{
+		{`[]`, 0},
+		{`[1]`, 1},
+		{`[1,2,3]`, 3},
+		{` [ 1 , 2 , 3 ] `, 3}, // callers must position i at '[' (after their own whitespace skip)
+		{`["a","b"]`, 2},
+		{`["a,b","c]d"]`, 2},        // commas/brackets inside strings are not counted
+		{`[{"x":1},{"y":[2,3]}]`, 2}, // object elements
+		{`[[1,2],[3,4],[5,6]]`, 3},   // nested arrays (the coordinate shape)
+		{`[[[1,2],[3,4]]]`, 1},       // one outer element
+		{`[null,true,false]`, 3},
+		{`[`, 0},        // truncated
+		{`[1,2`, 0},     // unterminated
+		{`[1,2,]`, 0},   // trailing comma -> bail to append
+		{`{}`, 0},       // not an array
+		{``, 0},         // empty input
+	}
+	for _, tt := range tests {
+		// The caller positions i at '[' (after its own SkipWS); mirror that.
+		i := 0
+		for i < len(tt.in) && (tt.in[i] == ' ' || tt.in[i] == '\t') {
+			i++
+		}
+		if got := CountArrayElements([]byte(tt.in), i); got != tt.want {
+			t.Errorf("CountArrayElements(%q) = %d, want %d", tt.in, got, tt.want)
+		}
+	}
+}
+
+// TestDecodeValueCompact checks the compact dynamic-decode path: on whitespace-
+// free input it must agree with DecodeValue (objects, arrays, and nesting), and
+// it still tolerates leading whitespace at the value itself (only inter-token
+// whitespace is assumed absent).
+func TestDecodeValueCompact(t *testing.T) {
+	compact := []byte(`{"a":1,"b":[true,null,"x"],"c":{"d":2.5}}`)
+	want, end1, err1 := DecodeValue(compact, 0)
+	got, end2, err2 := DecodeValueCompact(compact, 0)
+	if err1 != nil || err2 != nil {
+		t.Fatalf("DecodeValue err=%v, DecodeValueCompact err=%v", err1, err2)
+	}
+	if end1 != end2 {
+		t.Fatalf("end mismatch: %d vs %d", end1, end2)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("compact decode != non-compact\n got %#v\nwant %#v", got, want)
+	}
+	// Like DecodeValue, the compact variant assumes data[i] is the value start
+	// (the caller has skipped any leading whitespace), so both decode a bare
+	// scalar identically.
+	if v, _, err := DecodeValueCompact([]byte(`42`), 0); err != nil || v != 42.0 {
+		t.Fatalf("scalar: got %v, %v", v, err)
 	}
 }

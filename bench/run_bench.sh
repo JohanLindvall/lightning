@@ -58,6 +58,28 @@ shopt -s nullglob
 status=0
 for dir in */; do
 	[ -f "${dir}data.go" ]    || continue
+	# A case whose input.json is too large to commit (e.g. bench/large-json) ships
+	# a tiny input.url pointing at the data instead; fetch it on demand so the case
+	# is runnable from a fresh checkout. A failed download leaves no input.json, so
+	# the case is simply skipped below.
+	if [ ! -f "${dir}input.json" ] && [ -f "${dir}input.url" ]; then
+		url=$(tr -d '[:space:]' < "${dir}input.url")
+		echo "==> bench/${dir}: downloading input.json from ${url}"
+		# A .gz URL (e.g. the go-json-experiment testdata) is fetched to a temp
+		# file and gunzipped into input.json; anything else is fetched directly.
+		dl="${dir}input.json"
+		case "$url" in *.gz) dl="${dir}input.json.gz" ;; esac
+		if command -v curl >/dev/null 2>&1; then
+			curl -fsSL -o "$dl" "$url" || rm -f "$dl"
+		elif command -v wget >/dev/null 2>&1; then
+			wget -qO "$dl" "$url" || rm -f "$dl"
+		else
+			echo "  no curl or wget available to download ${dir}input.json" >&2
+		fi
+		if [ "$dl" != "${dir}input.json" ] && [ -f "$dl" ]; then
+			gunzip -f "$dl" || rm -f "$dl" "${dir}input.json"
+		fi
+	fi
 	[ -f "${dir}input.json" ] || { echo "skip ${dir}: no input.json" >&2; continue; }
 	echo "==> bench/${dir}"
 
@@ -92,6 +114,8 @@ import (
 	"os"
 	"testing"
 
+	"github.com/bytedance/sonic"
+	jsonv2 "github.com/go-json-experiment/json"
 	ej "__EJ_IMPORT__"
 )
 
@@ -138,6 +162,35 @@ func BenchmarkEasyjson(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		var v ej.Log
 		if err := v.UnmarshalJSON(benchInput); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkSonic measures bytedance/sonic's JIT decoder. It decodes into logStd
+// (the methodless type) so sonic uses its own reflection/JIT decoder rather than
+// the generated UnmarshalJSON, an apples-to-apples third-party comparison.
+func BenchmarkSonic(b *testing.B) {
+	b.SetBytes(int64(len(benchInput)))
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		var v logStd
+		if err := sonic.Unmarshal(benchInput, &v); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkJSONV2 measures the json/v2 reference implementation
+// (github.com/go-json-experiment/json, the basis of encoding/json/v2). Like the
+// stdlib and sonic cases it decodes into logStd, so it uses its own reflection
+// decoder rather than the generated UnmarshalJSON.
+func BenchmarkJSONV2(b *testing.B) {
+	b.SetBytes(int64(len(benchInput)))
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		var v logStd
+		if err := jsonv2.Unmarshal(benchInput, &v); err != nil {
 			b.Fatal(err)
 		}
 	}

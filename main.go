@@ -100,8 +100,29 @@ func generate(inPath string) error {
 		return fmt.Errorf("no top-level struct types found")
 	}
 
+	// A top-level type that is nested inside another (referenced by one of its
+	// fields, directly or through slices/maps/pointers/anonymous structs) gets
+	// only an internal decode function, not its own UnmarshalJSON method: the
+	// referencing root emits the function when it reaches the field. Emitting a
+	// method on such a nested type would attach json.Unmarshaler to it, so the
+	// `type logStd Log` reflection baselines (stdlib, sonic, json/v2) used in the
+	// benchmarks would route through the generated decoder instead. Named nested
+	// types are needed for recursive or shared schemas (e.g. a tree node, a FHIR
+	// code) that an anonymous struct cannot express. With one top-level type — the
+	// common case — nothing is referenced, so every type still gets its method.
+	referenced := map[string]bool{}
+	for _, name := range g.order {
+		for _, f := range g.structTypes[name].Fields.List {
+			g.markReferenced(f.Type, name, referenced)
+		}
+	}
+	allReferenced := len(referenced) == len(g.order) // degenerate (fully cyclic); emit all
+
 	var methods []string
 	for _, name := range g.order {
+		if referenced[name] && !allReferenced {
+			continue // nested in another type; its decoder is emitted there
+		}
 		g.compact = g.compactTypes[name]
 		g.prefix = "lightning" + g.pathFrag + name
 		methods = append(methods, g.genUnmarshal(name))
@@ -713,12 +734,16 @@ func (g *gen) anyValue(dest string) string {
 	g.needAny = true
 	g.needBool = true
 	g.needFloat = true
-	return fmt.Sprintf(`val, end, err := support.DecodeValue(data, i)
+	decode := "support.DecodeValue"
+	if g.compact {
+		decode = "support.DecodeValueCompact"
+	}
+	return fmt.Sprintf(`val, end, err := %s(data, i)
 if err != nil {
 	return end, err
 }
 %s = val
-i = end`, dest)
+i = end`, decode, dest)
 }
 
 func (g *gen) skipEmit() string {
@@ -845,8 +870,32 @@ func (g *gen) slicePresize(elt ast.Expr, eltStr string) string {
 		case t.Name == "string":
 			counter = "support.CountArrayElements"
 		}
-	case *ast.StructType, *ast.ArrayType, *ast.MapType:
+		// Presize a slice of structs only when each element is cheap to skip — a
+		// flat record of scalars and strings, like a Cloudflare log line. If an
+		// element nests a slice, array, map, or interface (the citm_catalog
+		// performances → seatCategories → areas tree, or a citylots Feature whose
+		// geometry holds a [][][]float64), the CountArrayElements scan that sizes
+		// the slice must descend through every element's whole subtree — which the
+		// decoder then walks again — costing far more than the reallocations
+		// presize avoids. There, let the slice append instead.
+	case *ast.StructType:
+		if g.structSkipIsCheap(t) {
+			counter = "support.CountArrayElements"
+		}
+	case *ast.MapType:
 		counter = "support.CountArrayElements"
+	case *ast.ArrayType:
+		// elt is itself a slice/array. Presize this level only when its element
+		// is a leaf (a scalar slice like []float64, or a slice of structs/
+		// strings) — there the count is the number of inner slices and presizing
+		// avoids real reallocation. For a slice *of slices of slices*, the outer
+		// dimension is typically small, yet counting it would deep-scan every
+		// element that the inner decoders then re-scan; skip presize there so the
+		// outer slice just appends (a handful of elements, no measurable realloc)
+		// instead of paying for a full structural pass.
+		if _, nested := unparen(t.Elt).(*ast.ArrayType); !nested {
+			counter = "support.CountArrayElements"
+		}
 	case *ast.SelectorExpr:
 		if isTime(t) || isRaw(t) {
 			counter = "support.CountArrayElements"
@@ -964,6 +1013,49 @@ func (g *gen) isStruct(expr ast.Expr) bool {
 	return false
 }
 
+// structSkipIsCheap reports whether skipping a JSON value of expr (transitively,
+// descending through structs, pointers, and named struct types) is cheap and
+// bounded — which decides whether presizing a slice of this element type pays
+// off (see slicePresize). A scalar, string, time, or raw leaf, and a struct
+// built only from those, skips in a single bounded SIMD pass; presizing a slice
+// of such records (a Cloudflare log line, say) is worth the count.
+//
+// A slice, array, map, or interface field is not cheap: skipping it is unbounded
+// and recursive, so a counting scan would re-traverse the whole subtree the
+// decoder walks anyway — far more work than the ~log2(n) backing-array
+// reallocations presize would save. That covers a multi-dimensional [][][]float64
+// of GeoJSON coordinates and the citm_catalog performances → seatCategories →
+// areas tree alike.
+func (g *gen) structSkipIsCheap(expr ast.Expr) bool {
+	return g.structSkipIsCheapSeen(expr, map[string]bool{})
+}
+
+func (g *gen) structSkipIsCheapSeen(expr ast.Expr, seen map[string]bool) bool {
+	switch t := unparen(expr).(type) {
+	case *ast.ArrayType, *ast.MapType, *ast.InterfaceType:
+		return false
+	case *ast.StarExpr:
+		return g.structSkipIsCheapSeen(t.X, seen)
+	case *ast.StructType:
+		for _, f := range t.Fields.List {
+			if !g.structSkipIsCheapSeen(f.Type, seen) {
+				return false
+			}
+		}
+		return true
+	case *ast.Ident:
+		if seen[t.Name] {
+			return true // recursive type already being walked; don't recount
+		}
+		seen[t.Name] = true
+		if st, ok := g.structTypes[t.Name]; ok {
+			return g.structSkipIsCheapSeen(st, seen)
+		}
+		return true // a scalar named type (int, string, ...)
+	}
+	return true // selector leaves (time.Time, json.RawMessage)
+}
+
 func (g *gen) baseName(expr ast.Expr) string {
 	switch t := expr.(type) {
 	case *ast.ParenExpr:
@@ -991,11 +1083,28 @@ func (g *gen) baseName(expr ast.Expr) string {
 const supportPkg = "github.com/JohanLindvall/lightning/pkg/support"
 
 func (g *gen) assemble(inPath string, methods []string) string {
+	var body strings.Builder
+	for _, m := range methods {
+		body.WriteString(m)
+		body.WriteString("\n\n")
+	}
+	for _, d := range g.decoders {
+		body.WriteString(d)
+		body.WriteString("\n\n")
+	}
+	code := body.String()
+
+	// "time" and "encoding/json" are needed only when a spelled type actually
+	// names them (time.Time, or json.RawMessage/RawValue in an anonymous struct,
+	// slice or map element). Decide from the generated text rather than from
+	// heuristic flags: those both miss types nested inside an anonymous struct and
+	// over-fire on a nocopy raw field whose decode emits no json. reference. The
+	// tokens appear only as real type usages, never in the generated comments.
 	imports := []string{strconv.Quote(supportPkg)}
-	if g.needJSON {
+	if strings.Contains(code, "json.RawMessage") || strings.Contains(code, "json.RawValue") {
 		imports = append(imports, `json "encoding/json"`)
 	}
-	if g.needTime {
+	if strings.Contains(code, "time.Time") {
 		imports = append(imports, `"time"`)
 	}
 
@@ -1007,15 +1116,7 @@ func (g *gen) assemble(inPath string, methods []string) string {
 		fmt.Fprintf(&b, "\t%s\n", im)
 	}
 	b.WriteString(")\n\n")
-
-	for _, m := range methods {
-		b.WriteString(m)
-		b.WriteString("\n\n")
-	}
-	for _, d := range g.decoders {
-		b.WriteString(d)
-		b.WriteString("\n\n")
-	}
+	b.WriteString(code)
 	return b.String()
 }
 
@@ -1079,6 +1180,30 @@ func singular(s string) string {
 		return s[:len(s)-1]
 	}
 	return s
+}
+
+// markReferenced records, in ref, every top-level struct type named anywhere
+// within expr — through pointers, slices, maps, and anonymous structs — except
+// self, so a recursive type referencing only itself is not treated as nested in
+// another. It stops at named types (they are walked on their own pass), so it
+// captures direct references rather than recursing through the whole graph.
+func (g *gen) markReferenced(expr ast.Expr, self string, ref map[string]bool) {
+	switch t := unparen(expr).(type) {
+	case *ast.Ident:
+		if _, ok := g.structTypes[t.Name]; ok && t.Name != self {
+			ref[t.Name] = true
+		}
+	case *ast.StarExpr:
+		g.markReferenced(t.X, self, ref)
+	case *ast.ArrayType:
+		g.markReferenced(t.Elt, self, ref)
+	case *ast.MapType:
+		g.markReferenced(t.Value, self, ref)
+	case *ast.StructType:
+		for _, f := range t.Fields.List {
+			g.markReferenced(f.Type, self, ref)
+		}
+	}
 }
 
 // unparen strips any enclosing parentheses from a type expression.

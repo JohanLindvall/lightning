@@ -261,9 +261,19 @@ func UnescapeStringInto(in, out []byte) (string, error) {
 }
 
 // decodeStringEscaped is the slow path for quoted strings containing backslash
-// escapes, terminated by the closing quote in data. It allocates a new buffer.
+// escapes, terminated by the closing quote in data. It allocates a new buffer
+// sized to the string body: the closing quote is located up front (data[start-1]
+// is the opening quote) and, since unescaping never lengthens a string, the
+// decoded result fits in body-length bytes with a single allocation. Sizing to
+// len(data)-start instead over-allocated by the whole remaining document, which
+// is catastrophic for an escaped string near the start of a large input (e.g.
+// the many "\/"-escaped URLs in a multi-hundred-KB Twitter payload).
 func decodeStringEscaped(data []byte, start, i int) (string, int, error) {
-	return decodeEscaped(make([]byte, 0, len(data)-start), data, start, i, true)
+	capHint := i - start // fallback: the escape-free prefix; append grows the rest
+	if end, err := skipString(data, start-1); err == nil {
+		capHint = end - 1 - start // end is past the closing quote
+	}
+	return decodeEscaped(make([]byte, 0, capHint), data, start, i, true)
 }
 
 // decodeEscaped decodes a backslash-escaped string body, starting from the
@@ -491,6 +501,9 @@ func ReadFloat64OrNull(data []byte, i int) (float64, int, error) {
 	if fast {
 		return f, end, nil
 	}
+	// scanFloat already tried Eisel–Lemire on the extracted mantissa/exp10; reaching
+	// here means it declined (e.g. >19 significant digits, ambiguous rounding,
+	// subnormal/overflow, or exponent outside the table), so defer to strconv.
 	// unsafeStr avoids copying the token; ParseFloat does not retain it.
 	f, perr := strconv.ParseFloat(unsafeStr(data[i:end]), 64)
 	if perr != nil {
@@ -521,14 +534,18 @@ func ParseFloat(b []byte) (float64, error) {
 }
 
 // scanFloat scans the JSON number token beginning at data[i] in a single pass,
-// returning the index just past it and, when the value lies on the Clinger fast
-// path (an exactly representable mantissa < 2^53 with a decimal exponent in
-// [-22, 22]), the parsed value with fast=true. Otherwise fast=false and the
-// caller parses data[i:end] with strconv.ParseFloat. ok=false marks a token with
-// no digits (or an exponent marker with no digits), in which case end points at
-// the offending byte.
+// returning the index just past it and, when it can resolve the value exactly,
+// the parsed result with fast=true. Two fast paths run on the mantissa and
+// exponent the scan extracts, so no rescan is needed: the Clinger path (an
+// exactly representable mantissa < 2^53 with a decimal exponent in [-22, 22],
+	// converted with one multiply or divide) and, for an exact mantissa that misses
+	// Clinger, Eisel-Lemire (a 128-bit multiply — see eiselLemire64). Values with a
+	// mantissa of more than 19 significant digits, ambiguous rounding, subnormal/
+	// overflow results, or an exponent outside the powers-of-ten table return
+	// fast=false, leaving the caller to parse data[i:end] with strconv.ParseFloat.
+// marker with no digits), in which case end points at the offending byte.
 //
-// Folding the token scan and the fast-path parse into one pass spares the
+// Folding the token scan and both fast-path parses into one pass spares the
 // separate skipNumber scan the previous two-call form made; and because the scan
 // always runs to the end of the token, the slow path no longer pays for the
 // fast-path parser's full rescan-then-reject before handing off to strconv.
@@ -631,6 +648,11 @@ func scanFloat(data []byte, i int) (f float64, end int, fast, ok bool) {
 		}
 	}
 	if overflow || mant>>53 != 0 {
+		if !overflow {
+			if v, ok := eiselLemire64(mant, exp, neg); ok {
+				return v, end, true, true
+			}
+		}
 		return 0, end, false, true // hand the exact token to strconv
 	}
 
@@ -643,6 +665,9 @@ func scanFloat(data []byte, i int) (f float64, end int, fast, ok bool) {
 	case exp < 0 && exp >= -22:
 		f /= pow10exact[-exp]
 	default:
+		if v, ok := eiselLemire64(mant, exp, neg); ok {
+			return v, end, true, true
+		}
 		return 0, end, false, true
 	}
 	if neg {
@@ -929,12 +954,18 @@ func ExpectNull(data []byte, i int) (int, error) {
 
 // CountArrayElements returns the number of top-level elements in the JSON array
 // beginning at data[i] (data[i] must be '['), so a destination slice can be
-// allocated once instead of grown by repeated append. It makes a single pass,
-// descending into nested arrays/objects and skipping string contents so that
-// commas inside them are not miscounted. It returns 0 for an empty array or when
-// the count cannot be determined cheaply (a truncated or malformed array); the
-// caller then simply falls back to append-driven growth, so an imperfect count
-// is only ever a missed optimization, never a correctness problem.
+// allocated once instead of grown by repeated append. It returns 0 for an empty
+// array or when the count cannot be determined cheaply (a truncated or malformed
+// array); the caller then simply falls back to append-driven growth, so an
+// imperfect count is only ever a missed optimization, never a correctness
+// problem.
+//
+// Each element is skipped whole with SkipValue rather than walked byte by byte:
+// SkipValue uses the SIMD indexStructural scanner for nested arrays/objects and
+// indexCloseOrEscape for strings, so a structurally dense element — a nested
+// coordinate array of many numbers, say — is jumped over in vectorized strides
+// instead of one byte at a time. This is what makes presizing slices of arrays,
+// objects, or strings cheap.
 func CountArrayElements(data []byte, i int) int {
 	if i >= len(data) || data[i] != '[' {
 		return 0
@@ -944,35 +975,28 @@ func CountArrayElements(data []byte, i int) int {
 		return 0
 	}
 	n := 1
-	depth := 0
-	for i < len(data) {
+	for {
+		end, err := SkipValue(data, i)
+		if err != nil {
+			return 0
+		}
+		i = SkipWS(data, end)
+		if i >= len(data) {
+			return 0
+		}
 		switch data[i] {
-		case '"':
-			end, err := skipString(data, i)
-			if err != nil {
+		case ']':
+			return n
+		case ',':
+			n++
+			i = SkipWS(data, i+1)
+			if i >= len(data) {
 				return 0
 			}
-			i = end
-			continue
-		case '[', '{':
-			depth++
-		case ']':
-			if depth == 0 {
-				return n
-			}
-			depth--
-		case '}':
-			if depth > 0 {
-				depth--
-			}
-		case ',':
-			if depth == 0 {
-				n++
-			}
+		default:
+			return 0 // malformed; let the caller grow on demand
 		}
-		i++
 	}
-	return 0 // unterminated; let the caller grow on demand
 }
 
 // CountArrayScalars counts the elements of a JSON array of scalar values
@@ -1456,9 +1480,22 @@ func objectField(data []byte, i int, key string, compact bool) (int, error) {
 }
 
 // DecodeValue decodes an arbitrary JSON value at data[i] into the standard Go
-// representation (nil, bool, float64, string, []any,
-// map[string]any).
+// representation (nil, bool, float64, string, []any, map[string]any).
 func DecodeValue(data []byte, i int) (any, int, error) {
+	return decodeValue(data, i, false)
+}
+
+// DecodeValueCompact is DecodeValue for compact JSON — input with no whitespace
+// between tokens — skipping the inter-token whitespace scans DecodeValue makes
+// while walking objects and arrays. The generator routes the dynamic any/map
+// value path here for a //lightning:compact type. On compact input it behaves
+// identically to DecodeValue but faster; given inter-token whitespace it may
+// report an error.
+func DecodeValueCompact(data []byte, i int) (any, int, error) {
+	return decodeValue(data, i, true)
+}
+
+func decodeValue(data []byte, i int, compact bool) (any, int, error) {
 	if i >= len(data) {
 		return nil, i, ErrTruncated
 	}
@@ -1467,9 +1504,9 @@ func DecodeValue(data []byte, i int) (any, int, error) {
 		s, end, err := ReadStringOrNull(data, i)
 		return s, end, err
 	case '{':
-		return decodeAnyObject(data, i)
+		return decodeAnyObject(data, i, compact)
 	case '[':
-		return decodeAnyArray(data, i)
+		return decodeAnyArray(data, i, compact)
 	case 't', 'f':
 		b, end, err := ReadBoolOrNull(data, i)
 		return b, end, err
@@ -1482,12 +1519,12 @@ func DecodeValue(data []byte, i int) (any, int, error) {
 	}
 }
 
-func decodeAnyObject(data []byte, i int) (any, int, error) {
+func decodeAnyObject(data []byte, i int, compact bool) (any, int, error) {
 	// data[i] == '{'
 	i++
 	m := map[string]any{}
 	for {
-		i = SkipWS(data, i)
+		i = skipWSc(data, i, compact)
 		if i >= len(data) {
 			return nil, i, ErrTruncated
 		}
@@ -1498,17 +1535,17 @@ func decodeAnyObject(data []byte, i int) (any, int, error) {
 		if err != nil {
 			return nil, ni, err
 		}
-		i = SkipWS(data, ni)
+		i = skipWSc(data, ni, compact)
 		if i >= len(data) || data[i] != ':' {
 			return nil, i, ErrExpectColon
 		}
-		i = SkipWS(data, i+1)
-		val, end, err := DecodeValue(data, i)
+		i = skipWSc(data, i+1, compact)
+		val, end, err := decodeValue(data, i, compact)
 		if err != nil {
 			return nil, end, err
 		}
 		m[string([]byte(key))] = val
-		i = SkipWS(data, end)
+		i = skipWSc(data, end, compact)
 		if i >= len(data) {
 			return nil, i, ErrTruncated
 		}
@@ -1522,24 +1559,24 @@ func decodeAnyObject(data []byte, i int) (any, int, error) {
 	}
 }
 
-func decodeAnyArray(data []byte, i int) (any, int, error) {
+func decodeAnyArray(data []byte, i int, compact bool) (any, int, error) {
 	// data[i] == '['
 	i++
 	a := []any{}
 	for {
-		i = SkipWS(data, i)
+		i = skipWSc(data, i, compact)
 		if i >= len(data) {
 			return nil, i, ErrTruncated
 		}
 		if data[i] == ']' {
 			return a, i + 1, nil
 		}
-		val, end, err := DecodeValue(data, i)
+		val, end, err := decodeValue(data, i, compact)
 		if err != nil {
 			return nil, end, err
 		}
 		a = append(a, val)
-		i = SkipWS(data, end)
+		i = skipWSc(data, end, compact)
 		if i >= len(data) {
 			return nil, i, ErrTruncated
 		}
