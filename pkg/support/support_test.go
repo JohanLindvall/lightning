@@ -129,10 +129,10 @@ func TestUnwrap(t *testing.T) {
 		{"plain array", `"[1,2,3]"`, `[1,2,3]`, nil},
 		{"plain with leading ws", `"  {\"x\":1}"`, `  {"x":1}`, nil},
 		{"plain scalar", `"42"`, `42`, nil},
-		{"base64 padded", `"eyJ4IjoxfQ=="`, `{"x":1}`, nil},          // base64({"x":1})
-		{"base64 unpadded", `"eyJ4IjoxfQ"`, `{"x":1}`, nil},          // RawStd
-		{"base64 array", `"WzEsMiwzXQ=="`, `[1,2,3]`, nil},           // base64([1,2,3])
-		{"null", `null`, "", nil},                                   // nil document
+		{"base64 padded", `"eyJ4IjoxfQ=="`, `{"x":1}`, nil}, // base64({"x":1})
+		{"base64 unpadded", `"eyJ4IjoxfQ"`, `{"x":1}`, nil}, // RawStd
+		{"base64 array", `"WzEsMiwzXQ=="`, `[1,2,3]`, nil},  // base64([1,2,3])
+		{"null", `null`, "", nil},                           // nil document
 		{"not a string", `42`, "", ErrInvalidJSON},
 	}
 	for _, tt := range tests {
@@ -437,10 +437,10 @@ func TestReadTimeOrNull(t *testing.T) {
 			"2023-01-02T15:04:05-11:30",
 			"2023-01-02T15:04:05.250+00:00",
 			"0001-01-01T00:00:00Z",
-			"2023-1x-02T15:04:05Z",  // non-digit in month
-			"2023-01-02T15:04:6zZ",  // non-digit in seconds
-			"2023-13-02T15:04:05Z",  // month out of range
-			"2023-01-02T15:04:05X",  // bad zone
+			"2023-1x-02T15:04:05Z",     // non-digit in month
+			"2023-01-02T15:04:6zZ",     // non-digit in seconds
+			"2023-13-02T15:04:05Z",     // month out of range
+			"2023-01-02T15:04:05X",     // bad zone
 			"2023-01-02T15:04:05+2:00", // malformed offset
 			"not-a-time",
 		}
@@ -801,9 +801,9 @@ func TestIndexCloseOrEscapeScalar(t *testing.T) {
 		{`abc`, 3},
 		{`ab"c`, 2},
 		{`ab\c`, 2},
-		{`a\"b`, 1},  // backslash before quote
-		{`"`, 0},     // quote first
-		{`\`, 0},     // backslash first
+		{`a\"b`, 1}, // backslash before quote
+		{`"`, 0},    // quote first
+		{`\`, 0},    // backslash first
 		{`abc"def`, 3},
 		{strings.Repeat("x", 50) + `"`, 50}, // long, quote at end
 		{strings.Repeat("x", 50) + `\`, 50}, // long, backslash at end
@@ -911,16 +911,16 @@ func TestCountArrayElements(t *testing.T) {
 		{`[1,2,3]`, 3},
 		{` [ 1 , 2 , 3 ] `, 3}, // callers must position i at '[' (after their own whitespace skip)
 		{`["a","b"]`, 2},
-		{`["a,b","c]d"]`, 2},        // commas/brackets inside strings are not counted
+		{`["a,b","c]d"]`, 2},         // commas/brackets inside strings are not counted
 		{`[{"x":1},{"y":[2,3]}]`, 2}, // object elements
 		{`[[1,2],[3,4],[5,6]]`, 3},   // nested arrays (the coordinate shape)
 		{`[[[1,2],[3,4]]]`, 1},       // one outer element
 		{`[null,true,false]`, 3},
-		{`[`, 0},        // truncated
-		{`[1,2`, 0},     // unterminated
-		{`[1,2,]`, 0},   // trailing comma -> bail to append
-		{`{}`, 0},       // not an array
-		{``, 0},         // empty input
+		{`[`, 0},      // truncated
+		{`[1,2`, 0},   // unterminated
+		{`[1,2,]`, 0}, // trailing comma -> bail to append
+		{`{}`, 0},     // not an array
+		{``, 0},       // empty input
 	}
 	for _, tt := range tests {
 		// The caller positions i at '[' (after its own SkipWS); mirror that.
