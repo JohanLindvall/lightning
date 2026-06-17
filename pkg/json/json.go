@@ -21,8 +21,7 @@ func UnescapeString(in []byte) (string, error) {
 }
 
 // UnescapeStringInto is like UnescapeString but writes the decoded bytes
-// into out instead of allocating, mirroring the Unescape(in, out) convention of
-// github.com/buger/jsonparser. If in has no escapes the returned string aliases
+// into out instead of allocating. If in has no escapes the returned string aliases
 // in and out is untouched; otherwise the decode goes into out (allocating only
 // if cap(out) < len(in), since unescaping never lengthens a string) and the
 // returned string aliases out.
@@ -45,9 +44,8 @@ func ParseFloat(b []byte) (float64, error) {
 }
 
 // Get walks the object-key path keys into the JSON document data and returns
-// the raw bytes of the value found at that path, modeled on
-// github.com/buger/jsonparser's Get but without reporting a value type. It is
-// built on the scanner primitives, so non-target object members are skipped
+// the raw bytes of the value found at that path, without reporting a value type.
+// It is built on the scanner primitives, so non-target object members are skipped
 // without allocating and the returned slice aliases data (the caller must keep
 // data unchanged while the result is in use).
 //
@@ -56,8 +54,8 @@ func ParseFloat(b []byte) (float64, error) {
 // it is the literal token. The returned int is the offset in data at which the
 // value begins. Each key must name a member of the object at the current level,
 // otherwise Get returns ErrKeyNotFound; with no keys it returns the document's
-// root value. To replicate jsonparser's "value exists and is an object" check
-// without inspecting a type, test err == nil and that the first byte is '{'.
+// root value. To check "value exists and is an object" without inspecting a
+// type, test err == nil and that the first byte is '{'.
 func Get(data []byte, keys ...string) ([]byte, int, error) {
 	return support.Get(data, keys...)
 }
@@ -93,10 +91,9 @@ func GetManyCompact(data []byte, keys []string, out [][]byte) ([][]byte, error) 
 }
 
 // ObjectEach calls fn once for every member of the JSON object reached by the
-// object-key path keys in data, modeled on github.com/buger/jsonparser's
-// ObjectEach but without reporting a value type. fn receives the member's
-// decoded key and the raw bytes of its value (both aliasing data, so the caller
-// must keep data unchanged while they are in use); the value follows the same
+// object-key path keys in data, without reporting a value type. fn receives the
+// member's decoded key and the raw bytes of its value (both aliasing data, so the
+// caller must keep data unchanged while they are in use); the value follows the same
 // conventions as Get — quotes kept for strings, the full span for objects and
 // arrays, the literal token for scalars.
 //
@@ -153,4 +150,22 @@ const (
 // (AssumeCompact), or keep the input's formatting (PreserveWhitespace).
 func StripDefaults(input, output []byte, defaults, keep [][]byte, ws WhitespaceMode) []byte {
 	return support.StripDefaults(input, output, defaults, keep, ws)
+}
+
+// Set returns the JSON document in with the value at the object-key path keys
+// replaced by the raw JSON value rawVal, written into out. When the path does
+// not exist it is created: a missing member is inserted into its parent object,
+// and a missing intermediate object — or a non-object value found where the path
+// still needs to descend — is created as nested objects. With no keys the whole
+// document is replaced by rawVal.
+//
+// rawVal is inserted verbatim and must be a single well-formed JSON value; newly
+// created keys are written as JSON strings without escaping, so they should not
+// contain characters that need escaping. Inter-token whitespace in in is
+// tolerated and preserved outside the edited span.
+//
+// out is filled from out[:0] and returned (pass a reusable buffer to avoid
+// allocation; a nil out allocates). out must not alias in.
+func Set(in, out, rawVal []byte, keys []string) []byte {
+	return support.Set(in, out, rawVal, keys)
 }

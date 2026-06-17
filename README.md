@@ -236,9 +236,8 @@ its surrounding quotes with escapes intact, an object or array spans the whole
 
 - `Get(data []byte, keys ...string) ([]byte, int, error)` — walks the object-key
   path `keys` one level per key and returns the value's raw bytes (and the offset
-  it starts at), modeled on [buger/jsonparser](https://github.com/buger/jsonparser)'s
-  `Get`. With no keys it returns the whole root value; a missing key returns
-  `ErrKeyNotFound`.
+  it starts at), without reporting a value type. With no keys it returns the whole
+  root value; a missing key returns `ErrKeyNotFound`.
 - `GetMany(data []byte, keys []string, out [][]byte) ([][]byte, error)` — looks up
   several *top-level* keys in a **single pass** over the object, where N separate
   `Get` calls would rescan it N times. Results are written into `out[:0]` (pass a
@@ -280,8 +279,7 @@ just want to decode or encode it.
   `in` contains no escapes the result aliases `in` with no copy; otherwise a new
   string is allocated. `in` is left unchanged.
 - `UnescapeStringInto(in, out []byte) (string, error)` — same, but writes the
-  decoded bytes into `out` instead of allocating (mirroring the `Unescape(in,
-  out)` convention of [buger/jsonparser](https://github.com/buger/jsonparser)).
+  decoded bytes into `out` instead of allocating.
   With no escapes the result aliases `in`; otherwise it aliases `out` and
   allocates nothing when `cap(out) >= len(in)`, since unescaping never lengthens
   a string. Pass `out == in` (e.g. `in[:0]`) to decode truly in place,
