@@ -870,15 +870,16 @@ func (g *gen) slicePresize(elt ast.Expr, eltStr string) string {
 		case t.Name == "string":
 			counter = "support.CountArrayElements"
 		}
+		// Presize a slice of structs only when each element is cheap to skip — a
+		// flat record of scalars and strings, like a Cloudflare log line. If an
+		// element nests a slice, array, map, or interface (the citm_catalog
+		// performances → seatCategories → areas tree, or a citylots Feature whose
+		// geometry holds a [][][]float64), the CountArrayElements scan that sizes
+		// the slice must descend through every element's whole subtree — which the
+		// decoder then walks again — costing far more than the reallocations
+		// presize avoids. There, let the slice append instead.
 	case *ast.StructType:
-		// Presize a slice of structs unless the struct carries a multi-dimensional
-		// array — the citylots Feature, say, whose geometry holds a [][][]float64
-		// of coordinates. Counting such a slice to presize it must skip every
-		// element's full coordinate contents, which costs far more than the few
-		// reallocations presize avoids (and those barely affect the allocation
-		// count), so let it append. A record of scalars and strings (a Cloudflare
-		// log line) is cheap to count and keeps its presize.
-		if !g.hasMultiDimSlice(t) {
+		if g.structSkipIsCheap(t) {
 			counter = "support.CountArrayElements"
 		}
 	case *ast.MapType:
@@ -1012,51 +1013,47 @@ func (g *gen) isStruct(expr ast.Expr) bool {
 	return false
 }
 
-// hasMultiDimSlice reports whether expr (transitively, descending through
-// structs, pointers, named struct types, and the element/value of slices and
-// maps) contains a multi-dimensional slice or array — a slice whose element is
-// itself a slice or array, such as the [][][]float64 of GeoJSON coordinates.
+// structSkipIsCheap reports whether skipping a JSON value of expr (transitively,
+// descending through structs, pointers, and named struct types) is cheap and
+// bounded — which decides whether presizing a slice of this element type pays
+// off (see slicePresize). A scalar, string, time, or raw leaf, and a struct
+// built only from those, skips in a single bounded SIMD pass; presizing a slice
+// of such records (a Cloudflare log line, say) is worth the count.
 //
-// slicePresize uses it to decide whether presizing a slice of this element type
-// pays off. A multi-dimensional array holds the bulk of an element's bytes far
-// from its struct header, so counting a slice of such elements for presize must
-// structurally skip every element's full contents — far more work than the
-// handful of backing-array reallocations the presize would save (and those barely
-// move the allocation count, only ~log2(n) extra). Strings and one-dimensional
-// slices ([]string, []float64) are cheap to skip with the SIMD scanners, so a
-// record built from those — a Cloudflare log line, say — does not trip this and
-// keeps its presize.
-func (g *gen) hasMultiDimSlice(expr ast.Expr) bool {
-	return g.hasMultiDimSliceSeen(expr, map[string]bool{})
+// A slice, array, map, or interface field is not cheap: skipping it is unbounded
+// and recursive, so a counting scan would re-traverse the whole subtree the
+// decoder walks anyway — far more work than the ~log2(n) backing-array
+// reallocations presize would save. That covers a multi-dimensional [][][]float64
+// of GeoJSON coordinates and the citm_catalog performances → seatCategories →
+// areas tree alike.
+func (g *gen) structSkipIsCheap(expr ast.Expr) bool {
+	return g.structSkipIsCheapSeen(expr, map[string]bool{})
 }
 
-func (g *gen) hasMultiDimSliceSeen(expr ast.Expr, seen map[string]bool) bool {
+func (g *gen) structSkipIsCheapSeen(expr ast.Expr, seen map[string]bool) bool {
 	switch t := unparen(expr).(type) {
-	case *ast.ArrayType:
-		if _, ok := unparen(t.Elt).(*ast.ArrayType); ok {
-			return true // a slice/array of slices/arrays
-		}
-		return g.hasMultiDimSliceSeen(t.Elt, seen) // e.g. []Struct that nests one
-	case *ast.MapType:
-		return g.hasMultiDimSliceSeen(t.Value, seen)
+	case *ast.ArrayType, *ast.MapType, *ast.InterfaceType:
+		return false
 	case *ast.StarExpr:
-		return g.hasMultiDimSliceSeen(t.X, seen)
+		return g.structSkipIsCheapSeen(t.X, seen)
 	case *ast.StructType:
 		for _, f := range t.Fields.List {
-			if g.hasMultiDimSliceSeen(f.Type, seen) {
-				return true
+			if !g.structSkipIsCheapSeen(f.Type, seen) {
+				return false
 			}
 		}
+		return true
 	case *ast.Ident:
 		if seen[t.Name] {
-			return false
+			return true // recursive type already being walked; don't recount
 		}
 		seen[t.Name] = true
 		if st, ok := g.structTypes[t.Name]; ok {
-			return g.hasMultiDimSliceSeen(st, seen)
+			return g.structSkipIsCheapSeen(st, seen)
 		}
+		return true // a scalar named type (int, string, ...)
 	}
-	return false
+	return true // selector leaves (time.Time, json.RawMessage)
 }
 
 func (g *gen) baseName(expr ast.Expr) string {
