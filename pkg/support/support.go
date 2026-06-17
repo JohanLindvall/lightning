@@ -538,11 +538,11 @@ func ParseFloat(b []byte) (float64, error) {
 // the parsed result with fast=true. Two fast paths run on the mantissa and
 // exponent the scan extracts, so no rescan is needed: the Clinger path (an
 // exactly representable mantissa < 2^53 with a decimal exponent in [-22, 22],
-// converted with one multiply or divide) and, for an exact mantissa that misses
-// Clinger, Eisel-Lemire (a 128-bit multiply — see eiselLemire64). Only a mantissa
-// of more than 19 significant digits or a value Eisel-Lemire finds ambiguous
-// returns fast=false, leaving the caller to parse data[i:end] with
-// strconv.ParseFloat. ok=false marks a token with no digits (or an exponent
+	// converted with one multiply or divide) and, for an exact mantissa that misses
+	// Clinger, Eisel-Lemire (a 128-bit multiply — see eiselLemire64). Values with a
+	// mantissa of more than 19 significant digits, ambiguous rounding, subnormal/
+	// overflow results, or an exponent outside the powers-of-ten table return
+	// fast=false, leaving the caller to parse data[i:end] with strconv.ParseFloat.
 // marker with no digits), in which case end points at the offending byte.
 //
 // Folding the token scan and both fast-path parses into one pass spares the
