@@ -169,8 +169,7 @@ func (c *cleaner) handle(key bool, read, write int) (int, int) {
 				out[write] = ','
 				write++
 			}
-			// Parse key position — keys are always quoted strings. skipString
-			// honors backslash escapes, so a key like "a\"b" is spanned correctly.
+			// Parse key position — keys are always quoted strings.
 			read = skipWSc(in, read, compact)
 			if read >= datalen || in[read] != '"' {
 				return eject()
