@@ -4,12 +4,13 @@
 // replace.
 module github.com/JohanLindvall/lightning/bench
 
-go 1.25.0
+go 1.26
 
 require (
 	github.com/JohanLindvall/lightning v0.0.0
 	github.com/buger/jsonparser v1.2.0
 	github.com/bytedance/sonic v1.15.2
+	github.com/go-json-experiment/json v0.0.0-20260601182631-00ed12fed2a6
 	github.com/mailru/easyjson v0.9.2
 )
 

@@ -261,9 +261,19 @@ func UnescapeStringInto(in, out []byte) (string, error) {
 }
 
 // decodeStringEscaped is the slow path for quoted strings containing backslash
-// escapes, terminated by the closing quote in data. It allocates a new buffer.
+// escapes, terminated by the closing quote in data. It allocates a new buffer
+// sized to the string body: the closing quote is located up front (data[start-1]
+// is the opening quote) and, since unescaping never lengthens a string, the
+// decoded result fits in body-length bytes with a single allocation. Sizing to
+// len(data)-start instead over-allocated by the whole remaining document, which
+// is catastrophic for an escaped string near the start of a large input (e.g.
+// the many "\/"-escaped URLs in a multi-hundred-KB Twitter payload).
 func decodeStringEscaped(data []byte, start, i int) (string, int, error) {
-	return decodeEscaped(make([]byte, 0, len(data)-start), data, start, i, true)
+	capHint := i - start // fallback: the escape-free prefix; append grows the rest
+	if end, err := skipString(data, start-1); err == nil {
+		capHint = end - 1 - start // end is past the closing quote
+	}
+	return decodeEscaped(make([]byte, 0, capHint), data, start, i, true)
 }
 
 // decodeEscaped decodes a backslash-escaped string body, starting from the

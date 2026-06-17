@@ -100,8 +100,29 @@ func generate(inPath string) error {
 		return fmt.Errorf("no top-level struct types found")
 	}
 
+	// A top-level type that is nested inside another (referenced by one of its
+	// fields, directly or through slices/maps/pointers/anonymous structs) gets
+	// only an internal decode function, not its own UnmarshalJSON method: the
+	// referencing root emits the function when it reaches the field. Emitting a
+	// method on such a nested type would attach json.Unmarshaler to it, so the
+	// `type logStd Log` reflection baselines (stdlib, sonic, json/v2) used in the
+	// benchmarks would route through the generated decoder instead. Named nested
+	// types are needed for recursive or shared schemas (e.g. a tree node, a FHIR
+	// code) that an anonymous struct cannot express. With one top-level type — the
+	// common case — nothing is referenced, so every type still gets its method.
+	referenced := map[string]bool{}
+	for _, name := range g.order {
+		for _, f := range g.structTypes[name].Fields.List {
+			g.markReferenced(f.Type, name, referenced)
+		}
+	}
+	allReferenced := len(referenced) == len(g.order) // degenerate (fully cyclic); emit all
+
 	var methods []string
 	for _, name := range g.order {
+		if referenced[name] && !allReferenced {
+			continue // nested in another type; its decoder is emitted there
+		}
 		g.compact = g.compactTypes[name]
 		g.prefix = "lightning" + g.pathFrag + name
 		methods = append(methods, g.genUnmarshal(name))
@@ -1065,11 +1086,28 @@ func (g *gen) baseName(expr ast.Expr) string {
 const supportPkg = "github.com/JohanLindvall/lightning/pkg/support"
 
 func (g *gen) assemble(inPath string, methods []string) string {
+	var body strings.Builder
+	for _, m := range methods {
+		body.WriteString(m)
+		body.WriteString("\n\n")
+	}
+	for _, d := range g.decoders {
+		body.WriteString(d)
+		body.WriteString("\n\n")
+	}
+	code := body.String()
+
+	// "time" and "encoding/json" are needed only when a spelled type actually
+	// names them (time.Time, or json.RawMessage/RawValue in an anonymous struct,
+	// slice or map element). Decide from the generated text rather than from
+	// heuristic flags: those both miss types nested inside an anonymous struct and
+	// over-fire on a nocopy raw field whose decode emits no json. reference. The
+	// tokens appear only as real type usages, never in the generated comments.
 	imports := []string{strconv.Quote(supportPkg)}
-	if g.needJSON {
+	if strings.Contains(code, "json.RawMessage") || strings.Contains(code, "json.RawValue") {
 		imports = append(imports, `json "encoding/json"`)
 	}
-	if g.needTime {
+	if strings.Contains(code, "time.Time") {
 		imports = append(imports, `"time"`)
 	}
 
@@ -1081,15 +1119,7 @@ func (g *gen) assemble(inPath string, methods []string) string {
 		fmt.Fprintf(&b, "\t%s\n", im)
 	}
 	b.WriteString(")\n\n")
-
-	for _, m := range methods {
-		b.WriteString(m)
-		b.WriteString("\n\n")
-	}
-	for _, d := range g.decoders {
-		b.WriteString(d)
-		b.WriteString("\n\n")
-	}
+	b.WriteString(code)
 	return b.String()
 }
 
@@ -1153,6 +1183,30 @@ func singular(s string) string {
 		return s[:len(s)-1]
 	}
 	return s
+}
+
+// markReferenced records, in ref, every top-level struct type named anywhere
+// within expr — through pointers, slices, maps, and anonymous structs — except
+// self, so a recursive type referencing only itself is not treated as nested in
+// another. It stops at named types (they are walked on their own pass), so it
+// captures direct references rather than recursing through the whole graph.
+func (g *gen) markReferenced(expr ast.Expr, self string, ref map[string]bool) {
+	switch t := unparen(expr).(type) {
+	case *ast.Ident:
+		if _, ok := g.structTypes[t.Name]; ok && t.Name != self {
+			ref[t.Name] = true
+		}
+	case *ast.StarExpr:
+		g.markReferenced(t.X, self, ref)
+	case *ast.ArrayType:
+		g.markReferenced(t.Elt, self, ref)
+	case *ast.MapType:
+		g.markReferenced(t.Value, self, ref)
+	case *ast.StructType:
+		for _, f := range t.Fields.List {
+			g.markReferenced(f.Type, self, ref)
+		}
+	}
 }
 
 // unparen strips any enclosing parentheses from a type expression.
