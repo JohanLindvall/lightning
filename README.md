@@ -321,6 +321,43 @@ The [`pkg/json`](pkg/json) package also exposes the scanner's float parser:
   with no surrounding whitespace; trailing bytes or an empty input return an
   error. Nothing is retained or copied.
 
+## Stripping default fields
+
+The [`pkg/json`](pkg/json) package can also prune a JSON document in a single
+pass, dropping object members whose value is a "default" — useful for shrinking
+verbose, mostly-default records (Cloudflare HTTP logs, say) before storing or
+forwarding them:
+
+- `StripDefaults(input, output []byte, defaults, keep [][]byte, compact bool) []byte`
+  — copies `input` to `output`, dropping every object member whose value is a
+  default and then dropping any object or array that this leaves empty. A value
+  is a default when it is empty or byte-equal to one of `defaults` (compared
+  against the bare token — the unquoted contents for a string, the literal token
+  for a number or keyword, e.g. `[]byte("none")`, `[]byte("false")`). A member is
+  kept despite a default value when its unquoted key is byte-equal to one of
+  `keep` (e.g. `[]byte("WallTimeMs")`). String values keep their surrounding
+  quotes and escapes; scalars keep their literal token.
+
+`output` is filled from the front and the populated prefix is returned; `input`
+is never modified. StripDefaults never lengthens the document, so `output` is grown
+(allocated) only when `cap(output) < len(input)` — pass `input[:0]` to strip in
+place, or a reused buffer to run allocation-free. It is best effort and copies
+malformed input through unchanged. Set `compact` when the input has no whitespace
+between tokens (as [`GetCompact`](#key-lookups) does) to skip the inter-token
+`SkipWS` scans.
+
+```go
+defaults := [][]byte{[]byte("0"), []byte("none"), []byte("false"), []byte("unknown")}
+keep := [][]byte{[]byte("WallTimeMs")} // retained even when their value is a default
+var scratch []byte
+scratch = json.StripDefaults(record, scratch[:0], defaults, keep, true)
+// {"a":0,"b":"x","WallTimeMs":0}  ->  {"b":"x","WallTimeMs":0}
+```
+
+Matching is length-pre-filtered so a value or key longer than any candidate
+skips the scan, and a kept member is moved with a single `copy` when its
+`"key":value` span is contiguous in the input.
+
 ## SIMD scanning
 
 Two hot scan loops use a single vectorized pass instead of byte-at-a-time work,
@@ -381,7 +418,7 @@ Representative numbers for a 1.8 KB Cloudflare log (Go 1.26, amd64):
 |---|---|
 | [`main.go`](main.go) | the generator (`package main`) |
 | [`pkg/support`](pkg/support) | shared JSON scanning primitives used by generated code |
-| [`pkg/json`](pkg/json) | small public API over the scanner (`Get`/`GetMany`/`ObjectEach`, `UnescapeString`, `ParseFloat`) |
+| [`pkg/json`](pkg/json) | small public API over the scanner (`Get`/`GetMany`/`ObjectEach`, `UnescapeString`, `ParseFloat`, `StripDefaults`) |
 | [`bench/`](bench) | benchmark module: hand-written `data.go` + `input.json` per case, plus the generated decoders, harness, and results |
 
 Generated files (`*_unmarshal.go`, `bench/*/bench_test.go`, `bench/*/ej/`, and
