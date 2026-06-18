@@ -1,14 +1,14 @@
 // Code generated from github.com/go-json-experiment/jsonbench testdata; the
-// golang_source root type, with the root renamed to Log for the lightning harness.
+// golang_source root type, with the root renamed to Benchmark for the lightning harness.
 package bench
 
 type (
-	Log struct {
+	Benchmark struct {
 		Tree     *golangNode `json:"tree"`
-		Username string      `json:"username"`
+		Username string      `json:"username,nocopy"`
 	}
 	golangNode struct {
-		Name     string       `json:"name"`
+		Name     string       `json:"name,nocopy"`
 		Kids     []golangNode `json:"kids"`
 		CLWeight float64      `json:"cl_weight"`
 		Touches  int          `json:"touches"`

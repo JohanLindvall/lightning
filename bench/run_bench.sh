@@ -135,54 +135,54 @@ var benchInput = func() []byte {
 	return b
 }()
 
-// BenchmarkLightning measures the generated (*Log).UnmarshalJSON.
+// BenchmarkLightning measures the generated (*Benchmark).UnmarshalJSON.
 func BenchmarkLightning(b *testing.B) {
 	b.SetBytes(int64(len(benchInput)))
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		var v Log
+		var v Benchmark
 		if err := v.UnmarshalJSON(benchInput); err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
-// logStd has Log's fields but none of its methods, so encoding/json uses its
+// benchmarkStd has Benchmark's fields but none of its methods, so encoding/json uses its
 // reflection-based decoder, giving an apples-to-apples stdlib baseline.
-type logStd Log
+type benchmarkStd Benchmark
 
 // BenchmarkStdlib measures encoding/json's reflection decoder on the same data.
 func BenchmarkStdlib(b *testing.B) {
 	b.SetBytes(int64(len(benchInput)))
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		var v logStd
+		var v benchmarkStd
 		if err := stdjson.Unmarshal(benchInput, &v); err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
-// BenchmarkEasyjson measures the mailru/easyjson generated (*ej.Log).UnmarshalJSON.
+// BenchmarkEasyjson measures the mailru/easyjson generated (*ej.Benchmark).UnmarshalJSON.
 func BenchmarkEasyjson(b *testing.B) {
 	b.SetBytes(int64(len(benchInput)))
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		var v ej.Log
+		var v ej.Benchmark
 		if err := v.UnmarshalJSON(benchInput); err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
-// BenchmarkSonic measures bytedance/sonic's JIT decoder. It decodes into logStd
+// BenchmarkSonic measures bytedance/sonic's JIT decoder. It decodes into benchmarkStd
 // (the methodless type) so sonic uses its own reflection/JIT decoder rather than
 // the generated UnmarshalJSON, an apples-to-apples third-party comparison.
 func BenchmarkSonic(b *testing.B) {
 	b.SetBytes(int64(len(benchInput)))
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		var v logStd
+		var v benchmarkStd
 		if err := sonic.Unmarshal(benchInput, &v); err != nil {
 			b.Fatal(err)
 		}
@@ -195,7 +195,7 @@ func BenchmarkSonicFastest(b *testing.B) {
 	b.SetBytes(int64(len(benchInput)))
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		var v logStd
+		var v benchmarkStd
 		if err := sonic.ConfigFastest.Unmarshal(benchInput, &v); err != nil {
 			b.Fatal(err)
 		}
@@ -203,12 +203,12 @@ func BenchmarkSonicFastest(b *testing.B) {
 }
 
 // BenchmarkGoccy measures goccy/go-json, a fast pure-Go drop-in for encoding/json
-// (no JIT or codegen). It decodes into logStd, like the other third-party cases.
+// (no JIT or codegen). It decodes into benchmarkStd, like the other third-party cases.
 func BenchmarkGoccy(b *testing.B) {
 	b.SetBytes(int64(len(benchInput)))
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		var v logStd
+		var v benchmarkStd
 		if err := gojson.Unmarshal(benchInput, &v); err != nil {
 			b.Fatal(err)
 		}
@@ -217,13 +217,13 @@ func BenchmarkGoccy(b *testing.B) {
 
 // BenchmarkJSONV2 measures the json/v2 reference implementation
 // (github.com/go-json-experiment/json, the basis of encoding/json/v2). Like the
-// stdlib and sonic cases it decodes into logStd, so it uses its own reflection
+// stdlib and sonic cases it decodes into benchmarkStd, so it uses its own reflection
 // decoder rather than the generated UnmarshalJSON.
 func BenchmarkJSONV2(b *testing.B) {
 	b.SetBytes(int64(len(benchInput)))
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		var v logStd
+		var v benchmarkStd
 		if err := jsonv2.Unmarshal(benchInput, &v); err != nil {
 			b.Fatal(err)
 		}

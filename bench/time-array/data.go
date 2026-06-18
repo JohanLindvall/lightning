@@ -2,6 +2,6 @@ package bench
 
 import "time"
 
-type Log struct {
+type Benchmark struct {
 	Times []time.Time `json:"Times"`
 }

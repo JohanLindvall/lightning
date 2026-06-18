@@ -12,7 +12,7 @@ import (
 // is expected to reject inter-token whitespace — the contract the tag asserts.
 func TestCompactDecode(t *testing.T) {
 	t.Run("matches stdlib", func(t *testing.T) {
-		var got, want Log
+		var got, want Benchmark
 		if err := got.UnmarshalJSON(benchInput); err != nil {
 			t.Fatalf("compact UnmarshalJSON: %v", err)
 		}
@@ -27,14 +27,14 @@ func TestCompactDecode(t *testing.T) {
 	t.Run("tolerates surrounding whitespace", func(t *testing.T) {
 		framed := append([]byte("\n  "), benchInput...)
 		framed = append(framed, " \n"...)
-		var v Log
+		var v Benchmark
 		if err := v.UnmarshalJSON(framed); err != nil {
 			t.Fatalf("compact decoder rejected leading/trailing whitespace: %v", err)
 		}
 	})
 
 	t.Run("rejects inter-token whitespace", func(t *testing.T) {
-		var v Log
+		var v Benchmark
 		// A space after the first key's colon is between-token whitespace, which
 		// the compact decoder is permitted to reject.
 		if err := v.UnmarshalJSON([]byte(`{"EventTimestampMs": 1}`)); err == nil {

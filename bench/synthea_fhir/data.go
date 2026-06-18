@@ -1,5 +1,5 @@
 // Code generated from github.com/go-json-experiment/jsonbench testdata; the
-// synthea_fhir root type, with the root renamed to Log for the lightning harness.
+// synthea_fhir root type, with the root renamed to Benchmark for the lightning harness.
 package bench
 
 import (
@@ -8,12 +8,12 @@ import (
 )
 
 type (
-	Log struct {
+	Benchmark struct {
 		Entry []struct {
-			FullURL string `json:"fullUrl"`
+			FullURL string `json:"fullUrl,nocopy"`
 			Request *struct {
-				Method string `json:"method"`
-				URL    string `json:"url"`
+				Method string `json:"method,nocopy"`
+				URL    string `json:"url,nocopy"`
 			} `json:"request"`
 			Resource *struct {
 				AbatementDateTime time.Time   `json:"abatementDateTime"`
@@ -23,17 +23,17 @@ type (
 					Detail *struct {
 						Code     syntheaCode      `json:"code"`
 						Location syntheaReference `json:"location"`
-						Status   string           `json:"status"`
+						Status   string           `json:"status,nocopy"`
 					} `json:"detail"`
 				} `json:"activity"`
 				Address        []syntheaAddress   `json:"address"`
 				Addresses      []syntheaReference `json:"addresses"`
 				AuthoredOn     time.Time          `json:"authoredOn"`
 				BillablePeriod syntheaRange       `json:"billablePeriod"`
-				BirthDate      string             `json:"birthDate"`
+				BirthDate      string             `json:"birthDate,nocopy"`
 				CareTeam       []struct {
 					Provider  syntheaReference `json:"provider"`
-					Reference string           `json:"reference"`
+					Reference string           `json:"reference,nocopy"`
 					Role      syntheaCode      `json:"role"`
 					Sequence  int64            `json:"sequence"`
 				} `json:"careTeam"`
@@ -51,13 +51,13 @@ type (
 				} `json:"component"`
 				Contained []struct {
 					Beneficiary  syntheaReference   `json:"beneficiary"`
-					ID           string             `json:"id"`
-					Intent       string             `json:"intent"`
+					ID           string             `json:"id,nocopy"`
+					Intent       string             `json:"intent,nocopy"`
 					Payor        []syntheaReference `json:"payor"`
 					Performer    []syntheaReference `json:"performer"`
 					Requester    syntheaReference   `json:"requester"`
-					ResourceType string             `json:"resourceType"`
-					Status       string             `json:"status"`
+					ResourceType string             `json:"resourceType,nocopy"`
+					Status       string             `json:"status,nocopy"`
 					Subject      syntheaReference   `json:"subject"`
 					Type         syntheaCode        `json:"type"`
 				} `json:"contained"`
@@ -82,21 +82,21 @@ type (
 						Repeat *struct {
 							Frequency  int64   `json:"frequency"`
 							Period     float64 `json:"period"`
-							PeriodUnit string  `json:"periodUnit"`
+							PeriodUnit string  `json:"periodUnit,nocopy"`
 						} `json:"repeat"`
 					} `json:"timing"`
 				} `json:"dosageInstruction"`
 				EffectiveDateTime time.Time          `json:"effectiveDateTime"`
 				Encounter         syntheaReference   `json:"encounter"`
 				Extension         []syntheaExtension `json:"extension"`
-				Gender            string             `json:"gender"`
+				Gender            string             `json:"gender,nocopy"`
 				Goal              []syntheaReference `json:"goal"`
-				ID                string             `json:"id"`
+				ID                string             `json:"id,nocopy"`
 				Identifier        []struct {
-					System string      `json:"system"`
+					System string      `json:"system,nocopy"`
 					Type   syntheaCode `json:"type"`
-					Use    string      `json:"use"`
-					Value  string      `json:"value"`
+					Use    string      `json:"use,nocopy"`
+					Value  string      `json:"value,nocopy"`
 				} `json:"identifier"`
 				Insurance []struct {
 					Coverage syntheaReference `json:"coverage"`
@@ -104,7 +104,7 @@ type (
 					Sequence int64            `json:"sequence"`
 				} `json:"insurance"`
 				Insurer syntheaReference `json:"insurer"`
-				Intent  string           `json:"intent"`
+				Intent  string           `json:"intent,nocopy"`
 				Issued  time.Time        `json:"issued"`
 				Item    []struct {
 					Adjudication []struct {
@@ -122,7 +122,7 @@ type (
 					Sequence                int64              `json:"sequence"`
 					ServicedPeriod          syntheaRange       `json:"servicedPeriod"`
 				} `json:"item"`
-				LifecycleStatus           string             `json:"lifecycleStatus"`
+				LifecycleStatus           string             `json:"lifecycleStatus,nocopy"`
 				ManagingOrganization      []syntheaReference `json:"managingOrganization"`
 				MaritalStatus             syntheaCode        `json:"maritalStatus"`
 				MedicationCodeableConcept syntheaCode        `json:"medicationCodeableConcept"`
@@ -132,7 +132,7 @@ type (
 				NumberOfSeries            int64              `json:"numberOfSeries"`
 				OccurrenceDateTime        time.Time          `json:"occurrenceDateTime"`
 				OnsetDateTime             time.Time          `json:"onsetDateTime"`
-				Outcome                   string             `json:"outcome"`
+				Outcome                   string             `json:"outcome,nocopy"`
 				Participant               []struct {
 					Individual syntheaReference `json:"individual"`
 					Member     syntheaReference `json:"member"`
@@ -157,74 +157,74 @@ type (
 				RecordedDate    time.Time          `json:"recordedDate"`
 				Referral        syntheaReference   `json:"referral"`
 				Requester       syntheaReference   `json:"requester"`
-				ResourceType    string             `json:"resourceType"`
+				ResourceType    string             `json:"resourceType,nocopy"`
 				Result          []syntheaReference `json:"result"`
 				Series          []struct {
 					BodySite syntheaCoding `json:"bodySite"`
 					Instance []struct {
 						Number   int64         `json:"number"`
 						SopClass syntheaCoding `json:"sopClass"`
-						Title    string        `json:"title"`
-						UID      string        `json:"uid"`
+						Title    string        `json:"title,nocopy"`
+						UID      string        `json:"uid,nocopy"`
 					} `json:"instance"`
 					Modality          syntheaCoding `json:"modality"`
 					Number            int64         `json:"number"`
 					NumberOfInstances int64         `json:"numberOfInstances"`
-					Started           string        `json:"started"`
-					UID               string        `json:"uid"`
+					Started           string        `json:"started,nocopy"`
+					UID               string        `json:"uid,nocopy"`
 				} `json:"series"`
 				ServiceProvider syntheaReference `json:"serviceProvider"`
 				Started         time.Time        `json:"started"`
-				Status          string           `json:"status"`
+				Status          string           `json:"status,nocopy"`
 				Subject         syntheaReference `json:"subject"`
 				SupportingInfo  []struct {
 					Category       syntheaCode      `json:"category"`
 					Sequence       int64            `json:"sequence"`
 					ValueReference syntheaReference `json:"valueReference"`
 				} `json:"supportingInfo"`
-				Telecom              []map[string]string `json:"telecom"`
-				Text                 map[string]string   `json:"text"`
+				Telecom              []map[string]string `json:"telecom,nocopy"`
+				Text                 map[string]string   `json:"text,nocopy"`
 				Total                json.RawMessage     `json:"total"`
 				Type                 json.RawMessage     `json:"type"`
-				Use                  string              `json:"use"`
+				Use                  string              `json:"use,nocopy"`
 				VaccineCode          syntheaCode         `json:"vaccineCode"`
 				ValueCodeableConcept syntheaCode         `json:"valueCodeableConcept"`
 				ValueQuantity        syntheaCoding       `json:"valueQuantity"`
 				VerificationStatus   syntheaCode         `json:"verificationStatus"`
 			} `json:"resource"`
 		} `json:"entry"`
-		ResourceType string `json:"resourceType"`
-		Type         string `json:"type"`
+		ResourceType string `json:"resourceType,nocopy"`
+		Type         string `json:"type,nocopy"`
 	}
 	syntheaCode struct {
 		Coding []syntheaCoding `json:"coding"`
-		Text   string          `json:"text"`
+		Text   string          `json:"text,nocopy"`
 	}
 	syntheaCoding struct {
-		Code    string  `json:"code"`
-		Display string  `json:"display"`
-		System  string  `json:"system"`
-		Unit    string  `json:"unit"`
+		Code    string  `json:"code,nocopy"`
+		Display string  `json:"display,nocopy"`
+		System  string  `json:"system,nocopy"`
+		Unit    string  `json:"unit,nocopy"`
 		Value   float64 `json:"value"`
 	}
 	syntheaReference struct {
-		Display   string `json:"display"`
-		Reference string `json:"reference"`
+		Display   string `json:"display,nocopy"`
+		Reference string `json:"reference,nocopy"`
 	}
 	syntheaAddress struct {
-		City       string             `json:"city"`
-		Country    string             `json:"country"`
+		City       string             `json:"city,nocopy"`
+		Country    string             `json:"country,nocopy"`
 		Extension  []syntheaExtension `json:"extension"`
-		Line       []string           `json:"line"`
-		PostalCode string             `json:"postalCode"`
-		State      string             `json:"state"`
+		Line       []string           `json:"line,nocopy"`
+		PostalCode string             `json:"postalCode,nocopy"`
+		State      string             `json:"state,nocopy"`
 	}
 	syntheaExtension struct {
-		URL          string             `json:"url"`
+		URL          string             `json:"url,nocopy"`
 		ValueAddress syntheaAddress     `json:"valueAddress"`
-		ValueCode    string             `json:"valueCode"`
+		ValueCode    string             `json:"valueCode,nocopy"`
 		ValueDecimal float64            `json:"valueDecimal"`
-		ValueString  string             `json:"valueString"`
+		ValueString  string             `json:"valueString,nocopy"`
 		Extension    []syntheaExtension `json:"extension"`
 	}
 	syntheaRange struct {
@@ -232,7 +232,7 @@ type (
 		Start time.Time `json:"start"`
 	}
 	syntheaCurrency struct {
-		Currency string  `json:"currency"`
+		Currency string  `json:"currency,nocopy"`
 		Value    float64 `json:"value"`
 	}
 )

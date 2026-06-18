@@ -1,68 +1,68 @@
 // Code generated from github.com/go-json-experiment/jsonbench testdata; the
-// string_unicode root type, with the root renamed to Log for the lightning harness.
+// string_unicode root type, with the root renamed to Benchmark for the lightning harness.
 package bench
 
 type (
-	Log struct {
-		Arabic                             string `json:"Arabic"`
-		ArabicPresentationFormsA           string `json:"Arabic Presentation Forms-A"`
-		ArabicPresentationFormsB           string `json:"Arabic Presentation Forms-B"`
-		Armenian                           string `json:"Armenian"`
-		Arrows                             string `json:"Arrows"`
-		Bengali                            string `json:"Bengali"`
-		Bopomofo                           string `json:"Bopomofo"`
-		BoxDrawing                         string `json:"Box Drawing"`
-		CJKCompatibility                   string `json:"CJK Compatibility"`
-		CJKCompatibilityForms              string `json:"CJK Compatibility Forms"`
-		CJKCompatibilityIdeographs         string `json:"CJK Compatibility Ideographs"`
-		CJKSymbolsAndPunctuation           string `json:"CJK Symbols and Punctuation"`
-		CJKUnifiedIdeographs               string `json:"CJK Unified Ideographs"`
-		CJKUnifiedIdeographsExtensionA     string `json:"CJK Unified Ideographs Extension A"`
-		CJKUnifiedIdeographsExtensionB     string `json:"CJK Unified Ideographs Extension B"`
-		Cherokee                           string `json:"Cherokee"`
-		CurrencySymbols                    string `json:"Currency Symbols"`
-		Cyrillic                           string `json:"Cyrillic"`
-		CyrillicSupplementary              string `json:"Cyrillic Supplementary"`
-		Devanagari                         string `json:"Devanagari"`
-		EnclosedAlphanumerics              string `json:"Enclosed Alphanumerics"`
-		EnclosedCJKLettersAndMonths        string `json:"Enclosed CJK Letters and Months"`
-		Ethiopic                           string `json:"Ethiopic"`
-		GeometricShapes                    string `json:"Geometric Shapes"`
-		Georgian                           string `json:"Georgian"`
-		GreekAndCoptic                     string `json:"Greek and Coptic"`
-		Gujarati                           string `json:"Gujarati"`
-		Gurmukhi                           string `json:"Gurmukhi"`
-		HangulCompatibilityJamo            string `json:"Hangul Compatibility Jamo"`
-		HangulJamo                         string `json:"Hangul Jamo"`
-		HangulSyllables                    string `json:"Hangul Syllables"`
-		Hebrew                             string `json:"Hebrew"`
-		Hiragana                           string `json:"Hiragana"`
-		IPAExtentions                      string `json:"IPA Extentions"`
-		KangxiRadicals                     string `json:"Kangxi Radicals"`
-		Katakana                           string `json:"Katakana"`
-		Khmer                              string `json:"Khmer"`
-		KhmerSymbols                       string `json:"Khmer Symbols"`
-		Latin                              string `json:"Latin"`
-		LatinExtendedAdditional            string `json:"Latin Extended Additional"`
-		Latin1Supplement                   string `json:"Latin-1 Supplement"`
-		LatinExtendedA                     string `json:"Latin-Extended A"`
-		LatinExtendedB                     string `json:"Latin-Extended B"`
-		LetterlikeSymbols                  string `json:"Letterlike Symbols"`
-		Malayalam                          string `json:"Malayalam"`
-		MathematicalAlphanumericSymbols    string `json:"Mathematical Alphanumeric Symbols"`
-		MathematicalOperators              string `json:"Mathematical Operators"`
-		MiscellaneousSymbols               string `json:"Miscellaneous Symbols"`
-		Mongolian                          string `json:"Mongolian"`
-		NumberForms                        string `json:"Number Forms"`
-		Oriya                              string `json:"Oriya"`
-		PhoneticExtensions                 string `json:"Phonetic Extensions"`
-		SupplementalArrowsB                string `json:"Supplemental Arrows-B"`
-		Syriac                             string `json:"Syriac"`
-		Tamil                              string `json:"Tamil"`
-		Thaana                             string `json:"Thaana"`
-		Thai                               string `json:"Thai"`
-		UnifiedCanadianAboriginalSyllabics string `json:"Unified Canadian Aboriginal Syllabics"`
-		YiRadicals                         string `json:"Yi Radicals"`
-		YiSyllables                        string `json:"Yi Syllables"`
+	Benchmark struct {
+		Arabic                             string `json:"Arabic,nocopy"`
+		ArabicPresentationFormsA           string `json:"Arabic Presentation Forms-A,nocopy"`
+		ArabicPresentationFormsB           string `json:"Arabic Presentation Forms-B,nocopy"`
+		Armenian                           string `json:"Armenian,nocopy"`
+		Arrows                             string `json:"Arrows,nocopy"`
+		Bengali                            string `json:"Bengali,nocopy"`
+		Bopomofo                           string `json:"Bopomofo,nocopy"`
+		BoxDrawing                         string `json:"Box Drawing,nocopy"`
+		CJKCompatibility                   string `json:"CJK Compatibility,nocopy"`
+		CJKCompatibilityForms              string `json:"CJK Compatibility Forms,nocopy"`
+		CJKCompatibilityIdeographs         string `json:"CJK Compatibility Ideographs,nocopy"`
+		CJKSymbolsAndPunctuation           string `json:"CJK Symbols and Punctuation,nocopy"`
+		CJKUnifiedIdeographs               string `json:"CJK Unified Ideographs,nocopy"`
+		CJKUnifiedIdeographsExtensionA     string `json:"CJK Unified Ideographs Extension A,nocopy"`
+		CJKUnifiedIdeographsExtensionB     string `json:"CJK Unified Ideographs Extension B,nocopy"`
+		Cherokee                           string `json:"Cherokee,nocopy"`
+		CurrencySymbols                    string `json:"Currency Symbols,nocopy"`
+		Cyrillic                           string `json:"Cyrillic,nocopy"`
+		CyrillicSupplementary              string `json:"Cyrillic Supplementary,nocopy"`
+		Devanagari                         string `json:"Devanagari,nocopy"`
+		EnclosedAlphanumerics              string `json:"Enclosed Alphanumerics,nocopy"`
+		EnclosedCJKLettersAndMonths        string `json:"Enclosed CJK Letters and Months,nocopy"`
+		Ethiopic                           string `json:"Ethiopic,nocopy"`
+		GeometricShapes                    string `json:"Geometric Shapes,nocopy"`
+		Georgian                           string `json:"Georgian,nocopy"`
+		GreekAndCoptic                     string `json:"Greek and Coptic,nocopy"`
+		Gujarati                           string `json:"Gujarati,nocopy"`
+		Gurmukhi                           string `json:"Gurmukhi,nocopy"`
+		HangulCompatibilityJamo            string `json:"Hangul Compatibility Jamo,nocopy"`
+		HangulJamo                         string `json:"Hangul Jamo,nocopy"`
+		HangulSyllables                    string `json:"Hangul Syllables,nocopy"`
+		Hebrew                             string `json:"Hebrew,nocopy"`
+		Hiragana                           string `json:"Hiragana,nocopy"`
+		IPAExtentions                      string `json:"IPA Extentions,nocopy"`
+		KangxiRadicals                     string `json:"Kangxi Radicals,nocopy"`
+		Katakana                           string `json:"Katakana,nocopy"`
+		Khmer                              string `json:"Khmer,nocopy"`
+		KhmerSymbols                       string `json:"Khmer Symbols,nocopy"`
+		Latin                              string `json:"Latin,nocopy"`
+		LatinExtendedAdditional            string `json:"Latin Extended Additional,nocopy"`
+		Latin1Supplement                   string `json:"Latin-1 Supplement,nocopy"`
+		LatinExtendedA                     string `json:"Latin-Extended A,nocopy"`
+		LatinExtendedB                     string `json:"Latin-Extended B,nocopy"`
+		LetterlikeSymbols                  string `json:"Letterlike Symbols,nocopy"`
+		Malayalam                          string `json:"Malayalam,nocopy"`
+		MathematicalAlphanumericSymbols    string `json:"Mathematical Alphanumeric Symbols,nocopy"`
+		MathematicalOperators              string `json:"Mathematical Operators,nocopy"`
+		MiscellaneousSymbols               string `json:"Miscellaneous Symbols,nocopy"`
+		Mongolian                          string `json:"Mongolian,nocopy"`
+		NumberForms                        string `json:"Number Forms,nocopy"`
+		Oriya                              string `json:"Oriya,nocopy"`
+		PhoneticExtensions                 string `json:"Phonetic Extensions,nocopy"`
+		SupplementalArrowsB                string `json:"Supplemental Arrows-B,nocopy"`
+		Syriac                             string `json:"Syriac,nocopy"`
+		Tamil                              string `json:"Tamil,nocopy"`
+		Thaana                             string `json:"Thaana,nocopy"`
+		Thai                               string `json:"Thai,nocopy"`
+		UnifiedCanadianAboriginalSyllabics string `json:"Unified Canadian Aboriginal Syllabics,nocopy"`
+		YiRadicals                         string `json:"Yi Radicals,nocopy"`
+		YiSyllables                        string `json:"Yi Syllables,nocopy"`
 	}
 )

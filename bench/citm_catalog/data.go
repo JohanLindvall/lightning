@@ -1,22 +1,22 @@
 // Code generated from github.com/go-json-experiment/jsonbench testdata; the
-// citm_catalog root type, with the root renamed to Log for the lightning harness.
+// citm_catalog root type, with the root renamed to Benchmark for the lightning harness.
 package bench
 
 type (
-	Log struct {
-		AreaNames                map[string]string `json:"areaNames"`
-		AudienceSubCategoryNames map[string]string `json:"audienceSubCategoryNames"`
-		BlockNames               map[string]string `json:"blockNames"`
+	Benchmark struct {
+		AreaNames                map[string]string `json:"areaNames,nocopy"`
+		AudienceSubCategoryNames map[string]string `json:"audienceSubCategoryNames,nocopy"`
+		BlockNames               map[string]string `json:"blockNames,nocopy"`
 		Events                   map[string]struct {
-			Description string `json:"description"`
+			Description string `json:"description,nocopy"`
 			ID          int    `json:"id"`
-			Logo        string `json:"logo"`
-			Name        string `json:"name"`
+			Logo        string `json:"logo,nocopy"`
+			Name        string `json:"name,nocopy"`
 			SubTopicIds []int  `json:"subTopicIds"`
 			SubjectCode any    `json:"subjectCode"`
 			Subtitle    any    `json:"subtitle"`
 			TopicIds    []int  `json:"topicIds"`
-		} `json:"events"`
+		} `json:"events,nocopy"`
 		Performances []struct {
 			EventID int `json:"eventId"`
 			ID      int `json:"id"`
@@ -36,13 +36,13 @@ type (
 			} `json:"seatCategories"`
 			SeatMapImage any    `json:"seatMapImage"`
 			Start        int64  `json:"start"`
-			VenueCode    string `json:"venueCode"`
+			VenueCode    string `json:"venueCode,nocopy"`
 		} `json:"performances"`
-		SeatCategoryNames map[string]string   `json:"seatCategoryNames"`
-		SubTopicNames     map[string]string   `json:"subTopicNames"`
-		SubjectNames      map[string]string   `json:"subjectNames"`
-		TopicNames        map[string]string   `json:"topicNames"`
-		TopicSubTopics    map[string][]uint64 `json:"topicSubTopics"`
-		VenueNames        map[string]string   `json:"venueNames"`
+		SeatCategoryNames map[string]string   `json:"seatCategoryNames,nocopy"`
+		SubTopicNames     map[string]string   `json:"subTopicNames,nocopy"`
+		SubjectNames      map[string]string   `json:"subjectNames,nocopy"`
+		TopicNames        map[string]string   `json:"topicNames,nocopy"`
+		TopicSubTopics    map[string][]uint64 `json:"topicSubTopics,nocopy"`
+		VenueNames        map[string]string   `json:"venueNames,nocopy"`
 	}
 )

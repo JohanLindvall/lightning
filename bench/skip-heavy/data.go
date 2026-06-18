@@ -1,5 +1,5 @@
 package bench
 
-type Log struct {
+type Benchmark struct {
 	ID int `json:"id"`
 }

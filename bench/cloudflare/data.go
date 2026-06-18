@@ -2,7 +2,7 @@ package bench
 
 import json "encoding/json"
 
-type Log struct {
+type Benchmark struct {
 	EdgeStartTimestamp *json.RawMessage `json:"EdgeStartTimestamp"`
 	EventTimestampMs   int64            `json:"EventTimestampMs"`
 	Datetime           json.RawMessage  `json:"Datetime"`
