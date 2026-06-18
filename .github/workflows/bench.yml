@@ -24,14 +24,19 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with:
           go-version-file: bench/go.mod
       - name: Run benchmarks
+        # run_bench.sh builds the main module (go 1.25) and tests the bench module
+        # (go 1.26); GOTOOLCHAIN=auto lets go fetch the required toolchain instead
+        # of failing under a pinned GOTOOLCHAIN=local.
+        env:
+          GOTOOLCHAIN: auto
         run: make bench-md
       - name: Upload results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: results-${{ matrix.arch }}
           path: bench/results_${{ matrix.arch }}.md
@@ -44,9 +49,9 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Download results
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
       - name: Commit results

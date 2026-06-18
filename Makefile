@@ -41,7 +41,7 @@ bench:
 # Generate the committed benchmark results (bench/results.txt and the rendered
 # bench/results_<arch>.md), running each benchmark for 10s for steadier numbers.
 bench-md:
-	BENCHTIME=10s bash bench/run_bench.sh
+	BENCHTIME=30s bash bench/run_bench.sh
 
 # Force-install the latest version of each developer tool. Unlike a file target,
 # a phony recipe runs every time, so @latest is actually re-fetched.
