@@ -302,6 +302,29 @@ func (g *gen) skipWS(dst, src string) string {
 	}`, set, dst)
 }
 
+// readKey emits the object-key read with its no-escape fast path written inline,
+// the way skipWS inlines the whitespace fast path. The common case — a quoted
+// key with no backslash escape — is an IndexCloseOrEscape scan plus an UnsafeStr
+// alias at the call site, costing no ReadKey call; only an escaped key (or an
+// error) falls back to support.ReadKey. It declares key and ni for the loop that
+// follows. The enclosing decoder returns (int, error).
+func (g *gen) readKey() string {
+	return `var key string
+	var ni int
+	if i >= len(data) || data[i] != '"' {
+		return i, support.ErrInvalidJSON
+	}
+	ks := i + 1
+	if k := support.IndexCloseOrEscape(data[ks:]); ks+k < len(data) && data[ks+k] == '"' {
+		key, ni = support.UnsafeStr(data[ks:ks+k]), ks+k+1
+	} else {
+		var err error
+		if key, ni, err = support.ReadKey(data, i); err != nil {
+			return ni, err
+		}
+	}`
+}
+
 // cmark and csuf distinguish a compact decoder from its non-compact counterpart
 // in, respectively, memo keys and generated function names, so the same type
 // reached from both a compact and a non-compact root yields two decoders.
@@ -589,10 +612,7 @@ func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
 		if data[i] == '}' {
 			return i + 1, nil
 		}
-		key, ni, err := support.ReadKey(data, i)
-		if err != nil {
-			return ni, err
-		}
+		%[8]s
 		%[5]s
 		if i >= len(data) || data[i] != ':' {
 			return i, support.ErrExpectColon
@@ -622,7 +642,7 @@ func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
 		}
 		i++
 	}
-}`, fn, paramType, cases.String(), g.skipWS("i", "i"), g.skipWS("i", "ni"), g.skipWS("i", "i+1"), g.skipWS("i", "i"))
+}`, fn, paramType, cases.String(), g.skipWS("i", "i"), g.skipWS("i", "ni"), g.skipWS("i", "i+1"), g.skipWS("i", "i"), g.readKey())
 	g.decoders = append(g.decoders, body)
 }
 
@@ -1216,10 +1236,7 @@ func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy, lax boo
 			*out = m
 			return i + 1, nil
 		}
-		key, ni, err := support.ReadKey(data, i)
-		if err != nil {
-			return ni, err
-		}
+		%[7]s
 		%[5]s
 		if i >= len(data) || data[i] != ':' {
 			return i, support.ErrExpectColon
@@ -1244,7 +1261,7 @@ func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy, lax boo
 		}
 		i++
 	}
-}`, fn, valStr, inner, g.skipWS("i", "i"), g.skipWS("i", "ni"), g.skipWS("i", "i+1"))
+}`, fn, valStr, inner, g.skipWS("i", "i"), g.skipWS("i", "ni"), g.skipWS("i", "i+1"), g.readKey())
 	g.decoders = append(g.decoders, body)
 	return fn
 }

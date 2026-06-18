@@ -57,6 +57,18 @@ func ReadKey(data []byte, i int) (string, int, error) {
 	return unsafeStr(rest[:k]), i + k + 1, nil
 }
 
+// IndexCloseOrEscape returns the index of the first '"' or '\\' byte in b, or
+// len(b) if neither is present. It is exported (and inlinable) so generated
+// decoders can write the object-key / string read inline at the call site — the
+// no-escape fast path — instead of paying a ReadKey call; ReadKey stays the
+// escape/error fallback.
+func IndexCloseOrEscape(b []byte) int { return indexCloseOrEscape(b) }
+
+// UnsafeStr returns a string that aliases b without copying, so the caller must
+// keep b unchanged while the result is in use. Exported for the same inlined
+// read path; escaped or copied results still go through ReadKey/ReadString*.
+func UnsafeStr(b []byte) string { return unsafeStr(b) }
+
 // ReadStringOrNull reads a JSON string (or null) at data[i], copying the bytes
 // into a fresh string.
 func ReadStringOrNull(data []byte, i int) (string, int, error) {
@@ -791,7 +803,7 @@ func parseRFC3339(s string, allowSpace bool) (time.Time, bool) {
 		// The fields are already range-checked, so build the instant directly and
 		// skip time.Date's field-normalization machinery (dateToAbsDays and the
 		// surrounding range handling were ~18% of timestamp-array decoding).
-		secs := daysFromCivil(year, month, day)*86400 + int64(hour)*3600 + int64(min)*60 + int64(sec)
+		secs := daysFromCivilCached(year, month, day)*86400 + int64(hour)*3600 + int64(min)*60 + int64(sec)
 		return time.Unix(secs, int64(nsec)).UTC(), true
 	}
 	return time.Date(year, time.Month(month), day, hour, min, sec, nsec, loc), true
@@ -822,6 +834,36 @@ func daysFromCivil(y, m, d int) int64 {
 	doy := (153*mp+2)/5 + int64(d) - 1     // day of year, [0, 365]
 	doe := yoe*365 + yoe/4 - yoe/100 + doy // day of era, [0, 146096]
 	return era*146097 + doe - 719468       // 719468 = days from 0000-03-01 to 1970-01-01
+}
+
+// monthYearDay[m-1] is the number of days before the first of month m in a
+// non-leap year (January = index 0).
+var monthYearDay = [12]int32{0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334}
+
+// yearStartDays[i] is the number of days from 1970-01-01 to (1970+i)-01-01, built
+// once from daysFromCivil (so it cannot disagree with it). It spans 1970 through
+// 2261, the years that dominate real timestamps.
+var yearStartDays = func() [292]int32 {
+	var t [292]int32
+	for i := range t {
+		t[i] = int32(daysFromCivil(1970+i, 1, 1))
+	}
+	return t
+}()
+
+// daysFromCivilCached is daysFromCivil specialized for the common case. A year in
+// [1970, 2261] resolves to two table lookups, the day, and a single leap-day
+// bump — skipping the general algorithm's several multiplies and divisions —
+// while any other year defers to it. The caller has range-checked m and d.
+func daysFromCivilCached(y, m, d int) int64 {
+	if uint(y-1970) < uint(len(yearStartDays)) {
+		days := int64(yearStartDays[y-1970]) + int64(monthYearDay[m-1]) + int64(d-1)
+		if m > 2 && y%4 == 0 && (y%100 != 0 || y%400 == 0) {
+			days++ // leap day of this year has already passed
+		}
+		return days
+	}
+	return daysFromCivil(y, m, d)
 }
 
 // atoi2 parses exactly two decimal digits of s at off into a non-negative int,

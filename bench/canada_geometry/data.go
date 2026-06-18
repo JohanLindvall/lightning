@@ -11,7 +11,7 @@ type (
 				Name string `json:"name,nocopy"`
 			} `json:"properties"`
 			Geometry struct {
-				Type        string        `json:"type,nocopy"`
+				Type        string         `json:"type,nocopy"`
 				Coordinates [][][2]float64 `json:"coordinates"`
 			} `json:"geometry"`
 		} `json:"features"`
