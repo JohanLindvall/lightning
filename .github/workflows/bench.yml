@@ -27,7 +27,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
         with:
-          go-version-file: go.mod
+          go-version-file: bench/go.mod
       - name: Run benchmarks
         run: make bench-md
       - name: Upload results
