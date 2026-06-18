@@ -16,13 +16,18 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
+      # The generated decoders are gitignored, so a fresh checkout has none and the
+      # conformance package (and its test) would not compile. Generate them before
+      # linting; `make test` regenerates as needed via the same Makefile rule.
+      - name: Generate
+        run: make generate
       # Prebuilt binary (no source compile) + cached binary and lint cache.
       - name: Lint
         uses: golangci/golangci-lint-action@v9
         with:
           version: v2.12.2
       - name: Test
-        run: go test -cover ./...
+        run: make test
 
   # On a green main build, bump the patch of the latest vX.Y.Z tag (the Go module
   # version convention). Patch only: a major bump would require a /vN module path,

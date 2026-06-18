@@ -1,4 +1,4 @@
-.PHONY: all download check bench bench-md update-tools fix
+.PHONY: all download check bench bench-md update-tools fix test generate
 
 GOPATH := $(shell go env GOPATH)
 GOBIN := $(GOPATH)/bin
@@ -11,15 +11,22 @@ all: fix check
 download: go.mod go.sum
 	go mod download
 
-check: $(GOBIN)/golangci-lint conformance/data_unmarshal.go
+check: $(GOBIN)/golangci-lint test
 	golangci-lint run ./...
+
+test: conformance/data_unmarshal.go
 	go test -cover ./...
+
+# Build every gitignored generated source. A phony aggregate over the file targets
+# below, so CI (and a fresh checkout) can produce them in one call before linting.
+generate: conformance/data_unmarshal.go
 
 # The conformance test decodes test.json with a generated decoder, but that
 # decoder is gitignored (like every *_unmarshal.go), so a clean checkout has none
 # and the package would not compile. Regenerate it from its source struct whenever
 # that struct or the generator (main.go) changes; listing it as a prerequisite of
-# check makes the test run against an up-to-date decoder.
+# test makes the suite run against an up-to-date decoder (and check, which depends
+# on test, inherits it).
 conformance/data_unmarshal.go: conformance/data.go main.go
 	go run . conformance/data.go
 
