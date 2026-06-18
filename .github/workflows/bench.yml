@@ -1,0 +1,65 @@
+name: Benchmark
+
+# Manual only: benchmarking is slow (downloads the ~8 MB GeoJSON, runs every case
+# for 10s against four libraries) and the numbers are machine-specific, so it is
+# never run on push — only when explicitly dispatched.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Run the comparison suite on each architecture (the rendered summary is
+  # per-GOARCH: results_amd64.md, results_arm64.md). Each job uploads only its own
+  # file so the two never race to push; the commit job below collects both.
+  bench:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Run benchmarks
+        run: make bench-md
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-${{ matrix.arch }}
+          path: bench/results_${{ matrix.arch }}.md
+
+  # Collect both architectures' results and commit them in a single push. The
+  # [skip ci] marker keeps this commit from triggering the push-driven CI workflow.
+  commit:
+    needs: bench
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - name: Download results
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Commit results
+        run: |
+          set -euo pipefail
+          find artifacts -name 'results_amd64.md' -exec cp {} bench/ \;
+          find artifacts -name 'results_arm64.md' -exec cp {} bench/ \;
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if git diff --quiet -- bench/results_amd64.md bench/results_arm64.md; then
+            echo "Benchmark results unchanged; nothing to commit."
+            exit 0
+          fi
+          git add bench/results_amd64.md bench/results_arm64.md
+          git commit -m "Update benchmark results [skip ci]"
+          git push
