@@ -510,6 +510,45 @@ func ReadUint64OrNull(data []byte, i int) (uint64, int, error) {
 	return n, i, nil
 }
 
+// ReadNumberOrNull reads a JSON number (or null) at data[i] and returns its raw
+// literal as a string — the bytes a json.Number holds. The token bounds come from
+// the same scanner SkipValue uses, so the literal is captured verbatim without
+// parsing it to a float; a JSON null yields the empty string.
+func ReadNumberOrNull(data []byte, i int) (string, int, error) {
+	if i >= len(data) {
+		return "", i, ErrTruncated
+	}
+	if data[i] == 'n' {
+		end, err := ExpectNull(data, i)
+		return "", end, err
+	}
+	start := i
+	end, err := skipNumber(data, i)
+	if err != nil {
+		return "", end, err
+	}
+	return string(data[start:end]), end, nil
+}
+
+// ReadNumberNoCopyOrNull is ReadNumberOrNull but returns a string that aliases
+// data instead of copying it, so the caller must keep data unchanged while the
+// result is in use.
+func ReadNumberNoCopyOrNull(data []byte, i int) (string, int, error) {
+	if i >= len(data) {
+		return "", i, ErrTruncated
+	}
+	if data[i] == 'n' {
+		end, err := ExpectNull(data, i)
+		return "", end, err
+	}
+	start := i
+	end, err := skipNumber(data, i)
+	if err != nil {
+		return "", end, err
+	}
+	return unsafeStr(data[start:end]), end, nil
+}
+
 // pow10exact holds the powers of ten that are exactly representable as a
 // float64 (10^0 .. 10^22). Used by the fast-path float parser.
 var pow10exact = [...]float64{

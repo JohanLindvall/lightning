@@ -1,0 +1,14 @@
+version: "2"
+
+# Default linter set (standard) is kept; this file only adds a scoped exclusion.
+linters:
+  exclusions:
+    rules:
+      # conformance/data.go deliberately exercises lightning's own struct-tag
+      # options (nocopy, lax, unwrap, pipe-separated names) so the generated
+      # decoder covers them. staticcheck's SA5008 only knows encoding/json's
+      # options and flags ours as unknown; silence it for that file alone.
+      - path: conformance/data\.go
+        linters:
+          - staticcheck
+        text: SA5008

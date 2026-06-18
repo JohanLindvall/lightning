@@ -10,9 +10,9 @@
 // calls the shared scanner helpers in pkg/support.
 //
 // Supported field types: string, bool, all sized int/uint kinds, float32,
-// float64, json.RawMessage, nested (named or anonymous) structs, slices, maps
-// with string keys, pointers, and interface{}/any (decoded into the usual
-// Go representation of an arbitrary JSON value).
+// float64, json.Number, time.Time, json.RawMessage, nested (named or anonymous)
+// structs, slices, maps with string keys, pointers, and interface{}/any (decoded
+// into the usual Go representation of an arbitrary JSON value).
 package main
 
 import (
@@ -695,6 +695,9 @@ func (g *gen) field(dest string, expr ast.Expr, hint string, nocopy, lax bool) s
 		if t.Sel.Name == "RawMessage" || t.Sel.Name == "RawValue" {
 			return g.rawMessage(dest, nocopy)
 		}
+		if isNumber(t) {
+			return g.numberRead(dest, nocopy)
+		}
 		if isTime(t) {
 			return g.timeRead(dest, lax)
 		}
@@ -897,6 +900,22 @@ if data[start] != 'n' {
 	%s
 }
 i = end`, assign)
+}
+
+// numberRead emits the read for a json.Number field: capture the number token's
+// raw literal as a string and convert it to json.Number. nocopy aliases the input
+// (json.Number's underlying type is string, so the conversion never copies).
+func (g *gen) numberRead(dest string, nocopy bool) string {
+	reader := "support.ReadNumberOrNull"
+	if nocopy {
+		reader = "support.ReadNumberNoCopyOrNull"
+	}
+	return fmt.Sprintf(`s, end, err := %s(data, i)
+if err != nil {
+	return end, err
+}
+%s = json.Number(s)
+i = end`, reader, dest)
 }
 
 func (g *gen) timeRead(dest string, lax bool) string {
@@ -1166,7 +1185,12 @@ func (g *gen) slicePresize(elt ast.Expr, eltStr string) string {
 			}
 		}
 	case *ast.SelectorExpr:
-		if isTime(t) || isRaw(t) {
+		switch {
+		case isNumber(t):
+			// A json.Number element is a bare number token — a scalar — so the
+			// cheaper comma-counting scan sizes the slice.
+			counter = "support.CountArrayScalars"
+		case isTime(t) || isRaw(t):
 			counter = "support.CountArrayElements"
 		}
 	}
@@ -1361,13 +1385,13 @@ func (g *gen) assemble(inPath string, methods []string) string {
 	code := body.String()
 
 	// "time" and "encoding/json" are needed only when a spelled type actually
-	// names them (time.Time, or json.RawMessage/RawValue in an anonymous struct,
-	// slice or map element). Decide from the generated text rather than from
+	// names them (time.Time, or json.RawMessage/RawValue/Number in an anonymous
+	// struct, slice or map element). Decide from the generated text rather than from
 	// heuristic flags: those both miss types nested inside an anonymous struct and
 	// over-fire on a nocopy raw field whose decode emits no json. reference. The
 	// tokens appear only as real type usages, never in the generated comments.
 	imports := []string{strconv.Quote(supportPkg)}
-	if strings.Contains(code, "json.RawMessage") || strings.Contains(code, "json.RawValue") {
+	if strings.Contains(code, "json.RawMessage") || strings.Contains(code, "json.RawValue") || strings.Contains(code, "json.Number") {
 		imports = append(imports, `json "encoding/json"`)
 	}
 	if strings.Contains(code, "time.Time") {
@@ -1489,6 +1513,18 @@ func isRaw(expr ast.Expr) bool {
 	}
 	sel, ok := expr.(*ast.SelectorExpr)
 	return ok && (sel.Sel.Name == "RawMessage" || sel.Sel.Name == "RawValue")
+}
+
+func isNumber(expr ast.Expr) bool {
+	if p, ok := expr.(*ast.ParenExpr); ok {
+		return isNumber(p.X)
+	}
+	sel, ok := expr.(*ast.SelectorExpr)
+	if !ok || sel.Sel.Name != "Number" {
+		return false
+	}
+	pkg, ok := sel.X.(*ast.Ident)
+	return ok && pkg.Name == "json"
 }
 
 func isTime(expr ast.Expr) bool {

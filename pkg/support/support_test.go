@@ -225,6 +225,54 @@ func TestReadUint64OrNull(t *testing.T) {
 	}
 }
 
+// --- ReadNumberOrNull ------------------------------------------------------
+
+func TestReadNumberOrNull(t *testing.T) {
+	tests := []struct {
+		name    string
+		in      string
+		want    string
+		wantEnd int
+		wantErr error
+	}{
+		{"int", `12345`, "12345", 5, nil},
+		{"negative", `-42`, "-42", 3, nil},
+		{"float", `3.14159`, "3.14159", 7, nil},
+		{"scientific", `-6.022e23`, "-6.022e23", 9, nil},
+		{"big uint literal", `18446744073709551616`, "18446744073709551616", 20, nil},
+		{"null", `null`, "", 4, nil},
+		{"trailing", `7]`, "7", 1, nil},
+		{"in object", `99,`, "99", 2, nil},
+
+		{"empty", ``, "", 0, ErrTruncated},
+		{"quoted rejected", `"7.5"`, "", 0, ErrBadNumber},
+		{"not a number", `x`, "", 0, ErrBadNumber},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, nocopy := range []bool{false, true} {
+				var got string
+				var end int
+				var err error
+				if nocopy {
+					got, end, err = ReadNumberNoCopyOrNull([]byte(tt.in), 0)
+				} else {
+					got, end, err = ReadNumberOrNull([]byte(tt.in), 0)
+				}
+				if !errors.Is(err, tt.wantErr) {
+					t.Fatalf("nocopy=%v: err = %v, want %v", nocopy, err, tt.wantErr)
+				}
+				if err == nil && got != tt.want {
+					t.Errorf("nocopy=%v: got %q, want %q", nocopy, got, tt.want)
+				}
+				if end != tt.wantEnd {
+					t.Errorf("nocopy=%v: end = %d, want %d", nocopy, end, tt.wantEnd)
+				}
+			}
+		})
+	}
+}
+
 // --- ReadFloat64OrNull -----------------------------------------------------
 
 func TestReadFloat64OrNull(t *testing.T) {

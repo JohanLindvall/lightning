@@ -11,9 +11,17 @@ all: fix check
 download: go.mod go.sum
 	go mod download
 
-check: $(GOBIN)/golangci-lint
+check: $(GOBIN)/golangci-lint conformance/data_unmarshal.go
 	golangci-lint run ./...
 	go test -cover ./...
+
+# The conformance test decodes test.json with a generated decoder, but that
+# decoder is gitignored (like every *_unmarshal.go), so a clean checkout has none
+# and the package would not compile. Regenerate it from its source struct whenever
+# that struct or the generator (main.go) changes; listing it as a prerequisite of
+# check makes the test run against an up-to-date decoder.
+conformance/data_unmarshal.go: conformance/data.go main.go
+	go run . conformance/data.go
 
 # Run every benchmark: first the package microbenchmarks in the main module, then
 # the comparison suite. bench/ is a separate module (so its benchmark-only deps
