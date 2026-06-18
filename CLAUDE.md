@@ -43,6 +43,28 @@ byte-identical when adding cold paths; push new logic out-of-line.
   for mantissa ≥2^53 or |exp|>22) → `strconv`. EL is inline in `scanFloat` (no
   rescan) and bit-identical to strconv when it returns ok; guarded by the
   differential fuzz `TestParseFloatMatchesStrconv`. Don't remove EL.
+- **SWAR fractional digits** in `scanFloat`: the fraction loop folds **four bytes
+  at a time** (`is4Digits`/`parse4Digits`, the simdjson bit trick) instead of one
+  `mant*10+d` per byte, with the 1–3 digit tail dropping to the scalar loop. Just
+  a flat 4-byte loop — no 8-byte chunk, no trailing chunk. Net vs scalar:
+  canada_geometry −5.6%, large-json −3%, float-array-slow −13%, golang_source −1%,
+  and only +1.4% on the synthetic `float-array`. An earlier version added 8-byte
+  runs (`is8Digits`/`parse8Digits`) for long fractions plus a trailing 4-byte; a
+  direct A/B showed that machinery was **statistically tied** with the flat 4-byte
+  loop on the real-world long-fraction cases (canada/large-json/golang_source —
+  their 14–15-digit fractions still fold mostly in SWAR either way) while *costing*
+  2.56% on `float-array`; it won only on `float-array-slow`'s 16-digit synthetic
+  mantissas (+1.4%). So the 8-byte path was net-negative once its float-array cost
+  is counted — dropped for the simpler, smaller, faster-on-balance 4-only loop.
+- **SWAR integer digits** in `ReadInt64OrNull`/`ReadUint64OrNull`: same flat
+  4-byte fold (`is4Digits`/`parse4Digits`) as the float fraction, scalar tail for
+  the last 1-3 digits. `n*10000+v` is bit-identical to the scalar `n*10+d` chain,
+  overflow wrap included. Win comes from long IDs/timestamps: golang_source −2.4%
+  (10-digit ints), twitter_status −1.3% (18-digit IDs). No regression on short-int
+  workloads (synthea/cloudflare flat) — unlike float-array, the per-int SWAR
+  overhead is diluted by the surrounding string/object work. citm_catalog is flat
+  despite the most 9-digit IDs: its bottleneck is key reading and map building, not
+  int parsing.
 - **`CountArrayElements`** (slice presize) skips each element with `SkipValue`
   (vectorized via `indexStructural`), not a byte-by-byte depth walk.
 - **`slicePresize`** skips presize when a struct element transitively holds a
@@ -87,9 +109,28 @@ reads.
 
 ## Tried and rejected (don't re-attempt without a new idea)
 
-- **SWAR 8-digit float parsing**: net-negative. Helped only synthetic
-  `float-array-slow` (−18%); regressed common `float-array` (+4–9%, the per-number
-  `is8Digits` check); flat on real `large-json` coordinates.
+- **SWAR fraction fold with an 8-byte chunk** (any arrangement): the live decoder
+  folds fractions four bytes at a time; adding an 8-byte path never paid off.
+  8-digit-only regressed common `float-array` and was flat on `large-json` (4–7
+  digit fractions fail the 8-byte gate). 4-then-8-runs-then-trailing-4 beat scalar
+  but a direct A/B vs the flat 4-byte loop was *tied* on real data and cost 2.56%
+  on `float-array` (it only won `float-array-slow`'s synthetic 16-digit mantissas).
+  Scalar-scanning the first four then switching to 8-byte runs was worse still
+  (canada +2%, `float-array` +16%). See the "SWAR fractional digits" entry above.
+  Don't reintroduce an 8-byte chunk without a new idea.
+- **One-byte `data[i+3]` digit guard** before the 4-byte fold (skip the load+
+  `is4Digits` for <4-digit fractions): didn't move `float-array` (its regression
+  wasn't the failed test — it's alignment-class) and cost ~1.5% on canada by adding
+  a load to its always-passing 14-digit path. Rejected.
+- **Variable-length SWAR fraction fold** (count leading digits, fold k at once): a
+  single 8-byte loop where `leadingDigits8` (nibble test + carry-safe haszero +
+  `TrailingZeros`) returns the digit count and a shift-padded `parse8Digits` folds
+  the final partial chunk (no divide). Correct (passes the strconv fuzz) and
+  elegant — folds the whole fraction in SWAR — but measured worse everywhere
+  (canada/large-json flat, `float-array` +14%, slow −11%): the count's
+  mask+`TrailingZeros` is dearer than `is4Digits`, and the variable shift + `pow10`
+  table load beats the fixed-width `parse4Digits` whose multipliers are
+  compile-time immediates. Fixed widths win *because* they're fixed.
 - **Vectorizing `SkipWS` as a standalone function**: regresses — the SWAR/SIMD
   setup isn't amortized on the common 0–1 byte runs. It pays off *only* via the
   inline trick above (inline fast path for short runs; `SkipWSRun` SWAR for ≥2-byte

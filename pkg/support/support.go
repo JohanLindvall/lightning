@@ -431,6 +431,17 @@ func ReadInt64OrNull(data []byte, i int) (int64, int, error) {
 		return 0, i, ErrBadNumber
 	}
 	var n int64
+	// Fold four digits per SWAR chunk for long integers (database/timestamp IDs
+	// run 9-18 digits), then a scalar tail for the last 1-3. n*10000+v matches the
+	// scalar n*10+d chain bit for bit, including the wrap past 2^63 on overflow.
+	for i+4 <= len(data) {
+		w := binary.LittleEndian.Uint32(data[i : i+4])
+		if !is4Digits(w) {
+			break
+		}
+		n = n*10000 + int64(parse4Digits(w))
+		i += 4
+	}
 	for i < len(data) {
 		d := data[i] - '0'
 		if d > 9 {
@@ -468,6 +479,16 @@ func ReadUint64OrNull(data []byte, i int) (uint64, int, error) {
 		return 0, i, ErrBadNumber
 	}
 	var n uint64
+	// Fold four digits per SWAR chunk (see ReadInt64OrNull); the scalar tail picks
+	// up the last 1-3 digits.
+	for i+4 <= len(data) {
+		w := binary.LittleEndian.Uint32(data[i : i+4])
+		if !is4Digits(w) {
+			break
+		}
+		n = n*10000 + uint64(parse4Digits(w))
+		i += 4
+	}
 	for i < len(data) {
 		d := data[i] - '0'
 		if d > 9 {
@@ -544,6 +565,22 @@ func ParseFloat(b []byte) (float64, error) {
 	return f, nil
 }
 
+// is4Digits reports whether the four bytes packed little-endian in w are all
+// ASCII digits '0'..'9' (the simdjson bit trick).
+func is4Digits(w uint32) bool {
+	return (w&0xF0F0F0F0)|(((w+0x06060606)&0xF0F0F0F0)>>4) == 0x33333333
+}
+
+// parse4Digits folds four ASCII digits packed little-endian in w into their
+// integer value. The caller has verified the bytes are digits with is4Digits.
+func parse4Digits(w uint32) uint32 {
+	w -= 0x30303030
+	lo := w & 0x00FF00FF
+	hi := (w >> 8) & 0x00FF00FF
+	w = lo*10 + hi
+	return (w&0x0000FFFF)*100 + (w >> 16)
+}
+
 // scanFloat scans the JSON number token beginning at data[i] in a single pass,
 // returning the index just past it and, when it can resolve the value exactly,
 // the parsed result with fast=true. Two fast paths run on the mantissa and
@@ -554,7 +591,6 @@ func ParseFloat(b []byte) (float64, error) {
 // mantissa of more than 19 significant digits, ambiguous rounding, subnormal/
 // overflow results, or an exponent outside the powers-of-ten table return
 // fast=false, leaving the caller to parse data[i:end] with strconv.ParseFloat.
-// marker with no digits), in which case end points at the offending byte.
 //
 // Folding the token scan and both fast-path parses into one pass spares the
 // separate skipNumber scan the previous two-call form made; and because the scan
@@ -596,6 +632,21 @@ func scanFloat(data []byte, i int) (f float64, end int, fast, ok bool) {
 	exp := 0
 	if i < n && data[i] == '.' {
 		i++
+		// Fold fractional digits four bytes at a time while they fit the 19-digit
+		// budget, replacing per-digit mant*10+d steps with one SWAR multiply chain
+		// per chunk. The 1-3 digit tail (and any digits past the 19-digit budget)
+		// drops to the scalar loop below.
+		for mdigits+4 <= 19 && i+4 <= n {
+			w := binary.LittleEndian.Uint32(data[i : i+4])
+			if !is4Digits(w) {
+				break
+			}
+			mant = mant*10000 + uint64(parse4Digits(w))
+			mdigits += 4
+			digits += 4
+			exp -= 4
+			i += 4
+		}
 		for i < n {
 			d := data[i] - '0'
 			if d > 9 {
