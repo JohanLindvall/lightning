@@ -671,6 +671,20 @@ func scanFloat(data []byte, i int) (f float64, end int, fast, ok bool) {
 	exp := 0
 	if i < n && data[i] == '.' {
 		i++
+		// Leading fraction zeros (the "000" of 0.000698…) are not significant
+		// digits: they only shift the decimal exponent. Skip them here so they do
+		// not consume the 19-digit mantissa budget — otherwise a value like
+		// 0.0006988752666567719 (16 significant digits, comfortably exact) would be
+		// counted as 20 digits, falsely flagged as overflow, and dropped to strconv
+		// instead of taking the Clinger/Eisel-Lemire fast path. Only when no
+		// significant digit has been seen yet (mant == 0); a zero between nonzero
+		// digits is significant and stays in the loops below.
+		if mant == 0 {
+			for i < n && data[i] == '0' {
+				exp--
+				i++
+			}
+		}
 		// Fold fractional digits four bytes at a time while they fit the 19-digit
 		// budget, replacing per-digit mant*10+d steps with one SWAR multiply chain
 		// per chunk. The 1-3 digit tail (and any digits past the 19-digit budget)

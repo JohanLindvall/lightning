@@ -43,6 +43,15 @@ byte-identical when adding cold paths; push new logic out-of-line.
   for mantissa ≥2^53 or |exp|>22) → `strconv`. EL is inline in `scanFloat` (no
   rescan) and bit-identical to strconv when it returns ok; guarded by the
   differential fuzz `TestParseFloatMatchesStrconv`. Don't remove EL.
+- **Leading fraction zeros don't consume the 19-digit budget** in `scanFloat`:
+  while `mant == 0`, leading `0`s after the decimal point (the `000` of
+  `0.000698…`) only shift `exp`; they are skipped before the digit loops so they
+  aren't counted toward the significant-digit total. Without this a small decimal
+  like `0.0006988752666567719` (16 significant digits, easily exact) counts as 20
+  digits, trips the `digits > mdigits` overflow guard, and falls all the way to
+  `strconv` instead of Clinger/EL. Real-world win: golang_source −16.6% (its
+  `cl_weight` weights are all sub-thousandth decimals); no regression elsewhere.
+  A zero *between* nonzero digits stays significant (the guard is `mant == 0`).
 - **SWAR fractional digits** in `scanFloat`: the fraction loop folds **four bytes
   at a time** (`is4Digits`/`parse4Digits`, the simdjson bit trick) instead of one
   `mant*10+d` per byte, with the 1–3 digit tail dropping to the scalar loop. Just
@@ -135,6 +144,12 @@ reads.
   setup isn't amortized on the common 0–1 byte runs. It pays off *only* via the
   inline trick above (inline fast path for short runs; `SkipWSRun` SWAR for ≥2-byte
   runs). Done — not rejected — once moved to the call site.
+- **Widening `SkipWSRun` past 8 bytes/iter** (a 32-byte unrolled SWAR after the
+  first 8-byte chunk, for deeply-indented pretty JSON whose runs are 16–28 bytes):
+  regressed everywhere it was tried (citm +5%, twitter +3%, synthea +4.5%). The
+  wide loop reads 32 bytes (four loads) even when the run ends mid-chunk, so it
+  does *more* loads than the 8-byte loop that stops as soon as a non-space chunk
+  appears. The plain 8-byte SWAR is already near-optimal for these run lengths.
 - **Pure-SSE2 `indexStructural`** (dropping AVX2): ~2× slower on the skip path
   (`skip-heavy`); the throughput loss dwarfs the VZEROUPPER saving.
 
