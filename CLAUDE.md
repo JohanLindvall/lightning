@@ -82,6 +82,15 @@ byte-identical when adding cold paths; push new logic out-of-line.
   value never contains a `,` or `]`, so a `[]time.Time` sizes by comma count. That
   avoids a `skipString` over every element (which re-scanned each date string just
   to count it, doubling the per-date work): time-array −16%.
+- **`CountArrayObjects`** extends that to a *struct* of only number/bool fields
+  (`isBracketFreeStruct`): its JSON (`{"a":1,"b":2}`) holds no string, `[`, `]`, or
+  nested `{`, so the array's `]` is the first `]` and the element count is the
+  number of `{` before it — again two vectorized scans instead of a `SkipValue`
+  per struct. citm_catalog's price entries hit this: −6% with *no* change in
+  allocations (the slice is still presized exactly, just counted cheaply). Any
+  string/array/pointer/nested field disqualifies the struct (its JSON could carry
+  a bracket); those keep `CountArrayElements`. All these counters are presize
+  hints — a wrong count only mis-sizes the slice, never misdecodes.
 - **`slicePresize`** skips presize when a struct element transitively holds a
   *multi-dimensional* slice (`hasMultiDimSlice`, e.g. GeoJSON `[][][]float64`):
   counting it would deep-scan every element's bulk for only ~log2(n) reallocs

@@ -1160,7 +1160,13 @@ func (g *gen) slicePresize(elt ast.Expr, eltStr string) string {
 		// decoder then walks again — costing far more than the reallocations
 		// presize avoids. There, let the slice append instead.
 	case *ast.StructType:
-		if g.structSkipIsCheap(t) {
+		switch {
+		case isBracketFreeStruct(t):
+			// A struct of only number/bool fields has no string, '[' or ']' in its
+			// JSON, so its array is sized by the cheap CountArrayObjects (find ']',
+			// count '{') instead of a SkipValue per element. (citm price entries.)
+			counter = "support.CountArrayObjects"
+		case g.structSkipIsCheap(t):
 			counter = "support.CountArrayElements"
 		}
 	case *ast.MapType:
@@ -1551,6 +1557,32 @@ func isScalar(name string) bool {
 		return true
 	}
 	return intKinds[name] || uintKinds[name]
+}
+
+// isBracketFreeStruct reports whether every field of t is a plain number/bool
+// scalar, so the struct's JSON contains no string, '[' or ']' and no nested '{'.
+// An array of such structs can be counted by CountArrayObjects (find ']', count
+// '{'). Any string, pointer, array, map, embedded/named struct, or selector field
+// (time.Time, json.Number, json.RawMessage) disqualifies it — its JSON could hold
+// a bracket. Pipe-renamed or "-"/option-tagged fields are fine; only the field
+// *type* matters. A struct with no fields is excluded (nothing to size against).
+func isBracketFreeStruct(t *ast.StructType) bool {
+	if t.Fields == nil || len(t.Fields.List) == 0 {
+		return false
+	}
+	for _, f := range t.Fields.List {
+		id, ok := unparen(f.Type).(*ast.Ident)
+		if !ok {
+			return false
+		}
+		switch {
+		case id.Name == "bool" || id.Name == "float32" || id.Name == "float64",
+			intKinds[id.Name], uintKinds[id.Name]:
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 var intKinds = map[string]bool{

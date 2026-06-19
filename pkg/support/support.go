@@ -1167,6 +1167,29 @@ func CountArrayScalars(data []byte, i int) int {
 }
 
 var commaByte = []byte{','}
+var openBraceByte = []byte{'{'}
+
+// CountArrayObjects counts the elements of a JSON array of "bracket-free" objects
+// beginning at data[i] (data[i] must be '['). A bracket-free object has only
+// number/bool fields — its JSON ({"a":1,"b":2}) holds no string, '[' or ']', and
+// no nested '{' — so the array's closing ']' is the first ']' in the input and the
+// element count is exactly the number of '{' before it, both found with vectorized
+// byte scans. Like CountArrayScalars it is far cheaper than CountArrayElements (no
+// per-element SkipValue) and valid only for the element shape the generator
+// vouches for; it sizes a slice of flat numeric records — citm_catalog's price
+// entries — without re-scanning every struct. As a presize hint a miscount on
+// unexpected input only over- or under-allocates, never misdecodes. Returns 0 for
+// an empty array.
+func CountArrayObjects(data []byte, i int) int {
+	if i >= len(data) {
+		return 0
+	}
+	rb := bytes.IndexByte(data[i+1:], ']')
+	if rb < 0 {
+		return 0
+	}
+	return bytes.Count(data[i+1:i+1+rb], openBraceByte)
+}
 
 // SkipValue advances past any JSON value starting at data[i].
 func SkipValue(data []byte, i int) (int, error) {
