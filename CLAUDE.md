@@ -118,6 +118,24 @@ reads.
 
 ## Tried and rejected (don't re-attempt without a new idea)
 
+- **Routing Clinger's negative-exponent case through Eisel-Lemire** (replace the
+  `f /= pow10exact[-exp]` division with EL's 128-bit multiply, which is also
+  correctly-rounded so it's a legal swap): measured *worse* everywhere —
+  canada_geometry +12%, `float-array` +24%, large-json +3%. A single FP division
+  is cheaper than EL's table load + `bits.Mul64` + normalization. The tier order
+  (Clinger first, EL only for mantissa ≥2^53 or |exp|>22) is correct as-is.
+- **Presizing slices whose element nests a slice/array/struct** (forcing
+  `CountArrayElements` on the multi-dim coordinate slices and struct-with-nested
+  slices that `slicePresize` deliberately skips): catastrophic — citm_catalog
+  +155%, canada +61%, large-json +48%. Counting a nested element costs the same
+  as decoding it (`SkipValue` recurses through the whole subtree), and presizing
+  at every nesting level re-counts the sub-structure O(depth) times. `growslice`
+  (12–20% on these benchmarks) is the lesser evil; the presize-skip rules stand.
+- **SWAR-folding the RFC 3339 fractional-seconds (nanosecond) loop** (`is4Digits`/
+  `parse4Digits` on the `.190533` digits): statistically tied on time-array — the
+  digit accumulation isn't the bottleneck there (validation + `time.Unix`
+  construction dominate), and assembling the uint32 from string bytes doesn't fold
+  to one load. Not worth the extra code.
 - **SWAR fraction fold with an 8-byte chunk** (any arrangement): the live decoder
   folds fractions four bytes at a time; adding an 8-byte path never paid off.
   8-digit-only regressed common `float-array` and was flat on `large-json` (4–7
