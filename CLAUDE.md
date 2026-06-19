@@ -75,7 +75,13 @@ byte-identical when adding cold paths; push new logic out-of-line.
   despite the most 9-digit IDs: its bottleneck is key reading and map building, not
   int parsing.
 - **`CountArrayElements`** (slice presize) skips each element with `SkipValue`
-  (vectorized via `indexStructural`), not a byte-by-byte depth walk.
+  (vectorized via `indexStructural`), not a byte-by-byte depth walk. Element types
+  whose JSON can hold no comma or bracket use the much cheaper `CountArrayScalars`
+  (find `]`, count commas — two vectorized scans, no per-element work): bare
+  numbers/bools, `json.Number`, **and `time.Time`** — an RFC 3339 / Unix-timestamp
+  value never contains a `,` or `]`, so a `[]time.Time` sizes by comma count. That
+  avoids a `skipString` over every element (which re-scanned each date string just
+  to count it, doubling the per-date work): time-array −16%.
 - **`slicePresize`** skips presize when a struct element transitively holds a
   *multi-dimensional* slice (`hasMultiDimSlice`, e.g. GeoJSON `[][][]float64`):
   counting it would deep-scan every element's bulk for only ~log2(n) reallocs
@@ -131,6 +137,14 @@ reads.
   as decoding it (`SkipValue` recurses through the whole subtree), and presizing
   at every nesting level re-counts the sub-structure O(depth) times. `growslice`
   (12–20% on these benchmarks) is the lesser evil; the presize-skip rules stand.
+  A follow-up tried presizing *just* the leaf coordinate rings (`[][N]scalar`)
+  with a cheap bracket-only counter (`CountNestedScalarElements`, an
+  `indexStructural` depth walk that needs no per-element `SkipValue`): still
+  net-negative — canada +7%, large-json +14%. The count plus the `memclr` of the
+  presized backing outweighs the rings' append growth. Only the *date* half of
+  that idea paid off (the cheap comma count for `[]time.Time`, above), because
+  there the array was already presized — the win was a cheaper *counter*, not a
+  newly-presized slice.
 - **SWAR-folding the RFC 3339 fractional-seconds (nanosecond) loop** (`is4Digits`/
   `parse4Digits` on the `.190533` digits): statistically tied on time-array — the
   digit accumulation isn't the bottleneck there (validation + `time.Unix`
