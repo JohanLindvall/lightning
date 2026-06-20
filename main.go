@@ -1639,25 +1639,6 @@ func isScalar(name string) bool {
 // (time.Time, json.Number, json.RawMessage) disqualifies it — its JSON could hold
 // a bracket. Pipe-renamed or "-"/option-tagged fields are fine; only the field
 // *type* matters. A struct with no fields is excluded (nothing to size against).
-func isBracketFreeStruct(t *ast.StructType) bool {
-	if t.Fields == nil || len(t.Fields.List) == 0 {
-		return false
-	}
-	for _, f := range t.Fields.List {
-		id, ok := unparen(f.Type).(*ast.Ident)
-		if !ok {
-			return false
-		}
-		switch {
-		case id.Name == "bool" || id.Name == "float32" || id.Name == "float64",
-			intKinds[id.Name], uintKinds[id.Name]:
-		default:
-			return false
-		}
-	}
-	return true
-}
-
 // isFlatScalarStringStruct reports whether every field is a plain number, bool or
 // string identifier — no nested struct/array/map/pointer. Such a struct's JSON
 // contains no '[', ']' or nested '{' of its own (only its single object braces and
