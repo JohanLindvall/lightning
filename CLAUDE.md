@@ -11,9 +11,10 @@ allocation-light `json.Unmarshaler` implementations.
   `//lightning:compact` directive (compile-time elision of inter-token `SkipWS`).
 - `pkg/support` — the runtime scanning primitives every generated decoder calls.
   This is where almost all performance work happens.
-- `pkg/json` — small public API over the scanner (`Get`/`GetMany`/`ObjectEach`
-  + `*Compact`, `Unwrap`, `UnescapeString`, `ParseFloat`, `DecodeAny` — the
-  dynamic decode-into-`interface{}` entry point for schema-less input).
+- `pkg/json` — small public API over the scanner: `Get`/`GetMany`/`ObjectEach`
+  (+ `*Compact`) read fields, `Set`/`SetMany` splice values, `StripDefaults`
+  prunes default members, `DecodeAny` decodes a whole document into `interface{}`
+  (schema-less), plus `UnescapeString`/`EscapeString` and `ParseFloat`.
 - `bench/` — separate module (keeps easyjson/sonic deps out of the main module).
   `run_bench.sh` regenerates decoders and benchmarks lightning vs
   encoding/json, easyjson, and bytedance/sonic. `bench/large-json/input.json` is
@@ -239,6 +240,25 @@ reads.
   appears. The plain 8-byte SWAR is already near-optimal for these run lengths.
 - **Pure-SSE2 `indexStructural`** (dropping AVX2): ~2× slower on the skip path
   (`skip-heavy`); the throughput loss dwarfs the VZEROUPPER saving.
+- **Key interning / map presizing in the dynamic `any` decoder**
+  (`decodeAnyObject`, the `DecodeValue`/`json.DecodeAny` path): twitterescaped's
+  `DecodeAny` is bound by building `map[string]any` — `mapassign` plus bucket
+  allocation is ~40% of the decode, and the per-key copy `m[string([]byte(key))]`
+  is the single biggest allocation (54% of allocs; twitter keys like `id`,
+  `created_at`, `text` repeat thousands of times). **Interning** the keys — a
+  document-wide `map[string]string` threaded through `decodeValue`/`decodeAnyObject`
+  (nil for the per-field path, a real map for `json.DecodeAny`), copying each
+  distinct key out of the input once — cut allocs −42% and B/op −9% but left
+  wall-time flat (−1.6%, noise): it trades ~14k key *allocations* for ~14k
+  intern-map *lookups* (`mapaccess2`, a second hash of the same bytes), a wash.
+  **Presizing** the result map didn't help either — twitter objects are bimodal
+  (many 2–5-field nested objects, a few 30–40-field ones) so a fixed `make(map, N)`
+  hint mis-sizes both and `make(map,8)` moved nothing; an *exact* member count
+  needs a structural pre-scan that re-walks nested content depth-times, net-negative
+  for the same reason `slicePresize` skips complex elements. The `any` path is
+  ~2.8× the typed path (twitterescaped 1.9 ms vs 0.67 ms) purely from `map[string]any`
+  + interface boxing, intrinsic to the dynamic representation. Reverted both; don't
+  re-attempt without a way to populate the result map without the per-key hash.
 
 ## Conventions
 
