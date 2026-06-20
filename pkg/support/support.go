@@ -824,6 +824,10 @@ func ReadTimeOrNull(data []byte, i int) (time.Time, int, error) {
 // field, or a timezone that is neither 'Z' nor ±HH:MM. allowSpace additionally
 // permits a space in place of the 'T' date/time separator (the lax variant).
 //
+// pow10nano[fd] scales a fraction of fd significant digits (1..9) up to whole
+// nanoseconds: pow10nano[fd] == 10^(9-fd). Index 0 is unused (fd >= 1).
+var pow10nano = [...]int{1e9, 1e8, 1e7, 1e6, 1e5, 1e4, 1e3, 1e2, 1e1, 1e0}
+
 // It sidesteps time.Parse's reference-layout machinery, which dominates decoding
 // of timestamp-heavy documents, by reading the fixed-offset fields directly.
 func parseRFC3339(s string, allowSpace bool) (time.Time, bool) {
@@ -856,19 +860,26 @@ func parseRFC3339(s string, allowSpace bool) (time.Time, bool) {
 	nsec := 0
 	if s[i] == '.' {
 		i++
-		fd := 0
-		for i < len(s) && s[i] >= '0' && s[i] <= '9' {
-			if fd < 9 { // nanosecond precision; extra digits are ignored
-				nsec = nsec*10 + int(s[i]-'0')
-				fd++
-			}
+		start := i
+		// Accumulate up to 9 fractional digits (nanosecond precision). Bounding the
+		// loop at nine keeps the per-digit `fd < 9` test out of it, and scaling the
+		// result by one table multiply replaces the trailing `for fd<9 { nsec*=10 }`.
+		end9 := i + 9
+		if end9 > len(s) {
+			end9 = len(s)
+		}
+		for i < end9 && s[i] >= '0' && s[i] <= '9' {
+			nsec = nsec*10 + int(s[i]-'0')
 			i++
 		}
+		fd := i - start
 		if fd == 0 {
 			return time.Time{}, false
 		}
-		for ; fd < 9; fd++ {
-			nsec *= 10
+		nsec *= pow10nano[fd]
+		// Any digits past the ninth are below nanosecond resolution; skip them.
+		for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+			i++
 		}
 	}
 
