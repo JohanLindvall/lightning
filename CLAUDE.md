@@ -132,7 +132,16 @@ byte-identical when adding cold paths; push new logic out-of-line.
   saved. Flat / string / 1-D-slice records (Cloudflare-style) keep presize and
   their low B/op.
 - **SIMD scanners** in `index_amd64.s`/`index_arm64.s`: `indexCloseOrEscape`
-  (next `"`/`\`) and `indexStructural` (next `{}[]"`, AVX2). The string scanner
+  (next `"`/`\`) and `indexStructural` (next `{}[]"`, AVX2). The amd64
+  `indexStructuralAVX2` classifies its 5 target bytes with simdjson's
+  **shuffle trick** — two `VPSHUFB` table lookups (`structLoTable[lowNibble] &
+  structHiTable[highNibble] != 0`) plus a compare-to-zero, instead of five
+  `VPCMPEQB`+`VPOR`. Two bits suffice: one for `"` (lo 0x2/hi 0x2), one for the
+  brackets/braces (lo 0xB|0xD / hi 0x5|0x7), so cross combos like `0x52` 'R'
+  stay non-structural. Fewer ops win on the throughput-bound skip loop where many
+  32-byte blocks run back-to-back: skip-heavy −5%, no regression on citm /
+  large-json / canada (whose `SkipValue`/presize use of it early-exits within a
+  block via the scalar prescan, so it never reaches the loop). The string scanner
   (`indexQuoteOrBackslashSSE2`) is a **length-adaptive hybrid**: the first 32-byte
   block is SSE2, so short keys/values return with no AVX2 state and no VZEROUPPER;
   only a string whose first 32 bytes hold no `"`/`\` (a long text field) switches

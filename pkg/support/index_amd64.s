@@ -13,35 +13,29 @@ DATA bslashMask<>+16(SB)/8, $0x5c5c5c5c5c5c5c5c
 DATA bslashMask<>+24(SB)/8, $0x5c5c5c5c5c5c5c5c
 GLOBL bslashMask<>(SB), RODATA|NOPTR, $32
 
-// 32-byte constant vectors of the JSON structural bytes '{' (0x7b), '}' (0x7d),
-// '[' (0x5b), ']' (0x5d) and '"' (0x22). Precomputed in RODATA and loaded with
-// VMOVDQU so indexStructuralAVX2 does not rebuild them with VPBROADCASTB (and
-// the GP→XMM domain crossings that entails) on every call — that per-call setup
-// dominated when the routine early-exits after a single block, which is the
-// common case for token-dense JSON.
-DATA lbraceMask<>+0(SB)/8, $0x7b7b7b7b7b7b7b7b
-DATA lbraceMask<>+8(SB)/8, $0x7b7b7b7b7b7b7b7b
-DATA lbraceMask<>+16(SB)/8, $0x7b7b7b7b7b7b7b7b
-DATA lbraceMask<>+24(SB)/8, $0x7b7b7b7b7b7b7b7b
-GLOBL lbraceMask<>(SB), RODATA|NOPTR, $32
+// Shuffle-classification tables for indexStructuralAVX2 (the simdjson
+// find_structurals trick). A byte is one of '{' '}' '[' ']' '"' iff
+// structLoTable[lowNibble] & structHiTable[highNibble] != 0. The two bits encode
+// the two nibble groups — '"' (lo 0x2, hi 0x2) and the brackets/braces (lo 0xB/0xD,
+// hi 0x5/0x7) — so cross combinations like 0x52 'R' classify as non-structural.
+// Each 16-byte table is duplicated across both AVX2 lanes (VPSHUFB is per-lane).
+DATA structLoTable<>+0(SB)/8, $0x0000000000010000
+DATA structLoTable<>+8(SB)/8, $0x0000020002000000
+DATA structLoTable<>+16(SB)/8, $0x0000000000010000
+DATA structLoTable<>+24(SB)/8, $0x0000020002000000
+GLOBL structLoTable<>(SB), RODATA|NOPTR, $32
 
-DATA rbraceMask<>+0(SB)/8, $0x7d7d7d7d7d7d7d7d
-DATA rbraceMask<>+8(SB)/8, $0x7d7d7d7d7d7d7d7d
-DATA rbraceMask<>+16(SB)/8, $0x7d7d7d7d7d7d7d7d
-DATA rbraceMask<>+24(SB)/8, $0x7d7d7d7d7d7d7d7d
-GLOBL rbraceMask<>(SB), RODATA|NOPTR, $32
+DATA structHiTable<>+0(SB)/8, $0x0200020000010000
+DATA structHiTable<>+8(SB)/8, $0x0000000000000000
+DATA structHiTable<>+16(SB)/8, $0x0200020000010000
+DATA structHiTable<>+24(SB)/8, $0x0000000000000000
+GLOBL structHiTable<>(SB), RODATA|NOPTR, $32
 
-DATA lbrackMask<>+0(SB)/8, $0x5b5b5b5b5b5b5b5b
-DATA lbrackMask<>+8(SB)/8, $0x5b5b5b5b5b5b5b5b
-DATA lbrackMask<>+16(SB)/8, $0x5b5b5b5b5b5b5b5b
-DATA lbrackMask<>+24(SB)/8, $0x5b5b5b5b5b5b5b5b
-GLOBL lbrackMask<>(SB), RODATA|NOPTR, $32
-
-DATA rbrackMask<>+0(SB)/8, $0x5d5d5d5d5d5d5d5d
-DATA rbrackMask<>+8(SB)/8, $0x5d5d5d5d5d5d5d5d
-DATA rbrackMask<>+16(SB)/8, $0x5d5d5d5d5d5d5d5d
-DATA rbrackMask<>+24(SB)/8, $0x5d5d5d5d5d5d5d5d
-GLOBL rbrackMask<>(SB), RODATA|NOPTR, $32
+DATA nibbleMask<>+0(SB)/8, $0x0f0f0f0f0f0f0f0f
+DATA nibbleMask<>+8(SB)/8, $0x0f0f0f0f0f0f0f0f
+DATA nibbleMask<>+16(SB)/8, $0x0f0f0f0f0f0f0f0f
+DATA nibbleMask<>+24(SB)/8, $0x0f0f0f0f0f0f0f0f
+GLOBL nibbleMask<>(SB), RODATA|NOPTR, $32
 
 // func indexQuoteOrBackslashSSE2(b []byte) int
 //
@@ -175,26 +169,24 @@ TEXT ·indexStructuralAVX2(SB), NOSPLIT, $0-32
 	MOVQ b_base+0(FP), SI
 	MOVQ b_len+8(FP), CX
 	XORQ DI, DI
-	VMOVDQU lbraceMask<>(SB), Y0 // '{'
-	VMOVDQU rbraceMask<>(SB), Y1 // '}'
-	VMOVDQU lbrackMask<>(SB), Y2 // '['
-	VMOVDQU rbrackMask<>(SB), Y3 // ']'
-	VMOVDQU quoteMask<>(SB), Y4  // '"'
+	VMOVDQU structLoTable<>(SB), Y0
+	VMOVDQU structHiTable<>(SB), Y1
+	VMOVDQU nibbleMask<>(SB), Y2
+	VPXOR   Y3, Y3, Y3
 
 loops:
 	CMPQ CX, $32
 	JL   tails
-	VMOVDQU (SI)(DI*1), Y5
-	VPCMPEQB Y0, Y5, Y6
-	VPCMPEQB Y1, Y5, Y7
-	VPOR     Y7, Y6, Y6
-	VPCMPEQB Y2, Y5, Y7
-	VPOR     Y7, Y6, Y6
-	VPCMPEQB Y3, Y5, Y7
-	VPOR     Y7, Y6, Y6
-	VPCMPEQB Y4, Y5, Y7
-	VPOR     Y7, Y6, Y6
-	VPMOVMSKB Y6, AX
+	VMOVDQU  (SI)(DI*1), Y5
+	VPAND    Y2, Y5, Y6  // low nibbles
+	VPSHUFB  Y6, Y0, Y6  // structLoTable[lowNibble]
+	VPSRLW   $4, Y5, Y7
+	VPAND    Y2, Y7, Y7  // high nibbles
+	VPSHUFB  Y7, Y1, Y7  // structHiTable[highNibble]
+	VPAND    Y7, Y6, Y6  // nonzero where structural
+	VPCMPEQB Y3, Y6, Y6  // 0xFF where NOT structural
+	VPMOVMSKB Y6, AX     // 1-bits mark non-structural bytes
+	NOTL     AX          // ... so invert to mark structural bytes
 	TESTL    AX, AX
 	JNZ      founds
 	ADDQ     $32, DI

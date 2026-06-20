@@ -532,3 +532,27 @@ Representative numbers for a 1.8 KB Cloudflare log (Go 1.26, amd64):
 Generated files (`*_unmarshal.go`, `bench/*/bench_test.go`, `bench/*/ej/`, and
 the `bench/results.*` outputs) are reproducible and excluded from version
 control via [`.gitignore`](.gitignore).
+
+## Credits
+
+Several of the hot-path techniques are borrowed from prior art:
+
+- **[simdjson](https://github.com/simdjson/simdjson)** (Geoff Langdale and Daniel
+  Lemire) and its Go port **[minio/simdjson-go](https://github.com/minio/simdjson-go)** —
+  the SWAR "parse four digits at once" bit trick used in the float and integer
+  scanners, and the two-`VPSHUFB` nibble-table classification that
+  `indexStructuralAVX2` uses to find structural bytes.
+- The float parser in `scanFloat` layers two published algorithms: William
+  Clinger's fast path for exactly-representable values, then the
+  **[Eisel–Lemire](https://github.com/fastfloat/fast_float)** algorithm (Michael
+  Eisel and Daniel Lemire) for the rest — bit-for-bit identical to
+  `strconv.ParseFloat` on the values it accepts.
+- The benchmark corpus draws on
+  [minio/simdjson-go](https://github.com/minio/simdjson-go/tree/master/testdata)
+  and [go-json-experiment/jsonbench](https://github.com/go-json-experiment/jsonbench)
+  test data, and the comparison suite measures against
+  [encoding/json](https://pkg.go.dev/encoding/json),
+  [mailru/easyjson](https://github.com/mailru/easyjson),
+  [bytedance/sonic](https://github.com/bytedance/sonic),
+  [goccy/go-json](https://github.com/goccy/go-json), and
+  [go-json-experiment/json](https://github.com/go-json-experiment/json) (json/v2).
