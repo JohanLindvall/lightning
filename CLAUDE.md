@@ -289,6 +289,29 @@ reads.
   ~2.8× the typed path (twitterescaped 1.9 ms vs 0.67 ms) purely from `map[string]any`
   + interface boxing, intrinsic to the dynamic representation. Reverted both; don't
   re-attempt without a way to populate the result map without the per-key hash.
+- **Two-stage structural feed** (simdjson-style: a stage-1 SIMD pass builds a
+  structural-position *index*, then stage-2 navigates it by position instead of
+  scanning inline). Fully prototyped (the `VPSHUFB`/nibble-table classification
+  extends to `{}[]":,.\` within 4 bits for free; stage-1 indexes at 7–15 GB/s; a
+  hand-written typed stage-2 produced byte-identical output). Measured **net-negative
+  on the common case and a win only on heavily pretty-printed input** — it is purely
+  a *whitespace play*, winning in proportion to the whitespace fraction (stage-2
+  jumps token-to-token, never skipping whitespace; stage-1 absorbs it in the bulk
+  SIMD scan) and losing a flat ~30% on compact (stage-1 is pure overhead with
+  nothing to reclaim). Fair A/B (both allocate output; two-stage reuses only its
+  index scratch): synthetic flat-int records (59% ws) pretty **−28%** / compact
+  **+29%**; cloudflare-like string records (shallow, 34% ws) pretty **−11%** /
+  compact **+30%**. A **string-aware** index (the simdjson inside-string mask —
+  `find_escaped` + a quote-mask prefix-XOR, verified bit-exact, ~13 GB/s — so stage-2
+  can alias clean strings straight from the boundaries: gsoc 95% of strings clean)
+  did *not* rescue the compact case: the mask *adds* stage-1 cost, and single-pass
+  `nocopy` already aliases a short string after one `indexCloseOrEscape` that finds
+  its close-quote in the first 16–32 bytes — little to amortize. The deeper reason
+  the economics differ from simdjson: simdjson's stage-2 is a cheap *tape copy* that
+  amortizes stage-1, whereas lightning's "stage-2" is the expensive *typed* parse, so
+  the index is mostly redundant work plus a second pass over the bytes. Not worth a
+  wholesale rewrite (it would regress every compact wire-format decode); only ever an
+  opt-in mode for sources known to be both large and deeply indented.
 
 ## Conventions
 
