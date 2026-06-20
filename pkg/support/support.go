@@ -275,16 +275,28 @@ func UnescapeStringInto(in, out []byte) (string, error) {
 
 // decodeStringEscaped is the slow path for quoted strings containing backslash
 // escapes, terminated by the closing quote in data. It allocates a new buffer
-// sized to the string body: the closing quote is located up front (data[start-1]
-// is the opening quote) and, since unescaping never lengthens a string, the
+// sized to the string body: since unescaping never lengthens a string, the
 // decoded result fits in body-length bytes with a single allocation. Sizing to
 // len(data)-start instead over-allocated by the whole remaining document, which
 // is catastrophic for an escaped string near the start of a large input (e.g.
 // the many "\/"-escaped URLs in a multi-hundred-KB Twitter payload).
+//
+// The body length is the distance to the closing '"'. The next '"' is located
+// with a plain IndexByte rather than an escape-aware skipString: on densely
+// escaped text (\uXXXX-per-character CJK) skipString stops at every backslash,
+// scanning the string a second time, while IndexByte sweeps to the quote in one
+// pass. When that quote is not preceded by a backslash it is unescaped — the
+// real close — so its offset is the exact body length. Only when it might be an
+// escaped \" (rare) is the escape-aware skipString needed to find the true end;
+// the dense-escape strings that made skipString costly never take that branch.
 func decodeStringEscaped(data []byte, start, i int) (string, int, error) {
 	capHint := i - start // fallback: the escape-free prefix; append grows the rest
-	if end, err := skipString(data, start-1); err == nil {
-		capHint = end - 1 - start // end is past the closing quote
+	if rel := bytes.IndexByte(data[start:], '"'); rel >= 0 {
+		if rel == 0 || data[start+rel-1] != '\\' {
+			capHint = rel // unescaped quote: exact body length
+		} else if end, err := skipString(data, start-1); err == nil {
+			capHint = end - 1 - start // escaped \" up front; find the true close
+		}
 	}
 	return decodeEscaped(make([]byte, 0, capHint), data, start, i, true)
 }
@@ -303,18 +315,24 @@ func decodeStringEscaped(data []byte, start, i int) (string, int, error) {
 func decodeEscaped(buf, data []byte, start, i int, quoted bool) (string, int, error) {
 	buf = append(buf, data[start:i]...)
 	for i < len(data) {
-		// Bulk-copy the literal run up to the next escape (quoted mode also
-		// stops at the closing quote) in a single vectorized pass.
-		rest := data[i:]
-		var k int
 		if quoted {
-			k = indexCloseOrEscape(rest)
-			if k == len(rest) {
-				break // unterminated string
+			// Bulk-copy the literal run up to the next escape (or the closing
+			// quote) in one vectorized pass — but only when there is a run. Densely
+			// escaped strings (\uXXXX-per-character CJK text) sit on a '\' every
+			// other step, so checking the current byte first skips a whole
+			// indexCloseOrEscape/SSE2 call per escape.
+			c := data[i]
+			if c != '\\' && c != '"' {
+				rest := data[i:]
+				k := indexCloseOrEscape(rest)
+				if k == len(rest) {
+					break // unterminated string
+				}
+				buf = append(buf, rest[:k]...)
+				i += k
+				c = data[i]
 			}
-			buf = append(buf, rest[:k]...)
-			i += k
-			if data[i] == '"' {
+			if c == '"' {
 				return string(buf), i + 1, nil
 			}
 			i++ // step over the backslash
@@ -388,25 +406,39 @@ func decodeEscaped(buf, data []byte, start, i int, quoted bool) (string, int, er
 	return unsafeStr(buf), i, nil
 }
 
+// hexNibble maps a byte to its hex value (0–15), or 0xFF if it is not a hex
+// digit. Four table loads replace the four 3-way comparison chains the
+// digit-at-a-time parse ran, and validation falls out of the lookup: a non-hex
+// byte yields 0xFF, whose high bit survives the OR in readUnicodeEscape.
+var hexNibble = func() [256]uint8 {
+	var t [256]uint8
+	for i := range t {
+		t[i] = 0xFF
+	}
+	for c := byte('0'); c <= '9'; c++ {
+		t[c] = c - '0'
+	}
+	for c := byte('a'); c <= 'f'; c++ {
+		t[c] = c - 'a' + 10
+	}
+	for c := byte('A'); c <= 'F'; c++ {
+		t[c] = c - 'A' + 10
+	}
+	return t
+}()
+
 func readUnicodeEscape(data []byte, i int) (rune, int, error) {
 	if i+4 > len(data) {
 		return 0, i, ErrTruncated
 	}
-	var r rune
-	for k := 0; k < 4; k++ {
-		c := data[i+k]
-		switch {
-		case c >= '0' && c <= '9':
-			r = r<<4 | rune(c-'0')
-		case c >= 'a' && c <= 'f':
-			r = r<<4 | rune(c-'a'+10)
-		case c >= 'A' && c <= 'F':
-			r = r<<4 | rune(c-'A'+10)
-		default:
-			return 0, i, ErrBadUnicode
-		}
+	a := hexNibble[data[i]]
+	b := hexNibble[data[i+1]]
+	c := hexNibble[data[i+2]]
+	d := hexNibble[data[i+3]]
+	if a|b|c|d >= 0x80 { // some byte was not a hex digit (mapped to 0xFF)
+		return 0, i, ErrBadUnicode
 	}
-	return r, i + 4, nil
+	return rune(a)<<12 | rune(b)<<8 | rune(c)<<4 | rune(d), i + 4, nil
 }
 
 // ReadInt64OrNull reads a JSON integer (or null) at data[i]. Fractional and

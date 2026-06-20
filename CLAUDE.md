@@ -74,6 +74,26 @@ byte-identical when adding cold paths; push new logic out-of-line.
   overhead is diluted by the surrounding string/object work. citm_catalog is flat
   despite the most 9-digit IDs: its bottleneck is key reading and map building, not
   int parsing.
+- **Escaped-string decoding** (`decodeEscaped` / `readUnicodeEscape` /
+  `decodeStringEscaped`) — three things make densely-escaped text fast
+  (`\uXXXX`-per-character CJK, the twitterescaped workload): **(1)** the
+  literal-run scan is skipped when already sitting on a `\` or `"` — consecutive
+  escapes land on a `\` every other byte, so calling the SSE2
+  `indexCloseOrEscape` each time just to find `\` at offset 0 was pure call
+  overhead; **(2)** `readUnicodeEscape` parses the four hex digits through a
+  256-byte `hexNibble` table (nibble value, or `0xFF` for a non-hex byte) — four
+  loads + one `a|b|c|d >= 0x80` test replace four 3-way comparison chains, and
+  validation falls out of the lookup because the `0xFF`'s high bit survives the
+  OR; **(3)** the buffer cap hint in `decodeStringEscaped` finds the body end
+  with a plain `bytes.IndexByte('"')` (one vectorized pass) instead of the
+  escape-aware `skipString`, which stops at *every* backslash and re-scans the
+  whole string. A `"` not preceded by `\` is definitively the unescaped close, so
+  its offset is the exact body length (decoded ≤ escaped, always); only when the
+  found `"` *is* preceded by `\` (a possible `\"`, rare) does it fall back to
+  `skipString` for the true end — and the dense-escape strings that made
+  `skipString` costly never hit that branch. Net: twitterescaped −33%, no
+  regression on twitter_status, string_unicode, citm, golang_source, synthea, or
+  cloudflare.
 - **`CountArrayElements`** (slice presize) skips each element with `SkipValue`
   (vectorized via `indexStructural`), not a byte-by-byte depth walk. Element types
   whose JSON can hold no comma or bracket use the much cheaper `CountArrayScalars`
