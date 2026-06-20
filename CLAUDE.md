@@ -132,16 +132,22 @@ byte-identical when adding cold paths; push new logic out-of-line.
   saved. Flat / string / 1-D-slice records (Cloudflare-style) keep presize and
   their low B/op.
 - **SIMD scanners** in `index_amd64.s`/`index_arm64.s`: `indexCloseOrEscape`
-  (next `"`/`\`) and `indexStructural` (next `{}[]"`, AVX2). The amd64
-  `indexStructuralAVX2` classifies its 5 target bytes with simdjson's
-  **shuffle trick** — two `VPSHUFB` table lookups (`structLoTable[lowNibble] &
-  structHiTable[highNibble] != 0`) plus a compare-to-zero, instead of five
-  `VPCMPEQB`+`VPOR`. Two bits suffice: one for `"` (lo 0x2/hi 0x2), one for the
+  (next `"`/`\`) and `indexStructural` (next `{}[]"`). Both arches classify the 5
+  target bytes with simdjson's **shuffle trick** — two table lookups
+  (`structLo[lowNibble] & structHi[highNibble] != 0`) instead of five
+  compare+or. Two bits suffice: one for `"` (lo 0x2/hi 0x2), one for the
   brackets/braces (lo 0xB|0xD / hi 0x5|0x7), so cross combos like `0x52` 'R'
-  stay non-structural. Fewer ops win on the throughput-bound skip loop where many
-  32-byte blocks run back-to-back: skip-heavy −5%, no regression on citm /
-  large-json / canada (whose `SkipValue`/presize use of it early-exits within a
-  block via the scalar prescan, so it never reaches the loop). The string scanner
+  stay non-structural. amd64 (`VPSHUFB`) needs a trailing compare-to-zero +
+  `VPMOVMSKB`+`NOT` (the movemask reads bit 7); arm64 (`TBL`) needs neither — its
+  RBIT/CLZ recovery finds the first nonzero byte directly, so the loop is just
+  `VAND`/`VTBL`/`VUSHR`/`VTBL`/`VAND` (5 ops vs the old 9). Fewer ops win on the
+  throughput-bound skip loop where blocks run back-to-back: **amd64 skip-heavy −5%**,
+  no regression on citm / large-json / canada (whose `SkipValue`/presize use
+  early-exits within a block via the scalar prescan, so it never reaches the loop).
+  arm64 mirrors the change (correctness verified under qemu — full support suite +
+  an exhaustive 0–255 × boundary-offset differential); its speedup is unmeasured
+  here (qemu isn't cycle-accurate) and wants a real-arm64/CI run to confirm. The
+  string scanner
   (`indexQuoteOrBackslashSSE2`) is a **length-adaptive hybrid**: the first 32-byte
   block is SSE2, so short keys/values return with no AVX2 state and no VZEROUPPER;
   only a string whose first 32 bytes hold no `"`/`\` (a long text field) switches

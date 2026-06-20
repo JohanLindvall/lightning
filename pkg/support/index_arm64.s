@@ -1,15 +1,29 @@
 #include "textflag.h"
 
-// 16-byte constant of byte indices is not needed; we recover the position with
-// scalar RBIT/CLZ on the comparison mask moved into general registers.
+// No 16-byte index constant is needed for position recovery: scalar RBIT/CLZ on
+// the result mask moved into general registers finds the first nonzero byte.
 //
-// The comparison splats are built per call with MOVD-immediate + VDUP rather
-// than loaded from a RODATA table. On amd64 the equivalent constants are kept in
-// RODATA because building them inline needs VPBROADCASTB, whose GP→XMM domain
-// crossing dominates when the routine early-exits after a single block; arm64's
-// VDUP-from-GPR has no such penalty, so the inline form is cheaper than a VLD1
-// load (no load-use latency, no memory dependency) and measures ~2% faster on
-// the get benchmark. See index_amd64.s for the contrasting choice.
+// indexQuoteOrBackslashNEON builds its two comparison splats ('"', '\\') per call
+// with MOVD-immediate + VDUP rather than loading a RODATA table: on amd64 the
+// equivalent constants live in RODATA because building them inline needs
+// VPBROADCASTB (a GP→XMM domain crossing that dominates a single-block call), but
+// arm64's VDUP-from-GPR has no such penalty, so the inline form is cheaper than a
+// VLD1 (no load-use latency) and measures ~2% faster on the get benchmark.
+//
+// indexStructuralNEON instead classifies its five target bytes with simdjson's
+// shuffle trick — two TBL (NEON's VPSHUFB) lookups into the nibble tables below,
+// structLo[lowNibble] & structHi[highNibble] != 0 — which a single-byte VDUP
+// cannot build, so those tables are kept in RODATA and loaded once per call (the
+// scalar prescan means the NEON loop, hence this load, runs only for long skips).
+// Two bits encode the groups: '"' (lo 0x2 / hi 0x2) and the brackets/braces
+// (lo 0xB|0xD / hi 0x5|0x7). The 0x0f mask isolates the low nibble.
+DATA structTablesArm<>+0(SB)/8, $0x0000000000010000  // structLo nibbles 0–7
+DATA structTablesArm<>+8(SB)/8, $0x0000020002000000  // structLo nibbles 8–15
+DATA structTablesArm<>+16(SB)/8, $0x0200020000010000 // structHi nibbles 0–7
+DATA structTablesArm<>+24(SB)/8, $0x0000000000000000 // structHi nibbles 8–15
+DATA structTablesArm<>+32(SB)/8, $0x0f0f0f0f0f0f0f0f // low-nibble mask
+DATA structTablesArm<>+40(SB)/8, $0x0f0f0f0f0f0f0f0f
+GLOBL structTablesArm<>(SB), RODATA|NOPTR, $48
 
 // func indexQuoteOrBackslashNEON(b []byte) int
 //
@@ -87,32 +101,20 @@ TEXT ·indexStructuralNEON(SB), NOSPLIT, $0-32
 	MOVD b_base+0(FP), R0
 	MOVD b_len+8(FP), R1
 	MOVD $0, R2
-	MOVD $0x7b, R3
-	VDUP R3, V0.B16   // '{'
-	MOVD $0x7d, R3
-	VDUP R3, V1.B16   // '}'
-	MOVD $0x5b, R3
-	VDUP R3, V2.B16   // '['
-	MOVD $0x5d, R3
-	VDUP R3, V3.B16   // ']'
-	MOVD $0x22, R3
-	VDUP R3, V4.B16   // '"'
+	MOVD $structTablesArm<>(SB), R3
+	VLD1 (R3), [V0.B16, V1.B16, V2.B16] // structLo, structHi, 0x0f mask
 
 sloop:
 	SUB  R2, R1, R7
 	CMP  $16, R7
 	BLT  stail
 	ADD  R0, R2, R8
-	VLD1 (R8), [V5.B16]          // chunk
-	VCMEQ V0.B16, V5.B16, V6.B16
-	VCMEQ V1.B16, V5.B16, V7.B16
-	VORR V7.B16, V6.B16, V6.B16
-	VCMEQ V2.B16, V5.B16, V7.B16
-	VORR V7.B16, V6.B16, V6.B16
-	VCMEQ V3.B16, V5.B16, V7.B16
-	VORR V7.B16, V6.B16, V6.B16
-	VCMEQ V4.B16, V5.B16, V7.B16
-	VORR V7.B16, V6.B16, V6.B16
+	VLD1  (R8), [V5.B16]              // chunk
+	VAND  V2.B16, V5.B16, V6.B16     // low nibbles
+	VTBL  V6.B16, [V0.B16], V6.B16   // structLo[lowNibble]
+	VUSHR $4, V5.B16, V7.B16         // high nibbles (per-byte shift)
+	VTBL  V7.B16, [V1.B16], V7.B16   // structHi[highNibble]
+	VAND  V7.B16, V6.B16, V6.B16     // nonzero byte where structural
 	VMOV V6.D[0], R9
 	VMOV V6.D[1], R10
 	CBNZ R9, slow8
