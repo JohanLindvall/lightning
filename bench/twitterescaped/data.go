@@ -18,11 +18,25 @@ type Benchmark struct {
 		Coordinates  any    `json:"coordinates"`
 		CreatedAt    string `json:"created_at,nocopy"`
 		Entities     struct {
-			Hashtags     []any `json:"hashtags"`
-			Symbols      []any `json:"symbols"`
-			Urls         []any `json:"urls"`
-			UserMentions []any `json:"user_mentions"`
-			Media        []struct {
+			Hashtags []struct {
+				Indices []int64 `json:"indices"`
+				Text    string  `json:"text,nocopy"`
+			} `json:"hashtags"`
+			Symbols []any `json:"symbols"`
+			Urls    []struct {
+				DisplayUrl  string  `json:"display_url,nocopy"`
+				ExpandedUrl string  `json:"expanded_url,nocopy"`
+				Indices     []int64 `json:"indices"`
+				URL         string  `json:"url,nocopy"`
+			} `json:"urls"`
+			UserMentions []struct {
+				ID         int64   `json:"id"`
+				IdStr      string  `json:"id_str,nocopy"`
+				Indices    []int64 `json:"indices"`
+				Name       string  `json:"name,nocopy"`
+				ScreenName string  `json:"screen_name,nocopy"`
+			} `json:"user_mentions"`
+			Media []struct {
 				DisplayUrl    string  `json:"display_url,nocopy"`
 				ExpandedUrl   string  `json:"expanded_url,nocopy"`
 				ID            int64   `json:"id"`
@@ -139,8 +153,11 @@ type Benchmark struct {
 			Coordinates  any    `json:"coordinates"`
 			CreatedAt    string `json:"created_at,nocopy"`
 			Entities     struct {
-				Hashtags []any `json:"hashtags"`
-				Media    []struct {
+				Hashtags []struct {
+					Indices []int64 `json:"indices"`
+					Text    string  `json:"text,nocopy"`
+				} `json:"hashtags"`
+				Media []struct {
 					DisplayUrl    string  `json:"display_url,nocopy"`
 					ExpandedUrl   string  `json:"expanded_url,nocopy"`
 					ID            int64   `json:"id"`
@@ -175,9 +192,20 @@ type Benchmark struct {
 					SourceStatusId    int64  `json:"source_status_id"`
 					SourceStatusIdStr string `json:"source_status_id_str,nocopy"`
 				} `json:"media"`
-				Symbols      []any `json:"symbols"`
-				Urls         []any `json:"urls"`
-				UserMentions []any `json:"user_mentions"`
+				Symbols []any `json:"symbols"`
+				Urls    []struct {
+					DisplayUrl  string  `json:"display_url,nocopy"`
+					ExpandedUrl string  `json:"expanded_url,nocopy"`
+					Indices     []int64 `json:"indices"`
+					URL         string  `json:"url,nocopy"`
+				} `json:"urls"`
+				UserMentions []struct {
+					ID         int64   `json:"id"`
+					IdStr      string  `json:"id_str,nocopy"`
+					Indices    []int64 `json:"indices"`
+					Name       string  `json:"name,nocopy"`
+					ScreenName string  `json:"screen_name,nocopy"`
+				} `json:"user_mentions"`
 			} `json:"entities"`
 			FavoriteCount        int64  `json:"favorite_count"`
 			Favorited            bool   `json:"favorited"`
