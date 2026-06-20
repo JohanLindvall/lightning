@@ -36,3 +36,6 @@ bench/twitter_status/input.json
 # Compiled Go test binaries (`go test -c`), e.g. the ones the A/B bench harness
 # builds into bench/ — never artifacts to commit.
 *.test
+
+# Simdjson-go testdata bench inputs (downloaded from input.url by run_bench.sh)
+bench/sj_*/input.json

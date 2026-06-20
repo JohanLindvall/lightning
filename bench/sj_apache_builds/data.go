@@ -1,0 +1,33 @@
+// Code generated from apache_builds.json (minio/simdjson-go testdata); root renamed Benchmark.
+package bench
+
+type Benchmark struct {
+	AssignedLabels []struct {
+	} `json:"assignedLabels"`
+	Description string `json:"description"`
+	Jobs        []struct {
+		Color string `json:"color"`
+		Name  string `json:"name"`
+		URL   string `json:"url"`
+	} `json:"jobs"`
+	Mode            string `json:"mode"`
+	NodeDescription string `json:"nodeDescription"`
+	NodeName        string `json:"nodeName"`
+	NumExecutors    int64  `json:"numExecutors"`
+	OverallLoad     struct {
+	} `json:"overallLoad"`
+	PrimaryView struct {
+		Name string `json:"name"`
+		URL  string `json:"url"`
+	} `json:"primaryView"`
+	QuietingDown   bool  `json:"quietingDown"`
+	SlaveAgentPort int64 `json:"slaveAgentPort"`
+	UnlabeledLoad  struct {
+	} `json:"unlabeledLoad"`
+	UseCrumbs   bool `json:"useCrumbs"`
+	UseSecurity bool `json:"useSecurity"`
+	Views       []struct {
+		Name string `json:"name"`
+		URL  string `json:"url"`
+	} `json:"views"`
+}

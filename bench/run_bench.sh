@@ -75,7 +75,10 @@ for dir in */; do
 		# A .gz URL (e.g. the go-json-experiment testdata) is fetched to a temp
 		# file and gunzipped into input.json; anything else is fetched directly.
 		dl="${dir}input.json"
-		case "$url" in *.gz) dl="${dir}input.json.gz" ;; esac
+		case "$url" in
+		*.gz) dl="${dir}input.json.gz" ;;
+		*.zst) dl="${dir}input.json.zst" ;;
+		esac
 		if command -v curl >/dev/null 2>&1; then
 			curl -fsSL -o "$dl" "$url" || rm -f "$dl"
 		elif command -v wget >/dev/null 2>&1; then
@@ -84,7 +87,10 @@ for dir in */; do
 			echo "  no curl or wget available to download ${dir}input.json" >&2
 		fi
 		if [ "$dl" != "${dir}input.json" ] && [ -f "$dl" ]; then
-			gunzip -f "$dl" || rm -f "$dl" "${dir}input.json"
+			case "$dl" in
+			*.gz)  gunzip -f "$dl"      || rm -f "$dl" "${dir}input.json" ;;
+			*.zst) zstd -dfq "$dl" && rm -f "$dl" || rm -f "$dl" "${dir}input.json" ;;
+			esac
 		fi
 	fi
 	[ -f "${dir}input.json" ] || { echo "skip ${dir}: no input.json" >&2; continue; }
@@ -231,6 +237,14 @@ func BenchmarkJSONV2(b *testing.B) {
 }
 EOF
 	perl -i -pe "s#__EJ_IMPORT__#${ejimport}#" "${dir}bench_test.go"
+
+	# easyjson only emits an UnmarshalJSON for struct types; an array-root document
+	# (type Benchmark []T) leaves ej.Benchmark without the method, so drop the
+	# easyjson import and benchmark for those cases (lightning still decodes them —
+	# it handles named slice roots — and the other libraries are reflection-based).
+	if ! grep -rqs 'func (v \*Benchmark) UnmarshalJSON' "${ejdir}"; then
+		perl -0777 -i -pe 's{\n\tej "[^"]*"}{}; s{\n// BenchmarkEasyjson.*?\n\}\n}{}s' "${dir}bench_test.go"
+	fi
 
 	# 4. Run the benchmarks and record the output.
 	{
