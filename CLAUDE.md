@@ -95,8 +95,21 @@ byte-identical when adding cold paths; push new logic out-of-line.
   regression on twitter_status, string_unicode, citm, golang_source, synthea, or
   cloudflare.
 - **`CountArrayElements`** (slice presize) skips each element with `SkipValue`
-  (vectorized via `indexStructural`), not a byte-by-byte depth walk. Element types
-  whose JSON can hold no comma or bracket use the much cheaper `CountArrayScalars`
+  (vectorized via `indexStructural`), not a byte-by-byte depth walk — but **gives
+  up the per-element walk after `countSampleCap` (64) elements** and extrapolates
+  the total from the bytes the sample spans (`n * (approxEnd − open) / sampled`,
+  with `approxEnd` the first `]` via `bytes.IndexByte`). A huge uniform array
+  (apache_builds' **875** `{name,url,color}` job objects, all strings, so the
+  cheap counters below don't apply) is then sized from a 64-element sample instead
+  of a full `skipObject`-per-element pass that re-scans every URL: apache_builds
+  **−41%**, allocs unchanged (the estimate, 912 vs 875, still presizes in one
+  alloc). The first `]` is at or before the true close (a `]` inside a string only
+  moves it earlier) and the result is only ever a presize hint — a wrong count
+  mis-sizes the slice, never misdecodes — so an over/under-estimate is harmless;
+  arrays ≤ 64 elements still get an exact count. No regression on citm, large-json,
+  golang_source, synthea, twitter, marine_ik, payload_large, update_center.
+  Element types whose JSON can hold no comma or bracket use the much cheaper
+  `CountArrayScalars`
   (find `]`, count commas — two vectorized scans, no per-element work): bare
   numbers/bools, `json.Number`, **and `time.Time`** — an RFC 3339 / Unix-timestamp
   value never contains a `,` or `]`, so a `[]time.Time` sizes by comma count. That

@@ -1155,10 +1155,17 @@ func ExpectNull(data []byte, i int) (int, error) {
 // coordinate array of many numbers, say — is jumped over in vectorized strides
 // instead of one byte at a time. This is what makes presizing slices of arrays,
 // objects, or strings cheap.
+// countSampleCap bounds the per-element walk: a huge array (apache_builds' 875
+// job objects) need not be skipped in full just to size a slice. After this many
+// elements the total is extrapolated from the bytes the sample spans, turning an
+// O(array) skip into O(countSampleCap).
+const countSampleCap = 64
+
 func CountArrayElements(data []byte, i int) int {
 	if i >= len(data) || data[i] != '[' {
 		return 0
 	}
+	open := i
 	i = SkipWS(data, i+1)
 	if i >= len(data) || data[i] == ']' {
 		return 0
@@ -1181,6 +1188,26 @@ func CountArrayElements(data []byte, i int) int {
 			i = SkipWS(data, i+1)
 			if i >= len(data) {
 				return 0
+			}
+			if n == countSampleCap {
+				// Sample large enough: stop skipping element-by-element and
+				// estimate the total from the array's byte span. The closing ']'
+				// is located with a plain IndexByte — the first ']' is at or
+				// before the true close (a ']' inside a string only moves it
+				// earlier), so for bracket-free elements the estimate matches and
+				// it is a presize hint regardless: a wrong count mis-sizes the
+				// slice, never misdecodes.
+				rel := bytes.IndexByte(data[i:], ']')
+				if rel < 0 {
+					return n
+				}
+				span := i + rel - open // '[' .. approximate ']'
+				sampled := i - open    // bytes covering n elements
+				est := n * span / sampled
+				if est > span { // every element spans at least one byte
+					est = span
+				}
+				return est
 			}
 		default:
 			return 0 // malformed; let the caller grow on demand
