@@ -9,6 +9,16 @@ style `UnmarshalJSON` method plus the recursive decoders it needs. The decoders
 share a single set of scanning primitives in [`pkg/support`](pkg/support), so the
 generated files stay small.
 
+Those same primitives are also exposed directly as a small toolkit in
+[`pkg/json`](pkg/json), for working with JSON without generating or decoding into
+a struct at all: pull a few fields out of a document
+([`Get`/`GetMany`](#key-lookups)), edit values in place
+([`Set`/`SetMany`](#setting-a-value)), prune default members
+([`StripDefaults`](#stripping-default-fields)), decode into a generic value
+([`DecodeAny`](#decoding-into-any)), and escape, unescape, or parse a JSON number
+on its own — each an allocation-light, single-pass operation over the raw bytes.
+See [Layout](#layout) for the full list.
+
 ## Installation
 
 Run it straight from the module path (no clone needed):
