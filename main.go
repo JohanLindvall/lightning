@@ -1223,10 +1223,15 @@ func (g *gen) slicePresize(elt ast.Expr, eltStr string) string {
 		// presize avoids. There, let the slice append instead.
 	case *ast.StructType:
 		switch {
-		case isBracketFreeStruct(t):
-			// A struct of only number/bool fields has no string, '[' or ']' in its
-			// JSON, so its array is sized by the cheap CountArrayObjects (find ']',
-			// count '{') instead of a SkipValue per element. (citm price entries.)
+		case isFlatScalarStringStruct(t):
+			// A flat struct of only number/bool/string fields has no '[', ']' or
+			// nested '{' of its own, so its array is sized by the cheap
+			// CountArrayObjects (find ']', count '{') instead of a SkipValue per
+			// element. Exact for number/bool fields (citm price entries); for string
+			// fields it is a presize hint — a '['/']'/'{' inside a string value can
+			// mis-size the slice but never misdecodes — which avoids the per-element
+			// skipObject that dominates arrays of small {name,version}-style records
+			// (update_center dependencies/developers, apache_builds jobs).
 			counter = "support.CountArrayObjects"
 		case g.structSkipIsCheap(t):
 			counter = "support.CountArrayElements"
@@ -1645,6 +1650,33 @@ func isBracketFreeStruct(t *ast.StructType) bool {
 		}
 		switch {
 		case id.Name == "bool" || id.Name == "float32" || id.Name == "float64",
+			intKinds[id.Name], uintKinds[id.Name]:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// isFlatScalarStringStruct reports whether every field is a plain number, bool or
+// string identifier — no nested struct/array/map/pointer. Such a struct's JSON
+// contains no '[', ']' or nested '{' of its own (only its single object braces and
+// its scalar/string values), so an array of them can be counted by CountArrayObjects
+// ('{' before the first ']'). Bracket-free (number/bool only) is exact; with string
+// fields it is a presize hint, since a bracket inside a string value could throw the
+// count off — harmless, as a miscount only mis-sizes the slice.
+func isFlatScalarStringStruct(t *ast.StructType) bool {
+	if t.Fields == nil || len(t.Fields.List) == 0 {
+		return false
+	}
+	for _, f := range t.Fields.List {
+		id, ok := unparen(f.Type).(*ast.Ident)
+		if !ok {
+			return false
+		}
+		switch {
+		case id.Name == "string" || id.Name == "bool" ||
+			id.Name == "float32" || id.Name == "float64",
 			intKinds[id.Name], uintKinds[id.Name]:
 		default:
 			return false

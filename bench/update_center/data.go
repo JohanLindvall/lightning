@@ -38,7 +38,7 @@ type Benchmark struct {
 		PreviousTimestamp      string   `json:"previousTimestamp,nocopy"`
 		PreviousVersion        string   `json:"previousVersion,nocopy"`
 		CompatibleSinceVersion string   `json:"compatibleSinceVersion,nocopy"`
-	} `json:"plugins"`
+	} `json:"plugins,nocopy"`
 	Signature struct {
 		Certificates     []string `json:"certificates,nocopy"`
 		CorrectDigest    string   `json:"correct_digest,nocopy"`

@@ -117,15 +117,25 @@ byte-identical when adding cold paths; push new logic out-of-line.
   value never contains a `,` or `]`, so a `[]time.Time` sizes by comma count. That
   avoids a `skipString` over every element (which re-scanned each date string just
   to count it, doubling the per-date work): time-array −16%.
-- **`CountArrayObjects`** extends that to a *struct* of only number/bool fields
-  (`isBracketFreeStruct`): its JSON (`{"a":1,"b":2}`) holds no string, `[`, `]`, or
-  nested `{`, so the array's `]` is the first `]` and the element count is the
-  number of `{` before it — again two vectorized scans instead of a `SkipValue`
-  per struct. citm_catalog's price entries hit this: −6% with *no* change in
-  allocations (the slice is still presized exactly, just counted cheaply). Any
-  string/array/pointer/nested field disqualifies the struct (its JSON could carry
-  a bracket); those keep `CountArrayElements`. All these counters are presize
-  hints — a wrong count only mis-sizes the slice, never misdecodes.
+- **`CountArrayObjects`** extends that to a *flat struct of number/bool/**string**
+  fields* (`isFlatScalarStringStruct`): its JSON holds no `[`, `]` or nested `{` of
+  its own, so the array's `]` is the first `]` and the element count is the number
+  of `{` before it — two vectorized scans instead of a `SkipValue` per struct.
+  Number/bool-only is *exact* (citm_catalog price entries: −6%, no alloc change).
+  With string fields it is a presize *hint* — a `[`/`]`/`{` inside a string value
+  could mis-size the slice, but a miscount only mis-sizes, never misdecodes — and
+  it pays where the array holds many small `{name,version}`-style records:
+  update_center dependencies/developers and **apache_builds jobs −2.7%** (cheaper
+  than the cap-and-extrapolate `CountArrayElements` it replaces, since two
+  `IndexByte`/`Count` passes beat skipping 64 elements). A *nested*
+  struct/array/pointer/map field disqualifies it (its JSON carries real brackets);
+  those keep `CountArrayElements`. All these counters are presize hints.
+  (Tried-and-rejected for update_center: presizing the `map[string]struct` plugins
+  map saves the ~7 rehashes of its large struct values, −5% — but counting its 654
+  members needs a depth-aware scan or a matching-`}` extent for extrapolation, both
+  ~as costly as the rehash they'd save. The `//lightning:nocopy`-equivalent
+  `,nocopy` on the plugins map *field* does land though: aliasing the 654 plugin-name
+  keys is −21% allocs / −2.5% time.)
 - **`slicePresize`** skips presize when a struct element transitively holds a
   *multi-dimensional* slice (`hasMultiDimSlice`, e.g. GeoJSON `[][][]float64`):
   counting it would deep-scan every element's bulk for only ~log2(n) reallocs
