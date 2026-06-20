@@ -77,11 +77,11 @@ type Benchmark struct {
 		Geo                  any    `json:"geo"`
 		ID                   int64  `json:"id"`
 		IdStr                string `json:"id_str,nocopy"`
-		InReplyToScreenName  any    `json:"in_reply_to_screen_name"`
-		InReplyToStatusId    any    `json:"in_reply_to_status_id"`
-		InReplyToStatusIdStr any    `json:"in_reply_to_status_id_str"`
-		InReplyToUserId      any    `json:"in_reply_to_user_id"`
-		InReplyToUserIdStr   any    `json:"in_reply_to_user_id_str"`
+		InReplyToScreenName  string `json:"in_reply_to_screen_name,nocopy"`
+		InReplyToStatusId    int64  `json:"in_reply_to_status_id"`
+		InReplyToStatusIdStr string `json:"in_reply_to_status_id_str,nocopy"`
+		InReplyToUserId      int64  `json:"in_reply_to_user_id"`
+		InReplyToUserIdStr   string `json:"in_reply_to_user_id_str,nocopy"`
 		Lang                 string `json:"lang,nocopy"`
 		Metadata             struct {
 			IsoLanguageCode string `json:"iso_language_code,nocopy"`
@@ -142,9 +142,9 @@ type Benchmark struct {
 			Protected                      bool   `json:"protected"`
 			ScreenName                     string `json:"screen_name,nocopy"`
 			StatusesCount                  int64  `json:"statuses_count"`
-			TimeZone                       any    `json:"time_zone"`
-			URL                            any    `json:"url"`
-			UtcOffset                      any    `json:"utc_offset"`
+			TimeZone                       string `json:"time_zone,nocopy"`
+			URL                            string `json:"url,nocopy"`
+			UtcOffset                      int64  `json:"utc_offset"`
 			Verified                       bool   `json:"verified"`
 		} `json:"user"`
 		PossiblySensitive bool `json:"possibly_sensitive"`
@@ -212,11 +212,11 @@ type Benchmark struct {
 			Geo                  any    `json:"geo"`
 			ID                   int64  `json:"id"`
 			IdStr                string `json:"id_str,nocopy"`
-			InReplyToScreenName  any    `json:"in_reply_to_screen_name"`
-			InReplyToStatusId    any    `json:"in_reply_to_status_id"`
-			InReplyToStatusIdStr any    `json:"in_reply_to_status_id_str"`
-			InReplyToUserId      any    `json:"in_reply_to_user_id"`
-			InReplyToUserIdStr   any    `json:"in_reply_to_user_id_str"`
+			InReplyToScreenName  string `json:"in_reply_to_screen_name,nocopy"`
+			InReplyToStatusId    int64  `json:"in_reply_to_status_id"`
+			InReplyToStatusIdStr string `json:"in_reply_to_status_id_str,nocopy"`
+			InReplyToUserId      int64  `json:"in_reply_to_user_id"`
+			InReplyToUserIdStr   string `json:"in_reply_to_user_id_str,nocopy"`
 			Lang                 string `json:"lang,nocopy"`
 			Metadata             struct {
 				IsoLanguageCode string `json:"iso_language_code,nocopy"`
@@ -278,9 +278,9 @@ type Benchmark struct {
 				Protected                      bool   `json:"protected"`
 				ScreenName                     string `json:"screen_name,nocopy"`
 				StatusesCount                  int64  `json:"statuses_count"`
-				TimeZone                       any    `json:"time_zone"`
-				URL                            any    `json:"url"`
-				UtcOffset                      any    `json:"utc_offset"`
+				TimeZone                       string `json:"time_zone,nocopy"`
+				URL                            string `json:"url,nocopy"`
+				UtcOffset                      int64  `json:"utc_offset"`
 				Verified                       bool   `json:"verified"`
 			} `json:"user"`
 		} `json:"retweeted_status"`
