@@ -61,6 +61,7 @@ func generate(inPath string) error {
 		used:         map[string]bool{},
 		memo:         map[string]string{},
 		compactTypes: map[string]bool{},
+		nocopyTypes:  map[string]bool{},
 	}
 
 	// Generated helper functions are named "lightning<ImportPath><Type>decode...",
@@ -104,6 +105,9 @@ func generate(inPath string) error {
 					if hasCompactDirective(gd.Doc, ts.Doc) {
 						g.compactTypes[ts.Name.Name] = true
 					}
+					if hasNoCopyDirective(gd.Doc, ts.Doc) {
+						g.nocopyTypes[ts.Name.Name] = true
+					}
 				}
 			case *ast.MapType:
 				// A named map root type (type Foo map[string]V) for object-root
@@ -112,6 +116,9 @@ func generate(inPath string) error {
 				g.order = append(g.order, ts.Name.Name)
 				if hasCompactDirective(gd.Doc, ts.Doc) {
 					g.compactTypes[ts.Name.Name] = true
+				}
+				if hasNoCopyDirective(gd.Doc, ts.Doc) {
+					g.nocopyTypes[ts.Name.Name] = true
 				}
 			}
 		}
@@ -189,6 +196,7 @@ type gen struct {
 	memo map[string]string // type-key -> decoder function name (dedupe)
 
 	compactTypes map[string]bool // top-level types tagged //lightning:compact
+	nocopyTypes  map[string]bool // top-level slice/map root types tagged //lightning:nocopy
 	compact      bool            // whether the type currently being generated is compact
 	pathFrag     string          // import path sanitized into an identifier fragment
 	prefix       string          // current per-type prefix for generated function names
@@ -217,12 +225,24 @@ func (g *gen) uniq(base string) string {
 // hasCompactDirective reports whether any of the given doc-comment groups
 // carries the //lightning:compact directive.
 func hasCompactDirective(groups ...*ast.CommentGroup) bool {
+	return hasDirective("lightning:compact", groups...)
+}
+
+// hasNoCopyDirective reports whether any doc-comment group carries the
+// //lightning:nocopy directive, which makes a named slice or map root decode its
+// string elements / map keys as aliases of the input (zero-copy) — the type-level
+// equivalent of a field's ",nocopy" json tag, for a root that has no json tag.
+func hasNoCopyDirective(groups ...*ast.CommentGroup) bool {
+	return hasDirective("lightning:nocopy", groups...)
+}
+
+func hasDirective(name string, groups ...*ast.CommentGroup) bool {
 	for _, cg := range groups {
 		if cg == nil {
 			continue
 		}
 		for _, c := range cg.List {
-			if strings.TrimSpace(strings.TrimPrefix(c.Text, "//")) == "lightning:compact" {
+			if strings.TrimSpace(strings.TrimPrefix(c.Text, "//")) == name {
 				return true
 			}
 		}
@@ -377,13 +397,14 @@ func (g *gen) genUnmarshal(name string) string {
 	// *map[string]V, and the receiver *Name (whose underlying type matches) is
 	// converted to it.
 	var call string
+	nocopy := g.nocopyTypes[name] // //lightning:nocopy on a slice/map root
 	switch {
 	case g.sliceTypes[name] != nil:
 		at := g.sliceTypes[name]
-		call = fmt.Sprintf("%s((*[]%s)(v), data, i)", g.sliceDecoder(at.Elt, name, false, false), g.typeStr(at.Elt))
+		call = fmt.Sprintf("%s((*[]%s)(v), data, i)", g.sliceDecoder(at.Elt, name, nocopy, false), g.typeStr(at.Elt))
 	case g.mapTypes[name] != nil:
 		mt := g.mapTypes[name]
-		call = fmt.Sprintf("%s((*map[string]%s)(v), data, i)", g.mapDecoder(mt.Key, mt.Value, name, false, false), g.typeStr(mt.Value))
+		call = fmt.Sprintf("%s((*map[string]%s)(v), data, i)", g.mapDecoder(mt.Key, mt.Value, name, nocopy, false), g.typeStr(mt.Value))
 	default:
 		call = g.namedStruct(name) + "(v, data, i)"
 	}
@@ -1284,6 +1305,12 @@ func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy, lax boo
 	}
 	valStr := g.typeStr(valExpr)
 	inner := g.field("val", valExpr, hint+"Value", nocopy, lax)
+	// With nocopy the key aliases the input (ReadKey already returns an alias for
+	// an unescaped key); otherwise it is copied so the map owns it.
+	keyAssign := "m[string([]byte(key))] = val"
+	if nocopy {
+		keyAssign = "m[key] = val"
+	}
 	body := fmt.Sprintf(`func %[1]s(out *map[string]%[2]s, data []byte, i int) (int, error) {
 	if i >= len(data) {
 		return i, support.ErrTruncated
@@ -1324,7 +1351,7 @@ func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy, lax boo
 		}
 		var val %[2]s
 		%[3]s
-		m[string([]byte(key))] = val
+		%[8]s
 		%[4]s
 		if i >= len(data) {
 			return i, support.ErrTruncated
@@ -1338,7 +1365,7 @@ func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy, lax boo
 		}
 		i++
 	}
-}`, fn, valStr, inner, g.skipWS("i", "i"), g.skipWS("i", "ni"), g.skipWS("i", "i+1"), g.readKey())
+}`, fn, valStr, inner, g.skipWS("i", "i"), g.skipWS("i", "ni"), g.skipWS("i", "i+1"), g.readKey(), keyAssign)
 	g.decoders = append(g.decoders, body)
 	return fn
 }

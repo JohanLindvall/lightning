@@ -1,6 +1,7 @@
 // Code generated from gsoc_2018.json (minio/simdjson-go testdata); root renamed Benchmark.
 package bench
 
+//lightning:nocopy
 type Benchmark map[string]struct {
 	Context string `json:"@context,nocopy"`
 	Type    string `json:"@type,nocopy"`

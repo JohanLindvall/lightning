@@ -245,6 +245,27 @@ pretty-printed) returns an error instead of parsing it. Use it only for sources
 that are guaranteed compact. The directive applies to the whole type graph it
 roots, including nested structs, slices, and maps.
 
+### `//lightning:nocopy`
+
+The [`nocopy`](#the-nocopy-tag-option) tag option lives on a *field*, but a named
+slice or map **root** type has no field to tag — its element strings and map keys
+would always be copied. Mark such a root `//lightning:nocopy` to alias them out of
+the input instead, the same zero-copy trade as the tag (the caller must keep the
+input `[]byte` unchanged while the result is in use):
+
+```go
+//lightning:nocopy
+type Index map[string]Record // the map keys alias the input, not copied
+```
+
+It applies to what the root itself owns — a map's keys, a slice's string elements
+— while each value/element type keeps its own field tags (so a
+`map[string]struct{…}` aliases the keys and the struct's fields still decide
+field-by-field). On `map[string]struct` documents with many keys this is a real
+saving: tagging the GeoSciences `gsoc_2018` corpus's root map cut its allocations
+~21%. (Only slice and map roots take the directive; a struct root uses per-field
+`nocopy` tags.)
+
 ## Generated function names
 
 The `UnmarshalJSON` methods keep their exact name (the `json.Unmarshaler`

@@ -118,3 +118,6 @@ type PointList []struct {
 // ScoreMap is a named map root type: the generator emits UnmarshalJSON on it
 // directly (object-root JSON that's a data map). Exercised by TestMapRoot.
 type ScoreMap map[string]int
+
+//lightning:nocopy
+type NoCopyMap map[string]string

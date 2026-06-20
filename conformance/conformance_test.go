@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 // TestConformance decodes test.json with the generated UnmarshalJSON and checks
@@ -137,5 +138,26 @@ func TestMapRoot(t *testing.T) {
 	var n ScoreMap
 	if err := n.UnmarshalJSON([]byte(`null`)); err != nil || n != nil {
 		t.Fatalf("null: got %#v err %v", n, err)
+	}
+}
+
+// TestNoCopyDirective covers //lightning:nocopy on a map root: the keys and
+// string values alias the input instead of being copied.
+func TestNoCopyDirective(t *testing.T) {
+	data := []byte(`{"alpha":"one","beta":"two"}`)
+	var m NoCopyMap
+	if err := m.UnmarshalJSON(data); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(m, NoCopyMap{"alpha": "one", "beta": "two"}) {
+		t.Fatalf("got %#v", m)
+	}
+	// A key must alias data (its bytes live inside the input), not be a copy.
+	base := uintptr(unsafe.Pointer(&data[0]))
+	for k := range m {
+		kp := uintptr(unsafe.Pointer(unsafe.StringData(k)))
+		if kp < base || kp >= base+uintptr(len(data)) {
+			t.Errorf("key %q does not alias input (not nocopy)", k)
+		}
 	}
 }
