@@ -5,12 +5,12 @@ type Benchmark struct {
 	Features []struct {
 		Geometry struct {
 			Coordinates [][][2]float64 `json:"coordinates"`
-			Type        string         `json:"type"`
+			Type        string         `json:"type,nocopy"`
 		} `json:"geometry"`
 		Properties struct {
-			Name string `json:"name"`
+			Name string `json:"name,nocopy"`
 		} `json:"properties"`
-		Type string `json:"type"`
+		Type string `json:"type,nocopy"`
 	} `json:"features"`
-	Type string `json:"type"`
+	Type string `json:"type,nocopy"`
 }

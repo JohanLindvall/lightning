@@ -15,12 +15,12 @@ type Benchmark struct {
 		Fadeout                       int64  `json:"fadeout"`
 		GlobalVolume                  int64  `json:"global_volume"`
 		GraphInsert                   int64  `json:"graph_insert"`
-		LegacyFilename                string `json:"legacy_filename"`
+		LegacyFilename                string `json:"legacy_filename,nocopy"`
 		MidiBank                      int64  `json:"midi_bank"`
 		MidiChannel                   int64  `json:"midi_channel"`
 		MidiDrumSet                   int64  `json:"midi_drum_set"`
 		MidiProgram                   int64  `json:"midi_program"`
-		Name                          string `json:"name"`
+		Name                          string `json:"name,nocopy"`
 		NewNoteAction                 int64  `json:"new_note_action"`
 		NoteMap                       any    `json:"note_map"`
 		PanningEnvelope               struct {
@@ -69,11 +69,11 @@ type Benchmark struct {
 		VolumeRampUp   int64 `json:"volume_ramp_up"`
 	} `json:"instruments"`
 	Message   any    `json:"message"`
-	Name      string `json:"name"`
+	Name      string `json:"name,nocopy"`
 	Orderlist any    `json:"orderlist"`
 	Patterns  []struct {
 		Data           any    `json:"data"`
-		Name           string `json:"name"`
+		Name           string `json:"name,nocopy"`
 		Rows           int64  `json:"rows"`
 		RowsPerBeat    int64  `json:"rows_per_beat"`
 		RowsPerMeasure int64  `json:"rows_per_measure"`
@@ -82,11 +82,11 @@ type Benchmark struct {
 	Samples     []struct {
 		C5Samplerate   int64  `json:"c5_samplerate"`
 		GlobalVolume   int64  `json:"global_volume"`
-		LegacyFilename string `json:"legacy_filename"`
+		LegacyFilename string `json:"legacy_filename,nocopy"`
 		Length         int64  `json:"length"`
 		LoopEnd        int64  `json:"loop_end"`
 		LoopStart      int64  `json:"loop_start"`
-		Name           string `json:"name"`
+		Name           string `json:"name,nocopy"`
 		Pan            int64  `json:"pan"`
 		SustainEnd     int64  `json:"sustain_end"`
 		SustainStart   int64  `json:"sustain_start"`

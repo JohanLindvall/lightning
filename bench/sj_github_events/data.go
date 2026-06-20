@@ -3,154 +3,154 @@ package bench
 
 type Benchmark []struct {
 	Actor struct {
-		AvatarUrl  string `json:"avatar_url"`
-		GravatarId string `json:"gravatar_id"`
+		AvatarUrl  string `json:"avatar_url,nocopy"`
+		GravatarId string `json:"gravatar_id,nocopy"`
 		ID         int64  `json:"id"`
-		Login      string `json:"login"`
-		URL        string `json:"url"`
+		Login      string `json:"login,nocopy"`
+		URL        string `json:"url,nocopy"`
 	} `json:"actor"`
-	CreatedAt string `json:"created_at"`
-	ID        string `json:"id"`
+	CreatedAt string `json:"created_at,nocopy"`
+	ID        string `json:"id,nocopy"`
 	Payload   struct {
-		Before  string `json:"before"`
+		Before  string `json:"before,nocopy"`
 		Commits []struct {
 			Author struct {
-				Email string `json:"email"`
-				Name  string `json:"name"`
+				Email string `json:"email,nocopy"`
+				Name  string `json:"name,nocopy"`
 			} `json:"author"`
 			Distinct bool   `json:"distinct"`
-			Message  string `json:"message"`
-			Sha      string `json:"sha"`
-			URL      string `json:"url"`
+			Message  string `json:"message,nocopy"`
+			Sha      string `json:"sha,nocopy"`
+			URL      string `json:"url,nocopy"`
 		} `json:"commits"`
 		DistinctSize int64  `json:"distinct_size"`
-		Head         string `json:"head"`
+		Head         string `json:"head,nocopy"`
 		PushId       int64  `json:"push_id"`
 		Ref          any    `json:"ref"`
 		Size         int64  `json:"size"`
-		Description  string `json:"description"`
-		MasterBranch string `json:"master_branch"`
-		RefType      string `json:"ref_type"`
+		Description  string `json:"description,nocopy"`
+		MasterBranch string `json:"master_branch,nocopy"`
+		RefType      string `json:"ref_type,nocopy"`
 		Forkee       struct {
-			ArchiveUrl       string `json:"archive_url"`
-			AssigneesUrl     string `json:"assignees_url"`
-			BlobsUrl         string `json:"blobs_url"`
-			BranchesUrl      string `json:"branches_url"`
-			CloneUrl         string `json:"clone_url"`
-			CollaboratorsUrl string `json:"collaborators_url"`
-			CommentsUrl      string `json:"comments_url"`
-			CommitsUrl       string `json:"commits_url"`
-			CompareUrl       string `json:"compare_url"`
-			ContentsUrl      string `json:"contents_url"`
-			ContributorsUrl  string `json:"contributors_url"`
-			CreatedAt        string `json:"created_at"`
-			Description      string `json:"description"`
-			DownloadsUrl     string `json:"downloads_url"`
-			EventsUrl        string `json:"events_url"`
+			ArchiveUrl       string `json:"archive_url,nocopy"`
+			AssigneesUrl     string `json:"assignees_url,nocopy"`
+			BlobsUrl         string `json:"blobs_url,nocopy"`
+			BranchesUrl      string `json:"branches_url,nocopy"`
+			CloneUrl         string `json:"clone_url,nocopy"`
+			CollaboratorsUrl string `json:"collaborators_url,nocopy"`
+			CommentsUrl      string `json:"comments_url,nocopy"`
+			CommitsUrl       string `json:"commits_url,nocopy"`
+			CompareUrl       string `json:"compare_url,nocopy"`
+			ContentsUrl      string `json:"contents_url,nocopy"`
+			ContributorsUrl  string `json:"contributors_url,nocopy"`
+			CreatedAt        string `json:"created_at,nocopy"`
+			Description      string `json:"description,nocopy"`
+			DownloadsUrl     string `json:"downloads_url,nocopy"`
+			EventsUrl        string `json:"events_url,nocopy"`
 			Fork             bool   `json:"fork"`
 			Forks            int64  `json:"forks"`
 			ForksCount       int64  `json:"forks_count"`
-			ForksUrl         string `json:"forks_url"`
-			FullName         string `json:"full_name"`
-			GitCommitsUrl    string `json:"git_commits_url"`
-			GitRefsUrl       string `json:"git_refs_url"`
-			GitTagsUrl       string `json:"git_tags_url"`
-			GitUrl           string `json:"git_url"`
+			ForksUrl         string `json:"forks_url,nocopy"`
+			FullName         string `json:"full_name,nocopy"`
+			GitCommitsUrl    string `json:"git_commits_url,nocopy"`
+			GitRefsUrl       string `json:"git_refs_url,nocopy"`
+			GitTagsUrl       string `json:"git_tags_url,nocopy"`
+			GitUrl           string `json:"git_url,nocopy"`
 			HasDownloads     bool   `json:"has_downloads"`
 			HasIssues        bool   `json:"has_issues"`
 			HasWiki          bool   `json:"has_wiki"`
 			Homepage         any    `json:"homepage"`
-			HooksUrl         string `json:"hooks_url"`
-			HtmlUrl          string `json:"html_url"`
+			HooksUrl         string `json:"hooks_url,nocopy"`
+			HtmlUrl          string `json:"html_url,nocopy"`
 			ID               int64  `json:"id"`
-			IssueCommentUrl  string `json:"issue_comment_url"`
-			IssueEventsUrl   string `json:"issue_events_url"`
-			IssuesUrl        string `json:"issues_url"`
-			KeysUrl          string `json:"keys_url"`
-			LabelsUrl        string `json:"labels_url"`
-			Language         string `json:"language"`
-			LanguagesUrl     string `json:"languages_url"`
-			MergesUrl        string `json:"merges_url"`
-			MilestonesUrl    string `json:"milestones_url"`
+			IssueCommentUrl  string `json:"issue_comment_url,nocopy"`
+			IssueEventsUrl   string `json:"issue_events_url,nocopy"`
+			IssuesUrl        string `json:"issues_url,nocopy"`
+			KeysUrl          string `json:"keys_url,nocopy"`
+			LabelsUrl        string `json:"labels_url,nocopy"`
+			Language         string `json:"language,nocopy"`
+			LanguagesUrl     string `json:"languages_url,nocopy"`
+			MergesUrl        string `json:"merges_url,nocopy"`
+			MilestonesUrl    string `json:"milestones_url,nocopy"`
 			MirrorUrl        any    `json:"mirror_url"`
-			Name             string `json:"name"`
-			NotificationsUrl string `json:"notifications_url"`
+			Name             string `json:"name,nocopy"`
+			NotificationsUrl string `json:"notifications_url,nocopy"`
 			OpenIssues       int64  `json:"open_issues"`
 			OpenIssuesCount  int64  `json:"open_issues_count"`
 			Owner            struct {
-				AvatarUrl         string `json:"avatar_url"`
-				EventsUrl         string `json:"events_url"`
-				FollowersUrl      string `json:"followers_url"`
-				FollowingUrl      string `json:"following_url"`
-				GistsUrl          string `json:"gists_url"`
-				GravatarId        string `json:"gravatar_id"`
+				AvatarUrl         string `json:"avatar_url,nocopy"`
+				EventsUrl         string `json:"events_url,nocopy"`
+				FollowersUrl      string `json:"followers_url,nocopy"`
+				FollowingUrl      string `json:"following_url,nocopy"`
+				GistsUrl          string `json:"gists_url,nocopy"`
+				GravatarId        string `json:"gravatar_id,nocopy"`
 				ID                int64  `json:"id"`
-				Login             string `json:"login"`
-				OrganizationsUrl  string `json:"organizations_url"`
-				ReceivedEventsUrl string `json:"received_events_url"`
-				ReposUrl          string `json:"repos_url"`
-				StarredUrl        string `json:"starred_url"`
-				SubscriptionsUrl  string `json:"subscriptions_url"`
-				Type              string `json:"type"`
-				URL               string `json:"url"`
+				Login             string `json:"login,nocopy"`
+				OrganizationsUrl  string `json:"organizations_url,nocopy"`
+				ReceivedEventsUrl string `json:"received_events_url,nocopy"`
+				ReposUrl          string `json:"repos_url,nocopy"`
+				StarredUrl        string `json:"starred_url,nocopy"`
+				SubscriptionsUrl  string `json:"subscriptions_url,nocopy"`
+				Type              string `json:"type,nocopy"`
+				URL               string `json:"url,nocopy"`
 			} `json:"owner"`
 			Private         bool   `json:"private"`
 			Public          bool   `json:"public"`
-			PullsUrl        string `json:"pulls_url"`
-			PushedAt        string `json:"pushed_at"`
+			PullsUrl        string `json:"pulls_url,nocopy"`
+			PushedAt        string `json:"pushed_at,nocopy"`
 			Size            int64  `json:"size"`
-			SshUrl          string `json:"ssh_url"`
-			StargazersUrl   string `json:"stargazers_url"`
-			StatusesUrl     string `json:"statuses_url"`
-			SubscribersUrl  string `json:"subscribers_url"`
-			SubscriptionUrl string `json:"subscription_url"`
-			SvnUrl          string `json:"svn_url"`
-			TagsUrl         string `json:"tags_url"`
-			TeamsUrl        string `json:"teams_url"`
-			TreesUrl        string `json:"trees_url"`
-			UpdatedAt       string `json:"updated_at"`
-			URL             string `json:"url"`
+			SshUrl          string `json:"ssh_url,nocopy"`
+			StargazersUrl   string `json:"stargazers_url,nocopy"`
+			StatusesUrl     string `json:"statuses_url,nocopy"`
+			SubscribersUrl  string `json:"subscribers_url,nocopy"`
+			SubscriptionUrl string `json:"subscription_url,nocopy"`
+			SvnUrl          string `json:"svn_url,nocopy"`
+			TagsUrl         string `json:"tags_url,nocopy"`
+			TeamsUrl        string `json:"teams_url,nocopy"`
+			TreesUrl        string `json:"trees_url,nocopy"`
+			UpdatedAt       string `json:"updated_at,nocopy"`
+			URL             string `json:"url,nocopy"`
 			Watchers        int64  `json:"watchers"`
 			WatchersCount   int64  `json:"watchers_count"`
 		} `json:"forkee"`
-		Action  string `json:"action"`
+		Action  string `json:"action,nocopy"`
 		Comment struct {
-			Body      string `json:"body"`
-			CreatedAt string `json:"created_at"`
+			Body      string `json:"body,nocopy"`
+			CreatedAt string `json:"created_at,nocopy"`
 			ID        int64  `json:"id"`
-			IssueUrl  string `json:"issue_url"`
-			UpdatedAt string `json:"updated_at"`
-			URL       string `json:"url"`
+			IssueUrl  string `json:"issue_url,nocopy"`
+			UpdatedAt string `json:"updated_at,nocopy"`
+			URL       string `json:"url,nocopy"`
 			User      struct {
-				AvatarUrl         string `json:"avatar_url"`
-				EventsUrl         string `json:"events_url"`
-				FollowersUrl      string `json:"followers_url"`
-				FollowingUrl      string `json:"following_url"`
-				GistsUrl          string `json:"gists_url"`
-				GravatarId        string `json:"gravatar_id"`
+				AvatarUrl         string `json:"avatar_url,nocopy"`
+				EventsUrl         string `json:"events_url,nocopy"`
+				FollowersUrl      string `json:"followers_url,nocopy"`
+				FollowingUrl      string `json:"following_url,nocopy"`
+				GistsUrl          string `json:"gists_url,nocopy"`
+				GravatarId        string `json:"gravatar_id,nocopy"`
 				ID                int64  `json:"id"`
-				Login             string `json:"login"`
-				OrganizationsUrl  string `json:"organizations_url"`
-				ReceivedEventsUrl string `json:"received_events_url"`
-				ReposUrl          string `json:"repos_url"`
-				StarredUrl        string `json:"starred_url"`
-				SubscriptionsUrl  string `json:"subscriptions_url"`
-				Type              string `json:"type"`
-				URL               string `json:"url"`
+				Login             string `json:"login,nocopy"`
+				OrganizationsUrl  string `json:"organizations_url,nocopy"`
+				ReceivedEventsUrl string `json:"received_events_url,nocopy"`
+				ReposUrl          string `json:"repos_url,nocopy"`
+				StarredUrl        string `json:"starred_url,nocopy"`
+				SubscriptionsUrl  string `json:"subscriptions_url,nocopy"`
+				Type              string `json:"type,nocopy"`
+				URL               string `json:"url,nocopy"`
 			} `json:"user"`
 		} `json:"comment"`
 		Issue struct {
 			Assignee    any    `json:"assignee"`
-			Body        string `json:"body"`
+			Body        string `json:"body,nocopy"`
 			ClosedAt    any    `json:"closed_at"`
 			Comments    int64  `json:"comments"`
-			CommentsUrl string `json:"comments_url"`
-			CreatedAt   string `json:"created_at"`
-			EventsUrl   string `json:"events_url"`
-			HtmlUrl     string `json:"html_url"`
+			CommentsUrl string `json:"comments_url,nocopy"`
+			CreatedAt   string `json:"created_at,nocopy"`
+			EventsUrl   string `json:"events_url,nocopy"`
+			HtmlUrl     string `json:"html_url,nocopy"`
 			ID          int64  `json:"id"`
 			Labels      []any  `json:"labels"`
-			LabelsUrl   string `json:"labels_url"`
+			LabelsUrl   string `json:"labels_url,nocopy"`
 			Milestone   any    `json:"milestone"`
 			Number      int64  `json:"number"`
 			PullRequest struct {
@@ -158,49 +158,49 @@ type Benchmark []struct {
 				HtmlUrl  any `json:"html_url"`
 				PatchUrl any `json:"patch_url"`
 			} `json:"pull_request"`
-			State     string `json:"state"`
-			Title     string `json:"title"`
-			UpdatedAt string `json:"updated_at"`
-			URL       string `json:"url"`
+			State     string `json:"state,nocopy"`
+			Title     string `json:"title,nocopy"`
+			UpdatedAt string `json:"updated_at,nocopy"`
+			URL       string `json:"url,nocopy"`
 			User      struct {
-				AvatarUrl         string `json:"avatar_url"`
-				EventsUrl         string `json:"events_url"`
-				FollowersUrl      string `json:"followers_url"`
-				FollowingUrl      string `json:"following_url"`
-				GistsUrl          string `json:"gists_url"`
-				GravatarId        string `json:"gravatar_id"`
+				AvatarUrl         string `json:"avatar_url,nocopy"`
+				EventsUrl         string `json:"events_url,nocopy"`
+				FollowersUrl      string `json:"followers_url,nocopy"`
+				FollowingUrl      string `json:"following_url,nocopy"`
+				GistsUrl          string `json:"gists_url,nocopy"`
+				GravatarId        string `json:"gravatar_id,nocopy"`
 				ID                int64  `json:"id"`
-				Login             string `json:"login"`
-				OrganizationsUrl  string `json:"organizations_url"`
-				ReceivedEventsUrl string `json:"received_events_url"`
-				ReposUrl          string `json:"repos_url"`
-				StarredUrl        string `json:"starred_url"`
-				SubscriptionsUrl  string `json:"subscriptions_url"`
-				Type              string `json:"type"`
-				URL               string `json:"url"`
+				Login             string `json:"login,nocopy"`
+				OrganizationsUrl  string `json:"organizations_url,nocopy"`
+				ReceivedEventsUrl string `json:"received_events_url,nocopy"`
+				ReposUrl          string `json:"repos_url,nocopy"`
+				StarredUrl        string `json:"starred_url,nocopy"`
+				SubscriptionsUrl  string `json:"subscriptions_url,nocopy"`
+				Type              string `json:"type,nocopy"`
+				URL               string `json:"url,nocopy"`
 			} `json:"user"`
 		} `json:"issue"`
 		Pages []struct {
-			Action   string `json:"action"`
-			HtmlUrl  string `json:"html_url"`
-			PageName string `json:"page_name"`
-			Sha      string `json:"sha"`
+			Action   string `json:"action,nocopy"`
+			HtmlUrl  string `json:"html_url,nocopy"`
+			PageName string `json:"page_name,nocopy"`
+			Sha      string `json:"sha,nocopy"`
 			Summary  any    `json:"summary"`
-			Title    string `json:"title"`
+			Title    string `json:"title,nocopy"`
 		} `json:"pages"`
 	} `json:"payload"`
 	Public bool `json:"public"`
 	Repo   struct {
 		ID   int64  `json:"id"`
-		Name string `json:"name"`
-		URL  string `json:"url"`
+		Name string `json:"name,nocopy"`
+		URL  string `json:"url,nocopy"`
 	} `json:"repo"`
-	Type string `json:"type"`
+	Type string `json:"type,nocopy"`
 	Org  struct {
-		AvatarUrl  string `json:"avatar_url"`
-		GravatarId string `json:"gravatar_id"`
+		AvatarUrl  string `json:"avatar_url,nocopy"`
+		GravatarId string `json:"gravatar_id,nocopy"`
 		ID         int64  `json:"id"`
-		Login      string `json:"login"`
-		URL        string `json:"url"`
+		Login      string `json:"login,nocopy"`
+		URL        string `json:"url,nocopy"`
 	} `json:"org"`
 }
