@@ -202,3 +202,20 @@ func StripDefaults(input, output []byte, defaults, keep [][]byte, ws WhitespaceM
 func Set(in, out, rawVal []byte, keys []string) []byte {
 	return support.Set(in, out, rawVal, keys)
 }
+
+// SetMany sets several of the root object's top-level keys in a single pass:
+// keys[i]'s value becomes the raw JSON rawVal[i], replacing the value of a key
+// that already exists and appending a member for one that does not. It is the
+// multi-key counterpart of Set (as GetMany is to Get), editing the document in
+// one walk where N separate Set calls would rescan and rewrite it N times.
+//
+// Each rawVal[i] is inserted verbatim and must be a single well-formed JSON
+// value; created keys are written as plain JSON strings (no escaping, so avoid
+// keys needing it). out is filled from out[:0] and returned — pass a reusable
+// buffer to avoid allocation; out must not alias in, which is never modified. A
+// non-object root is replaced by a fresh object of all the members. Inter-token
+// whitespace outside the edited spans is preserved. If rawVal is shorter than
+// keys the surplus keys are ignored.
+func SetMany(in, out []byte, rawVal [][]byte, keys []string) []byte {
+	return support.SetMany(in, out, rawVal, keys)
+}

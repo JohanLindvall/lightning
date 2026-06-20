@@ -404,7 +404,7 @@ skips the scan, and a kept member is moved with a single `copy` when its
 
 ## Setting a value
 
-The [`pkg/json`](pkg/json) package can also splice one value into a document in a
+The [`pkg/json`](pkg/json) package can also splice values into a document in a
 single pass, without a full unmarshal/edit/marshal round-trip:
 
 - `Set(in, out, rawVal []byte, keys []string) []byte` — returns `in` with the
@@ -413,17 +413,27 @@ single pass, without a full unmarshal/edit/marshal round-trip:
   into its parent, and a missing intermediate object (or a non-object found where
   the path must still descend) is built up as nested objects. With no keys the
   whole document becomes `rawVal`.
+- `SetMany(in, out []byte, rawVal [][]byte, keys []string) []byte` — sets several
+  of the root object's own keys at once: `keys[i]`'s value becomes `rawVal[i]`,
+  replacing it where the key exists and appending a member where it doesn't.
+  `SetMany` is to `Set` what [`GetMany`](#key-lookups) is to `Get` — one walk over
+  the object instead of rescanning and rewriting it once per key. A non-object
+  root is replaced by a fresh object of all the members; a `rawVal` shorter than
+  `keys` ignores the surplus keys.
 
 ```go
 // {"a":{"b":1}}  ->  {"a":{"b":1},"c":[true]}
 out = json.Set(doc, out[:0], []byte("[true]"), []string{"c"})
+
+// {"a":1,"b":2}  ->  {"a":1,"b":9,"c":3}   (replace b, add c, one pass)
+out = json.SetMany(doc, out[:0], [][]byte{[]byte("9"), []byte("3")}, []string{"b", "c"})
 ```
 
-`rawVal` is inserted verbatim and must be one well-formed JSON value; any keys
-created along the way are written as plain JSON strings (no escaping, so avoid
-keys needing it). `out` is filled from `out[:0]` and returned — pass a reusable
-buffer to avoid allocation; `out` must not alias `in`, which is never modified.
-Inter-token whitespace in `in` is preserved outside the edited span.
+Each `rawVal` is inserted verbatim and must be one well-formed JSON value; any
+keys created along the way are written as plain JSON strings (no escaping, so
+avoid keys needing it). `out` is filled from `out[:0]` and returned — pass a
+reusable buffer to avoid allocation; `out` must not alias `in`, which is never
+modified. Inter-token whitespace in `in` is preserved outside the edited spans.
 
 ## SIMD scanning
 
@@ -485,7 +495,7 @@ Representative numbers for a 1.8 KB Cloudflare log (Go 1.26, amd64):
 |---|---|
 | [`main.go`](main.go) | the generator (`package main`) |
 | [`pkg/support`](pkg/support) | shared JSON scanning primitives used by generated code |
-| [`pkg/json`](pkg/json) | small public API over the scanner (`Get`/`GetMany`/`ObjectEach`, `DecodeAny`, `UnescapeString`, `ParseFloat`, `StripDefaults`, `Set`) |
+| [`pkg/json`](pkg/json) | small public API over the scanner (`Get`/`GetMany`/`ObjectEach`, `DecodeAny`, `UnescapeString`, `ParseFloat`, `StripDefaults`, `Set`/`SetMany`) |
 | [`bench/`](bench) | benchmark module: hand-written `data.go` + `input.json` per case, plus the generated decoders, harness, and results |
 
 Generated files (`*_unmarshal.go`, `bench/*/bench_test.go`, `bench/*/ej/`, and

@@ -1873,6 +1873,93 @@ func skipValueOrEnd(data []byte, i int) int {
 	return len(data)
 }
 
+// SetMany sets several of the root object's own keys in a single pass: keys[i]'s
+// value becomes the raw JSON rawVal[i], whether the key already exists (its value
+// is replaced in place) or not (the member is appended). It is the multi-key
+// counterpart of Set restricted to the top level — SetMany is to Set what GetMany
+// is to Get — editing the document in one walk where N separate Set calls would
+// rescan and rewrite it N times.
+//
+// Like Set it is best-effort and writes into out (filled from out[:0] and
+// returned); out must not alias in, which is never modified. rawVal[i] is
+// inserted verbatim and must be a single well-formed JSON value; created keys are
+// written as plain JSON strings without escaping. A non-object root is replaced
+// by a fresh object holding all the given members. Inter-token whitespace outside
+// the replaced values and the insertion point is preserved. If rawVal is shorter
+// than keys the extra keys are ignored.
+func SetMany(in, out []byte, rawVal [][]byte, keys []string) []byte {
+	out = out[:0]
+	n := len(keys)
+	if n > len(rawVal) {
+		n = len(rawVal)
+	}
+	j := SkipWS(in, 0)
+	if j >= len(in) || in[j] != '{' {
+		// Non-object root: replace the whole document with a flat object.
+		out = append(out, '{')
+		for m := 0; m < n; m++ {
+			if m > 0 {
+				out = append(out, ',')
+			}
+			out = appendMember(out, keys[m:m+1], rawVal[m])
+		}
+		return append(out, '}')
+	}
+	found := make([]bool, n)
+	prev := 0 // bytes of in already copied into out
+	afterBrace := j + 1
+	p := SkipWS(in, afterBrace)
+	empty := p >= len(in) || in[p] == '}'
+	lastValEnd := afterBrace // insertion point for new members: after the last value
+	for p < len(in) && in[p] != '}' {
+		k, np, err := ReadKey(in, p)
+		if err != nil {
+			break
+		}
+		q := SkipWS(in, np)
+		if q >= len(in) || in[q] != ':' {
+			break
+		}
+		q = SkipWS(in, q+1)
+		vs := q
+		ve := skipValueOrEnd(in, q)
+		lastValEnd = ve
+		// Replace this member's value if its key was requested and not yet set
+		// (the first occurrence wins, as in GetMany). Key sets are small, so the
+		// linear scan is cheaper than a map.
+		for m := 0; m < n; m++ {
+			if !found[m] && keys[m] == k {
+				out = append(out, in[prev:vs]...) // copy through up to the old value
+				out = append(out, rawVal[m]...)   // ... and substitute it
+				prev = ve
+				found[m] = true
+				break
+			}
+		}
+		p = SkipWS(in, ve)
+		if p < len(in) && in[p] == ',' {
+			p = SkipWS(in, p+1)
+			continue
+		}
+		break
+	}
+	// Copy the untouched remainder up to the insertion point, append any keys
+	// that were not found, then copy the tail (the closing brace onward).
+	out = append(out, in[prev:lastValEnd]...)
+	needComma := !empty
+	for m := 0; m < n; m++ {
+		if found[m] {
+			continue
+		}
+		if needComma {
+			out = append(out, ',')
+		}
+		out = appendMember(out, keys[m:m+1], rawVal[m])
+		needComma = true
+	}
+	return append(out, in[lastValEnd:]...)
+}
+
 // DecodeValue decodes an arbitrary JSON value at data[i] into the standard Go
 // representation (nil, bool, float64, string, []any, map[string]any).
 func DecodeValue(data []byte, i int) (any, int, error) {
