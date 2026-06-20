@@ -124,3 +124,18 @@ func TestSliceRoot(t *testing.T) {
 		t.Fatalf("null: got %#v err %v, want nil", n, err)
 	}
 }
+
+// TestMapRoot covers a named map root type (object-root data map).
+func TestMapRoot(t *testing.T) {
+	var got ScoreMap
+	if err := got.UnmarshalJSON([]byte(`{"a":1,"b":2,"c":3}`)); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, ScoreMap{"a": 1, "b": 2, "c": 3}) {
+		t.Fatalf("got %#v", got)
+	}
+	var n ScoreMap
+	if err := n.UnmarshalJSON([]byte(`null`)); err != nil || n != nil {
+		t.Fatalf("null: got %#v err %v", n, err)
+	}
+}

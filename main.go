@@ -56,6 +56,7 @@ func generate(inPath string) error {
 		pkg:          file.Name.Name,
 		structTypes:  map[string]*ast.StructType{},
 		sliceTypes:   map[string]*ast.ArrayType{},
+		mapTypes:     map[string]*ast.MapType{},
 		order:        nil,
 		used:         map[string]bool{},
 		memo:         map[string]string{},
@@ -104,6 +105,14 @@ func generate(inPath string) error {
 						g.compactTypes[ts.Name.Name] = true
 					}
 				}
+			case *ast.MapType:
+				// A named map root type (type Foo map[string]V) for object-root
+				// documents that are data maps rather than fixed records.
+				g.mapTypes[ts.Name.Name] = t
+				g.order = append(g.order, ts.Name.Name)
+				if hasCompactDirective(gd.Doc, ts.Doc) {
+					g.compactTypes[ts.Name.Name] = true
+				}
 			}
 		}
 	}
@@ -129,6 +138,8 @@ func generate(inPath string) error {
 			}
 		} else if at, ok := g.sliceTypes[name]; ok {
 			g.markReferenced(at.Elt, name, referenced)
+		} else if mt, ok := g.mapTypes[name]; ok {
+			g.markReferenced(mt.Value, name, referenced)
 		}
 	}
 	allReferenced := len(referenced) == len(g.order) // degenerate (fully cyclic); emit all
@@ -171,6 +182,7 @@ type gen struct {
 	pkg         string
 	structTypes map[string]*ast.StructType
 	sliceTypes  map[string]*ast.ArrayType // named slice root types (type X []T)
+	mapTypes    map[string]*ast.MapType   // named map root types (type X map[string]V)
 	order       []string
 
 	used map[string]bool   // reserved decoder function names
@@ -361,12 +373,18 @@ func (g *gen) csuf() string {
 // genUnmarshal emits the UnmarshalJSON method for a named struct type and makes
 // sure its decoder (and everything it reaches) is generated.
 func (g *gen) genUnmarshal(name string) string {
-	// The decode call differs for a slice root: its decoder takes *[]T, and the
-	// receiver *Name (whose underlying type is []T) is converted to it.
+	// The decode call differs for a slice or map root: its decoder takes *[]T or
+	// *map[string]V, and the receiver *Name (whose underlying type matches) is
+	// converted to it.
 	var call string
-	if at, ok := g.sliceTypes[name]; ok {
+	switch {
+	case g.sliceTypes[name] != nil:
+		at := g.sliceTypes[name]
 		call = fmt.Sprintf("%s((*[]%s)(v), data, i)", g.sliceDecoder(at.Elt, name, false, false), g.typeStr(at.Elt))
-	} else {
+	case g.mapTypes[name] != nil:
+		mt := g.mapTypes[name]
+		call = fmt.Sprintf("%s((*map[string]%s)(v), data, i)", g.mapDecoder(mt.Key, mt.Value, name, false, false), g.typeStr(mt.Value))
+	default:
 		call = g.namedStruct(name) + "(v, data, i)"
 	}
 	return fmt.Sprintf(`// UnmarshalJSON parses JSON into the %[1]s. Fields whose json tag carries the

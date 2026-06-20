@@ -114,3 +114,7 @@ type PointList []struct {
 	Y   int    `json:"y"`
 	Tag string `json:"tag"`
 }
+
+// ScoreMap is a named map root type: the generator emits UnmarshalJSON on it
+// directly (object-root JSON that's a data map). Exercised by TestMapRoot.
+type ScoreMap map[string]int
