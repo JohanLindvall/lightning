@@ -245,6 +245,14 @@ reads.
   nested structs, so only `Benchmark` gets a generated method and
   `type benchmarkStd Benchmark` gives a clean reflection-only baseline for the
   stdlib/sonic benchmarks.
+- A bench case whose `data.go` is exactly `type Benchmark any` is an **any-decode**
+  case (the `any_*` dirs): it measures reading the whole document into Go's
+  generic `interface{}` value. Go forbids a method on an interface type, so there
+  is no generated decoder and no easyjson; `run_bench.sh` detects the marker and
+  emits a benchmark that drives lightning through `support.DecodeValue` (its
+  dynamic path) while the reflection libraries decode into a plain `any`. Each
+  `any_*` case reuses a paired typed case's input (`any_citm` ↔ `citm_catalog`)
+  to contrast dynamic vs concrete-struct decoding.
 - End-of-session: run the full suite (`go test ./...`), keep gofmt clean
   (the `daysFromCivil` comment-alignment flag is pre-existing — ignore it),
   and regenerate `bench/results_<goarch>.md` via `run_bench.sh`.

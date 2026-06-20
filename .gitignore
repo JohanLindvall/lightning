@@ -53,3 +53,6 @@ bench/payload_small/input.json
 bench/random/input.json
 bench/twitterescaped/input.json
 bench/update_center/input.json
+
+# any-decode benchmark inputs (reuse existing sources; downloaded on demand)
+bench/any_*/input.json
