@@ -82,7 +82,43 @@ sse_loop32:
 	JNZ      sse_found16
 	ADDQ     $32, DI
 	SUBQ     $32, CX
-	JMP      sse_loop32
+	// The first 32 bytes held no '"' or '\\': a long string (the short keys and
+	// values that dominate JSON already returned above, never reaching here). Such
+	// strings amortize AVX2's one VZEROUPPER over many bytes, and its single 32-byte
+	// compare per iteration halves the two 16-byte SSE compares the loop above does.
+	MOVBLZX ·useAVX2(SB), AX
+	TESTL   AX, AX
+	JNZ     qb_avx_setup
+	JMP     sse_loop32
+
+qb_avx_setup:
+	VMOVDQU quoteMask<>(SB), Y0
+	VMOVDQU bslashMask<>(SB), Y1
+
+qb_avx_loop:
+	CMPQ CX, $32
+	JL   qb_avx_done
+	VMOVDQU (SI)(DI*1), Y2
+	VPCMPEQB Y0, Y2, Y3
+	VPCMPEQB Y1, Y2, Y4
+	VPOR      Y4, Y3, Y3
+	VPMOVMSKB Y3, AX
+	TESTL     AX, AX
+	JNZ       qb_avx_found
+	ADDQ      $32, DI
+	SUBQ      $32, CX
+	JMP       qb_avx_loop
+
+qb_avx_found:
+	BSFL AX, AX
+	ADDQ DI, AX
+	MOVQ AX, ret+24(FP)
+	VZEROUPPER
+	RET
+
+qb_avx_done:
+	VZEROUPPER
+	// <32 bytes remain; the X-register splats survive VZEROUPPER, so finish in SSE.
 
 sse_loop16:
 	CMPQ CX, $16

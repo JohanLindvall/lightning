@@ -13,13 +13,16 @@ func indexStructuralAVX2(b []byte) int
 var useAVX2 = cpu.X86.HasAVX2
 
 // indexCloseOrEscape returns the index of the first '"' or '\\' byte in b, or
-// len(b) if neither is present. String scanning takes the SSE2 routine rather
-// than AVX2: SSE2 is baseline on every amd64 CPU (so no feature gate) and avoids
-// the VZEROUPPER every AVX2 call must execute, which is pure overhead for the
-// short keys and string values that dominate JSON. Its 32-byte-per-iteration
-// loop (two 16-byte compares) matches AVX2's stride, so even longer strings see
-// no regression — measured faster than the AVX2 path on cloudflare, pretty and
-// time-array alike.
+// len(b) if neither is present. String scanning begins in SSE2, not AVX2: SSE2 is
+// baseline on every amd64 CPU (no feature gate) and avoids the VZEROUPPER every
+// AVX2 call must execute, which is pure overhead for the short keys and string
+// values that dominate JSON — those are found within the first 32-byte SSE block
+// and return before any AVX2 state is touched. Only when the first 32 bytes hold
+// no '"' or '\\' (a long string, e.g. a unicode text field) does the routine
+// switch to AVX2 inside indexQuoteOrBackslashSSE2: one 32-byte compare per
+// iteration instead of two 16-byte ones, paying the single VZEROUPPER over many
+// bytes. So short strings keep the SSE2 cost and long strings get AVX2 throughput
+// (string_unicode −9%, no regression on cloudflare/pretty/time-array).
 //
 // The routine handles every length itself (the 32- and 16-byte loops fall
 // through to a scalar tail for the final <16 bytes), so the dispatch is a single

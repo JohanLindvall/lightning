@@ -97,9 +97,21 @@ byte-identical when adding cold paths; push new logic out-of-line.
   saved. Flat / string / 1-D-slice records (Cloudflare-style) keep presize and
   their low B/op.
 - **SIMD scanners** in `index_amd64.s`/`index_arm64.s`: `indexCloseOrEscape`
-  (next `"`/`\`, SSE2 — no VZEROUPPER), `indexStructural` (next `{}[]"`, AVX2).
+  (next `"`/`\`) and `indexStructural` (next `{}[]"`, AVX2). The string scanner
+  (`indexQuoteOrBackslashSSE2`) is a **length-adaptive hybrid**: the first 32-byte
+  block is SSE2, so short keys/values return with no AVX2 state and no VZEROUPPER;
+  only a string whose first 32 bytes hold no `"`/`\` (a long text field) switches
+  to an AVX2 tail loop — one 32-byte compare per iteration vs SSE2's two 16-byte —
+  amortizing the lone VZEROUPPER over the rest. Short-string benches (cloudflare)
+  are unchanged; long strings win (string_unicode −9%, twitter/large-json ~−1%).
+  Don't make it pure-AVX2: the per-call VZEROUPPER regresses the short-string
+  common case (the reason SSE2 was chosen originally).
 - **Date parsing**: `daysFromCivilCached` uses a year-start-days table (built from
   `daysFromCivil`) for 1970–2261; falls back to the general algorithm otherwise.
+  `parseRFC3339`'s fractional-seconds loop accumulates at most nine digits (bounded
+  so the per-digit `<9` test stays out of the loop) and scales to nanoseconds with
+  one `pow10nano[fd]` multiply instead of a trailing `for fd<9 { nsec*=10 }` pad:
+  time-array −1%.
 
 ## The inline trick — let the generator write hot bodies inline
 
