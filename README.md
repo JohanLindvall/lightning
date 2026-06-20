@@ -50,8 +50,9 @@ go run . path/to/data.go
 (`go run .` only works in this repo; elsewhere use the module path shown above.)
 
 For each input file `FOO.go` it writes `FOO_unmarshal.go` next to it, containing
-an `UnmarshalJSON` method for every top-level struct type. The generated code
-imports `github.com/JohanLindvall/lightning/pkg/support` for the shared scanner.
+an `UnmarshalJSON` method for every top-level type (a struct, or a named slice or
+map root — see [Root types](#root-types)). The generated code imports
+`github.com/JohanLindvall/lightning/pkg/support` for the shared scanner.
 
 Given:
 
@@ -91,6 +92,26 @@ unless a single field is tagged, and an embedded field with its own JSON tag nam
 is a plain named field rather than promoted. Embedding a type from another
 package, whose fields aren't visible to the generator, is the one gap — it is
 decoded as a single named field instead of being flattened.
+
+## Root types
+
+A top-level type need not be a struct: a named slice or a string-keyed map at the
+root gets its own `UnmarshalJSON` too, so a document that is a bare array or a
+data map needs no wrapper struct.
+
+```go
+type Records []Record          // a JSON array at the root
+type ByID    map[string]Record // a JSON object used as a data map
+```
+
+`type Records []Record` decodes a top-level `[…]` with the slice element rules;
+`type ByID map[string]Record` decodes a top-level `{…}` as a map, its keys the
+object's member names. Either element/value type, and any nested types and field
+options, behave exactly as the same type used for a struct field would. Several
+root types (struct, slice, map, in any mix) can live in one input file. For a
+root that is a *bare* `any`/`interface{}` — whose schema you don't know at all —
+there is no method to generate (Go forbids methods on interface types); decode it
+dynamically with [`json.DecodeAny`](#decoding-into-any) instead.
 
 ## The `nocopy` tag option
 
@@ -267,6 +288,23 @@ faster; whitespace surrounding the whole document is still tolerated. Feed one
 input that does contain inter-token whitespace and it may return an error, so use
 them only for sources guaranteed compact.
 
+## Decoding into `any`
+
+When a document's shape isn't known ahead of time — too variable to model, or
+genuinely arbitrary — `DecodeAny` reads the whole thing into the generic
+representation `encoding/json` produces for `interface{}`: `nil`, `bool`,
+`float64`, `string`, `[]any`, and `map[string]any`. It is the dynamic
+counterpart to a generated unmarshaler, using the same scanner but with no target
+type.
+
+- `DecodeAny(data []byte, compact bool) (any, error)` — decodes the single JSON
+  value in `data`. `compact` assumes no inter-token whitespace and skips the
+  `SkipWS` scans (as [`GetCompact`](#key-lookups) does), faster on minified
+  input. Whitespace around the whole document is tolerated; trailing
+  non-whitespace content after the value is an error. Unlike the key-lookup
+  helpers it builds Go values (so strings are unescaped and copied, numbers
+  parsed), allocating the maps and slices the result needs.
+
 ## String escaping and unescaping
 
 The [`pkg/json`](pkg/json) package exposes the scanner's string codec on its
@@ -364,6 +402,29 @@ Matching is length-pre-filtered so a value or key longer than any candidate
 skips the scan, and a kept member is moved with a single `copy` when its
 `"key":value` span is contiguous in the input.
 
+## Setting a value
+
+The [`pkg/json`](pkg/json) package can also splice one value into a document in a
+single pass, without a full unmarshal/edit/marshal round-trip:
+
+- `Set(in, out, rawVal []byte, keys []string) []byte` — returns `in` with the
+  value at the object-key path `keys` replaced by the raw JSON `rawVal`, written
+  into `out`. A path that doesn't exist is created: a missing member is inserted
+  into its parent, and a missing intermediate object (or a non-object found where
+  the path must still descend) is built up as nested objects. With no keys the
+  whole document becomes `rawVal`.
+
+```go
+// {"a":{"b":1}}  ->  {"a":{"b":1},"c":[true]}
+out = json.Set(doc, out[:0], []byte("[true]"), []string{"c"})
+```
+
+`rawVal` is inserted verbatim and must be one well-formed JSON value; any keys
+created along the way are written as plain JSON strings (no escaping, so avoid
+keys needing it). `out` is filled from `out[:0]` and returned — pass a reusable
+buffer to avoid allocation; `out` must not alias `in`, which is never modified.
+Inter-token whitespace in `in` is preserved outside the edited span.
+
 ## SIMD scanning
 
 Two hot scan loops use a single vectorized pass instead of byte-at-a-time work,
@@ -424,7 +485,7 @@ Representative numbers for a 1.8 KB Cloudflare log (Go 1.26, amd64):
 |---|---|
 | [`main.go`](main.go) | the generator (`package main`) |
 | [`pkg/support`](pkg/support) | shared JSON scanning primitives used by generated code |
-| [`pkg/json`](pkg/json) | small public API over the scanner (`Get`/`GetMany`/`ObjectEach`, `UnescapeString`, `ParseFloat`, `StripDefaults`) |
+| [`pkg/json`](pkg/json) | small public API over the scanner (`Get`/`GetMany`/`ObjectEach`, `DecodeAny`, `UnescapeString`, `ParseFloat`, `StripDefaults`, `Set`) |
 | [`bench/`](bench) | benchmark module: hand-written `data.go` + `input.json` per case, plus the generated decoders, harness, and results |
 
 Generated files (`*_unmarshal.go`, `bench/*/bench_test.go`, `bench/*/ej/`, and
