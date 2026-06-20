@@ -4,8 +4,8 @@ package bench
 type Benchmark struct {
 	Features []struct {
 		Geometry struct {
-			Coordinates [][][]float64 `json:"coordinates"`
-			Type        string        `json:"type"`
+			Coordinates [][][2]float64 `json:"coordinates"`
+			Type        string         `json:"type"`
 		} `json:"geometry"`
 		Properties struct {
 			Name string `json:"name"`
