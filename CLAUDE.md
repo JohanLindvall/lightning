@@ -12,7 +12,8 @@ allocation-light `json.Unmarshaler` implementations.
 - `pkg/support` — the runtime scanning primitives every generated decoder calls.
   This is where almost all performance work happens.
 - `pkg/json` — small public API over the scanner (`Get`/`GetMany`/`ObjectEach`
-  + `*Compact`, `Unwrap`, `UnescapeString`, `ParseFloat`).
+  + `*Compact`, `Unwrap`, `UnescapeString`, `ParseFloat`, `DecodeAny` — the
+  dynamic decode-into-`interface{}` entry point for schema-less input).
 - `bench/` — separate module (keeps easyjson/sonic deps out of the main module).
   `run_bench.sh` regenerates decoders and benchmarks lightning vs
   encoding/json, easyjson, and bytedance/sonic. `bench/large-json/input.json` is

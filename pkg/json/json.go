@@ -43,6 +43,39 @@ func ParseFloat(b []byte) (float64, error) {
 	return support.ParseFloat(b)
 }
 
+// DecodeAny decodes a whole JSON document into the generic Go representation —
+// nil, bool, float64, string, []any, map[string]any — the same shape
+// encoding/json produces when unmarshaling into an interface{}. It is the
+// dynamic counterpart to a generated unmarshaler, for input whose schema is not
+// known ahead of time.
+//
+// compact assumes the document has no inter-token whitespace and skips the scans
+// that would otherwise look for it; it is faster on minified input and may return
+// an error if whitespace is in fact present.
+//
+// Trailing content after the first complete value (other than whitespace) is an
+// error.
+func DecodeAny(data []byte, compact bool) (any, error) {
+	i := support.SkipWS(data, 0)
+	var (
+		v   any
+		end int
+		err error
+	)
+	if compact {
+		v, end, err = support.DecodeValueCompact(data, i)
+	} else {
+		v, end, err = support.DecodeValue(data, i)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if support.SkipWS(data, end) != len(data) {
+		return nil, support.ErrInvalidJSON
+	}
+	return v, nil
+}
+
 // Get walks the object-key path keys into the JSON document data and returns
 // the raw bytes of the value found at that path, without reporting a value type.
 // It is built on the scanner primitives, so non-target object members are skipped
