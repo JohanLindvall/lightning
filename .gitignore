@@ -38,4 +38,18 @@ bench/twitter_status/input.json
 *.test
 
 # Simdjson-go testdata bench inputs (downloaded from input.url by run_bench.sh)
-bench/sj_*/input.json
+bench/apache_builds/input.json
+bench/canada/input.json
+bench/github_events/input.json
+bench/gsoc_2018/input.json
+bench/instruments/input.json
+bench/marine_ik/input.json
+bench/mesh/input.json
+bench/mesh_pretty/input.json
+bench/numbers/input.json
+bench/payload_large/input.json
+bench/payload_medium/input.json
+bench/payload_small/input.json
+bench/random/input.json
+bench/twitterescaped/input.json
+bench/update_center/input.json
