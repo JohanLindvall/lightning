@@ -253,6 +253,21 @@ reads.
   wide loop reads 32 bytes (four loads) even when the run ends mid-chunk, so it
   does *more* loads than the 8-byte loop that stops as soon as a non-space chunk
   appears. The plain 8-byte SWAR is already near-optimal for these run lengths.
+- **SSE2 `skipNonWS` continuation for long whitespace runs** (`SkipWSRun` keeps
+  its 8-byte SWAR word for ≤8-byte runs but, when the first 8 bytes are all
+  whitespace, calls an SSE2 `PMINUB`+`PCMPEQB`+`PMOVMSKB` find-first-non-space for
+  the rest — `min`/`eq` against a 0x20 splat, 16 bytes/iter): a tight-loop
+  microbenchmark looked great (run 9 −25%, run 25 −52% vs SWAR), but in the real
+  decode it was **flat on citm and regressed mesh_pretty +6.5%, twitter +3%,
+  cloudflare +1.5%**. `SkipWSRun` is called once per inter-token gap; the SSE
+  routine's per-call setup (splat load, the SSE→GP `PMOVMSKB`, the asm call that
+  can't inline) is not amortized across a single run the way the microbench's tight
+  loop hid. citm's 21–29-byte runs are long enough that SSE2 *should* win, yet the
+  per-call overhead cancels it; the 9–13-byte runs of the other pretty cases tip
+  net-negative. Confirms the two entries above: whitespace skipping resists SIMD —
+  the 8-byte SWAR's cheapness per call beats any vector setup. Don't retry without
+  eliminating the per-call cost (e.g. inlining the SSE into the generated `skipWS`,
+  which would bloat every call site — see the "inline trick" scoping note).
 - **Pure-SSE2 `indexStructural`** (dropping AVX2): ~2× slower on the skip path
   (`skip-heavy`); the throughput loss dwarfs the VZEROUPPER saving.
 - **Key interning / map presizing in the dynamic `any` decoder**
