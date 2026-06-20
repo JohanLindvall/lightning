@@ -106,3 +106,21 @@ func TestConformance(t *testing.T) {
 		t.Errorf("TimeLax = %v, want %v", d.TimeLax, wantTime)
 	}
 }
+
+// TestSliceRoot covers a named slice root type (array-root JSON): the generator
+// emits UnmarshalJSON on PointList itself.
+func TestSliceRoot(t *testing.T) {
+	var got PointList
+	if err := got.UnmarshalJSON([]byte(`[{"x":1,"y":2,"tag":"a"},{"x":3,"y":4,"tag":"b"}]`)); err != nil {
+		t.Fatal(err)
+	}
+	want := PointList{{X: 1, Y: 2, Tag: "a"}, {X: 3, Y: 4, Tag: "b"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %#v, want %#v", got, want)
+	}
+	// null -> nil slice
+	var n PointList
+	if err := n.UnmarshalJSON([]byte(`null`)); err != nil || n != nil {
+		t.Fatalf("null: got %#v err %v, want nil", n, err)
+	}
+}

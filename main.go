@@ -55,6 +55,7 @@ func generate(inPath string) error {
 		fset:         fset,
 		pkg:          file.Name.Name,
 		structTypes:  map[string]*ast.StructType{},
+		sliceTypes:   map[string]*ast.ArrayType{},
 		order:        nil,
 		used:         map[string]bool{},
 		memo:         map[string]string{},
@@ -87,17 +88,27 @@ func generate(inPath string) error {
 			if !ok {
 				continue
 			}
-			if st, ok := ts.Type.(*ast.StructType); ok {
-				g.structTypes[ts.Name.Name] = st
+			switch t := ts.Type.(type) {
+			case *ast.StructType:
+				g.structTypes[ts.Name.Name] = t
 				g.order = append(g.order, ts.Name.Name)
 				if hasCompactDirective(gd.Doc, ts.Doc) {
 					g.compactTypes[ts.Name.Name] = true
+				}
+			case *ast.ArrayType:
+				// A named slice root type (type Foo []T) for array-root documents.
+				if t.Len == nil {
+					g.sliceTypes[ts.Name.Name] = t
+					g.order = append(g.order, ts.Name.Name)
+					if hasCompactDirective(gd.Doc, ts.Doc) {
+						g.compactTypes[ts.Name.Name] = true
+					}
 				}
 			}
 		}
 	}
 	if len(g.order) == 0 {
-		return fmt.Errorf("no top-level struct types found")
+		return fmt.Errorf("no top-level struct or slice types found")
 	}
 
 	// A top-level type that is nested inside another (referenced by one of its
@@ -112,8 +123,12 @@ func generate(inPath string) error {
 	// common case — nothing is referenced, so every type still gets its method.
 	referenced := map[string]bool{}
 	for _, name := range g.order {
-		for _, f := range g.structTypes[name].Fields.List {
-			g.markReferenced(f.Type, name, referenced)
+		if st, ok := g.structTypes[name]; ok {
+			for _, f := range st.Fields.List {
+				g.markReferenced(f.Type, name, referenced)
+			}
+		} else if at, ok := g.sliceTypes[name]; ok {
+			g.markReferenced(at.Elt, name, referenced)
 		}
 	}
 	allReferenced := len(referenced) == len(g.order) // degenerate (fully cyclic); emit all
@@ -155,6 +170,7 @@ type gen struct {
 	fset        *token.FileSet
 	pkg         string
 	structTypes map[string]*ast.StructType
+	sliceTypes  map[string]*ast.ArrayType // named slice root types (type X []T)
 	order       []string
 
 	used map[string]bool   // reserved decoder function names
@@ -345,7 +361,14 @@ func (g *gen) csuf() string {
 // genUnmarshal emits the UnmarshalJSON method for a named struct type and makes
 // sure its decoder (and everything it reaches) is generated.
 func (g *gen) genUnmarshal(name string) string {
-	fn := g.namedStruct(name)
+	// The decode call differs for a slice root: its decoder takes *[]T, and the
+	// receiver *Name (whose underlying type is []T) is converted to it.
+	var call string
+	if at, ok := g.sliceTypes[name]; ok {
+		call = fmt.Sprintf("%s((*[]%s)(v), data, i)", g.sliceDecoder(at.Elt, name, false, false), g.typeStr(at.Elt))
+	} else {
+		call = g.namedStruct(name) + "(v, data, i)"
+	}
 	return fmt.Sprintf(`// UnmarshalJSON parses JSON into the %[1]s. Fields whose json tag carries the
 // "nocopy" option alias the input data instead of copying it; if any are
 // present, the caller must keep data unchanged while the result is in use.
@@ -364,7 +387,7 @@ func (v *%[1]s) UnmarshalJSON(data []byte) error {
 		}
 		return nil
 	}
-	end, err := %[2]s(v, data, i)
+	end, err := %[2]s
 	if err != nil {
 		return err
 	}
@@ -372,7 +395,7 @@ func (v *%[1]s) UnmarshalJSON(data []byte) error {
 		return support.ErrInvalidJSON
 	}
 	return nil
-}`, name, fn)
+}`, name, call)
 }
 
 // namedStruct returns (generating on first use) the decoder for a named struct.

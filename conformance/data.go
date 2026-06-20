@@ -105,3 +105,12 @@ type Doc struct {
 	// failing the whole decode.
 	LaxSkip int `json:"laxSkip,lax"`
 }
+
+// PointList is a named slice root type: the generator emits an UnmarshalJSON on
+// it directly (array-root JSON), decoding via the element decoder. Exercised by
+// TestSliceRoot.
+type PointList []struct {
+	X   int    `json:"x"`
+	Y   int    `json:"y"`
+	Tag string `json:"tag"`
+}
