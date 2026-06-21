@@ -7,7 +7,7 @@
 //
 // For each input file FOO.go it writes FOO_unmarshal.go next to it, containing
 // an UnmarshalJSON method for every top-level struct type. The generated code
-// calls the shared scanner helpers in pkg/support.
+// calls the shared scanner helpers in pkg/unstable.
 //
 // Supported field types: string, bool, all sized int/uint kinds, float32,
 // float64, json.Number, time.Time, json.RawMessage, nested (named or anonymous)
@@ -338,8 +338,8 @@ func (g *gen) skipWS(dst, src string) string {
 	// stream, or the single space after a token in lightly-spaced JSON) resolve
 	// with one or two compares and never call out; only a real run of two or more
 	// whitespace bytes — the indentation of pretty-printed input — is handed to
-	// the SWAR support.SkipWSRun, which eats it eight bytes at a time. Doing this
-	// at the call site rather than in support.SkipWS sidesteps the inliner budget
+	// the SWAR unstable.SkipWSRun, which eats it eight bytes at a time. Doing this
+	// at the call site rather than in unstable.SkipWS sidesteps the inliner budget
 	// that would otherwise force every skip through a function call.
 	set := ""
 	if dst != src {
@@ -348,7 +348,7 @@ func (g *gen) skipWS(dst, src string) string {
 	return fmt.Sprintf(`%[1]sif %[2]s < len(data) && data[%[2]s] <= ' ' {
 		%[2]s++
 		if %[2]s < len(data) && data[%[2]s] <= ' ' {
-			%[2]s = support.SkipWSRun(data, %[2]s+1)
+			%[2]s = unstable.SkipWSRun(data, %[2]s+1)
 		}
 	}`, set, dst)
 }
@@ -357,20 +357,20 @@ func (g *gen) skipWS(dst, src string) string {
 // the way skipWS inlines the whitespace fast path. The common case — a quoted
 // key with no backslash escape — is an IndexCloseOrEscape scan plus an UnsafeStr
 // alias at the call site, costing no ReadKey call; only an escaped key (or an
-// error) falls back to support.ReadKey. It declares key and ni for the loop that
+// error) falls back to unstable.ReadKey. It declares key and ni for the loop that
 // follows. The enclosing decoder returns (int, error).
 func (g *gen) readKey() string {
 	return `var key string
 	var ni int
 	if i >= len(data) || data[i] != '"' {
-		return i, support.ErrInvalidJSON
+		return i, unstable.ErrInvalidJSON
 	}
 	ks := i + 1
-	if k := support.IndexCloseOrEscape(data[ks:]); ks+k < len(data) && data[ks+k] == '"' {
-		key, ni = support.UnsafeStr(data[ks:ks+k]), ks+k+1
+	if k := unstable.IndexCloseOrEscape(data[ks:]); ks+k < len(data) && data[ks+k] == '"' {
+		key, ni = unstable.UnsafeStr(data[ks:ks+k]), ks+k+1
 	} else {
 		var err error
-		if key, ni, err = support.ReadKey(data, i); err != nil {
+		if key, ni, err = unstable.ReadKey(data, i); err != nil {
 			return ni, err
 		}
 	}`
@@ -435,17 +435,17 @@ func (g *gen) genUnmarshal(name string) string {
 	}
 	return fmt.Sprintf(`%[2]s
 func (v *%[1]s) UnmarshalJSON(data []byte) error {
-	i := support.SkipWS(data, 0)
+	i := unstable.SkipWS(data, 0)
 	if i >= len(data) {
-		return support.ErrTruncated
+		return unstable.ErrTruncated
 	}
 	if data[i] == 'n' {
-		end, err := support.ExpectNull(data, i)
+		end, err := unstable.ExpectNull(data, i)
 		if err != nil {
 			return err
 		}
-		if support.SkipWS(data, end) != len(data) {
-			return support.ErrInvalidJSON
+		if unstable.SkipWS(data, end) != len(data) {
+			return unstable.ErrInvalidJSON
 		}
 		return nil
 	}
@@ -453,8 +453,8 @@ func (v *%[1]s) UnmarshalJSON(data []byte) error {
 	if err != nil {
 		return err
 	}
-	if support.SkipWS(data, end) != len(data) {
-		return support.ErrInvalidJSON
+	if unstable.SkipWS(data, end) != len(data) {
+		return unstable.ErrInvalidJSON
 	}
 	return nil
 }`, name, doc, call)
@@ -680,19 +680,19 @@ func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
 
 	body := fmt.Sprintf(`func %[1]s(v %[2]s, data []byte, i int) (int, error) {
 	if i >= len(data) {
-		return i, support.ErrTruncated
+		return i, unstable.ErrTruncated
 	}
 	if data[i] == 'n' {
-		return support.ExpectNull(data, i)
+		return unstable.ExpectNull(data, i)
 	}
 	if data[i] != '{' {
-		return i, support.ErrExpectObject
+		return i, unstable.ErrExpectObject
 	}
 	i++
 	for {
 		%[4]s
 		if i >= len(data) {
-			return i, support.ErrTruncated
+			return i, unstable.ErrTruncated
 		}
 		if data[i] == '}' {
 			return i + 1, nil
@@ -700,16 +700,16 @@ func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
 		%[8]s
 		%[5]s
 		if i >= len(data) || data[i] != ':' {
-			return i, support.ErrExpectColon
+			return i, unstable.ErrExpectColon
 		}
 		%[6]s
 		if i >= len(data) {
-			return i, support.ErrTruncated
+			return i, unstable.ErrTruncated
 		}
 		switch key {
 %[3]s
 		default:
-			end, err := support.SkipValue(data, i)
+			end, err := unstable.SkipValue(data, i)
 			if err != nil {
 				return end, err
 			}
@@ -717,13 +717,13 @@ func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
 		}
 		%[7]s
 		if i >= len(data) {
-			return i, support.ErrTruncated
+			return i, unstable.ErrTruncated
 		}
 		if data[i] == '}' {
 			return i + 1, nil
 		}
 		if data[i] != ',' {
-			return i, support.ErrInvalidJSON
+			return i, unstable.ErrInvalidJSON
 		}
 		i++
 	}
@@ -752,7 +752,7 @@ func (g *gen) field(dest string, expr ast.Expr, hint string, nocopy, lax bool) s
 		}
 		inner := g.field("(*"+dest+")", t.X, hint, nocopy, lax)
 		return fmt.Sprintf(`if data[i] == 'n' {
-	end, err := support.ExpectNull(data, i)
+	end, err := unstable.ExpectNull(data, i)
 	if err != nil {
 		return end, err
 	}
@@ -845,7 +845,7 @@ func (g *gen) laxField(dest string, expr ast.Expr, hint string, nocopy bool) str
 	return fmt.Sprintf(`var lax %[1]s
 end, err := %[2]s(&lax, data, i)
 if err != nil {
-	end, err = support.SkipValue(data, i)
+	end, err = unstable.SkipValue(data, i)
 	if err != nil {
 		return end, err
 	}
@@ -907,14 +907,14 @@ func (g *gen) valueDecoder(expr ast.Expr, hint string, nocopy, lax bool) string 
 func (g *gen) scalar(dest, name string, nocopy bool) string {
 	switch {
 	case name == "string":
-		reader := "support.ReadStringOrNull"
+		reader := "unstable.ReadStringOrNull"
 		if nocopy {
-			reader = "support.ReadStringNoCopyOrNull"
+			reader = "unstable.ReadStringNoCopyOrNull"
 			g.needNoCopyStr = true
 			if g.destructive {
 				// //lightning:destructive — unescape escaped strings into the input
 				// buffer instead of allocating, aliasing the result (destroys the input).
-				reader = "support.ReadStringDestructiveOrNull"
+				reader = "unstable.ReadStringDestructiveOrNull"
 			}
 		}
 		return fmt.Sprintf(`s, end, err := %s(data, i)
@@ -926,7 +926,7 @@ i = end`, reader, dest)
 
 	case name == "bool":
 		g.needBool = true
-		return fmt.Sprintf(`b, end, err := support.ReadBoolOrNull(data, i)
+		return fmt.Sprintf(`b, end, err := unstable.ReadBoolOrNull(data, i)
 if err != nil {
 	return end, err
 }
@@ -939,7 +939,7 @@ i = end`, dest)
 		if name == "float32" {
 			val = "float32(f)"
 		}
-		return fmt.Sprintf(`f, end, err := support.ReadFloat64OrNull(data, i)
+		return fmt.Sprintf(`f, end, err := unstable.ReadFloat64OrNull(data, i)
 if err != nil {
 	return end, err
 }
@@ -951,7 +951,7 @@ i = end`, dest, val)
 		if name != "int64" {
 			val = name + "(n)"
 		}
-		return fmt.Sprintf(`n, end, err := support.ReadInt64OrNull(data, i)
+		return fmt.Sprintf(`n, end, err := unstable.ReadInt64OrNull(data, i)
 if err != nil {
 	return end, err
 }
@@ -964,7 +964,7 @@ i = end`, dest, val)
 		if name != "uint64" {
 			val = name + "(n)"
 		}
-		return fmt.Sprintf(`n, end, err := support.ReadUint64OrNull(data, i)
+		return fmt.Sprintf(`n, end, err := unstable.ReadUint64OrNull(data, i)
 if err != nil {
 	return end, err
 }
@@ -982,7 +982,7 @@ func (g *gen) rawMessage(dest string, nocopy bool) string {
 		assign = fmt.Sprintf("%s = data[start:end]", dest)
 	}
 	return fmt.Sprintf(`start := i
-end, err := support.SkipValue(data, i)
+end, err := unstable.SkipValue(data, i)
 if err != nil {
 	return end, err
 }
@@ -996,9 +996,9 @@ i = end`, assign)
 // raw literal as a string and convert it to json.Number. nocopy aliases the input
 // (json.Number's underlying type is string, so the conversion never copies).
 func (g *gen) numberRead(dest string, nocopy bool) string {
-	reader := "support.ReadNumberOrNull"
+	reader := "unstable.ReadNumberOrNull"
 	if nocopy {
-		reader = "support.ReadNumberNoCopyOrNull"
+		reader = "unstable.ReadNumberNoCopyOrNull"
 	}
 	return fmt.Sprintf(`s, end, err := %s(data, i)
 if err != nil {
@@ -1009,10 +1009,10 @@ i = end`, reader, dest)
 }
 
 func (g *gen) timeRead(dest string, lax bool) string {
-	reader := "support.ReadTimeOrNull"
+	reader := "unstable.ReadTimeOrNull"
 	if lax {
 		// lax accepts RFC 3339 (with 'T' or space) and numeric Unix timestamps.
-		reader = "support.ReadTimeLaxOrNull"
+		reader = "unstable.ReadTimeLaxOrNull"
 	}
 	return fmt.Sprintf(`t, end, err := %s(data, i)
 if err != nil {
@@ -1026,9 +1026,9 @@ func (g *gen) anyValue(dest string) string {
 	g.needAny = true
 	g.needBool = true
 	g.needFloat = true
-	decode := "support.DecodeValue"
+	decode := "unstable.DecodeValue"
 	if g.compact {
-		decode = "support.DecodeValueCompact"
+		decode = "unstable.DecodeValueCompact"
 	}
 	return fmt.Sprintf(`val, end, err := %s(data, i)
 if err != nil {
@@ -1039,7 +1039,7 @@ i = end`, decode, dest)
 }
 
 func (g *gen) skipEmit() string {
-	return `end, err := support.SkipValue(data, i)
+	return `end, err := unstable.SkipValue(data, i)
 if err != nil {
 	return end, err
 }
@@ -1047,20 +1047,20 @@ i = end`
 }
 
 // unwrapField wraps a field's normal decode (inner) so it runs against the JSON
-// embedded in a string value (the "unwrap" option). support.Unwrap reads the
+// embedded in a string value (the "unwrap" option). unstable.Unwrap reads the
 // string, unescapes it, and base64-decodes it when needed; the embedded bytes
 // are then decoded by inner inside a closure that rebinds data and i to them, so
 // inner's own (int, error) returns stay scoped to the embedded document while the
 // outer cursor advances past the original string. A null or empty string leaves
 // the field at its zero value.
 func unwrapField(inner string) string {
-	return fmt.Sprintf(`body, bend, berr := support.Unwrap(data, i)
+	return fmt.Sprintf(`body, bend, berr := unstable.Unwrap(data, i)
 if berr != nil {
 	return bend, berr
 }
 if len(body) > 0 {
 	if _, ierr := func(data []byte, i int) (int, error) {
-		i = support.SkipWS(data, i)
+		i = unstable.SkipWS(data, i)
 %s
 		return i, nil
 	}(body, 0); ierr != nil {
@@ -1100,13 +1100,13 @@ func (g *gen) arrayDecoder(t *ast.ArrayType, hint string, nocopy, lax bool) stri
 	elem := g.field("(*out)[idx]", t.Elt, hint, nocopy, lax)
 	body := fmt.Sprintf(`func %[1]s(out *%[2]s, data []byte, i int) (int, error) {
 	if i >= len(data) {
-		return i, support.ErrTruncated
+		return i, unstable.ErrTruncated
 	}
 	if data[i] == 'n' {
-		return support.ExpectNull(data, i)
+		return unstable.ExpectNull(data, i)
 	}
 	if data[i] != '[' {
-		return i, support.ErrExpectArray
+		return i, unstable.ErrExpectArray
 	}
 	*out = %[2]s{}
 	i++
@@ -1114,7 +1114,7 @@ func (g *gen) arrayDecoder(t *ast.ArrayType, hint string, nocopy, lax bool) stri
 	for {
 		%[3]s
 		if i >= len(data) {
-			return i, support.ErrTruncated
+			return i, unstable.ErrTruncated
 		}
 		if data[i] == ']' {
 			return i + 1, nil
@@ -1122,7 +1122,7 @@ func (g *gen) arrayDecoder(t *ast.ArrayType, hint string, nocopy, lax bool) stri
 		if idx < len(out) {
 			%[4]s
 		} else {
-			end, err := support.SkipValue(data, i)
+			end, err := unstable.SkipValue(data, i)
 			if err != nil {
 				return end, err
 			}
@@ -1131,13 +1131,13 @@ func (g *gen) arrayDecoder(t *ast.ArrayType, hint string, nocopy, lax bool) stri
 		idx++
 		%[3]s
 		if i >= len(data) {
-			return i, support.ErrTruncated
+			return i, unstable.ErrTruncated
 		}
 		if data[i] == ']' {
 			return i + 1, nil
 		}
 		if data[i] != ',' {
-			return i, support.ErrInvalidJSON
+			return i, unstable.ErrInvalidJSON
 		}
 		i++
 	}
@@ -1176,10 +1176,10 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax bool) string {
 	presize := g.slicePresize(elt, eltStr)
 	body := fmt.Sprintf(`func %[1]s(out *[]%[2]s, data []byte, i int) (int, error) {
 	if i >= len(data) {
-		return i, support.ErrTruncated
+		return i, unstable.ErrTruncated
 	}
 	if data[i] == 'n' {
-		end, err := support.ExpectNull(data, i)
+		end, err := unstable.ExpectNull(data, i)
 		if err != nil {
 			return end, err
 		}
@@ -1187,13 +1187,13 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax bool) string {
 		return end, nil
 	}
 	if data[i] != '[' {
-		return i, support.ErrExpectArray
+		return i, unstable.ErrExpectArray
 	}
 %[4]s	i++
 	for {
 		%[5]s
 		if i >= len(data) {
-			return i, support.ErrTruncated
+			return i, unstable.ErrTruncated
 		}
 		if data[i] == ']' {
 			return i + 1, nil
@@ -1206,13 +1206,13 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax bool) string {
 		%[3]s
 		%[5]s
 		if i >= len(data) {
-			return i, support.ErrTruncated
+			return i, unstable.ErrTruncated
 		}
 		if data[i] == ']' {
 			return i + 1, nil
 		}
 		if data[i] != ',' {
-			return i, support.ErrInvalidJSON
+			return i, unstable.ErrInvalidJSON
 		}
 		i++
 	}
@@ -1237,9 +1237,9 @@ func (g *gen) slicePresize(elt ast.Expr, eltStr string) string {
 		switch {
 		case t.Name == "bool" || t.Name == "float32" || t.Name == "float64" ||
 			intKinds[t.Name] || uintKinds[t.Name]:
-			counter = "support.CountArrayScalars"
+			counter = "unstable.CountArrayScalars"
 		case t.Name == "string":
-			counter = "support.CountArrayElements"
+			counter = "unstable.CountArrayElements"
 		}
 		// Presize a slice of structs only when each element is cheap to skip — a
 		// flat record of scalars and strings, like a Cloudflare log line. If an
@@ -1260,12 +1260,12 @@ func (g *gen) slicePresize(elt ast.Expr, eltStr string) string {
 			// mis-size the slice but never misdecodes — which avoids the per-element
 			// skipObject that dominates arrays of small {name,version}-style records
 			// (update_center dependencies/developers, apache_builds jobs).
-			counter = "support.CountArrayObjects"
+			counter = "unstable.CountArrayObjects"
 		case g.structSkipIsCheap(t):
-			counter = "support.CountArrayElements"
+			counter = "unstable.CountArrayElements"
 		}
 	case *ast.MapType:
-		counter = "support.CountArrayElements"
+		counter = "unstable.CountArrayElements"
 	case *ast.ArrayType:
 		// elt is itself a slice/array. A fixed-size array element ([N]T, e.g. a
 		// [3]float64 coordinate point) is skipped here: counting the outer slice
@@ -1282,7 +1282,7 @@ func (g *gen) slicePresize(elt ast.Expr, eltStr string) string {
 		// re-scan; skip presize there too so the outer slice just appends.
 		if t.Len == nil {
 			if _, nested := unparen(t.Elt).(*ast.ArrayType); !nested {
-				counter = "support.CountArrayElements"
+				counter = "unstable.CountArrayElements"
 			}
 		}
 	case *ast.SelectorExpr:
@@ -1290,15 +1290,15 @@ func (g *gen) slicePresize(elt ast.Expr, eltStr string) string {
 		case isNumber(t):
 			// A json.Number element is a bare number token — a scalar — so the
 			// cheaper comma-counting scan sizes the slice.
-			counter = "support.CountArrayScalars"
+			counter = "unstable.CountArrayScalars"
 		case isTime(t):
 			// An RFC 3339 timestamp or Unix-timestamp number never contains a
 			// comma or bracket, so the cheap comma-counting scan sizes a
 			// []time.Time too — far cheaper than CountArrayElements, which would
 			// skipString past every element. (time-array −15%.)
-			counter = "support.CountArrayScalars"
+			counter = "unstable.CountArrayScalars"
 		case isRaw(t):
-			counter = "support.CountArrayElements"
+			counter = "unstable.CountArrayElements"
 		}
 	}
 	if counter == "" {
@@ -1346,10 +1346,10 @@ func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy, lax boo
 	}
 	body := fmt.Sprintf(`func %[1]s(out *map[string]%[2]s, data []byte, i int) (int, error) {
 	if i >= len(data) {
-		return i, support.ErrTruncated
+		return i, unstable.ErrTruncated
 	}
 	if data[i] == 'n' {
-		end, err := support.ExpectNull(data, i)
+		end, err := unstable.ExpectNull(data, i)
 		if err != nil {
 			return end, err
 		}
@@ -1357,7 +1357,7 @@ func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy, lax boo
 		return end, nil
 	}
 	if data[i] != '{' {
-		return i, support.ErrExpectObject
+		return i, unstable.ErrExpectObject
 	}
 	i++
 	m := *out
@@ -1367,7 +1367,7 @@ func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy, lax boo
 	for {
 		%[4]s
 		if i >= len(data) {
-			return i, support.ErrTruncated
+			return i, unstable.ErrTruncated
 		}
 		if data[i] == '}' {
 			*out = m
@@ -1376,25 +1376,25 @@ func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy, lax boo
 		%[7]s
 		%[5]s
 		if i >= len(data) || data[i] != ':' {
-			return i, support.ErrExpectColon
+			return i, unstable.ErrExpectColon
 		}
 		%[6]s
 		if i >= len(data) {
-			return i, support.ErrTruncated
+			return i, unstable.ErrTruncated
 		}
 		var val %[2]s
 		%[3]s
 		%[8]s
 		%[4]s
 		if i >= len(data) {
-			return i, support.ErrTruncated
+			return i, unstable.ErrTruncated
 		}
 		if data[i] == '}' {
 			*out = m
 			return i + 1, nil
 		}
 		if data[i] != ',' {
-			return i, support.ErrInvalidJSON
+			return i, unstable.ErrInvalidJSON
 		}
 		i++
 	}
@@ -1481,9 +1481,9 @@ func (g *gen) baseName(expr ast.Expr) string {
 	return "Value"
 }
 
-// supportPkg is the import path of the shared scanner package whose exported
+// unstablePkg is the import path of the shared scanner package whose exported
 // helpers the generated decoders call.
-const supportPkg = "github.com/JohanLindvall/lightning/pkg/support"
+const unstablePkg = "github.com/JohanLindvall/lightning/pkg/unstable"
 
 func (g *gen) assemble(inPath string, methods []string) string {
 	var body strings.Builder
@@ -1503,7 +1503,7 @@ func (g *gen) assemble(inPath string, methods []string) string {
 	// heuristic flags: those both miss types nested inside an anonymous struct and
 	// over-fire on a nocopy raw field whose decode emits no json. reference. The
 	// tokens appear only as real type usages, never in the generated comments.
-	imports := []string{strconv.Quote(supportPkg)}
+	imports := []string{strconv.Quote(unstablePkg)}
 	if strings.Contains(code, "json.RawMessage") || strings.Contains(code, "json.RawValue") || strings.Contains(code, "json.Number") {
 		imports = append(imports, `json "encoding/json"`)
 	}

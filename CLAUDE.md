@@ -18,12 +18,19 @@ allocation-light `json.Unmarshaler` implementations.
   those sets. `g.cmark`/`g.csuf` keep compact/destructive variants distinct in memo
   keys / function names (the `Destructive` suffix); nocopy variants are already
   distinguished by the `nocopy` decoder param / `NoCopy` suffix.
-- `pkg/support` — the runtime scanning primitives every generated decoder calls.
-  This is where almost all performance work happens.
-- `pkg/json` — small public API over the scanner: `Get`/`GetMany`/`ObjectEach`
-  (+ `*Compact`) read fields, `Set`/`SetMany` splice values, `StripDefaults`
-  prunes default members, `DecodeAny` decodes a whole document into `interface{}`
-  (schema-less), plus `UnescapeString`/`EscapeString` and `ParseFloat`.
+- `pkg/unstable` — the runtime scanning primitives the generated decoders call, plus
+  the handful exported for the `pkg/json` toolkit (`SkipWS`/`SkipWSCompact`/`SkipValue`/
+  `SkipString`/`ReadKey`/`DecodeValue`/`UnescapeString`/`ParseFloat` and the `Err*`
+  sentinels). This is where almost all performance work happens.
+- `pkg/json` — small public API over the scanner, **implemented here** (not just
+  wrappers) on the exported pkg/unstable primitives: `get.go` holds the read toolkit
+  `Get`/`GetMany`/`GetPaths`/`ObjectEach` (+ `*Compact`) — `GetPaths` pulls several
+  *nested* paths in one prefix-sharing pass (the multi-path form of `Get`); `set.go`
+  holds `Set`/`SetMany`/`SetPaths` (`SetPaths` edits/creates several nested paths in
+  one rewrite); `strip_defaults.go` holds `StripDefaults`; `json.go` keeps the
+  decode-internal-bound wrappers `DecodeAny`/`UnescapeString`/`ParseFloat` (they need
+  private `decodeEscaped`/`scanFloat`, so they stay in pkg/unstable). `EscapeString` lives
+  in `escape.go`.
 - `bench/` — separate module (keeps easyjson/sonic deps out of the main module).
   `run_bench.sh` regenerates decoders and benchmarks lightning vs
   encoding/json, easyjson, and bytedance/sonic. `bench/large-json/input.json` is
@@ -135,7 +142,7 @@ byte-identical when adding cold paths; push new logic out-of-line.
   input-restore copy real usage omits): **gsoc_2018 −41% time / −86% B/op / −57%
   allocs**, twitterescaped −9.5% / −29% / −64%. Distinct decoder variants vs the
   plain/compact forms via `g.cmark`/`g.csuf` (`Destructive` suffix). Covered by
-  conformance `TestDestructiveDirective` and the `destructive` arm of support's
+  conformance `TestDestructiveDirective` and the `destructive` arm of pkg/unstable's
   `TestReadStringOrNull`.
 - **`CountArrayElements`** (slice presize) skips each element with `SkipValue`
   (vectorized via `indexStructural`), not a byte-by-byte depth walk — but **gives
@@ -195,7 +202,7 @@ byte-identical when adding cold paths; push new logic out-of-line.
   throughput-bound skip loop where blocks run back-to-back: **amd64 skip-heavy −5%**,
   no regression on citm / large-json / canada (whose `SkipValue`/presize use
   early-exits within a block via the scalar prescan, so it never reaches the loop).
-  arm64 mirrors the change (correctness verified under qemu — full support suite +
+  arm64 mirrors the change (correctness verified under qemu — full pkg/unstable test suite +
   an exhaustive 0–255 × boundary-offset differential); its speedup is unmeasured
   here (qemu isn't cycle-accurate) and wants a real-arm64/CI run to confirm. The
   string scanner
@@ -219,21 +226,21 @@ byte-identical when adding cold paths; push new logic out-of-line.
 Go's inliner refuses `SkipWS`, `ReadKey`, and `indexCloseOrEscape` (each exceeds
 the cost budget once it holds a SIMD/asm call), so calling them from generated
 code pays full call overhead per token. Instead the **generator writes the hot
-fast path inline at the call site** and falls back to a support call only for the
+fast path inline at the call site** and falls back to a pkg/unstable call only for the
 rare/hard case. See `g.skipWS` and `g.readKey` in `main.go`:
 
 - **skipWS** emits the whitespace check inline:
-  `if i < len(data) && data[i] <= ' ' { i++; if i < len(data) && data[i] <= ' ' { i = support.SkipWSRun(data, i+1) } }`.
+  `if i < len(data) && data[i] <= ' ' { i++; if i < len(data) && data[i] <= ' ' { i = unstable.SkipWSRun(data, i+1) } }`.
   The common 0–1 whitespace bytes cost one or two compares and no call; only a run
   of ≥2 (pretty-print indentation) reaches the SWAR `SkipWSRun`.
-- **readKey** emits the no-escape key read inline — a `support.IndexCloseOrEscape`
-  scan plus a `support.UnsafeStr` alias — falling back to `support.ReadKey` only
+- **readKey** emits the no-escape key read inline — a `unstable.IndexCloseOrEscape`
+  scan plus a `unstable.UnsafeStr` alias — falling back to `unstable.ReadKey` only
   for an escaped key or an error. It relies on tiny inlinable exported wrappers
   `IndexCloseOrEscape`/`UnsafeStr` that themselves inline, so the generated code
   reaches the SIMD scanner with no wrapper call. Won ~6–7% on the cloudflare
   family, no regressions.
 
-Why it beats making the support funcs inlinable: the cheap common case skips the
+Why it beats making the pkg/unstable funcs inlinable: the cheap common case skips the
 call entirely, and the shared scanner keeps its tuned dispatch.
 
 **Scope it to once-per-loop reads.** `skipWS`/`readKey` fire once per object member,

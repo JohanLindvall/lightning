@@ -6,7 +6,7 @@ A small Go code generator that emits fast, allocation-light
 Instead of decoding JSON with reflection at run time (like `encoding/json`),
 lightning reads a struct definition at build time and writes a hand-written
 style `UnmarshalJSON` method plus the recursive decoders it needs. The decoders
-share a single set of scanning primitives in [`pkg/support`](pkg/support), so the
+share a single set of scanning primitives in [`pkg/unstable`](pkg/unstable), so the
 generated files stay small.
 
 Those same primitives are also exposed directly as a small toolkit in
@@ -35,12 +35,17 @@ go install github.com/JohanLindvall/lightning@latest
 lightning path/to/data.go
 ```
 
-The generated code imports `github.com/JohanLindvall/lightning/pkg/support`, so
+The generated code imports `github.com/JohanLindvall/lightning/pkg/unstable`, so
 the module you generate into must depend on lightning:
 
 ```sh
 go get github.com/JohanLindvall/lightning
 ```
+
+`pkg/unstable` is the generator's runtime: it is exported only because the
+generated `*_unmarshal.go` files (which live in your module) have to call into it.
+As its name says, it is **not a stable API** — don't import it directly; use
+[`pkg/json`](pkg/json) for the public toolkit.
 
 A `go:generate` directive in the file that holds your structs works well:
 
@@ -62,7 +67,7 @@ go run . path/to/data.go
 For each input file `FOO.go` it writes `FOO_unmarshal.go` next to it, containing
 an `UnmarshalJSON` method for every top-level type (a struct, or a named slice or
 map root — see [Root types](#root-types)). The generated code imports
-`github.com/JohanLindvall/lightning/pkg/support` for the shared scanner.
+`github.com/JohanLindvall/lightning/pkg/unstable` for the shared scanner.
 
 Given:
 
@@ -323,6 +328,13 @@ its surrounding quotes with escapes intact, an object or array spans the whole
   if that key is absent. A missing key is reported by the `nil` slot, not an
   error (a present key whose value is JSON `null` yields the bytes `"null"`,
   distinct from absent); a non-object root or malformed JSON returns an error.
+- `GetPaths(data []byte, paths [][]string, out [][]byte) ([][]byte, error)` — the
+  multi-path form of `Get` (as `GetMany` is its multi-key form): each `paths[n]` is
+  a nested key path and `out[n]` receives the value there. The document is walked
+  **once** and paths that share a prefix share that descent, so pulling several
+  nested fields — especially under a common parent — costs one traversal rather than
+  one `Get` per field (≈40–50% faster on a record with a handful of nested paths).
+  Same result conventions as `GetMany`; a `nil`/empty path selects the root.
 - `ObjectEach(data []byte, fn func(key string, value []byte) error, keys ...string) error`
   — calls `fn` for every member of the object reached by the path `keys` (the
   root object with no keys). If `fn` returns an error, iteration stops and
@@ -476,6 +488,15 @@ single pass, without a full unmarshal/edit/marshal round-trip:
   the object instead of rescanning and rewriting it once per key. A non-object
   root is replaced by a fresh object of all the members; a `rawVal` shorter than
   `keys` ignores the surplus keys.
+- `SetPaths(in, out []byte, rawVal [][]byte, paths [][]string) []byte` — the
+  multi-*path* form of `Set` (the write counterpart of `GetPaths`): each `paths[i]`
+  is a nested key path set to `rawVal[i]`, replaced if present or created (with any
+  missing intermediate objects) if absent. Paths that share a prefix are edited and
+  created together, so the document is rewritten **once** rather than once per path
+  — a large win over sequential `Set`, which re-reads and re-writes the whole
+  document each call (≈2–3× faster, far fewer allocations). A `nil`/empty path
+  replaces the whole document; when one path is a prefix of another the shorter
+  wins.
 
 ```go
 // {"a":{"b":1}}  ->  {"a":{"b":1},"c":[true]}
@@ -483,6 +504,10 @@ out = json.Set(doc, out[:0], []byte("[true]"), []string{"c"})
 
 // {"a":1,"b":2}  ->  {"a":1,"b":9,"c":3}   (replace b, add c, one pass)
 out = json.SetMany(doc, out[:0], [][]byte{[]byte("9"), []byte("3")}, []string{"b", "c"})
+
+// {"a":{"b":1}}  ->  {"a":{"b":9,"c":8}}   (replace a.b, create a.c, one pass)
+out = json.SetPaths(doc, out[:0], [][]byte{[]byte("9"), []byte("8")},
+	[][]string{{"a", "b"}, {"a", "c"}})
 ```
 
 Each `rawVal` is inserted verbatim and must be one well-formed JSON value; any
@@ -494,7 +519,7 @@ modified. Inter-token whitespace in `in` is preserved outside the edited spans.
 ## SIMD scanning
 
 Two hot scan loops use a single vectorized pass instead of byte-at-a-time work,
-with kernels in `pkg/support/index_amd64.s` and `pkg/support/index_arm64.s`
+with kernels in `pkg/unstable/index_amd64.s` and `pkg/unstable/index_arm64.s`
 (arm64 uses NEON/ASIMD, 16 bytes/pass, for both):
 
 - **next `"` or `\` in a string** — replaces two `bytes.IndexByte` scans; speeds
@@ -564,8 +589,8 @@ Representative numbers for a 1.8 KB Cloudflare log (Go 1.26, amd64):
 | Path | Description |
 |---|---|
 | [`main.go`](main.go) | the generator (`package main`) |
-| [`pkg/support`](pkg/support) | shared JSON scanning primitives used by generated code |
-| [`pkg/json`](pkg/json) | small public API over the scanner (`Get`/`GetMany`/`ObjectEach`, `DecodeAny`, `UnescapeString`, `ParseFloat`, `StripDefaults`, `Set`/`SetMany`) |
+| [`pkg/unstable`](pkg/unstable) | the (unstable, do-not-import) runtime the generated decoders call into |
+| [`pkg/json`](pkg/json) | small public API over the scanner (`Get`/`GetMany`/`ObjectEach`, `DecodeAny`, `UnescapeString`, `ParseFloat`, `StripDefaults`, `Set`/`SetMany`/`SetPaths`) |
 | [`bench/`](bench) | benchmark module: hand-written `data.go` + `input.json` per case, plus the generated decoders, harness, and results |
 
 Generated files (`*_unmarshal.go`, `bench/*/bench_test.go`, `bench/*/ej/`, and
