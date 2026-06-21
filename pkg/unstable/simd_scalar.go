@@ -1,9 +1,9 @@
 //go:build !amd64 && !arm64
 
-package support
+package unstable
 
-// These platforms have no SIMD implementation, so every primitive uses its
-// scalar fallback.
+// These platforms have no SIMD implementation, so indexCloseOrEscape and
+// indexStructural dispatch to the generic scalar implementations in simd_other.go.
 
 func indexCloseOrEscape(b []byte) int { return indexCloseOrEscapeScalar(b) }
 

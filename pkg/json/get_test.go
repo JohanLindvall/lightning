@@ -136,6 +136,97 @@ func TestGetMany(t *testing.T) {
 	})
 }
 
+func TestGetPaths(t *testing.T) {
+	doc := []byte(`{
+		"actor": {"login": "octocat", "id": 583231},
+		"repo":  {"name": "Hello-World", "owner": {"login": "octo-org"}},
+		"payload": {"ref": "refs/heads/main", "commits": [{"sha": "abc"}]},
+		"public": true
+	}`)
+
+	t.Run("nested paths, shared prefix, miss, root capture", func(t *testing.T) {
+		paths := [][]string{
+			{"actor", "login"},         // octocat
+			{"actor", "id"},            // 583231 (shares the actor descent)
+			{"repo", "owner", "login"}, // octo-org (two levels deep)
+			{"payload", "ref"},         // refs/heads/main
+			{"repo"},                   // whole repo object (ends where another path descends)
+			{"missing", "x"},           // absent
+			{"actor", "name"},          // absent (key not present)
+			nil,                        // whole document root
+		}
+		out, err := GetPaths(doc, paths, nil)
+		if err != nil {
+			t.Fatalf("GetPaths: %v", err)
+		}
+		want := []string{
+			`"octocat"`,
+			`583231`,
+			`"octo-org"`,
+			`"refs/heads/main"`,
+			`{"name": "Hello-World", "owner": {"login": "octo-org"}}`,
+			"", // missing.x
+			"", // actor.name
+			string(doc),
+		}
+		for n := range paths {
+			if string(out[n]) != want[n] {
+				t.Errorf("path %v: got %q, want %q", paths[n], out[n], want[n])
+			}
+		}
+	})
+
+	t.Run("agrees with Get for every path", func(t *testing.T) {
+		paths := [][]string{
+			{"actor", "login"}, {"repo", "owner", "login"}, {"payload", "ref"}, {"public"},
+		}
+		out, err := GetPaths(doc, paths, nil)
+		if err != nil {
+			t.Fatalf("GetPaths: %v", err)
+		}
+		for n, p := range paths {
+			g, _, gerr := Get(doc, p...)
+			if gerr != nil {
+				t.Fatalf("Get%v: %v", p, gerr)
+			}
+			if string(out[n]) != string(g) {
+				t.Errorf("path %v: GetPaths %q != Get %q", p, out[n], g)
+			}
+		}
+	})
+
+	t.Run("scratch reuse does not allocate beyond the active set", func(t *testing.T) {
+		paths := [][]string{{"public"}, {"actor", "login"}}
+		out, _ := GetPaths(doc, paths, make([][]byte, 0, len(paths)))
+		// One descent (into actor) builds one small recurse slice; assert it stays small.
+		allocs := testing.AllocsPerRun(100, func() { out, _ = GetPaths(doc, paths, out) })
+		if allocs > 1 {
+			t.Fatalf("GetPaths reusing scratch allocated %.0f times, want <= 1", allocs)
+		}
+	})
+
+	t.Run("compact variant agrees", func(t *testing.T) {
+		compact := []byte(`{"a":{"b":1,"c":2},"d":3}`)
+		paths := [][]string{{"a", "b"}, {"a", "c"}, {"d"}}
+		out, err := GetPathsCompact(compact, paths, nil)
+		if err != nil {
+			t.Fatalf("GetPathsCompact: %v", err)
+		}
+		want := []string{"1", "2", "3"}
+		for n := range paths {
+			if string(out[n]) != want[n] {
+				t.Errorf("path %v: got %q, want %q", paths[n], out[n], want[n])
+			}
+		}
+	})
+
+	t.Run("non-object root errors when a path needs to descend", func(t *testing.T) {
+		if _, err := GetPaths([]byte(`[1,2]`), [][]string{{"a"}}, nil); err == nil {
+			t.Fatal("expected an error for a non-object root")
+		}
+	})
+}
+
 // TestCompactVariants checks that GetCompact, GetManyCompact and
 // ObjectEachCompact agree with their non-compact counterparts on whitespace-free
 // input, descend nested paths, and still tolerate leading framing whitespace.

@@ -1,6 +1,6 @@
 //go:build amd64
 
-package support
+package unstable
 
 import "golang.org/x/sys/cpu"
 
@@ -27,7 +27,7 @@ var useAVX2 = cpu.X86.HasAVX2
 // The routine handles every length itself (the 32- and 16-byte loops fall
 // through to a scalar tail for the final <16 bytes), so the dispatch is a single
 // call with no length branch. That keeps indexCloseOrEscape inlinable into its
-// callers (ReadKey, the Read*String funcs, skipString), removing a call layer
+// callers (ReadKey, the Read*String funcs, SkipString), removing a call layer
 // from the hottest path in object decoding.
 func indexCloseOrEscape(b []byte) int {
 	return indexQuoteOrBackslashSSE2(b)

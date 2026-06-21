@@ -1,6 +1,6 @@
 //go:build arm64
 
-package support
+package unstable
 
 //go:noescape
 func indexQuoteOrBackslashNEON(b []byte) int
@@ -14,7 +14,7 @@ func indexStructuralNEON(b []byte) int
 // the dispatch is a single unconditional call with no length branch and no
 // feature gate (Advanced SIMD is mandatory in the ARMv8-A baseline Go targets).
 // That keeps indexCloseOrEscape inlinable into its callers (ReadKey, the
-// Read*String funcs, skipString, decodeEscaped), removing a call layer from the
+// Read*String funcs, SkipString, decodeEscaped), removing a call layer from the
 // hottest function in object decoding, where the scanner is ~40% of the work.
 func indexCloseOrEscape(b []byte) int {
 	return indexQuoteOrBackslashNEON(b)

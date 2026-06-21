@@ -1,6 +1,6 @@
 // Code generated for Eisel-Lemire; DO NOT EDIT.
 
-package support
+package unstable
 
 const (
 	detailedPowersOfTenMinExp10 = -348

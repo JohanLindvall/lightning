@@ -1,6 +1,10 @@
-package support
+package json
 
-import "bytes"
+import (
+	"bytes"
+
+	"github.com/JohanLindvall/lightning/pkg/unstable"
+)
 
 // WhitespaceMode selects how StripDefaults treats inter-token whitespace in the
 // input. The zero value, RemoveWhitespace, is the safe default: it tolerates any
@@ -58,7 +62,7 @@ func StripDefaults(input, output []byte, defaults, keep [][]byte, ws WhitespaceM
 	}
 	// Whitespace at the document start is tolerated (and preserved when asked) for
 	// every mode; handle's own skips honor ws thereafter.
-	start := SkipWS(input, 0)
+	start := unstable.SkipWS(input, 0)
 	write := 0
 	if ws == PreserveWhitespace {
 		write = copy(output, input[:start])
@@ -181,7 +185,7 @@ func (s *stripper) handle(read, write int) (int, int) {
 	compact := s.ws == AssumeCompact
 	preserve := s.ws == PreserveWhitespace
 	dataLen := len(in)
-	read = skipWSc(in, read, compact)
+	read = unstable.SkipWSCompact(in, read, compact)
 	if read == dataLen {
 		return read, write
 	}
@@ -208,16 +212,16 @@ func (s *stripper) handle(read, write int) (int, int) {
 				write++
 			}
 			wsStart := read
-			read = skipWSc(in, read, compact)
+			read = unstable.SkipWSCompact(in, read, compact)
 			if read >= dataLen || in[read] != '"' {
 				return eject()
 			}
 			keyStart := read
-			keyEnd, err := skipString(in, read)
+			keyEnd, err := unstable.SkipString(in, read)
 			if err != nil {
 				return eject()
 			}
-			read = skipWSc(in, keyEnd, compact)
+			read = unstable.SkipWSCompact(in, keyEnd, compact)
 			colonPos := read
 			if read == dataLen || in[read] != ':' {
 				// Missing ':' — copy the key, then eject.
@@ -227,12 +231,12 @@ func (s *stripper) handle(read, write int) (int, int) {
 			read++
 			tmpRead := read
 
-			read = skipWSc(in, read, compact)
+			read = unstable.SkipWSCompact(in, read, compact)
 			valueEmpty := true
 			if read < dataLen {
 				switch in[read] {
 				case '"':
-					valEnd, err := skipString(in, read)
+					valEnd, err := unstable.SkipString(in, read)
 					if err != nil {
 						// Bad string: eject from the original position.
 						read, write = tmpRead, localStartWrite
@@ -248,7 +252,7 @@ func (s *stripper) handle(read, write int) (int, int) {
 					if in[read] == '[' {
 						closeBrace = ']'
 					}
-					if peek := skipWSc(in, read+1, compact); peek < dataLen && in[peek] == closeBrace {
+					if peek := unstable.SkipWSCompact(in, read+1, compact); peek < dataLen && in[peek] == closeBrace {
 						read = peek + 1 // empty nested container — drop the member
 						break
 					}
@@ -288,7 +292,7 @@ func (s *stripper) handle(read, write int) (int, int) {
 				written = true
 			}
 			wsBeforeDelim := read
-			read = skipWSc(in, read, compact)
+			read = unstable.SkipWSCompact(in, read, compact)
 			if read == dataLen {
 				return eject()
 			}
@@ -325,7 +329,7 @@ func (s *stripper) handle(read, write int) (int, int) {
 				write++
 			}
 			wsStart := read
-			read = skipWSc(in, read, compact)
+			read = unstable.SkipWSCompact(in, read, compact)
 			if preserve {
 				write += copy(out[write:], in[wsStart:read]) // element's leading whitespace
 			}
@@ -337,7 +341,7 @@ func (s *stripper) handle(read, write int) (int, int) {
 				written = true
 			}
 			wsBeforeDelim := read
-			read = skipWSc(in, read, compact)
+			read = unstable.SkipWSCompact(in, read, compact)
 			if read == dataLen {
 				return eject()
 			}
@@ -359,7 +363,7 @@ func (s *stripper) handle(read, write int) (int, int) {
 			}
 		}
 	case '"':
-		send, err := skipString(in, read)
+		send, err := unstable.SkipString(in, read)
 		if err != nil {
 			return eject()
 		}
