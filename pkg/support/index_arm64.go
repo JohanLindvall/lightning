@@ -2,25 +2,22 @@
 
 package support
 
-import "golang.org/x/sys/cpu"
-
 //go:noescape
 func indexQuoteOrBackslashNEON(b []byte) int
 
 //go:noescape
 func indexStructuralNEON(b []byte) int
 
-var useNEON = cpu.ARM64.HasASIMD
-
 // indexCloseOrEscape returns the index of the first '"' or '\\' byte in b, or
-// len(b) if neither is present. On arm64 with Advanced SIMD, strings of at
-// least 16 bytes are scanned in a single NEON pass; shorter inputs use the
-// scalar (bytes.IndexByte-based) fallback.
+// len(b) if neither is present. The NEON routine handles every length itself —
+// its 16-byte loop falls through to a scalar tail for the final <16 bytes — so
+// the dispatch is a single unconditional call with no length branch and no
+// feature gate (Advanced SIMD is mandatory in the ARMv8-A baseline Go targets).
+// That keeps indexCloseOrEscape inlinable into its callers (ReadKey, the
+// Read*String funcs, skipString, decodeEscaped), removing a call layer from the
+// hottest function in object decoding, where the scanner is ~40% of the work.
 func indexCloseOrEscape(b []byte) int {
-	if useNEON && len(b) >= 16 {
-		return indexQuoteOrBackslashNEON(b)
-	}
-	return indexCloseOrEscapeScalar(b)
+	return indexQuoteOrBackslashNEON(b)
 }
 
 // structuralPrescan is how many leading bytes indexStructural scans with the
@@ -38,7 +35,7 @@ const structuralPrescan = 16
 // indexStructural returns the index of the first '{', '}', '[', ']' or '"' byte
 // in b, or len(b) if none is present.
 func indexStructural(b []byte) int {
-	if !useNEON || len(b) < structuralPrescan+16 {
+	if len(b) < structuralPrescan+16 {
 		return indexStructuralScalar(b)
 	}
 	for i, c := range b[:structuralPrescan] {

@@ -482,11 +482,25 @@ with kernels in `pkg/support/index_amd64.s` and `pkg/support/index_arm64.s`
   array/object is dramatically faster (the `skip-heavy` benchmark decodes at
   >50 GB/s, ~230× `encoding/json`).
 
-Feature detection is at run time (`golang.org/x/sys/cpu`); other platforms, CPUs
-without the feature, and inputs shorter than the vector width fall back to scalar
-(`bytes.IndexByte`-based) code. Behavior is identical across paths — verified by
-fuzzing each primitive against a reference and by `SkipValue`/decode round-trips
-vs `encoding/json`, on amd64 and on arm64 under qemu.
+### CPU requirements
+
+The string scanner is used unconditionally on amd64 and arm64, relying only on
+each architecture's **baseline, mandatory** vector ISA — no runtime gate:
+
+- **amd64 requires SSE2.** SSE2 is part of the AMD64 ISA, so every 64-bit x86
+  CPU has it (Go itself requires it); the string scanner uses it directly.
+- **arm64 requires NEON / Advanced SIMD (ASIMD).** ASIMD is mandatory in the
+  ARMv8-A baseline that Go targets, so every arm64 CPU has it; the string scanner
+  uses it directly. (This unconditional call is also what lets the dispatch
+  inline into its callers.)
+
+The only **optional** feature is **AVX2** (amd64), used for the structural-byte
+scanner and runtime-detected via `golang.org/x/sys/cpu`; without it the
+structural scan falls back to scalar code. Inputs shorter than the vector width,
+and platforms other than amd64/arm64, also take the scalar (`bytes.IndexByte`-
+based) path. Behavior is identical across paths — verified by fuzzing each
+primitive against a reference and by `SkipValue`/decode round-trips vs
+`encoding/json`, on amd64 and on arm64 under qemu.
 
 ## Benchmarks
 

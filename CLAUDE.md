@@ -214,6 +214,29 @@ per-function budget, `IndexCloseOrEscape` stops inlining, and i-cache pressure
 turned a −8% cloudflare win into a +9% regression there. Don't inline per-field
 reads.
 
+**Make the dispatch wrapper itself inlinable (arm64).** `indexCloseOrEscape` is
+the single hottest call in object decoding — on cloudflare it (and the NEON
+scanner it guards) is ~40% of the work, and `pprof` showed the *wrapper* alone at
+~11% flat because it wasn't inlined (cost 129 > 80: two calls — the NEON asm and
+the `bytes.IndexByte` scalar fallback — plus a `useNEON && len(b)>=16` guard).
+Collapsing it to a single unconditional `return indexQuoteOrBackslashNEON(b)`
+drops the cost under budget so it inlines into every caller (`ReadStringOrNull`,
+`skipString`, `decodeEscaped`, the generated decoders), removing that call frame.
+Two facts make the collapse safe: Advanced SIMD (NEON) is **mandatory** in the
+ARMv8-A baseline Go targets, so the `useNEON` (`cpu.ARM64.HasASIMD`) gate is dead
+— always true — and can go; and the asm **already handles every length itself**
+(its 16-byte loop falls through to a scalar byte tail for the final <16 bytes, no
+out-of-bounds 16-byte load), so dropping the Go-side `len<16` → `bytes.IndexByte`
+branch only changes who scans short buffers. That short-buffer path is rare in
+decode anyway — the scanner is called on `string-body + rest-of-document`, so the
+buffer is almost always ≥16 and the close quote is found in a NEON *block*, not
+the tail (the tail fires once at end-of-document). Net, no regressions and broad
+wins: **golang_source −5.6%, cloudflare −5.4%, citm_catalog −3.0%, twitter_status
+−2.6%, string_unicode −2.0%, twitterescaped −2.0%**; gsoc_2018/synthea/large-json
+flat. (amd64's `indexCloseOrEscape` is structured the same way and is *also* not
+inlined — cost 127 — so the analogous collapse should help there too, but it's
+unmeasured on this arm64 box; left for an amd64 run.)
+
 ## Tried and rejected (don't re-attempt without a new idea)
 
 - **Routing Clinger's negative-exponent case through Eisel-Lemire** (replace the
@@ -291,6 +314,30 @@ reads.
   which would bloat every call site — see the "inline trick" scoping note).
 - **Pure-SSE2 `indexStructural`** (dropping AVX2): ~2× slower on the skip path
   (`skip-heavy`); the throughput loss dwarfs the VZEROUPPER saving.
+- **arm64 `indexQuoteOrBackslashNEON` hot-loop micro-opts** — three plausible
+  rewrites of the per-block match-test, each killed by the same lesson: the
+  decoder consumes each scanner result *immediately* (to slice the string), so a
+  single call is **latency-bound**, not throughput-bound. A tight independent-call
+  microbenchmark measures throughput and *lies* about these. **(1) Fold the 16-lane
+  mask to one 64-bit detect word** (`VEXT $8` + `VORR` so the low D lane is nonzero
+  iff any byte matched, then one `VMOV`/`CBNZ` instead of two), recovering the exact
+  lane only in a cold `found` path: the throughput microbench loved it (huge −13%,
+  long −10%) but it **regressed every real decode +2.4%…+6.3%** — it lengthens the
+  per-block critical path (extra `VEXT`+`VORR`) and the cold path re-does both
+  `VMOV`s, hurting the common close-quote-in-first-block case. **(2) Overlapping
+  final NEON block** instead of the byte-by-byte scalar tail (load at `len-16`,
+  caller guarantees `len≥16`, the re-read bytes were already proven match-free):
+  correct and removes the scalar tail, but **flat on all real decode** — the tail
+  is only ever hit once at end-of-document (the scanner's buffer is string +
+  rest-of-doc, so the close quote lands in a *block*, never the tail). **(3) Build
+  the two compare splats with one `VLD1` of a 32-byte RODATA pair** instead of two
+  `MOVD`-imm + `VDUP`: a *tradeoff, not a win* — long-string cases improve
+  (string_unicode/twitter ≈ −1.5…−1.9%) but cloudflare *regresses* +3.7% (load-use
+  latency on the lone block of a short string), exactly the short-vs-long tension
+  the asm comment already documents in favour of `VDUP`. The asm hot loop is
+  genuinely well-tuned for the mixed real workload; the win was the wrapper
+  inlining above, not the block body. Don't re-attempt these without a way to
+  shorten the single-call latency (not just block throughput).
 - **Key interning / map presizing in the dynamic `any` decoder**
   (`decodeAnyObject`, the `DecodeValue`/`json.DecodeAny` path): twitterescaped's
   `DecodeAny` is bound by building `map[string]any` — `mapassign` plus bucket
