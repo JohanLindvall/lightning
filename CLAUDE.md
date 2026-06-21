@@ -322,6 +322,19 @@ reads.
   the index is mostly redundant work plus a second pass over the bytes. Not worth a
   wholesale rewrite (it would regress every compact wire-format decode); only ever an
   opt-in mode for sources known to be both large and deeply indented.
+- **`append(value)` instead of grow-zero-then-assign for scalar slice elements.**
+  `sliceDecoder` decodes every element into the freshly-grown last slot
+  (`var zero T; *out = append(*out, zero); …(*out)[len(*out)-1] = v`). For a
+  *composite* element (struct/slice/map/pointer) this is load-bearing — decoding
+  through `&(*out)[last]` keeps the element from living in an escaping local, which
+  would heap-allocate per element. For a *by-value* leaf (number/string/time/raw,
+  whose reader returns the value) it looks wasteful — a dead zero-store plus an
+  indexed assign with a bounds check, where `*out = append(*out, v)` is one write.
+  Split the codegen so by-value leaves append directly: **statistically flat
+  everywhere** (marine_ik, numbers, canada, mesh, float-array, golang_source, citm —
+  all within noise). The Go compiler already dead-stores the zero and elides the
+  `(*out)[len(*out)-1]` bounds check, so the two forms compile to the same code.
+  Reverted — it only added an `isByValueLeaf` branch to the generator for no gain.
 
 ## Conventions
 
