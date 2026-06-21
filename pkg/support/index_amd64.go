@@ -30,10 +30,7 @@ var useAVX2 = cpu.X86.HasAVX2
 // callers (ReadKey, the Read*String funcs, skipString), removing a call layer
 // from the hottest path in object decoding.
 func indexCloseOrEscape(b []byte) int {
-	if len(b) >= 16 {
-		return indexQuoteOrBackslashSSE2(b)
-	}
-	return indexCloseOrEscapeScalar(b)
+	return indexQuoteOrBackslashSSE2(b)
 }
 
 // structuralPrescan is how many leading bytes indexStructural scans with the

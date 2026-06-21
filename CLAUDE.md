@@ -233,11 +233,33 @@ buffer is almost always ≥16 and the close quote is found in a NEON *block*, no
 the tail (the tail fires once at end-of-document). Net, no regressions and broad
 wins: **golang_source −5.6%, cloudflare −5.4%, citm_catalog −3.0%, twitter_status
 −2.6%, string_unicode −2.0%, twitterescaped −2.0%**; gsoc_2018/synthea/large-json
-flat. (amd64's `indexCloseOrEscape` is structured the same way and is *also* not
-inlined — cost 127 — so the analogous collapse should help there too, but it's
-unmeasured on this arm64 box; left for an amd64 run.)
+flat. (amd64's `indexCloseOrEscape` was structured the same way and *also* not
+inlined — cost 127 — and the analogous collapse to a single unconditional
+`return indexQuoteOrBackslashSSE2(b)` lands the same win there: it drops to cost 61
+and inlines into every caller. Safe for the same two reasons — SSE2 is the amd64
+baseline so the SSE path needs no feature gate (the AVX2 switch is gated *inside*
+the asm), and the asm handles every length itself (the 32- and 16-byte loops fall
+through to a scalar tail), so dropping the Go-side `len(b) >= 16` →
+`indexCloseOrEscapeScalar` branch only changes who scans the rare <16-byte buffer.
+Measured on amd64: **cloudflare −4.8%, cloudflare-compact −4.1%, golang_source
+−2.0%, string_unicode −1.7%, update_center −1.3%**; citm/twitter/synthea/gsoc flat,
+no regressions.)
 
 ## Tried and rejected (don't re-attempt without a new idea)
+
+- **amd64 `indexStructuralAVX2` — `VPCMPGTB` to drop the trailing `NOTL`.** The
+  shuffle-AND marker bytes are always `0x01`/`0x02` (positive), so
+  `VPCMPGTB Yzero, Y6` yields `0xFF` where structural *directly* — no
+  compare-to-zero + `NOTL` to invert a "non-structural" movemask. Correct (passes
+  the differential fuzz) and one instruction shorter, but measured **flat**
+  everywhere — micro (latency + throughput), skip-heavy, citm, large-json, canada
+  all within noise. The loop is bound by port 5 (the two `VPSHUFB`); the `NOTL` is a
+  GP op that already hid under that bottleneck, so removing it frees nothing.
+  Reverted — not worth churning fuzz-verified SIMD asm for a non-win. (A real
+  single-call latency win for the SSE2 string scanner is likewise elusive: load →
+  `PCMPEQB` → `POR` → `PMOVMSKB` → `BSF` is the irreducible chain, and the
+  destructive-compare copy `MOVOU X2,X3` is move-eliminated to ~0 latency on
+  current uarchs, so there is nothing to shave.)
 
 - **Routing Clinger's negative-exponent case through Eisel-Lemire** (replace the
   `f /= pow10exact[-exp]` division with EL's 128-bit multiply, which is also
