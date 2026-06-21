@@ -333,7 +333,11 @@ func decodeEscaped(buf, data []byte, start, i int, quoted bool) (string, int, er
 				c = data[i]
 			}
 			if c == '"' {
-				return string(buf), i + 1, nil
+				// buf is freshly allocated by decodeStringEscaped (the only quoted
+				// caller) and never mutated after this point, so it is handed out as
+				// a string without the extra copy string(buf) would make — same as
+				// the quoted=false return below.
+				return unsafeStr(buf), i + 1, nil
 			}
 			i++ // step over the backslash
 		} else {

@@ -95,7 +95,18 @@ byte-identical when adding cold paths; push new logic out-of-line.
   `skipString` for the true end — and the dense-escape strings that made
   `skipString` costly never hit that branch. Net: twitterescaped −33%, no
   regression on twitter_status, string_unicode, citm, golang_source, synthea, or
-  cloudflare.
+  cloudflare. **(4)** both return points hand out the scratch buffer with
+  `unsafeStr(buf)`, not `string(buf)`: `buf` is freshly `make`-allocated by
+  `decodeStringEscaped` (the only quoted caller) and never retained or mutated
+  afterward, so `string(buf)` was pure waste — a *second* allocation plus a
+  `slicebytetostring` memmove per escaped value, leaving the scratch buffer as
+  immediate garbage. Aliasing the buffer into the result string instead is one
+  alloc, not two, and no copy. The unquoted (`UnescapeString`) path already did
+  this; the hot JSON-scanner (quoted) path was still copying. Net on
+  escaped-string-heavy input: **gsoc_2018 −24% time, −46% B/op, −36% allocs**
+  (4704→2995 — it had trailed sonic on amd64, now beats it ~28%), twitter_status
+  −6%, string_unicode −7%, twitterescaped −4.5%; flat where escapes are rare
+  (golang_source, citm).
 - **`CountArrayElements`** (slice presize) skips each element with `SkipValue`
   (vectorized via `indexStructural`), not a byte-by-byte depth walk — but **gives
   up the per-element walk after `countSampleCap` (64) elements** and extrapolates
