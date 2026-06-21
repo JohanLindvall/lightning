@@ -52,16 +52,17 @@ func generate(inPath string) error {
 	}
 
 	g := &gen{
-		fset:         fset,
-		pkg:          file.Name.Name,
-		structTypes:  map[string]*ast.StructType{},
-		sliceTypes:   map[string]*ast.ArrayType{},
-		mapTypes:     map[string]*ast.MapType{},
-		order:        nil,
-		used:         map[string]bool{},
-		memo:         map[string]string{},
-		compactTypes: map[string]bool{},
-		nocopyTypes:  map[string]bool{},
+		fset:             fset,
+		pkg:              file.Name.Name,
+		structTypes:      map[string]*ast.StructType{},
+		sliceTypes:       map[string]*ast.ArrayType{},
+		mapTypes:         map[string]*ast.MapType{},
+		order:            nil,
+		used:             map[string]bool{},
+		memo:             map[string]string{},
+		compactTypes:     map[string]bool{},
+		nocopyTypes:      map[string]bool{},
+		destructiveTypes: map[string]bool{},
 	}
 
 	// Generated helper functions are named "lightning<ImportPath><Type>decode...",
@@ -77,9 +78,8 @@ func generate(inPath string) error {
 		g.pathFrag = sanitizeIdent(file.Name.Name)
 	}
 
-	// Collect every top-level struct type, in source order. A type carrying the
-	// //lightning:compact directive (on the type or its declaration) gets a
-	// decoder that omits the inter-token SkipWS calls; see (*gen).skipWS.
+	// Collect every top-level struct type, in source order, recording the
+	// //lightning:compact / :nocopy / :destructive directives each carries.
 	for _, d := range file.Decls {
 		gd, ok := d.(*ast.GenDecl)
 		if !ok || gd.Tok != token.TYPE {
@@ -94,32 +94,30 @@ func generate(inPath string) error {
 			case *ast.StructType:
 				g.structTypes[ts.Name.Name] = t
 				g.order = append(g.order, ts.Name.Name)
-				if hasCompactDirective(gd.Doc, ts.Doc) {
-					g.compactTypes[ts.Name.Name] = true
-				}
 			case *ast.ArrayType:
 				// A named slice root type (type Foo []T) for array-root documents.
 				if t.Len == nil {
 					g.sliceTypes[ts.Name.Name] = t
 					g.order = append(g.order, ts.Name.Name)
-					if hasCompactDirective(gd.Doc, ts.Doc) {
-						g.compactTypes[ts.Name.Name] = true
-					}
-					if hasNoCopyDirective(gd.Doc, ts.Doc) {
-						g.nocopyTypes[ts.Name.Name] = true
-					}
+				} else {
+					continue
 				}
 			case *ast.MapType:
 				// A named map root type (type Foo map[string]V) for object-root
 				// documents that are data maps rather than fixed records.
 				g.mapTypes[ts.Name.Name] = t
 				g.order = append(g.order, ts.Name.Name)
-				if hasCompactDirective(gd.Doc, ts.Doc) {
-					g.compactTypes[ts.Name.Name] = true
-				}
-				if hasNoCopyDirective(gd.Doc, ts.Doc) {
-					g.nocopyTypes[ts.Name.Name] = true
-				}
+			default:
+				continue
+			}
+			if hasDirective("lightning:compact", gd.Doc, ts.Doc) {
+				g.compactTypes[ts.Name.Name] = true
+			}
+			if hasDirective("lightning:nocopy", gd.Doc, ts.Doc) {
+				g.nocopyTypes[ts.Name.Name] = true
+			}
+			if hasDirective("lightning:destructive", gd.Doc, ts.Doc) {
+				g.destructiveTypes[ts.Name.Name] = true
 			}
 		}
 	}
@@ -157,6 +155,10 @@ func generate(inPath string) error {
 			continue // nested in another type; its decoder is emitted there
 		}
 		g.compact = g.compactTypes[name]
+		g.destructive = g.destructiveTypes[name]
+		// A destructive root aliases the very buffer it decodes into, so it is nocopy
+		// too; a plain //lightning:nocopy root (slice/map) aliases its keys/elements.
+		g.nocopy = g.destructive || g.nocopyTypes[name]
 		g.prefix = "lightning" + g.pathFrag + name
 		methods = append(methods, g.genUnmarshal(name))
 	}
@@ -195,11 +197,22 @@ type gen struct {
 	used map[string]bool   // reserved decoder function names
 	memo map[string]string // type-key -> decoder function name (dedupe)
 
-	compactTypes map[string]bool // top-level types tagged //lightning:compact
-	nocopyTypes  map[string]bool // top-level slice/map root types tagged //lightning:nocopy
-	compact      bool            // whether the type currently being generated is compact
-	pathFrag     string          // import path sanitized into an identifier fragment
-	prefix       string          // current per-type prefix for generated function names
+	// Comment-directive selectors, keyed by top-level type name:
+	//   //lightning:compact      -> compactTypes      (elide inter-token SkipWS)
+	//   //lightning:nocopy       -> nocopyTypes       (slice/map root aliases keys/elements)
+	//   //lightning:destructive  -> destructiveTypes  (unescape strings into the input
+	//                                                   buffer, destroying it; implies nocopy)
+	compactTypes     map[string]bool
+	nocopyTypes      map[string]bool
+	destructiveTypes map[string]bool
+
+	// Working flags for the root type currently being generated, derived from the
+	// directive sets above.
+	compact     bool
+	destructive bool   // //lightning:destructive: unescape strings in place
+	nocopy      bool   // //lightning:nocopy root, or a destructive root (which aliases what it decodes)
+	pathFrag    string // import path sanitized into an identifier fragment
+	prefix      string // current per-type prefix for generated function names
 
 	decoders []string // generated decoder functions, in creation order
 	errs     []error  // generation errors; reported together after the walk
@@ -222,20 +235,10 @@ func (g *gen) uniq(base string) string {
 	return name
 }
 
-// hasCompactDirective reports whether any of the given doc-comment groups
-// carries the //lightning:compact directive.
-func hasCompactDirective(groups ...*ast.CommentGroup) bool {
-	return hasDirective("lightning:compact", groups...)
-}
-
-// hasNoCopyDirective reports whether any doc-comment group carries the
-// //lightning:nocopy directive, which makes a named slice or map root decode its
-// string elements / map keys as aliases of the input (zero-copy) — the type-level
-// equivalent of a field's ",nocopy" json tag, for a root that has no json tag.
-func hasNoCopyDirective(groups ...*ast.CommentGroup) bool {
-	return hasDirective("lightning:nocopy", groups...)
-}
-
+// hasDirective reports whether any of the given doc-comment groups carries the
+// //<name> directive on its own line — e.g. //lightning:compact. Both the type
+// spec's doc and the enclosing GenDecl's doc are checked, so the directive may sit
+// above the type inside a `type (...)` block or above a standalone `type X`.
 func hasDirective(name string, groups ...*ast.CommentGroup) bool {
 	for _, cg := range groups {
 		if cg == nil {
@@ -373,31 +376,42 @@ func (g *gen) readKey() string {
 	}`
 }
 
-// cmark and csuf distinguish a compact decoder from its non-compact counterpart
-// in, respectively, memo keys and generated function names, so the same type
-// reached from both a compact and a non-compact root yields two decoders.
+// cmark and csuf distinguish a decoder's compact and destructive variants from their
+// plain counterparts in, respectively, memo keys and generated function names, so
+// the same type reached from roots with different directive combinations yields a
+// distinct decoder per combination.
 func (g *gen) cmark() string {
+	var m string
 	if g.compact {
-		return "compact:"
+		m += "compact:"
 	}
-	return ""
+	if g.destructive {
+		m += "destructive:"
+	}
+	return m
 }
 
 func (g *gen) csuf() string {
+	var s string
 	if g.compact {
-		return "Compact"
+		s += "Compact"
 	}
-	return ""
+	if g.destructive {
+		s += "Destructive"
+	}
+	return s
 }
 
-// genUnmarshal emits the UnmarshalJSON method for a named struct type and makes
-// sure its decoder (and everything it reaches) is generated.
+// genUnmarshal emits the UnmarshalJSON method for a named root type and makes sure
+// its decoder (and everything it reaches under the current g.compact/g.destructive/
+// g.nocopy flags) is generated. For a //lightning:destructive type the doc comment
+// warns that the method mutates its input.
 func (g *gen) genUnmarshal(name string) string {
 	// The decode call differs for a slice or map root: its decoder takes *[]T or
 	// *map[string]V, and the receiver *Name (whose underlying type matches) is
 	// converted to it.
 	var call string
-	nocopy := g.nocopyTypes[name] // //lightning:nocopy on a slice/map root
+	nocopy := g.nocopy // //lightning:nocopy or :destructive root: alias the slice/map root's keys/elements
 	switch {
 	case g.sliceTypes[name] != nil:
 		at := g.sliceTypes[name]
@@ -408,9 +422,18 @@ func (g *gen) genUnmarshal(name string) string {
 	default:
 		call = g.namedStruct(name) + "(v, data, i)"
 	}
-	return fmt.Sprintf(`// UnmarshalJSON parses JSON into the %[1]s. Fields whose json tag carries the
+	var doc string
+	if g.destructive {
+		doc = fmt.Sprintf(`// UnmarshalJSON parses JSON into the %[1]s, unescaping every "nocopy" string
+// field directly into data instead of allocating. This MUTATES and effectively
+// destroys data: the bytes of every escaped string are overwritten, so data is no
+// longer valid JSON afterward and must not be read or aliased again.`, name)
+	} else {
+		doc = fmt.Sprintf(`// UnmarshalJSON parses JSON into the %[1]s. Fields whose json tag carries the
 // "nocopy" option alias the input data instead of copying it; if any are
-// present, the caller must keep data unchanged while the result is in use.
+// present, the caller must keep data unchanged while the result is in use.`, name)
+	}
+	return fmt.Sprintf(`%[2]s
 func (v *%[1]s) UnmarshalJSON(data []byte) error {
 	i := support.SkipWS(data, 0)
 	if i >= len(data) {
@@ -426,7 +449,7 @@ func (v *%[1]s) UnmarshalJSON(data []byte) error {
 		}
 		return nil
 	}
-	end, err := %[2]s
+	end, err := %[3]s
 	if err != nil {
 		return err
 	}
@@ -434,7 +457,7 @@ func (v *%[1]s) UnmarshalJSON(data []byte) error {
 		return support.ErrInvalidJSON
 	}
 	return nil
-}`, name, call)
+}`, name, doc, call)
 }
 
 // namedStruct returns (generating on first use) the decoder for a named struct.
@@ -888,6 +911,11 @@ func (g *gen) scalar(dest, name string, nocopy bool) string {
 		if nocopy {
 			reader = "support.ReadStringNoCopyOrNull"
 			g.needNoCopyStr = true
+			if g.destructive {
+				// //lightning:destructive — unescape escaped strings into the input
+				// buffer instead of allocating, aliasing the result (destroys the input).
+				reader = "support.ReadStringDestructiveOrNull"
+			}
 		}
 		return fmt.Sprintf(`s, end, err := %s(data, i)
 if err != nil {

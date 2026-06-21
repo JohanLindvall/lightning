@@ -121,3 +121,13 @@ type ScoreMap map[string]int
 
 //lightning:nocopy
 type NoCopyMap map[string]string
+
+// DestructiveDoc carries //lightning:destructive: its nocopy string fields unescape
+// escaped values into the input buffer (aliasing and mutating it) rather than
+// allocating. Exercised by TestDestructiveDirective.
+//
+//lightning:destructive
+type DestructiveDoc struct {
+	Name string   `json:"name,nocopy"`
+	Tags []string `json:"tags,nocopy"`
+}

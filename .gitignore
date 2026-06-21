@@ -12,6 +12,10 @@
 # Benchmark harness written by bench/run_bench.sh (`// Code generated ... DO NOT EDIT`)
 bench/*/bench_test.go
 
+# Destructive variant source (data.go duplicated with types renamed + the
+# //lightning:destructive directive) written by bench/run_bench.sh for BenchmarkLightningDestructive
+bench/*/data_destructive.go
+
 # easyjson sub-packages: the copied struct and the easyjson output are both generated
 bench/*/ej/
 

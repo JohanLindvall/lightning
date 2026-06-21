@@ -100,6 +100,7 @@ func TestReadStringOrNull(t *testing.T) {
 			}{
 				{"copy", ReadStringOrNull},
 				{"nocopy", ReadStringNoCopyOrNull},
+				{"destructive", ReadStringDestructiveOrNull},
 			} {
 				got, end, err := fn.f([]byte(tt.in), 0)
 				if !errors.Is(err, tt.wantErr) {

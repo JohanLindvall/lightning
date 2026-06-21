@@ -141,6 +141,33 @@ type Log struct {
 boundaries (each struct's own field tags govern). Strings containing escape
 sequences still allocate, since they can't be a slice of the raw input.
 
+## The `//lightning:destructive` directive
+
+The one allocation `nocopy` can't avoid is unescaping: a string like `"a\/b"` has
+to be decoded somewhere, and it can't alias the raw input. The
+`//lightning:destructive` directive removes even that allocation by unescaping
+**into the input buffer** — overwriting the escaped bytes with the decoded ones (the
+decoded form is always shorter) and aliasing the result. Put it on the type, above
+its declaration:
+
+```go
+//lightning:destructive
+type Log struct {
+    RayID   string `json:"RayID,nocopy"`
+    Message string `json:"Message,nocopy"`
+}
+```
+
+The name says it plainly: this **mutates — and effectively destroys — the input
+document**. The bytes of every escaped string are overwritten in place, so the
+`[]byte` you pass in is no longer valid JSON afterward, and you must not read it
+again or hold any other alias into it. In return, escaped `nocopy` strings cost zero
+allocations. Use it when you own the input buffer and discard it after decoding (a
+request body, a buffer you'll reuse). It upgrades the type's `nocopy` string fields;
+escape-free input decodes byte-identically to plain `nocopy`. On escape-heavy
+documents the savings are large — e.g. **−41% time and −86% bytes** on a
+string-heavy corpus.
+
 ## Alternate field names
 
 A json tag may list several pipe-separated names. Any of them appearing in the
@@ -236,8 +263,8 @@ type Log struct {
 
 This runs a few percent faster on object-heavy payloads (the `cloudflare-compact`
 benchmark beats `cloudflare-nocopy`, its non-compact equivalent, by ~4%).
-Whitespace surrounding the whole document is still tolerated — a
-trailing newline is fine — so only *inter-token* whitespace is assumed absent.
+Whitespace surrounding the whole document is still tolerated — a trailing newline
+is fine — so only *inter-token* whitespace is assumed absent.
 
 The directive is an assertion you make about the input: a compact decoder fed
 input that does contain inter-token whitespace (for example the same document
@@ -259,12 +286,10 @@ type Index map[string]Record // the map keys alias the input, not copied
 ```
 
 It applies to what the root itself owns — a map's keys, a slice's string elements
-— while each value/element type keeps its own field tags (so a
-`map[string]struct{…}` aliases the keys and the struct's fields still decide
-field-by-field). On `map[string]struct` documents with many keys this is a real
-saving: tagging the GeoSciences `gsoc_2018` corpus's root map cut its allocations
-~21%. (Only slice and map roots take the directive; a struct root uses per-field
-`nocopy` tags.)
+— while each value/element type keeps its own field tags. On `map[string]struct`
+documents with many keys this is a real saving: tagging the GeoSciences `gsoc_2018`
+corpus's root map cut its allocations ~21%. (Only slice and map roots take the
+directive; a struct root uses per-field `nocopy` tags.)
 
 ## Generated function names
 

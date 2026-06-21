@@ -7,8 +7,17 @@ allocation-light `json.Unmarshaler` implementations.
 
 - `main.go` — the generator (`package main`). Reads struct defs, emits
   `*_unmarshal.go`. Key bits: `field`/`sliceDecoder`/`mapDecoder` build decoders;
-  `slicePresize` decides presizing; `g.compact`/`g.skipWS` handle the
-  `//lightning:compact` directive (compile-time elision of inter-token `SkipWS`).
+  `slicePresize` decides presizing. Behavior is selected by **per-type
+  `//lightning:` comment directives** (parsed by `hasDirective`, collected into
+  `compactTypes`/`nocopyTypes`/`destructiveTypes`): `//lightning:compact`
+  (`g.compact`/`g.skipWS`, compile-time elision of inter-token `SkipWS`),
+  `//lightning:destructive` (`g.destructive`/`g.scalar`, the type's nocopy strings
+  unescape into the input buffer instead of allocating — see below; implies nocopy),
+  and `//lightning:nocopy` (`g.nocopy`, a slice/map root aliases its keys/elements).
+  The per-root loop sets the working `g.compact`/`g.destructive`/`g.nocopy` from
+  those sets. `g.cmark`/`g.csuf` keep compact/destructive variants distinct in memo
+  keys / function names (the `Destructive` suffix); nocopy variants are already
+  distinguished by the `nocopy` decoder param / `NoCopy` suffix.
 - `pkg/support` — the runtime scanning primitives every generated decoder calls.
   This is where almost all performance work happens.
 - `pkg/json` — small public API over the scanner: `Get`/`GetMany`/`ObjectEach`
@@ -107,6 +116,27 @@ byte-identical when adding cold paths; push new logic out-of-line.
   (4704→2995 — it had trailed sonic on amd64, now beats it ~28%), twitter_status
   −6%, string_unicode −7%, twitterescaped −4.5%; flat where escapes are rare
   (golang_source, citm).
+- **`//lightning:destructive` — in-place unescape** (`ReadStringDestructiveOrNull`,
+  `g.destructive`). A nocopy string still *aliases* the input when it has no escapes;
+  the remaining per-string allocation is the scratch buffer `decodeStringEscaped`
+  makes for an *escaped* value (it can't alias an escaped body). Under this directive,
+  the type's nocopy strings are instead unescaped **into the input buffer**:
+  `ReadStringDestructiveOrNull` hands `decodeEscaped` a `buf := data[i:i:len(data)]`
+  aliasing the body, so the appends write through into `data` and the result aliases
+  it — zero allocation. Safe because unescaping only *shrinks* (every escape is ≥2
+  input bytes → ≤3 output bytes, `\uXXXX` 6→≤3), so the write cursor always trails
+  the read cursor and never clobbers an unconsumed byte; cap is the document tail so
+  `append` never reallocates away from `data`, and the closing quote (which the write
+  never reaches) still bounds the value. It **destroys the input** — every escaped
+  string's bytes are overwritten and any overlapping alias is invalidated — so it is
+  opt-in (the directive name says so) for callers that own the buffer and discard it.
+  It upgrades the type's `nocopy` string leaves (raw/number aliases are verbatim, no
+  escapes); escape-free input is byte-identical to nocopy. Wins (with a per-iteration
+  input-restore copy real usage omits): **gsoc_2018 −41% time / −86% B/op / −57%
+  allocs**, twitterescaped −9.5% / −29% / −64%. Distinct decoder variants vs the
+  plain/compact forms via `g.cmark`/`g.csuf` (`Destructive` suffix). Covered by
+  conformance `TestDestructiveDirective` and the `destructive` arm of support's
+  `TestReadStringOrNull`.
 - **`CountArrayElements`** (slice presize) skips each element with `SkipValue`
   (vectorized via `indexStructural`), not a byte-by-byte depth walk — but **gives
   up the per-element walk after `countSampleCap` (64) elements** and extrapolates
@@ -247,6 +277,32 @@ no regressions.)
 
 ## Tried and rejected (don't re-attempt without a new idea)
 
+- **A string arena / batched allocation for copied & escaped strings.** The alloc
+  *count* looks addressable — on nocopy twitter_status `decodeStringEscaped` is
+  **36% of allocations** (every escaped string — tweets are full of `\/`, `\"`,
+  `\uXXXX` — must decode into a fresh buffer; nocopy can't alias an escaped body),
+  and the copy-string variants (cloudflare default) allocate per value. The plan
+  was a chunked arena (escaped strings appended into pooled chunks, old chunks kept
+  valid so the aliases survive) to turn N small allocs into a few large ones. The
+  *general, non-destructive* arena (threaded through every
+  `Read*String`/`decodeEscaped` signature) is still unbuilt — but the
+  highest-value slice of it shipped instead as the `//lightning:destructive`
+  directive (above), with zero API churn. **Correction to an earlier note here:** a
+  `GOGC=off` test once suggested the escaped-string allocs cost only ~1.4% — that
+  was *misleading*. `GOGC=off` keeps the `mallocgc` + zeroing and removes only
+  *collection*, so it measures the GC pause, not the allocate-plus-zero-plus-cache
+  cost. Eliminating the allocations outright (`//lightning:destructive`) is **−41% time
+  / −86% B/op on gsoc_2018** — allocation reduction *is* a large lever for
+  escape-heavy input. Lesson: never size an allocation-reduction idea with
+  `GOGC=off`; measure against actually not allocating. A general arena for the
+  non-owned *copy* variant may still be worth it; size it that way before building.
+- **SWAR / uint64 key matching in the generated field switch.** The thought was to
+  load a key's bytes as a `uint64` and compare against precomputed constants instead
+  of `memcmp`. Already done — by the Go compiler: `key == "8bytechars"` against a
+  constant compiles to a word load + compare (and the switch length-buckets first),
+  so field dispatch is only ~3.5% even on cloudflare's 45-field struct (`memequal`
+  2.0% + `memeqbody` 1.5%, the >8-byte names). No codegen change can beat what the
+  compiler already emits.
 - **amd64 `indexStructuralAVX2` — `VPCMPGTB` to drop the trailing `NOTL`.** The
   shuffle-AND marker bytes are always `0x01`/`0x02` (positive), so
   `VPCMPGTB Yzero, Y6` yields `0xFF` where structural *directly* — no
@@ -443,6 +499,21 @@ no regressions.)
   the typed `Benchmark`, so the rendered table contrasts schema-less decoding with
   the generated unmarshaler. The harness minifies each input with `json.Compact`
   first (many corpus inputs are pretty-printed) so the compact path is valid.
+- And a `BenchmarkLightningDestructive`: the `//lightning:destructive` variant.
+  `run_bench.sh` duplicates `data.go` into a gitignored `data_destructive.go`,
+  renaming **every** top-level type `…Destructive` (an `awk` extractor handles both
+  the `type (...)` block and single-`type` forms; helpers are renamed too because the
+  generator parses the variant file alone and must resolve every referenced type) and
+  prepending `//lightning:destructive` to the root, then generates a second decoder.
+  Any `:compact`/`:nocopy` directive in the source rides along in the copy. The
+  benchmark restores a pristine copy of the input into a reused buffer each iteration
+  (the destructive decode mutates it) and decodes through
+  `(*BenchmarkDestructive).UnmarshalJSON` — so the gap vs `BenchmarkLightning`
+  *understates* the real win (a true owner wouldn't pay the restore-copy). Cases with
+  no `nocopy` string fields generate an identical decoder (destructive is a no-op
+  there) and read ~flat. Implemented as a per-case source duplicate, **not** a
+  generator twin (a `-inplace-twin` flag emitting a second `UnmarshalJSONInPlace`
+  method was prototyped and dropped in favour of the simpler duplicate).
 - End-of-session: run the full suite (`go test ./...`), keep gofmt clean
   (the `daysFromCivil` comment-alignment flag is pre-existing — ignore it),
   and regenerate `bench/results_<goarch>.md` via `run_bench.sh`.

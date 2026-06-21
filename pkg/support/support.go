@@ -122,6 +122,46 @@ func ReadStringNoCopyOrNull(data []byte, i int) (string, int, error) {
 	return unsafeStr(rest[:k]), i + k + 1, nil
 }
 
+// ReadStringDestructiveOrNull is ReadStringNoCopyOrNull but, for a string that
+// contains escapes, unescapes it *in place* — overwriting the escaped bytes of
+// data with the decoded ones — instead of allocating a scratch buffer, and aliases
+// the result. The unescaped form is never longer than the escaped body, so it fits
+// within the body's bytes; the rest of the body is left as overwritten garbage and
+// the closing quote (which the write cursor never reaches) still bounds the value.
+// This DESTROYS the input document: the bytes of every escaped string are clobbered
+// and any other alias into the same region (an overlapping nocopy value) is
+// invalidated. It is the //lightning:destructive counterpart of the nocopy reader,
+// for callers that own the buffer and discard it after decoding. Escape-free strings
+// alias the input unchanged, exactly like the nocopy reader.
+func ReadStringDestructiveOrNull(data []byte, i int) (string, int, error) {
+	if i >= len(data) {
+		return "", i, ErrTruncated
+	}
+	if data[i] == 'n' {
+		end, err := ExpectNull(data, i)
+		return "", end, err
+	}
+	if data[i] != '"' {
+		return "", i, ErrInvalidJSON
+	}
+	i++
+	rest := data[i:]
+	k := indexCloseOrEscape(rest)
+	if k == len(rest) {
+		return "", len(data), ErrTruncated
+	}
+	if rest[k] == '\\' {
+		// Decode into data starting at the body offset i: buf aliases data[i:] with
+		// length 0 and cap to the document end, so decodeEscaped's appends write
+		// through into data. The write cursor trails the read cursor (unescaping only
+		// shrinks), so it never clobbers a byte not yet consumed, and cap is large
+		// enough that append never reallocates away from data.
+		buf := data[i:i:len(data)]
+		return decodeEscaped(buf, data, i, i+k, true)
+	}
+	return unsafeStr(rest[:k]), i + k + 1, nil
+}
+
 // Unwrap reads the JSON string at data[i] and returns the JSON document embedded
 // in it — the backing of the "unwrap" field option. The string body is
 // unescaped; if it is not itself JSON (its first non-whitespace byte is not the
@@ -1973,7 +2013,7 @@ func DecodeValue(data []byte, i int) (any, int, error) {
 // DecodeValueCompact is DecodeValue for compact JSON — input with no whitespace
 // between tokens — skipping the inter-token whitespace scans DecodeValue makes
 // while walking objects and arrays. The generator routes the dynamic any/map
-// value path here for a //lightning:compact type. On compact input it behaves
+// value path here for a //lightning:compact decoder. On compact input it behaves
 // identically to DecodeValue but faster; given inter-token whitespace it may
 // report an error.
 func DecodeValueCompact(data []byte, i int) (any, int, error) {

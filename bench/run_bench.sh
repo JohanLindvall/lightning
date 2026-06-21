@@ -97,9 +97,29 @@ for dir in */; do
 	echo "==> bench/${dir}"
 
 	# 1. Generate the lightning UnmarshalJSON, running the generator from the
-	#    parent module where the generator (package main) lives.
+	#    parent module where the generator (package main) lives. The //lightning:*
+	#    directives a case needs (e.g. cloudflare-compact's :compact, gsoc_2018's
+	#    :nocopy) live in its data.go, so the generator call takes no extra arguments.
 	if ! (cd "$ROOT" && go run . "bench/${dir}data.go"); then
 		echo "  lightning generator failed" >&2
+		status=1
+		continue
+	fi
+
+	# Also build a destructive variant for BenchmarkLightningDestructive: duplicate
+	# data.go, rename every top-level type (…Destructive) so it coexists in the same
+	# package without clashing, and prepend //lightning:destructive to the root so its
+	# UnmarshalJSON unescapes nocopy strings directly into the input buffer instead of
+	# allocating. The helper types are renamed too because the generator parses the
+	# variant file on its own and must find every type the root references; any
+	# :compact / :nocopy directive in the source rides along in the copy.
+	dsrc="${dir}data_destructive.go"
+	cp "${dir}data.go" "$dsrc"
+	names=$(awk '/^type \(/{b=1;next} b&&/^\)/{b=0;next} b&&/^\t[A-Za-z_]/{print $1;next} /^type [A-Za-z_]/{print $2}' "${dir}data.go")
+	for n in $names; do gofmt -r "${n} -> ${n}Destructive" -w "$dsrc"; done
+	sed -i '0,/^type /s//\/\/lightning:destructive\ntype /' "$dsrc"
+	if ! (cd "$ROOT" && go run . "bench/${dsrc}"); then
+		echo "  lightning destructive generator failed" >&2
 		status=1
 		continue
 	fi
@@ -162,6 +182,25 @@ func BenchmarkLightning(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		var v Benchmark
 		if err := v.UnmarshalJSON(benchInput); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkLightningDestructive measures the //lightning:destructive variant
+// (*BenchmarkDestructive).UnmarshalJSON, which unescapes nocopy string fields
+// directly into the input buffer instead of allocating a scratch buffer per escaped
+// value. It destroys the input, so each iteration first restores a pristine copy
+// into a reused buffer — that copy is a benchmark artifact (a real caller owns and
+// discards the buffer), so the gap versus BenchmarkLightning understates the win.
+func BenchmarkLightningDestructive(b *testing.B) {
+	buf := make([]byte, len(benchInput))
+	b.SetBytes(int64(len(benchInput)))
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		copy(buf, benchInput)
+		var v BenchmarkDestructive
+		if err := v.UnmarshalJSON(buf); err != nil {
 			b.Fatal(err)
 		}
 	}

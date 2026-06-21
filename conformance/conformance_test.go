@@ -161,3 +161,29 @@ func TestNoCopyDirective(t *testing.T) {
 		}
 	}
 }
+
+// TestDestructiveDirective covers //lightning:destructive: an escaped string value is
+// unescaped into the input buffer (aliasing and mutating it), an escape-free value
+// aliases the input unchanged, and both decode to the same string the slow path
+// would produce.
+func TestDestructiveDirective(t *testing.T) {
+	orig := `{"name":"a\/b\tc","tags":["plain","x\ny"]}`
+	data := []byte(orig)
+	var d DestructiveDoc
+	if err := d.UnmarshalJSON(data); err != nil {
+		t.Fatal(err)
+	}
+	if d.Name != "a/b\tc" || len(d.Tags) != 2 || d.Tags[0] != "plain" || d.Tags[1] != "x\ny" {
+		t.Fatalf("got %#v", d)
+	}
+	// The escaped name was unescaped in place, so it must alias the input...
+	base := uintptr(unsafe.Pointer(&data[0]))
+	np := uintptr(unsafe.Pointer(unsafe.StringData(d.Name)))
+	if np < base || np >= base+uintptr(len(data)) {
+		t.Errorf("name %q does not alias input (not decoded in place)", d.Name)
+	}
+	// ...and the input must have been mutated by the in-place unescape.
+	if string(data) == orig {
+		t.Errorf("input was not mutated; in-place unescape did not write through")
+	}
+}
