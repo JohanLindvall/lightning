@@ -190,19 +190,50 @@ func BenchmarkLightning(b *testing.B) {
 // BenchmarkLightningDestructive measures the //lightning:destructive variant
 // (*BenchmarkDestructive).UnmarshalJSON, which unescapes nocopy string fields
 // directly into the input buffer instead of allocating a scratch buffer per escaped
-// value. It destroys the input, so each iteration first restores a pristine copy
-// into a reused buffer — that copy is a benchmark artifact (a real caller owns and
-// discards the buffer), so the gap versus BenchmarkLightning understates the win.
+// value. It destroys the input, so a pristine copy must be restored before each
+// decode; that restore-copy is a benchmark artifact (a real caller owns and discards
+// the buffer) and is excluded from the timing — the reported ns/op is the decode
+// alone, comparable to BenchmarkLightning.
+//
+// A per-iteration StopTimer/StartTimer would exclude the copy but add its own
+// overhead — each pause/resume calls runtime.ReadMemStats — which dominates fast
+// decodes. So instead a batch of buffers is restored under a single StopTimer and
+// then decoded timed, amortizing that overhead across the batch. The batch is sized
+// to ~256 KiB total so it stays within L2 (the restore-copy warms exactly those
+// bytes), which both amortizes ReadMemStats on small inputs and keeps the decode
+// cache-hot; large inputs fall back to a single reused buffer, where ReadMemStats is
+// negligible against a slow decode anyway.
 func BenchmarkLightningDestructive(b *testing.B) {
-	buf := make([]byte, len(benchInput))
+	batch := (256 << 10) / (len(benchInput) + 1)
+	if batch < 1 {
+		batch = 1
+	} else if batch > 1024 {
+		batch = 1024
+	}
+	bufs := make([][]byte, batch)
+	for j := range bufs {
+		bufs[j] = make([]byte, len(benchInput))
+	}
 	b.SetBytes(int64(len(benchInput)))
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		copy(buf, benchInput)
-		var v BenchmarkDestructive
-		if err := v.UnmarshalJSON(buf); err != nil {
-			b.Fatal(err)
+	b.ResetTimer()
+	for i := 0; i < b.N; {
+		b.StopTimer()
+		n := batch
+		if rem := b.N - i; rem < n {
+			n = rem
 		}
+		for j := 0; j < n; j++ {
+			copy(bufs[j], benchInput)
+		}
+		b.StartTimer()
+		for j := 0; j < n; j++ {
+			var v BenchmarkDestructive
+			if err := v.UnmarshalJSON(bufs[j]); err != nil {
+				b.Fatal(err)
+			}
+		}
+		i += n
 	}
 }
 
