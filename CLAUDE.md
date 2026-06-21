@@ -314,30 +314,46 @@ unmeasured on this arm64 box; left for an amd64 run.)
   which would bloat every call site — see the "inline trick" scoping note).
 - **Pure-SSE2 `indexStructural`** (dropping AVX2): ~2× slower on the skip path
   (`skip-heavy`); the throughput loss dwarfs the VZEROUPPER saving.
-- **arm64 `indexQuoteOrBackslashNEON` hot-loop micro-opts** — three plausible
+- **arm64 `indexQuoteOrBackslashNEON` hot-loop micro-opts** — five plausible
   rewrites of the per-block match-test, each killed by the same lesson: the
   decoder consumes each scanner result *immediately* (to slice the string), so a
   single call is **latency-bound**, not throughput-bound. A tight independent-call
-  microbenchmark measures throughput and *lies* about these. **(1) Fold the 16-lane
-  mask to one 64-bit detect word** (`VEXT $8` + `VORR` so the low D lane is nonzero
-  iff any byte matched, then one `VMOV`/`CBNZ` instead of two), recovering the exact
-  lane only in a cold `found` path: the throughput microbench loved it (huge −13%,
-  long −10%) but it **regressed every real decode +2.4%…+6.3%** — it lengthens the
-  per-block critical path (extra `VEXT`+`VORR`) and the cold path re-does both
-  `VMOV`s, hurting the common close-quote-in-first-block case. **(2) Overlapping
-  final NEON block** instead of the byte-by-byte scalar tail (load at `len-16`,
-  caller guarantees `len≥16`, the re-read bytes were already proven match-free):
-  correct and removes the scalar tail, but **flat on all real decode** — the tail
-  is only ever hit once at end-of-document (the scanner's buffer is string +
-  rest-of-doc, so the close quote lands in a *block*, never the tail). **(3) Build
-  the two compare splats with one `VLD1` of a 32-byte RODATA pair** instead of two
-  `MOVD`-imm + `VDUP`: a *tradeoff, not a win* — long-string cases improve
-  (string_unicode/twitter ≈ −1.5…−1.9%) but cloudflare *regresses* +3.7% (load-use
-  latency on the lone block of a short string), exactly the short-vs-long tension
-  the asm comment already documents in favour of `VDUP`. The asm hot loop is
-  genuinely well-tuned for the mixed real workload; the win was the wrapper
-  inlining above, not the block body. Don't re-attempt these without a way to
-  shorten the single-call latency (not just block throughput).
+  microbenchmark measures throughput and *lies* about these — its `huge −13%`
+  became `+6%` real. The block already does two *parallel* `VMOV`s of the D lanes
+  + two `CBNZ`s; that two-move form is **latency-optimal** (both lanes land at
+  once, recovery reads them directly), and every attempt to "reduce" it adds an op
+  to the chunk→branch critical path. **(1) Fold the 16-lane mask to one 64-bit
+  detect word** (`VEXT $8`+`VORR`, one `VMOV`/`CBNZ`, exact lane only in a cold
+  `found` path): throughput microbench loved it (huge −13%) but **regressed every
+  real decode +2.4%…+6.3%** — longer per-block path and the cold path re-does both
+  `VMOV`s. **(2) True NEON movemask** (`VUSHR $4, .H8` + `VUZP1` narrow the mask to
+  4 bits/byte so one `VMOV` carries all 16 lanes and `RBIT`/`CLZ`/`>>2` recover the
+  byte — the SHRN trick the Go assembler can't spell directly): genuinely halves
+  cross-domain traffic with *no* cold re-move, the cleanest version of the idea —
+  and still **regressed +2.7%…+9.2%**, because the two extra vector ops sit on the
+  latency path and the loop was never throughput-bound. (Also: it only works where
+  the mask byte is `0xFF`; `indexStructuralNEON`'s marker is the `0x01` table-AND,
+  which `>>4` annihilates — the differential fuzz catches it instantly.) **(3)
+  Defer the high-lane `VMOV` past the first `CBNZ`** (so a low-half match skips
+  it): a *real, data-dependent* split — golang_source −5.9% (short tokens match in
+  the low half) but cloudflare **+3.9%** (16–31-byte strings match in the high half
+  of block 1); a cloudflare regression is a blocker and there's no static way to
+  know which half a string ends in. **(4) Overlapping final NEON block** instead of
+  the scalar tail: flat — the tail is only hit once at end-of-document. **(5) One
+  `VLD1` of a 32-byte RODATA splat pair** instead of two `MOVD`-imm+`VDUP`: a
+  tradeoff (long strings −1.5…−1.9%, cloudflare +3.7% load-use latency), the
+  short-vs-long tension the asm comment already settles for `VDUP`. The hot loop is
+  genuinely well-tuned; the real arm64 string-handling win was making the dispatch
+  wrapper inline (above), not touching the block body. Don't re-attempt mask-
+  reduction tricks without a way to *shorten single-call latency*, not block
+  throughput.
+- **arm64 register-ABI (`<ABIInternal>`) for the NEON scanners** — the asm is
+  ABI0, so every (very hot) call spills base/len/cap to the stack and reloads the
+  result; declaring the functions `<ABIInternal>` would pass the slice in R0/R1/R2
+  and return in R0, removing that marshaling. The Go toolchain **forbids the
+  `<ABIInternal>` selector outside `package runtime`** ("ABI selector only
+  permitted when compiling runtime"), so this is simply unavailable to a
+  third-party package. No workaround that doesn't fork the toolchain.
 - **Key interning / map presizing in the dynamic `any` decoder**
   (`decodeAnyObject`, the `DecodeValue`/`json.DecodeAny` path): twitterescaped's
   `DecodeAny` is bound by building `map[string]any` — `mapassign` plus bucket
