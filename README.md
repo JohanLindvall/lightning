@@ -310,9 +310,11 @@ prefix is automatic.
 When you only need a few values out of a document and don't want to generate (or
 decode into) a struct, the [`pkg/json`](pkg/json) package exposes the scanner's
 key-lookup primitives. They walk the input with the same allocation-free
-`Skip`/`ReadKey` machinery the generated decoders use, and every value they
-return aliases the input `[]byte` (keep it unchanged while the result is in
-use). A returned value follows the same conventions throughout: a string keeps
+`Skip`/`ReadKey` machinery the generated decoders use — non-target objects and
+arrays are jumped with the [SIMD whole-container skip](#simd-scanning), so
+reaching a key behind many siblings in a large document stays fast — and every
+value they return aliases the input `[]byte` (keep it unchanged while the result
+is in use). A returned value follows the same conventions throughout: a string keeps
 its surrounding quotes with escapes intact, an object or array spans the whole
 `{`…`}` or `[`…`]`, and a scalar is the literal token.
 
@@ -518,9 +520,9 @@ modified. Inter-token whitespace in `in` is preserved outside the edited spans.
 
 ## SIMD scanning
 
-Two hot scan loops use a single vectorized pass instead of byte-at-a-time work,
-with kernels in `pkg/unstable/index_amd64.s` and `pkg/unstable/index_arm64.s`
-(arm64 uses NEON/ASIMD, 16 bytes/pass, for both):
+Several hot scan loops use a single vectorized pass instead of byte-at-a-time
+work, with kernels in `pkg/unstable/simd_{amd64,arm64}.s` and
+`pkg/unstable/skipfast_{amd64,arm64}.s` (arm64 uses NEON/ASIMD, amd64 SSE2/AVX2):
 
 - **next `"` or `\` in a string** — replaces two `bytes.IndexByte` scans; speeds
   up string-heavy payloads. On amd64 it uses SSE2 (16-byte vectors, two compares
@@ -531,6 +533,15 @@ with kernels in `pkg/unstable/index_amd64.s` and `pkg/unstable/index_arm64.s`
   keys, whitespace) when skipping unknown values. Skipping a large ignored
   array/object is dramatically faster (the `skip-heavy` benchmark decodes at
   >50 GB/s, ~230× `encoding/json`).
+- **whole-container skip** — when an object or array must be skipped (a non-target
+  value during a `Get`, an unknown struct field, a slice element counted for
+  presizing), `SkipValue` reads 32 bytes at a time, builds an *inside-string*
+  bitmask so `{`/`}`/`[`/`]`/`"` within string values are ignored, and balances
+  brackets to the matching close — absorbing string contents into the bulk scan
+  instead of a separate scan per string. This makes `Get` on a document where the
+  wanted key sits behind many nested-object siblings about **2× faster**. Objects
+  and arrays of objects/strings take this path; a flat scalar array (`[1,2,…]`)
+  keeps the structural-byte scan above, which already reaches the close in one pass.
 
 ### CPU requirements
 
@@ -545,12 +556,15 @@ each architecture's **baseline, mandatory** vector ISA — no runtime gate:
   inline into its callers.)
 
 The only **optional** feature is **AVX2** (amd64), used for the structural-byte
-scanner and runtime-detected via `golang.org/x/sys/cpu`; without it the
-structural scan falls back to scalar code. Inputs shorter than the vector width,
-and platforms other than amd64/arm64, also take the scalar (`bytes.IndexByte`-
-based) path. Behavior is identical across paths — verified by fuzzing each
-primitive against a reference and by `SkipValue`/decode round-trips vs
-`encoding/json`, on amd64 and on arm64 under qemu.
+scanner and the whole-container skip, and runtime-detected via
+`golang.org/x/sys/cpu`; without it the structural scan falls back to scalar code
+and `SkipValue` stays on the structural-byte skip. On arm64 both use NEON
+directly. Inputs shorter than the vector width, and platforms other than
+amd64/arm64, also take the scalar (`bytes.IndexByte`-based) path. Behavior is
+identical across paths — verified by fuzzing each primitive against a reference
+and by `SkipValue`/decode round-trips vs `encoding/json`, on amd64 and on arm64
+under qemu (the arm64 container-skip kernel is correctness-verified there, but its
+speed on real hardware is unmeasured).
 
 ## Benchmarks
 
@@ -590,7 +604,7 @@ Representative numbers for a 1.8 KB Cloudflare log (Go 1.26, amd64):
 |---|---|
 | [`main.go`](main.go) | the generator (`package main`) |
 | [`pkg/unstable`](pkg/unstable) | the (unstable, do-not-import) runtime the generated decoders call into |
-| [`pkg/json`](pkg/json) | small public API over the scanner (`Get`/`GetMany`/`ObjectEach`, `DecodeAny`, `UnescapeString`, `ParseFloat`, `StripDefaults`, `Set`/`SetMany`/`SetPaths`) |
+| [`pkg/json`](pkg/json) | small public API over the scanner (`Get`/`GetMany`/`GetPaths`/`ObjectEach`, `DecodeAny`, `UnescapeString`, `ParseFloat`, `StripDefaults`, `Set`/`SetMany`/`SetPaths`) |
 | [`bench/`](bench) | benchmark module: hand-written `data.go` + `input.json` per case, plus the generated decoders, harness, and results |
 
 Generated files (`*_unmarshal.go`, `bench/*/bench_test.go`, `bench/*/ej/`, and
@@ -604,8 +618,16 @@ Several of the hot-path techniques are borrowed from prior art:
 - **[simdjson](https://github.com/simdjson/simdjson)** (Geoff Langdale and Daniel
   Lemire) and its Go port **[minio/simdjson-go](https://github.com/minio/simdjson-go)** —
   the SWAR "parse four digits at once" bit trick used in the float and integer
-  scanners, and the two-`VPSHUFB` nibble-table classification that
-  `indexStructuralAVX2` uses to find structural bytes.
+  scanners, the two-`VPSHUFB` nibble-table classification that
+  `indexStructuralAVX2` uses to find structural bytes, and the branchless
+  escaped-quote detection + quote-mask prefix-XOR that builds the *inside-string*
+  bitmask for the whole-container skip.
+- **[sonic-rs](https://github.com/cloudwego/sonic-rs)** (ByteDance/CloudWeGo) and
+  the **[JSONSki](https://github.com/AutomataLab/JSONSki)** paper — the SIMD
+  container-skip used by `SkipValue`/`Get`: balance a container's brackets over
+  the inside-string bitmask, so string contents are absorbed into the bulk scan
+  rather than re-scanned per string. (The arm64 `maskBlock` movemask uses the
+  well-known byte-LSB gather, `(x & 0x01…01) * 0x0102…80 >> 56`.)
 - The float parser in `scanFloat` layers two published algorithms: William
   Clinger's fast path for exactly-representable values, then the
   **[Eisel–Lemire](https://github.com/fastfloat/fast_float)** algorithm (Michael

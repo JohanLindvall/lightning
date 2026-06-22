@@ -6,6 +6,18 @@ import (
 )
 
 // SkipValue advances past any JSON value starting at data[i].
+//
+// Objects and dense arrays (whose first element is itself an object, array, or
+// string) are skipped with the SIMD in-string-mask balance scan
+// (skipContainerFast) when it is available (AVX2 on amd64): it absorbs string
+// keys/values into one bulk pass instead of a SkipString call per string, which
+// is a large win on the containers Get/GetPaths and unknown-field skipping walk
+// over. A scalar-element array ('[1,2,...]') keeps the indexStructural skip,
+// where a single vectorized scan already reaches the closing bracket and the
+// mask path would only add per-block work. The array probe is a heuristic; a
+// wrong guess (or a miss on malformed input) only costs speed, never
+// correctness — both paths are bracket-balancers that agree on every value the
+// other accepts.
 func SkipValue(data []byte, i int) (int, error) {
 	if i >= len(data) {
 		return i, ErrTruncated
@@ -14,8 +26,20 @@ func SkipValue(data []byte, i int) (int, error) {
 	case '"':
 		return SkipString(data, i)
 	case '{':
+		if fastSkipAvail {
+			return skipContainerFast(data, i, '{')
+		}
 		return skipObject(data, i)
 	case '[':
+		if fastSkipAvail {
+			j := SkipWS(data, i+1)
+			if j < len(data) {
+				switch data[j] {
+				case '{', '[', '"':
+					return skipContainerFast(data, i, '[')
+				}
+			}
+		}
 		return skipArray(data, i)
 	case 't':
 		if i+4 <= len(data) && data[i+1] == 'r' && data[i+2] == 'u' && data[i+3] == 'e' {

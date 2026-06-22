@@ -67,7 +67,3 @@ func TestErrorSentinels(t *testing.T) {
 		}
 	}
 }
-
-// TestCountArrayElements covers the SkipValue-based element counter: nested
-// arrays, strings with structural bytes inside, objects, whitespace, and the
-// malformed/empty cases that must return 0 (so the caller falls back to append).

@@ -21,7 +21,11 @@ allocation-light `json.Unmarshaler` implementations.
 - `pkg/unstable` — the runtime scanning primitives the generated decoders call, plus
   the handful exported for the `pkg/json` toolkit (`SkipWS`/`SkipWSCompact`/`SkipValue`/
   `SkipString`/`ReadKey`/`DecodeValue`/`UnescapeString`/`ParseFloat` and the `Err*`
-  sentinels). This is where almost all performance work happens.
+  sentinels). This is where almost all performance work happens. Split into topical
+  files: `read.go` (the `Read*` readers), `skip.go`, `skipfast.go` (+ `skipfast_{amd64,arm64,noasm}`,
+  the SIMD container skip), `count.go` (slice-presize counters), `numeric.go` (`scanFloat`
+  + Eisel-Lemire), `string.go` (unescape/`Unwrap`), `date.go`/`time.go`, `any.go` (the
+  dynamic `DecodeValue`), and the `simd_*` SIMD kernels; `unstable.go` holds the rest.
 - `pkg/json` — small public API over the scanner, **implemented here** (not just
   wrappers) on the exported pkg/unstable primitives: `get.go` holds the read toolkit
   `Get`/`GetMany`/`GetPaths`/`ObjectEach` (+ `*Compact`) — `GetPaths` pulls several
@@ -189,7 +193,7 @@ byte-identical when adding cold paths; push new logic out-of-line.
   counting it would deep-scan every element's bulk for only ~log2(n) reallocs
   saved. Flat / string / 1-D-slice records (Cloudflare-style) keep presize and
   their low B/op.
-- **SIMD scanners** in `index_amd64.s`/`index_arm64.s`: `indexCloseOrEscape`
+- **SIMD scanners** in `simd_amd64.s`/`simd_arm64.s`: `indexCloseOrEscape`
   (next `"`/`\`) and `indexStructural` (next `{}[]"`). Both arches classify the 5
   target bytes with simdjson's **shuffle trick** — two table lookups
   (`structLo[lowNibble] & structHi[highNibble] != 0`) instead of five
@@ -220,6 +224,36 @@ byte-identical when adding cold paths; push new logic out-of-line.
   so the per-digit `<9` test stays out of the loop) and scales to nanoseconds with
   one `pow10nano[fd]` multiply instead of a trailing `for fd<9 { nsec*=10 }` pad:
   time-array −1%.
+- **SIMD in-string-mask container skip** (`skipfast.go` + `skipfast_amd64.s` /
+  `skipfast_arm64.s`, the sonic-rs `skip_container` / JSONSki technique). `SkipValue`
+  used to land on each structural byte with `indexStructural` and call `SkipString`
+  *per string*, so skipping a string-heavy container paid N calls. `skipContainerFast`
+  instead streams 32-byte blocks: `maskBlock` (AVX2 / NEON) returns the per-byte
+  bitmaps of `" \ { } [ ]`; `findEscaped32` (simdjson's branchless odd-run detection)
+  + `prefixXor32` (the carryless-multiply-by-ones done in five shift/XORs — **no
+  PCLMULQDQ**, so the bit math is plain Go) build the *inside-string* mask; the
+  bracket bitmaps are masked to bytes outside strings and balanced. Strings (keys and
+  values) are absorbed into the bulk scan — no per-string call. **`SkipValue` is the
+  dispatch**, so the win reaches every caller (`Get`/`GetMany`/`GetPaths`, `Set`,
+  `CountArrayElements`, generated unknown-field skips) with no call-site change:
+  objects always go fast (string keys dominate); an array goes fast only if its first
+  element is `{`/`[`/`"` — a *scalar* array (`[1,2,…]`) stays on the current path,
+  where one `indexStructural` scan already reaches the close and the mask path would
+  only add per-block work. The probe is a heuristic; a wrong guess (or a miss on
+  malformed input) only costs speed, never correctness — both paths are bracket
+  balancers that agree on every value the other accepts (50k-doc differential fuzz +
+  truncation safety vs `skipObject`/`skipArray`). **This is not the rejected two-stage
+  feed** (below): the skip path has no typed stage-2, so the index-like scan *is* the
+  work and the economics that sank two-stage do not apply. Wins: **`Get` end-to-end
+  +105%** (skip-heavy doc, skipping 500 nested-object siblings: 27.9→13.6 µs),
+  micro-skip −36 % (string object) / −49 % (number-valued object) / −79 % (array of
+  records), flat on scalar arrays, zero allocs. Gated `fastSkipAvail = useAVX2`
+  (amd64) / `true` (arm64, NEON baseline) / `false` (other, where the scalar
+  `maskBlock` is slower than `indexStructural`). The arm64 NEON `maskBlock` builds the
+  movemask NEON lacks (`PMOVMSKB`) with the byte-LSB gather (`& 0x01…01`, `× 0x0102…80`,
+  `>>56`, bit *j* ← lane *j*); it is **correctness-verified under qemu but its speed is
+  UNMEASURED** on real hardware (the gather is heavier than one `VPMOVMSKB`, so the
+  arm64 win, if any, is smaller — wants a real-arm64 benchstat before being relied on).
 
 ## The inline trick — let the generator write hot bodies inline
 
