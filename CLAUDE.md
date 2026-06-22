@@ -250,10 +250,19 @@ byte-identical when adding cold paths; push new logic out-of-line.
   records), flat on scalar arrays, zero allocs. Gated `fastSkipAvail = useAVX2`
   (amd64) / `true` (arm64, NEON baseline) / `false` (other, where the scalar
   `maskBlock` is slower than `indexStructural`). The arm64 NEON `maskBlock` builds the
-  movemask NEON lacks (`PMOVMSKB`) with the byte-LSB gather (`& 0x01…01`, `× 0x0102…80`,
-  `>>56`, bit *j* ← lane *j*); it is **correctness-verified under qemu but its speed is
-  UNMEASURED** on real hardware (the gather is heavier than one `VPMOVMSKB`, so the
-  arm64 win, if any, is smaller — wants a real-arm64 benchstat before being relied on).
+  movemask NEON lacks (`PMOVMSKB`) by **weight-and-fold**: `VAND` the 0x00/0xFF compare
+  mask with the `{1,2,4,…,128}`-repeated bit-weight vector, then three pairwise adds
+  (`VADDP`) collapse each 8-lane half to one byte whose bits are that half's mask, so a
+  single halfword `VMOV` lifts the full 16-bit result — one cross-domain move per 16-byte
+  half and no integer multiply. This replaced an earlier per-half `AND/MUL/LSR` byte-LSB
+  gather (`& 0x01…01`, `× 0x0102…80`, `>>56`) that did **two** `VMOV`s and two `MUL`s per
+  half; the fold halves the cross-domain traffic and drops the multiplies. **Now measured
+  on Apple M2** (the routine was previously qemu-correct but unbenched): `maskBlock` was
+  ~48% of `BenchmarkGetSkipHeavy` and the fold cut it to ~29%, **−28% end-to-end on that
+  benchmark** (30.8→22.2 µs, +39% B/s) and **−30% geomean** across the
+  `BenchmarkSkipContainer` shapes (string/number objects and nested records each ≈ −39%,
+  scalar arrays flat since they stay on the `indexStructural` path). The fold keeps the
+  same six-mask `maskBlock` signature, so only `skipfast_arm64.s` changed.
 
 ## The inline trick — let the generator write hot bodies inline
 
