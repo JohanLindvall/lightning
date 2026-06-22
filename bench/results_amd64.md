@@ -1,6 +1,6 @@
 # JSON Deserialization Benchmarks
 
-- generated 2026-06-21T21:08:54Z
+- generated 2026-06-22T19:49:47Z
 - go version go1.26.4 linux/amd64
 
 Lower ns/op is better; throughput (MB/s) and allocations are reported by `-benchmem`. **Speedup** is relative to the `encoding/json` (Stdlib) baseline.
@@ -9,415 +9,415 @@ Lower ns/op is better; throughput (MB/s) and allocations are reported by `-bench
 
 | Decoder | ns/op | Throughput | B/op | allocs/op | Speedup |
 |---|--:|--:|--:|--:|--:|
-| Lightning | 105373 | 1207.86 MB/s | 49760 | 3 | 12.5× |
-| LightningDestructive | 106021 | 1200.47 MB/s | 49280 | 2 | 12.4× |
-| Sonic | 199425 | 638.21 MB/s | 214980 | 15 | 6.6× |
-| SonicFastest | 200395 | 635.12 MB/s | 215218 | 15 | 6.6× |
-| Easyjson | 239659 | 531.07 MB/s | 122864 | 14 | 5.5× |
-| Goccy | 247675 | 513.88 MB/s | 225361 | 884 | 5.3× |
-| LightningDecodeAny | 472241 | 200.43 MB/s | 465586 | 9714 | 2.8× |
-| JSONV2 | 477184 | 266.72 MB/s | 195127 | 1805 | 2.8× |
-| Stdlib | 1314120 | 96.85 MB/s | 199696 | 2661 | 1.0× |
+| LightningDestructive | 107871 | 1179.88 MB/s | 49280 | 2 | 12.4× |
+| Lightning | 108628 | 1171.66 MB/s | 49760 | 3 | 12.3× |
+| SonicFastest | 201868 | 630.49 MB/s | 214433 | 15 | 6.6× |
+| Sonic | 202585 | 628.25 MB/s | 214421 | 15 | 6.6× |
+| Goccy | 253492 | 502.09 MB/s | 225265 | 884 | 5.3× |
+| Easyjson | 258779 | 491.83 MB/s | 122864 | 14 | 5.2× |
+| JSONV2 | 458895 | 277.35 MB/s | 195128 | 1805 | 2.9× |
+| LightningDecodeAny | 478725 | 197.72 MB/s | 465586 | 9714 | 2.8× |
+| Stdlib | 1338372 | 95.10 MB/s | 199696 | 2661 | 1.0× |
 
 ## bench/canada — 2251051 byte input
 
 | Decoder | ns/op | Throughput | B/op | allocs/op | Speedup |
 |---|--:|--:|--:|--:|--:|
-| LightningDestructive | 4072821 | 552.70 MB/s | 3122872 | 3081 | 8.3× |
-| Lightning | 4138798 | 543.89 MB/s | 3122872 | 3081 | 8.2× |
-| Sonic | 5105797 | 440.88 MB/s | 4872080 | 2584 | 6.7× |
-| SonicFastest | 5326534 | 422.61 MB/s | 4872632 | 2584 | 6.4× |
-| LightningDecodeAny | 12213176 | 184.31 MB/s | 7938298 | 281383 | 2.8× |
-| Goccy | 12771748 | 176.25 MB/s | 4170642 | 56534 | 2.7× |
-| Easyjson | 13225878 | 170.20 MB/s | 3099809 | 2120 | 2.6× |
-| JSONV2 | 17347730 | 129.76 MB/s | 3123215 | 3083 | 2.0× |
-| Stdlib | 33953694 | 66.30 MB/s | 3123392 | 3095 | 1.0× |
+| LightningDestructive | 4314567 | 521.73 MB/s | 3122873 | 3081 | 8.0× |
+| Lightning | 4331279 | 519.72 MB/s | 3122872 | 3081 | 8.0× |
+| Sonic | 4868196 | 462.40 MB/s | 4873514 | 2584 | 7.1× |
+| SonicFastest | 5473710 | 411.25 MB/s | 4869800 | 2584 | 6.3× |
+| Goccy | 11987535 | 187.78 MB/s | 4201355 | 56535 | 2.9× |
+| LightningDecodeAny | 12766909 | 176.32 MB/s | 7938300 | 281383 | 2.7× |
+| Easyjson | 14067957 | 160.01 MB/s | 3099810 | 2120 | 2.5× |
+| JSONV2 | 17303973 | 130.09 MB/s | 3123215 | 3083 | 2.0× |
+| Stdlib | 34471319 | 65.30 MB/s | 3123393 | 3095 | 1.0× |
 
 ## bench/canada_geometry — 270403 byte input
 
 | Decoder | ns/op | Throughput | B/op | allocs/op | Speedup |
 |---|--:|--:|--:|--:|--:|
-| LightningDestructive | 571063 | 473.51 MB/s | 348025 | 1627 | 7.6× |
-| Lightning | 571067 | 473.51 MB/s | 348025 | 1627 | 7.6× |
-| SonicFastest | 745373 | 362.78 MB/s | 641194 | 1147 | 5.9× |
-| Sonic | 746439 | 362.26 MB/s | 641026 | 1147 | 5.8× |
-| LightningDecodeAny | 1700386 | 159.02 MB/s | 1011488 | 37901 | 2.6× |
-| Easyjson | 1744749 | 154.98 MB/s | 330272 | 749 | 2.5× |
-| Goccy | 1775674 | 152.28 MB/s | 541407 | 8122 | 2.5× |
-| JSONV2 | 2315953 | 116.76 MB/s | 348159 | 1628 | 1.9× |
-| Stdlib | 4365739 | 61.94 MB/s | 348545 | 1641 | 1.0× |
+| Lightning | 590860 | 457.64 MB/s | 348025 | 1627 | 7.5× |
+| LightningDestructive | 594872 | 454.56 MB/s | 348024 | 1627 | 7.5× |
+| SonicFastest | 767935 | 352.12 MB/s | 641028 | 1147 | 5.8× |
+| Sonic | 770259 | 351.05 MB/s | 640481 | 1147 | 5.8× |
+| Goccy | 1697457 | 159.30 MB/s | 541316 | 8122 | 2.6× |
+| LightningDecodeAny | 1743874 | 155.06 MB/s | 1011487 | 37901 | 2.5× |
+| Easyjson | 1807717 | 149.58 MB/s | 330272 | 749 | 2.5× |
+| JSONV2 | 2356990 | 114.72 MB/s | 348161 | 1628 | 1.9× |
+| Stdlib | 4439950 | 60.90 MB/s | 348545 | 1641 | 1.0× |
 
 ## bench/citm_catalog — 1727204 byte input
 
 | Decoder | ns/op | Throughput | B/op | allocs/op | Speedup |
 |---|--:|--:|--:|--:|--:|
-| LightningDestructive | 1284012 | 1345.16 MB/s | 959848 | 5881 | 13.7× |
-| Lightning | 1346348 | 1282.88 MB/s | 959889 | 5882 | 13.0× |
-| SonicFastest | 2084533 | 828.58 MB/s | 2695099 | 5547 | 8.4× |
-| Sonic | 2090361 | 826.27 MB/s | 2695063 | 5547 | 8.4× |
-| Goccy | 2957963 | 583.92 MB/s | 2580961 | 14603 | 5.9× |
-| Easyjson | 4207799 | 410.48 MB/s | 972032 | 5389 | 4.2× |
-| LightningDecodeAny | 4429000 | 112.96 MB/s | 4976204 | 81466 | 4.0× |
-| JSONV2 | 4538734 | 380.55 MB/s | 1011611 | 7594 | 3.9× |
-| Stdlib | 17560009 | 98.36 MB/s | 1234448 | 17027 | 1.0× |
+| LightningDestructive | 1324676 | 1303.87 MB/s | 959849 | 5881 | 13.5× |
+| Lightning | 1386620 | 1245.62 MB/s | 959890 | 5882 | 12.9× |
+| SonicFastest | 2203721 | 783.77 MB/s | 2694482 | 5547 | 8.1× |
+| Sonic | 2204743 | 783.40 MB/s | 2694041 | 5547 | 8.1× |
+| Goccy | 2643324 | 653.42 MB/s | 2581689 | 14604 | 6.8× |
+| Easyjson | 4126311 | 418.58 MB/s | 972032 | 5389 | 4.3× |
+| LightningDecodeAny | 4608525 | 108.56 MB/s | 4976203 | 81466 | 3.9× |
+| JSONV2 | 4889140 | 353.27 MB/s | 1011615 | 7594 | 3.7× |
+| Stdlib | 17856001 | 96.73 MB/s | 1234448 | 17027 | 1.0× |
 
 ## bench/cloudflare-compact — 1812 byte input
 
 | Decoder | ns/op | Throughput | B/op | allocs/op | Speedup |
 |---|--:|--:|--:|--:|--:|
-| Lightning | 1004 | 1804.02 MB/s | 0 | 0 | 15.9× |
-| LightningDestructive | 1044 | 1736.10 MB/s | 0 | 0 | 15.3× |
-| Easyjson | 2857 | 634.25 MB/s | 24 | 1 | 5.6× |
-| Goccy | 3462 | 523.41 MB/s | 2608 | 4 | 4.6× |
-| SonicFastest | 6211 | 291.75 MB/s | 3345 | 38 | 2.6× |
-| Sonic | 6398 | 283.23 MB/s | 3344 | 38 | 2.5× |
-| JSONV2 | 8441 | 214.66 MB/s | 640 | 6 | 1.9× |
-| LightningDecodeAny | 9376 | 193.14 MB/s | 7536 | 158 | 1.7× |
-| Stdlib | 15966 | 113.49 MB/s | 928 | 16 | 1.0× |
+| Lightning | 1046 | 1732.57 MB/s | 0 | 0 | 15.5× |
+| LightningDestructive | 1094 | 1656.13 MB/s | 0 | 0 | 14.8× |
+| Easyjson | 2943 | 615.71 MB/s | 24 | 1 | 5.5× |
+| Goccy | 3301 | 548.96 MB/s | 2608 | 4 | 4.9× |
+| SonicFastest | 6425 | 282.02 MB/s | 3345 | 38 | 2.5× |
+| Sonic | 6711 | 270.01 MB/s | 3348 | 38 | 2.4× |
+| JSONV2 | 8278 | 218.90 MB/s | 640 | 6 | 2.0× |
+| LightningDecodeAny | 9618 | 188.29 MB/s | 7536 | 158 | 1.7× |
+| Stdlib | 16234 | 111.62 MB/s | 928 | 16 | 1.0× |
 
 ## bench/cloudflare-nocopy — 1812 byte input
 
 | Decoder | ns/op | Throughput | B/op | allocs/op | Speedup |
 |---|--:|--:|--:|--:|--:|
-| Lightning | 1101 | 1646.45 MB/s | 0 | 0 | 14.6× |
-| LightningDestructive | 1155 | 1569.37 MB/s | 0 | 0 | 13.9× |
-| Easyjson | 2839 | 638.35 MB/s | 24 | 1 | 5.7× |
-| Goccy | 3421 | 529.68 MB/s | 2608 | 4 | 4.7× |
-| SonicFastest | 6101 | 296.99 MB/s | 3342 | 38 | 2.6× |
-| Sonic | 6274 | 288.83 MB/s | 3342 | 38 | 2.6× |
-| JSONV2 | 8333 | 217.45 MB/s | 640 | 6 | 1.9× |
-| LightningDecodeAny | 9362 | 193.44 MB/s | 7536 | 158 | 1.7× |
-| Stdlib | 16054 | 112.87 MB/s | 928 | 16 | 1.0× |
+| Lightning | 1120 | 1617.73 MB/s | 0 | 0 | 14.5× |
+| LightningDestructive | 1209 | 1498.60 MB/s | 0 | 0 | 13.5× |
+| Easyjson | 3032 | 597.68 MB/s | 24 | 1 | 5.4× |
+| Goccy | 3221 | 562.56 MB/s | 2608 | 4 | 5.0× |
+| SonicFastest | 6152 | 294.56 MB/s | 3346 | 38 | 2.6× |
+| Sonic | 6318 | 286.80 MB/s | 3347 | 38 | 2.6× |
+| JSONV2 | 8155 | 222.19 MB/s | 640 | 6 | 2.0× |
+| LightningDecodeAny | 9334 | 194.02 MB/s | 7536 | 158 | 1.7× |
+| Stdlib | 16266 | 111.40 MB/s | 928 | 16 | 1.0× |
 
 ## bench/cloudflare — 1812 byte input
 
 | Decoder | ns/op | Throughput | B/op | allocs/op | Speedup |
 |---|--:|--:|--:|--:|--:|
-| Lightning | 1324 | 1368.20 MB/s | 144 | 10 | 12.2× |
-| LightningDestructive | 1434 | 1263.95 MB/s | 144 | 10 | 11.3× |
-| Goccy | 3207 | 565.04 MB/s | 2600 | 5 | 5.0× |
-| Easyjson | 3265 | 555.03 MB/s | 144 | 10 | 5.0× |
-| SonicFastest | 6199 | 292.30 MB/s | 3366 | 40 | 2.6× |
-| Sonic | 6396 | 283.31 MB/s | 3366 | 40 | 2.5× |
-| JSONV2 | 8316 | 217.89 MB/s | 632 | 7 | 1.9× |
-| LightningDecodeAny | 9248 | 195.83 MB/s | 7536 | 158 | 1.7× |
-| Stdlib | 16162 | 112.11 MB/s | 920 | 17 | 1.0× |
+| Lightning | 1327 | 1365.41 MB/s | 144 | 10 | 12.2× |
+| LightningDestructive | 1394 | 1300.13 MB/s | 144 | 10 | 11.6× |
+| Easyjson | 3208 | 564.86 MB/s | 144 | 10 | 5.0× |
+| Goccy | 3522 | 514.53 MB/s | 2600 | 5 | 4.6× |
+| SonicFastest | 6317 | 286.86 MB/s | 3364 | 40 | 2.6× |
+| Sonic | 6572 | 275.73 MB/s | 3365 | 40 | 2.5× |
+| JSONV2 | 8881 | 204.03 MB/s | 632 | 7 | 1.8× |
+| LightningDecodeAny | 9322 | 194.26 MB/s | 7536 | 158 | 1.7× |
+| Stdlib | 16169 | 112.07 MB/s | 920 | 17 | 1.0× |
 
 ## bench/float-array-slow — 494 byte input
 
 | Decoder | ns/op | Throughput | B/op | allocs/op | Speedup |
 |---|--:|--:|--:|--:|--:|
-| Lightning | 722 | 684.05 MB/s | 160 | 1 | 9.6× |
-| LightningDestructive | 734 | 672.52 MB/s | 160 | 1 | 9.4× |
-| SonicFastest | 1269 | 389.25 MB/s | 1075 | 8 | 5.5× |
-| Sonic | 1271 | 388.55 MB/s | 1075 | 8 | 5.4× |
-| LightningDecodeAny | 1783 | 276.49 MB/s | 1536 | 30 | 3.9× |
-| Easyjson | 2524 | 195.76 MB/s | 448 | 3 | 2.7× |
-| Goccy | 2693 | 183.42 MB/s | 856 | 23 | 2.6× |
-| JSONV2 | 3299 | 149.76 MB/s | 528 | 7 | 2.1× |
-| Stdlib | 6924 | 71.34 MB/s | 760 | 12 | 1.0× |
+| Lightning | 732 | 675.19 MB/s | 160 | 1 | 9.6× |
+| LightningDestructive | 742 | 665.34 MB/s | 160 | 1 | 9.5× |
+| Sonic | 1286 | 384.27 MB/s | 1075 | 8 | 5.5× |
+| SonicFastest | 1288 | 383.47 MB/s | 1076 | 8 | 5.5× |
+| LightningDecodeAny | 1801 | 273.66 MB/s | 1536 | 30 | 3.9× |
+| Goccy | 2624 | 188.27 MB/s | 856 | 23 | 2.7× |
+| Easyjson | 2718 | 181.78 MB/s | 448 | 3 | 2.6× |
+| JSONV2 | 3500 | 141.16 MB/s | 528 | 7 | 2.0× |
+| Stdlib | 7026 | 70.31 MB/s | 760 | 12 | 1.0× |
 
 ## bench/float-array — 230 byte input
 
 | Decoder | ns/op | Throughput | B/op | allocs/op | Speedup |
 |---|--:|--:|--:|--:|--:|
-| Lightning | 489 | 470.13 MB/s | 160 | 1 | 10.1× |
-| LightningDestructive | 494 | 465.85 MB/s | 160 | 1 | 10.0× |
-| Sonic | 919 | 250.35 MB/s | 801 | 8 | 5.4× |
-| SonicFastest | 922 | 249.49 MB/s | 801 | 8 | 5.4× |
-| LightningDecodeAny | 1601 | 143.02 MB/s | 1536 | 30 | 3.1× |
-| Easyjson | 1705 | 134.86 MB/s | 448 | 3 | 2.9× |
-| Goccy | 1839 | 125.06 MB/s | 584 | 23 | 2.7× |
-| JSONV2 | 2608 | 88.20 MB/s | 528 | 7 | 1.9× |
-| Stdlib | 4945 | 46.52 MB/s | 760 | 12 | 1.0× |
+| LightningDestructive | 499 | 460.80 MB/s | 160 | 1 | 9.9× |
+| Lightning | 500 | 460.37 MB/s | 160 | 1 | 9.9× |
+| SonicFastest | 932 | 246.82 MB/s | 801 | 8 | 5.3× |
+| Sonic | 935 | 246.09 MB/s | 800 | 8 | 5.3× |
+| LightningDecodeAny | 1634 | 140.12 MB/s | 1536 | 30 | 3.0× |
+| Easyjson | 1811 | 127.00 MB/s | 448 | 3 | 2.7× |
+| Goccy | 1818 | 126.51 MB/s | 584 | 23 | 2.7× |
+| JSONV2 | 2633 | 87.35 MB/s | 528 | 7 | 1.9× |
+| Stdlib | 4961 | 46.36 MB/s | 760 | 12 | 1.0× |
 
 ## bench/github_events — 65132 byte input
 
 | Decoder | ns/op | Throughput | B/op | allocs/op | Speedup |
 |---|--:|--:|--:|--:|--:|
-| Lightning | 92754 | 702.20 MB/s | 172434 | 107 | 7.3× |
-| LightningDestructive | 99113 | 657.15 MB/s | 166213 | 102 | 6.8× |
-| Sonic | 148465 | 438.70 MB/s | 235835 | 65 | 4.5× |
-| SonicFastest | 148886 | 437.46 MB/s | 235770 | 65 | 4.5× |
-| Goccy | 186285 | 349.64 MB/s | 228020 | 134 | 3.6× |
-| LightningDecodeAny | 199784 | 266.93 MB/s | 176961 | 3252 | 3.4× |
-| JSONV2 | 263478 | 247.20 MB/s | 206664 | 607 | 2.6× |
-| Stdlib | 672909 | 96.79 MB/s | 214617 | 842 | 1.0× |
+| Lightning | 91065 | 715.23 MB/s | 172434 | 107 | 7.5× |
+| LightningDestructive | 97263 | 669.65 MB/s | 166213 | 102 | 7.0× |
+| SonicFastest | 149773 | 434.87 MB/s | 235811 | 65 | 4.6× |
+| Sonic | 154193 | 422.41 MB/s | 235821 | 65 | 4.4× |
+| Goccy | 181098 | 359.65 MB/s | 228080 | 134 | 3.8× |
+| LightningDecodeAny | 206719 | 257.98 MB/s | 176960 | 3252 | 3.3× |
+| JSONV2 | 265743 | 245.09 MB/s | 206664 | 607 | 2.6× |
+| Stdlib | 684400 | 95.17 MB/s | 214617 | 842 | 1.0× |
 
 ## bench/golang_source — 1940472 byte input
 
 | Decoder | ns/op | Throughput | B/op | allocs/op | Speedup |
 |---|--:|--:|--:|--:|--:|
-| LightningDestructive | 2498344 | 776.70 MB/s | 2846864 | 2238 | 11.2× |
-| Lightning | 2587393 | 749.97 MB/s | 2846866 | 2238 | 10.8× |
-| SonicFastest | 4691407 | 413.62 MB/s | 4878689 | 1736 | 6.0× |
-| Sonic | 4745767 | 408.88 MB/s | 4881597 | 1736 | 5.9× |
-| Goccy | 4916728 | 394.67 MB/s | 4061841 | 13509 | 5.7× |
-| Easyjson | 8256173 | 235.03 MB/s | 3871265 | 15043 | 3.4× |
-| LightningDecodeAny | 9942190 | 195.18 MB/s | 7013525 | 219937 | 2.8× |
-| JSONV2 | 12634027 | 153.59 MB/s | 3237200 | 13947 | 2.2× |
-| Stdlib | 27966851 | 69.38 MB/s | 3551317 | 27166 | 1.0× |
+| LightningDestructive | 2573515 | 754.02 MB/s | 2846864 | 2238 | 11.0× |
+| Lightning | 2650910 | 732.00 MB/s | 2846866 | 2238 | 10.7× |
+| Goccy | 5067963 | 382.89 MB/s | 4063192 | 13509 | 5.6× |
+| Sonic | 5441406 | 356.61 MB/s | 4882554 | 1736 | 5.2× |
+| SonicFastest | 5464082 | 355.13 MB/s | 4882846 | 1736 | 5.2× |
+| Easyjson | 8357935 | 232.17 MB/s | 3871264 | 15043 | 3.4× |
+| LightningDecodeAny | 10163309 | 190.93 MB/s | 7013525 | 219937 | 2.8× |
+| JSONV2 | 12639312 | 153.53 MB/s | 3237192 | 13947 | 2.2× |
+| Stdlib | 28292043 | 68.59 MB/s | 3551316 | 27166 | 1.0× |
 
 ## bench/gsoc_2018 — 3327831 byte input
 
 | Decoder | ns/op | Throughput | B/op | allocs/op | Speedup |
 |---|--:|--:|--:|--:|--:|
-| LightningDestructive | 1053922 | 3157.57 MB/s | 351704 | 1286 | 22.2× |
-| Lightning | 1593525 | 2088.35 MB/s | 2488907 | 2995 | 14.7× |
-| SonicFastest | 2004545 | 1660.14 MB/s | 5896590 | 4263 | 11.7× |
-| Sonic | 2011909 | 1654.07 MB/s | 5896516 | 4263 | 11.6× |
-| LightningDecodeAny | 3538613 | 868.64 MB/s | 4886622 | 56892 | 6.6× |
-| Goccy | 4674507 | 711.91 MB/s | 3948915 | 3817 | 5.0× |
-| JSONV2 | 7394185 | 450.06 MB/s | 5364504 | 13243 | 3.2× |
-| Stdlib | 23423047 | 142.08 MB/s | 5565607 | 20690 | 1.0× |
+| LightningDestructive | 1090782 | 3050.87 MB/s | 351704 | 1286 | 22.4× |
+| Lightning | 1741713 | 1910.67 MB/s | 2488907 | 2995 | 14.0× |
+| SonicFastest | 2118321 | 1570.98 MB/s | 5896372 | 4263 | 11.5× |
+| Sonic | 2137061 | 1557.20 MB/s | 5895712 | 4263 | 11.4× |
+| LightningDecodeAny | 3974826 | 773.31 MB/s | 4886622 | 56892 | 6.1× |
+| Goccy | 6194768 | 537.20 MB/s | 3948914 | 3817 | 3.9× |
+| JSONV2 | 8173486 | 407.15 MB/s | 5364507 | 13243 | 3.0× |
+| Stdlib | 24422353 | 136.26 MB/s | 5565619 | 20690 | 1.0× |
 
 ## bench/instruments — 220346 byte input
 
 | Decoder | ns/op | Throughput | B/op | allocs/op | Speedup |
 |---|--:|--:|--:|--:|--:|
-| Lightning | 231540 | 951.65 MB/s | 136896 | 228 | 10.6× |
-| LightningDestructive | 238075 | 925.53 MB/s | 136896 | 228 | 10.3× |
-| Goccy | 480333 | 458.74 MB/s | 364024 | 1066 | 5.1× |
-| SonicFastest | 488164 | 451.38 MB/s | 350088 | 262 | 5.0× |
-| Sonic | 490363 | 449.35 MB/s | 350120 | 262 | 5.0× |
-| Easyjson | 629797 | 349.87 MB/s | 130512 | 245 | 3.9× |
-| JSONV2 | 755731 | 291.57 MB/s | 129746 | 470 | 3.2× |
-| LightningDecodeAny | 1011712 | 107.06 MB/s | 861394 | 11944 | 2.4× |
-| Stdlib | 2453765 | 89.80 MB/s | 131240 | 619 | 1.0× |
+| Lightning | 227146 | 970.06 MB/s | 136896 | 228 | 10.8× |
+| LightningDestructive | 236536 | 931.55 MB/s | 136896 | 228 | 10.4× |
+| SonicFastest | 486642 | 452.79 MB/s | 350317 | 262 | 5.0× |
+| Sonic | 489506 | 450.14 MB/s | 350511 | 262 | 5.0× |
+| Goccy | 494221 | 445.84 MB/s | 364084 | 1066 | 5.0× |
+| Easyjson | 676899 | 325.52 MB/s | 130512 | 245 | 3.6× |
+| JSONV2 | 722174 | 305.11 MB/s | 129747 | 470 | 3.4× |
+| LightningDecodeAny | 1031682 | 104.99 MB/s | 861394 | 11944 | 2.4× |
+| Stdlib | 2453298 | 89.82 MB/s | 131240 | 619 | 1.0× |
 
 ## bench/large-json — 8100039 byte input
 
 | Decoder | ns/op | Throughput | B/op | allocs/op | Speedup |
 |---|--:|--:|--:|--:|--:|
-| LightningDestructive | 14713176 | 550.53 MB/s | 15059834 | 51649 | 7.6× |
-| Lightning | 15414299 | 525.49 MB/s | 15059843 | 51649 | 7.3× |
-| SonicFastest | 17881557 | 452.98 MB/s | 19856834 | 41640 | 6.3× |
-| Sonic | 17926354 | 451.85 MB/s | 19857696 | 41640 | 6.3× |
-| Goccy | 26966880 | 300.37 MB/s | 19043690 | 107155 | 4.2× |
-| Easyjson | 34462069 | 235.04 MB/s | 15059620 | 41643 | 3.3× |
-| LightningDecodeAny | 42875531 | 121.35 MB/s | 34333347 | 912810 | 2.6× |
-| JSONV2 | 48254618 | 167.86 MB/s | 15233721 | 78972 | 2.3× |
-| Stdlib | 112313892 | 72.12 MB/s | 15665072 | 150647 | 1.0× |
+| LightningDestructive | 14809918 | 546.93 MB/s | 15059835 | 51649 | 7.6× |
+| Lightning | 15919020 | 508.83 MB/s | 15059844 | 51649 | 7.0× |
+| SonicFastest | 18018453 | 449.54 MB/s | 19859102 | 41640 | 6.2× |
+| Sonic | 18124399 | 446.91 MB/s | 19857252 | 41640 | 6.2× |
+| Goccy | 25128217 | 322.35 MB/s | 19016434 | 107155 | 4.5× |
+| Easyjson | 36769111 | 220.29 MB/s | 15059620 | 41643 | 3.0× |
+| LightningDecodeAny | 43597537 | 119.34 MB/s | 34333350 | 912810 | 2.6× |
+| JSONV2 | 50031355 | 161.90 MB/s | 15233721 | 78972 | 2.2× |
+| Stdlib | 112109093 | 72.25 MB/s | 15665073 | 150647 | 1.0× |
 
 ## bench/marine_ik — 2983466 byte input
 
 | Decoder | ns/op | Throughput | B/op | allocs/op | Speedup |
 |---|--:|--:|--:|--:|--:|
-| LightningDestructive | 6194862 | 481.60 MB/s | 3985336 | 30015 | 9.1× |
-| Lightning | 6406169 | 465.72 MB/s | 3985340 | 30015 | 8.8× |
-| SonicFastest | 8972643 | 332.51 MB/s | 9131945 | 57804 | 6.3× |
-| Sonic | 9022422 | 330.67 MB/s | 9131795 | 57804 | 6.3× |
-| Goccy | 18658014 | 159.90 MB/s | 9878220 | 273621 | 3.0× |
-| Easyjson | 19013711 | 156.91 MB/s | 9479440 | 30115 | 3.0× |
-| LightningDecodeAny | 20624938 | 88.93 MB/s | 20023835 | 408557 | 2.7× |
-| JSONV2 | 26603116 | 112.15 MB/s | 9257029 | 86278 | 2.1× |
-| Stdlib | 56416661 | 52.88 MB/s | 9258082 | 86317 | 1.0× |
+| Lightning | 6324603 | 471.72 MB/s | 3985339 | 30015 | 9.1× |
+| LightningDestructive | 6340665 | 470.53 MB/s | 3985336 | 30015 | 9.0× |
+| Sonic | 9258497 | 322.24 MB/s | 9131774 | 57804 | 6.2× |
+| SonicFastest | 9333510 | 319.65 MB/s | 9131304 | 57804 | 6.1× |
+| Goccy | 18551188 | 160.82 MB/s | 9845246 | 273620 | 3.1× |
+| Easyjson | 18916891 | 157.71 MB/s | 9479441 | 30115 | 3.0× |
+| LightningDecodeAny | 20952806 | 87.54 MB/s | 20023834 | 408557 | 2.7× |
+| JSONV2 | 29184986 | 102.23 MB/s | 9257069 | 86278 | 2.0× |
+| Stdlib | 57363284 | 52.01 MB/s | 9258085 | 86317 | 1.0× |
 
 ## bench/mesh — 723597 byte input
 
 | Decoder | ns/op | Throughput | B/op | allocs/op | Speedup |
 |---|--:|--:|--:|--:|--:|
-| LightningDestructive | 1438109 | 503.16 MB/s | 907394 | 3618 | 9.7× |
-| Lightning | 1516121 | 477.27 MB/s | 907386 | 3618 | 9.2× |
-| Sonic | 2130274 | 339.67 MB/s | 2373919 | 3683 | 6.6× |
-| SonicFastest | 2131384 | 339.50 MB/s | 2373041 | 3683 | 6.6× |
-| Easyjson | 5428580 | 133.29 MB/s | 2847906 | 3698 | 2.6× |
-| LightningDecodeAny | 5562953 | 116.95 MB/s | 5752202 | 80172 | 2.5× |
-| Goccy | 5584928 | 129.56 MB/s | 2728447 | 80269 | 2.5× |
-| JSONV2 | 6251233 | 115.75 MB/s | 2704701 | 7318 | 2.2× |
-| Stdlib | 13991377 | 51.72 MB/s | 2704550 | 7324 | 1.0× |
+| LightningDestructive | 1472919 | 491.27 MB/s | 907393 | 3618 | 9.6× |
+| Lightning | 1546452 | 467.91 MB/s | 907387 | 3618 | 9.2× |
+| SonicFastest | 2092179 | 345.86 MB/s | 2372464 | 3683 | 6.8× |
+| Sonic | 2092524 | 345.80 MB/s | 2373054 | 3683 | 6.8× |
+| Easyjson | 5321133 | 135.99 MB/s | 2847907 | 3698 | 2.7× |
+| Goccy | 5538248 | 130.65 MB/s | 2709251 | 80268 | 2.6× |
+| LightningDecodeAny | 5681556 | 114.51 MB/s | 5752204 | 80172 | 2.5× |
+| JSONV2 | 6303173 | 114.80 MB/s | 2704707 | 7318 | 2.2× |
+| Stdlib | 14163533 | 51.09 MB/s | 2704548 | 7324 | 1.0× |
 
 ## bench/mesh_pretty — 1577353 byte input
 
 | Decoder | ns/op | Throughput | B/op | allocs/op | Speedup |
 |---|--:|--:|--:|--:|--:|
-| Lightning | 2069943 | 762.03 MB/s | 907387 | 3618 | 9.6× |
-| LightningDestructive | 2085458 | 756.36 MB/s | 907392 | 3618 | 9.5× |
-| SonicFastest | 2472103 | 638.06 MB/s | 3230930 | 3683 | 8.0× |
-| Sonic | 2502203 | 630.39 MB/s | 3230296 | 3683 | 7.9× |
-| LightningDecodeAny | 4817704 | 156.38 MB/s | 5752199 | 80172 | 4.1× |
-| Easyjson | 6667541 | 236.57 MB/s | 2847905 | 3698 | 3.0× |
-| Goccy | 6768576 | 233.04 MB/s | 3487008 | 80262 | 2.9× |
-| JSONV2 | 6992812 | 225.57 MB/s | 2704551 | 7318 | 2.8× |
-| Stdlib | 19819673 | 79.59 MB/s | 2704550 | 7324 | 1.0× |
+| Lightning | 2034010 | 775.49 MB/s | 907386 | 3618 | 9.7× |
+| LightningDestructive | 2036545 | 774.52 MB/s | 907392 | 3618 | 9.7× |
+| SonicFastest | 2443970 | 645.41 MB/s | 3226202 | 3683 | 8.1× |
+| Sonic | 2488104 | 633.96 MB/s | 3228945 | 3683 | 7.9× |
+| LightningDecodeAny | 4799003 | 156.99 MB/s | 5752199 | 80172 | 4.1× |
+| Easyjson | 6278622 | 251.23 MB/s | 2847905 | 3698 | 3.1× |
+| Goccy | 6664789 | 236.67 MB/s | 3486209 | 80262 | 3.0× |
+| JSONV2 | 7186620 | 219.48 MB/s | 2704551 | 7318 | 2.7× |
+| Stdlib | 19725817 | 79.96 MB/s | 2704548 | 7324 | 1.0× |
 
 ## bench/numbers — 150124 byte input
 
 | Decoder | ns/op | Throughput | B/op | allocs/op | Speedup |
 |---|--:|--:|--:|--:|--:|
-| Lightning | 249709 | 601.20 MB/s | 81920 | 1 | 8.6× |
-| LightningDestructive | 259032 | 579.56 MB/s | 81920 | 1 | 8.3× |
-| Sonic | 378466 | 396.66 MB/s | 407279 | 16 | 5.7× |
-| SonicFastest | 402466 | 373.01 MB/s | 407359 | 16 | 5.3× |
-| LightningDecodeAny | 598895 | 250.66 MB/s | 746006 | 10020 | 3.6× |
-| Goccy | 1038208 | 144.60 MB/s | 329033 | 10005 | 2.1× |
-| JSONV2 | 1111125 | 135.11 MB/s | 357724 | 20 | 1.9× |
-| Stdlib | 2144082 | 70.02 MB/s | 357800 | 22 | 1.0× |
+| Lightning | 250503 | 599.29 MB/s | 81920 | 1 | 8.6× |
+| LightningDestructive | 261265 | 574.60 MB/s | 81920 | 1 | 8.3× |
+| Sonic | 429429 | 349.59 MB/s | 408077 | 16 | 5.0× |
+| SonicFastest | 430375 | 348.82 MB/s | 408449 | 16 | 5.0× |
+| LightningDecodeAny | 599621 | 250.36 MB/s | 746006 | 10020 | 3.6× |
+| Goccy | 1063755 | 141.13 MB/s | 330951 | 10005 | 2.0× |
+| JSONV2 | 1133100 | 132.49 MB/s | 357724 | 20 | 1.9× |
+| Stdlib | 2166735 | 69.29 MB/s | 357801 | 22 | 1.0× |
 
 ## bench/payload_large — 28117 byte input
 
 | Decoder | ns/op | Throughput | B/op | allocs/op | Speedup |
 |---|--:|--:|--:|--:|--:|
-| Lightning | 36054 | 779.87 MB/s | 30272 | 105 | 9.4× |
-| LightningDestructive | 37025 | 759.41 MB/s | 30144 | 103 | 9.2× |
-| SonicFastest | 58571 | 480.05 MB/s | 59467 | 83 | 5.8× |
-| Sonic | 58759 | 478.52 MB/s | 59496 | 83 | 5.8× |
-| Easyjson | 78333 | 358.94 MB/s | 32304 | 138 | 4.3× |
-| Goccy | 82264 | 341.79 MB/s | 59263 | 188 | 4.1× |
-| JSONV2 | 142026 | 197.97 MB/s | 36897 | 242 | 2.4× |
-| LightningDecodeAny | 166476 | 168.90 MB/s | 135024 | 2678 | 2.0× |
-| Stdlib | 340339 | 82.61 MB/s | 43968 | 513 | 1.0× |
+| Lightning | 34419 | 816.91 MB/s | 30272 | 105 | 10.0× |
+| LightningDestructive | 35759 | 786.30 MB/s | 30144 | 103 | 9.6× |
+| SonicFastest | 59933 | 469.14 MB/s | 59522 | 83 | 5.8× |
+| Sonic | 59961 | 468.92 MB/s | 59518 | 83 | 5.8× |
+| Goccy | 81976 | 342.99 MB/s | 59277 | 188 | 4.2× |
+| Easyjson | 82683 | 340.06 MB/s | 32304 | 138 | 4.2× |
+| JSONV2 | 134079 | 209.70 MB/s | 36897 | 242 | 2.6× |
+| LightningDecodeAny | 168929 | 166.44 MB/s | 135024 | 2678 | 2.0× |
+| Stdlib | 344967 | 81.51 MB/s | 43968 | 513 | 1.0× |
 
 ## bench/payload_medium — 2328 byte input
 
 | Decoder | ns/op | Throughput | B/op | allocs/op | Speedup |
 |---|--:|--:|--:|--:|--:|
-| Lightning | 1986 | 1172.28 MB/s | 32 | 1 | 13.1× |
-| LightningDestructive | 2056 | 1132.37 MB/s | 32 | 1 | 12.7× |
-| Sonic | 4677 | 497.80 MB/s | 3710 | 4 | 5.6× |
-| SonicFastest | 4703 | 495.03 MB/s | 3710 | 4 | 5.5× |
-| Goccy | 4853 | 479.73 MB/s | 3649 | 4 | 5.4× |
-| Easyjson | 5453 | 426.89 MB/s | 192 | 2 | 4.8× |
-| JSONV2 | 8780 | 265.13 MB/s | 1000 | 6 | 3.0× |
-| LightningDecodeAny | 10620 | 158.66 MB/s | 9960 | 195 | 2.5× |
-| Stdlib | 26045 | 89.38 MB/s | 2288 | 46 | 1.0× |
+| Lightning | 1971 | 1181.15 MB/s | 32 | 1 | 13.3× |
+| LightningDestructive | 2105 | 1106.06 MB/s | 32 | 1 | 12.4× |
+| SonicFastest | 4722 | 493.03 MB/s | 3707 | 4 | 5.5× |
+| Sonic | 4769 | 488.14 MB/s | 3709 | 4 | 5.5× |
+| Goccy | 4923 | 472.90 MB/s | 3649 | 4 | 5.3× |
+| Easyjson | 5101 | 456.39 MB/s | 192 | 2 | 5.1× |
+| JSONV2 | 8424 | 276.36 MB/s | 1000 | 6 | 3.1× |
+| LightningDecodeAny | 10652 | 158.18 MB/s | 9960 | 195 | 2.5× |
+| Stdlib | 26140 | 89.06 MB/s | 2288 | 46 | 1.0× |
 
 ## bench/payload_small — 189 byte input
 
 | Decoder | ns/op | Throughput | B/op | allocs/op | Speedup |
 |---|--:|--:|--:|--:|--:|
-| Lightning | 214 | 882.77 MB/s | 0 | 0 | 13.0× |
-| LightningDestructive | 221 | 855.72 MB/s | 0 | 0 | 12.6× |
-| Goccy | 446 | 423.71 MB/s | 304 | 2 | 6.2× |
-| Easyjson | 552 | 342.30 MB/s | 0 | 0 | 5.0× |
-| Sonic | 649 | 291.15 MB/s | 341 | 3 | 4.3× |
-| SonicFastest | 654 | 289.08 MB/s | 341 | 3 | 4.2× |
-| JSONV2 | 1072 | 176.27 MB/s | 112 | 1 | 2.6× |
-| LightningDecodeAny | 1365 | 98.20 MB/s | 1160 | 25 | 2.0× |
-| Stdlib | 2778 | 68.03 MB/s | 416 | 9 | 1.0× |
+| Lightning | 215 | 880.57 MB/s | 0 | 0 | 13.1× |
+| LightningDestructive | 225 | 841.20 MB/s | 0 | 0 | 12.5× |
+| Goccy | 433 | 436.83 MB/s | 304 | 2 | 6.5× |
+| Easyjson | 590 | 320.19 MB/s | 0 | 0 | 4.8× |
+| SonicFastest | 646 | 292.63 MB/s | 341 | 3 | 4.3× |
+| Sonic | 651 | 290.40 MB/s | 341 | 3 | 4.3× |
+| JSONV2 | 1007 | 187.66 MB/s | 112 | 1 | 2.8× |
+| LightningDecodeAny | 1363 | 98.33 MB/s | 1160 | 25 | 2.1× |
+| Stdlib | 2806 | 67.35 MB/s | 416 | 9 | 1.0× |
 
 ## bench/pretty — 2191 byte input
 
 | Decoder | ns/op | Throughput | B/op | allocs/op | Speedup |
 |---|--:|--:|--:|--:|--:|
-| Lightning | 1437 | 1524.83 MB/s | 0 | 0 | 13.1× |
-| LightningDestructive | 1501 | 1459.50 MB/s | 0 | 0 | 12.5× |
-| Easyjson | 3528 | 621.11 MB/s | 24 | 1 | 5.3× |
-| Goccy | 3866 | 566.73 MB/s | 2864 | 4 | 4.9× |
-| SonicFastest | 6477 | 338.28 MB/s | 3600 | 38 | 2.9× |
-| Sonic | 6675 | 328.24 MB/s | 3600 | 38 | 2.8× |
-| JSONV2 | 8469 | 258.71 MB/s | 640 | 6 | 2.2× |
-| LightningDecodeAny | 9236 | 196.08 MB/s | 7536 | 158 | 2.0× |
-| Stdlib | 18784 | 116.64 MB/s | 928 | 16 | 1.0× |
+| Lightning | 1491 | 1469.46 MB/s | 0 | 0 | 12.8× |
+| LightningDestructive | 1545 | 1418.10 MB/s | 0 | 0 | 12.4× |
+| Goccy | 3599 | 608.83 MB/s | 2864 | 4 | 5.3× |
+| Easyjson | 3845 | 569.81 MB/s | 24 | 1 | 5.0× |
+| SonicFastest | 6433 | 340.57 MB/s | 3597 | 38 | 3.0× |
+| Sonic | 6635 | 330.20 MB/s | 3597 | 38 | 2.9× |
+| JSONV2 | 8318 | 263.42 MB/s | 640 | 6 | 2.3× |
+| LightningDecodeAny | 9207 | 196.71 MB/s | 7536 | 158 | 2.1× |
+| Stdlib | 19129 | 114.54 MB/s | 928 | 16 | 1.0× |
 
 ## bench/random — 510476 byte input
 
 | Decoder | ns/op | Throughput | B/op | allocs/op | Speedup |
 |---|--:|--:|--:|--:|--:|
-| LightningDestructive | 697247 | 732.13 MB/s | 703779 | 1012 | 10.1× |
-| Lightning | 731880 | 697.49 MB/s | 703778 | 1012 | 9.6× |
-| Goccy | 1227235 | 415.96 MB/s | 1139585 | 5006 | 5.7× |
-| SonicFastest | 1286452 | 396.81 MB/s | 1309812 | 2014 | 5.5× |
-| Sonic | 1294194 | 394.44 MB/s | 1310242 | 2014 | 5.4× |
-| Easyjson | 1749439 | 291.79 MB/s | 863779 | 3012 | 4.0× |
-| JSONV2 | 3586505 | 142.33 MB/s | 1075955 | 12645 | 2.0× |
-| LightningDecodeAny | 3590160 | 128.54 MB/s | 2785927 | 66022 | 2.0× |
-| Stdlib | 7028343 | 72.63 MB/s | 1162118 | 16023 | 1.0× |
+| LightningDestructive | 703306 | 725.82 MB/s | 703779 | 1012 | 10.2× |
+| Lightning | 740264 | 689.59 MB/s | 703778 | 1012 | 9.7× |
+| SonicFastest | 1246923 | 409.39 MB/s | 1308037 | 2014 | 5.8× |
+| Sonic | 1249209 | 408.64 MB/s | 1308028 | 2014 | 5.8× |
+| Goccy | 1334330 | 382.57 MB/s | 1137784 | 5006 | 5.4× |
+| Easyjson | 1710689 | 298.40 MB/s | 863778 | 3012 | 4.2× |
+| JSONV2 | 3521556 | 144.96 MB/s | 1075957 | 12645 | 2.0× |
+| LightningDecodeAny | 3686644 | 125.17 MB/s | 2785927 | 66022 | 2.0× |
+| Stdlib | 7199487 | 70.90 MB/s | 1162118 | 16023 | 1.0× |
 
 ## bench/skip-heavy — 19789 byte input
 
 | Decoder | ns/op | Throughput | B/op | allocs/op | Speedup |
 |---|--:|--:|--:|--:|--:|
-| Lightning | 641 | 30860.68 MB/s | 0 | 0 | 254.2× |
-| LightningDestructive | 964 | 20530.99 MB/s | 0 | 0 | 169.1× |
-| SonicFastest | 6767 | 2924.25 MB/s | 21121 | 3 | 24.1× |
-| Goccy | 24379 | 811.72 MB/s | 20492 | 2 | 6.7× |
-| Sonic | 32121 | 616.08 MB/s | 20621 | 3 | 5.1× |
-| JSONV2 | 33769 | 586.01 MB/s | 8 | 1 | 4.8× |
-| LightningDecodeAny | 102142 | 193.73 MB/s | 117104 | 2019 | 1.6× |
-| Easyjson | 104768 | 188.88 MB/s | 0 | 0 | 1.6× |
-| Stdlib | 163001 | 121.40 MB/s | 240 | 6 | 1.0× |
+| Lightning | 643 | 30767.08 MB/s | 0 | 0 | 253.1× |
+| LightningDestructive | 942 | 20998.79 MB/s | 0 | 0 | 172.7× |
+| SonicFastest | 6515 | 3037.54 MB/s | 21119 | 3 | 25.0× |
+| Goccy | 29370 | 673.79 MB/s | 20492 | 2 | 5.5× |
+| Sonic | 32507 | 608.76 MB/s | 20631 | 3 | 5.0× |
+| JSONV2 | 33260 | 594.97 MB/s | 8 | 1 | 4.9× |
+| Easyjson | 101945 | 194.11 MB/s | 0 | 0 | 1.6× |
+| LightningDecodeAny | 103872 | 190.50 MB/s | 117104 | 2019 | 1.6× |
+| Stdlib | 162781 | 121.57 MB/s | 240 | 6 | 1.0× |
 
 ## bench/string_unicode — 18124 byte input
 
 | Decoder | ns/op | Throughput | B/op | allocs/op | Speedup |
 |---|--:|--:|--:|--:|--:|
-| Lightning | 2198 | 8244.41 MB/s | 432 | 2 | 54.2× |
-| LightningDestructive | 2550 | 7108.46 MB/s | 0 | 0 | 46.7× |
-| Easyjson | 4769 | 3800.11 MB/s | 432 | 2 | 25.0× |
-| SonicFastest | 8261 | 2193.86 MB/s | 20446 | 5 | 14.4× |
-| Sonic | 8308 | 2181.52 MB/s | 20430 | 5 | 14.3× |
-| LightningDecodeAny | 18952 | 943.56 MB/s | 29088 | 191 | 6.3× |
-| Goccy | 24666 | 734.77 MB/s | 19460 | 2 | 4.8× |
-| JSONV2 | 49131 | 368.89 MB/s | 16500 | 50 | 2.4× |
-| Stdlib | 119025 | 152.27 MB/s | 19320 | 67 | 1.0× |
+| Lightning | 2210 | 8200.76 MB/s | 432 | 2 | 58.0× |
+| LightningDestructive | 2549 | 7109.49 MB/s | 0 | 0 | 50.3× |
+| Easyjson | 5012 | 3615.97 MB/s | 432 | 2 | 25.6× |
+| Sonic | 9655 | 1877.22 MB/s | 20394 | 5 | 13.3× |
+| SonicFastest | 10224 | 1772.72 MB/s | 20382 | 5 | 12.5× |
+| LightningDecodeAny | 19247 | 929.08 MB/s | 29088 | 191 | 6.7× |
+| Goccy | 23251 | 779.51 MB/s | 19460 | 2 | 5.5× |
+| JSONV2 | 51705 | 350.53 MB/s | 16500 | 50 | 2.5× |
+| Stdlib | 128104 | 141.48 MB/s | 19320 | 67 | 1.0× |
 
 ## bench/synthea_fhir — 2008494 byte input
 
 | Decoder | ns/op | Throughput | B/op | allocs/op | Speedup |
 |---|--:|--:|--:|--:|--:|
-| LightningDestructive | 2296508 | 874.59 MB/s | 2960389 | 7411 | 9.6× |
-| Lightning | 2463833 | 815.19 MB/s | 2962101 | 7417 | 8.9× |
-| SonicFastest | 4044309 | 496.62 MB/s | 5155590 | 7085 | 5.4× |
-| Sonic | 4132948 | 485.97 MB/s | 5155408 | 7085 | 5.3× |
-| Goccy | 4697061 | 427.61 MB/s | 5411451 | 15832 | 4.7× |
-| Easyjson | 5212917 | 385.29 MB/s | 2981488 | 7439 | 4.2× |
-| LightningDecodeAny | 7093762 | 161.03 MB/s | 7386073 | 134751 | 3.1× |
-| JSONV2 | 7668711 | 261.91 MB/s | 3173683 | 14563 | 2.9× |
-| Stdlib | 22003220 | 91.28 MB/s | 3589318 | 29340 | 1.0× |
+| LightningDestructive | 2276399 | 882.31 MB/s | 2960389 | 7411 | 9.8× |
+| Lightning | 2408764 | 833.83 MB/s | 2962103 | 7417 | 9.2× |
+| SonicFastest | 4222816 | 475.63 MB/s | 5155451 | 7085 | 5.3× |
+| Sonic | 4341127 | 462.67 MB/s | 5154867 | 7085 | 5.1× |
+| Goccy | 4876908 | 411.84 MB/s | 5411622 | 15833 | 4.6× |
+| Easyjson | 5786720 | 347.09 MB/s | 2981492 | 7439 | 3.8× |
+| LightningDecodeAny | 7271817 | 157.08 MB/s | 7386076 | 134751 | 3.1× |
+| JSONV2 | 7804955 | 257.34 MB/s | 3173678 | 14563 | 2.9× |
+| Stdlib | 22259815 | 90.23 MB/s | 3589316 | 29340 | 1.0× |
 
 ## bench/time-array — 549 byte input
 
 | Decoder | ns/op | Throughput | B/op | allocs/op | Speedup |
 |---|--:|--:|--:|--:|--:|
-| Lightning | 852 | 644.29 MB/s | 480 | 1 | 8.0× |
-| LightningDestructive | 859 | 638.84 MB/s | 480 | 1 | 7.9× |
-| LightningDecodeAny | 2212 | 247.71 MB/s | 2261 | 50 | 3.1× |
-| Easyjson | 2262 | 242.67 MB/s | 1616 | 5 | 3.0× |
-| SonicFastest | 2397 | 229.02 MB/s | 2261 | 8 | 2.8× |
-| Sonic | 2410 | 227.76 MB/s | 2260 | 8 | 2.8× |
-| Goccy | 3401 | 161.43 MB/s | 2128 | 43 | 2.0× |
-| JSONV2 | 3532 | 155.42 MB/s | 1664 | 7 | 1.9× |
-| Stdlib | 6789 | 80.87 MB/s | 1896 | 12 | 1.0× |
+| Lightning | 855 | 642.14 MB/s | 480 | 1 | 8.0× |
+| LightningDestructive | 856 | 641.27 MB/s | 480 | 1 | 8.0× |
+| LightningDecodeAny | 2161 | 253.53 MB/s | 2261 | 50 | 3.2× |
+| SonicFastest | 2378 | 230.90 MB/s | 2260 | 8 | 2.9× |
+| Easyjson | 2387 | 229.98 MB/s | 1616 | 5 | 2.9× |
+| Sonic | 2411 | 227.73 MB/s | 2260 | 8 | 2.8× |
+| Goccy | 3356 | 163.57 MB/s | 2128 | 43 | 2.0× |
+| JSONV2 | 3634 | 151.08 MB/s | 1664 | 7 | 1.9× |
+| Stdlib | 6842 | 80.24 MB/s | 1896 | 12 | 1.0× |
 
 ## bench/twitter_status — 631514 byte input
 
 | Decoder | ns/op | Throughput | B/op | allocs/op | Speedup |
 |---|--:|--:|--:|--:|--:|
-| LightningDestructive | 502810 | 1255.97 MB/s | 364473 | 566 | 12.6× |
-| Lightning | 569453 | 1108.98 MB/s | 413001 | 878 | 11.1× |
-| SonicFastest | 1003163 | 629.52 MB/s | 1071054 | 814 | 6.3× |
-| Sonic | 1003944 | 629.03 MB/s | 1071084 | 814 | 6.3× |
-| Goccy | 1274395 | 495.54 MB/s | 987012 | 1200 | 5.0× |
-| Easyjson | 1390575 | 454.14 MB/s | 422504 | 936 | 4.5× |
-| JSONV2 | 2384579 | 264.83 MB/s | 571590 | 3144 | 2.7× |
-| LightningDecodeAny | 2502526 | 186.57 MB/s | 2010197 | 30295 | 2.5× |
-| Stdlib | 6324828 | 99.85 MB/s | 654665 | 6472 | 1.0× |
+| LightningDestructive | 503228 | 1254.93 MB/s | 364472 | 566 | 12.8× |
+| Lightning | 582020 | 1085.04 MB/s | 413001 | 878 | 11.0× |
+| Sonic | 1036129 | 609.49 MB/s | 1071956 | 814 | 6.2× |
+| SonicFastest | 1043407 | 605.24 MB/s | 1071998 | 814 | 6.2× |
+| Easyjson | 1309806 | 482.14 MB/s | 422504 | 936 | 4.9× |
+| Goccy | 1414193 | 446.55 MB/s | 987463 | 1200 | 4.5× |
+| JSONV2 | 2313320 | 272.99 MB/s | 571591 | 3144 | 2.8× |
+| LightningDecodeAny | 2554810 | 182.76 MB/s | 2010197 | 30295 | 2.5× |
+| Stdlib | 6419484 | 98.37 MB/s | 654665 | 6472 | 1.0× |
 
 ## bench/twitterescaped — 562408 byte input
 
 | Decoder | ns/op | Throughput | B/op | allocs/op | Speedup |
 |---|--:|--:|--:|--:|--:|
-| LightningDestructive | 821939 | 684.25 MB/s | 544249 | 448 | 7.3× |
-| Lightning | 1009295 | 557.23 MB/s | 767621 | 1254 | 5.9× |
-| Sonic | 1267108 | 443.85 MB/s | 1348849 | 1185 | 4.7× |
-| SonicFastest | 1302499 | 431.79 MB/s | 1350278 | 1185 | 4.6× |
-| Goccy | 1479138 | 380.23 MB/s | 1040847 | 1028 | 4.0× |
-| Easyjson | 2154962 | 260.98 MB/s | 775154 | 1254 | 2.8× |
-| LightningDecodeAny | 3110095 | 180.83 MB/s | 2114150 | 30295 | 1.9× |
-| JSONV2 | 3156358 | 178.18 MB/s | 927407 | 3482 | 1.9× |
-| Stdlib | 5985895 | 93.96 MB/s | 1011668 | 6763 | 1.0× |
+| LightningDestructive | 818185 | 687.38 MB/s | 544249 | 448 | 7.4× |
+| Lightning | 1038821 | 541.39 MB/s | 767622 | 1254 | 5.8× |
+| Sonic | 1290535 | 435.79 MB/s | 1348753 | 1185 | 4.7× |
+| SonicFastest | 1308897 | 429.68 MB/s | 1349307 | 1185 | 4.6× |
+| Goccy | 1644597 | 341.97 MB/s | 1039903 | 1028 | 3.7× |
+| Easyjson | 2152681 | 261.26 MB/s | 775154 | 1254 | 2.8× |
+| LightningDecodeAny | 3143147 | 178.93 MB/s | 2114150 | 30295 | 1.9× |
+| JSONV2 | 3204643 | 175.50 MB/s | 927407 | 3482 | 1.9× |
+| Stdlib | 6072610 | 92.61 MB/s | 1011668 | 6763 | 1.0× |
 
 ## bench/update_center — 533178 byte input
 
 | Decoder | ns/op | Throughput | B/op | allocs/op | Speedup |
 |---|--:|--:|--:|--:|--:|
-| LightningDestructive | 607193 | 878.10 MB/s | 333416 | 2084 | 10.3× |
-| Lightning | 692532 | 769.90 MB/s | 368224 | 2293 | 9.0× |
-| Sonic | 1110567 | 480.10 MB/s | 982078 | 3082 | 5.6× |
-| SonicFastest | 1119155 | 476.41 MB/s | 982183 | 3082 | 5.6× |
-| Easyjson | 1261352 | 422.70 MB/s | 428362 | 3273 | 4.9× |
-| Goccy | 1494593 | 356.74 MB/s | 1167080 | 5409 | 4.2× |
-| JSONV2 | 2865319 | 186.08 MB/s | 745422 | 13288 | 2.2× |
-| LightningDecodeAny | 3487585 | 152.88 MB/s | 2674617 | 50596 | 1.8× |
-| Stdlib | 6241825 | 85.42 MB/s | 798692 | 17133 | 1.0× |
+| LightningDestructive | 624299 | 854.04 MB/s | 333416 | 2084 | 10.3× |
+| Lightning | 705851 | 755.37 MB/s | 368224 | 2293 | 9.1× |
+| Sonic | 1113205 | 478.96 MB/s | 980851 | 3082 | 5.8× |
+| SonicFastest | 1113231 | 478.95 MB/s | 980970 | 3082 | 5.8× |
+| Easyjson | 1327003 | 401.79 MB/s | 428362 | 3273 | 4.8× |
+| Goccy | 1426198 | 373.85 MB/s | 1167074 | 5408 | 4.5× |
+| JSONV2 | 2840602 | 187.70 MB/s | 745421 | 13288 | 2.3× |
+| LightningDecodeAny | 3553237 | 150.05 MB/s | 2674617 | 50596 | 1.8× |
+| Stdlib | 6408744 | 83.20 MB/s | 798692 | 17133 | 1.0× |
