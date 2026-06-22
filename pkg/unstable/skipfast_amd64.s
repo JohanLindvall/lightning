@@ -37,38 +37,46 @@ DATA mbRbrack<>+16(SB)/8, $0x5d5d5d5d5d5d5d5d
 DATA mbRbrack<>+24(SB)/8, $0x5d5d5d5d5d5d5d5d
 GLOBL mbRbrack<>(SB), RODATA|NOPTR, $32
 
-// func maskBlock(b []byte) (quote, bslash, lbrace, rbrace, lbrack, rbrack uint32)
+// func maskBlock(b []byte, isArray bool) (quote, bslash, open, close uint64)
 //
-// Returns, for the 32 bytes at b[:32], the bitmap of each of '"' '\\' '{' '}'
-// '[' ']' (bit j set when b[j] is that byte). AVX2; the caller guarantees 32
-// readable bytes.
-TEXT ·maskBlock(SB), NOSPLIT, $0-48
-	MOVQ    b_base+0(FP), SI
-	VMOVDQU (SI), Y0
-	VMOVDQU mbQuote<>(SB), Y2
-	VMOVDQU mbBslash<>(SB), Y3
-	VMOVDQU mbLbrace<>(SB), Y4
-	VMOVDQU mbRbrace<>(SB), Y5
-	VMOVDQU mbLbrack<>(SB), Y6
-	VMOVDQU mbRbrack<>(SB), Y7
+// Returns, for the 64 bytes at b[:64], the bitmap of `"`, `\\`, and the
+// container's open/close brackets — `[`/`]` when isArray, else `{`/`}`; bit j set
+// when b[j] is that byte. AVX2; the caller guarantees 64 readable bytes. Each
+// uint64 is the low 32-byte half's 32-bit movemask in bits 0-31 and the high
+// half's in bits 32-63.
+//
+// CLASS computes one class: compare both 32-byte halves against splat \s, combine
+// the two movemasks into a uint64, and store at frame offset \off.
+#define CLASS(s, off) \
+	VPCMPEQB  s, Y0, Y2          \
+	VPMOVMSKB Y2, AX             \
+	VPCMPEQB  s, Y1, Y3          \
+	VPMOVMSKB Y3, BX             \
+	SHLQ      $32, BX            \
+	ORQ       BX, AX             \
+	MOVQ      AX, off(FP)
 
-	VPCMPEQB  Y2, Y0, Y8
-	VPMOVMSKB Y8, AX
-	MOVL      AX, quote+24(FP)
-	VPCMPEQB  Y3, Y0, Y8
-	VPMOVMSKB Y8, AX
-	MOVL      AX, bslash+28(FP)
-	VPCMPEQB  Y4, Y0, Y8
-	VPMOVMSKB Y8, AX
-	MOVL      AX, lbrace+32(FP)
-	VPCMPEQB  Y5, Y0, Y8
-	VPMOVMSKB Y8, AX
-	MOVL      AX, rbrace+36(FP)
-	VPCMPEQB  Y6, Y0, Y8
-	VPMOVMSKB Y8, AX
-	MOVL      AX, lbrack+40(FP)
-	VPCMPEQB  Y7, Y0, Y8
-	VPMOVMSKB Y8, AX
-	MOVL      AX, rbrack+44(FP)
+TEXT ·maskBlock(SB), NOSPLIT, $0-64
+	MOVQ    b_base+0(FP), SI
+	VMOVDQU (SI), Y0            // bytes 0-31
+	VMOVDQU 32(SI), Y1          // bytes 32-63
+	VMOVDQU mbQuote<>(SB), Y10
+	VMOVDQU mbBslash<>(SB), Y11
+	// Select the container's bracket splats: '['/']' for an array, else '{'/'}'.
+	MOVBLZX isArray+24(FP), AX
+	TESTL   AX, AX
+	JNZ     arrayBrackets
+	VMOVDQU mbLbrace<>(SB), Y12
+	VMOVDQU mbRbrace<>(SB), Y13
+	JMP     haveBrackets
+arrayBrackets:
+	VMOVDQU mbLbrack<>(SB), Y12
+	VMOVDQU mbRbrack<>(SB), Y13
+haveBrackets:
+	CLASS(Y10, quote+32)
+	CLASS(Y11, bslash+40)
+	CLASS(Y12, open+48)
+	CLASS(Y13, close+56)
+
 	VZEROUPPER
 	RET

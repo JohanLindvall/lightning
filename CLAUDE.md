@@ -228,9 +228,24 @@ byte-identical when adding cold paths; push new logic out-of-line.
   `skipfast_arm64.s`, the sonic-rs `skip_container` / JSONSki technique). `SkipValue`
   used to land on each structural byte with `indexStructural` and call `SkipString`
   *per string*, so skipping a string-heavy container paid N calls. `skipContainerFast`
-  instead streams 32-byte blocks: `maskBlock` (AVX2 / NEON) returns the per-byte
-  bitmaps of `" \ { } [ ]`; `findEscaped32` (simdjson's branchless odd-run detection)
-  + `prefixXor32` (the carryless-multiply-by-ones done in five shift/XORs — **no
+  instead streams **64-byte** blocks: `maskBlock` (AVX2 / NEON) returns four uint64
+  bitmaps — `"`, `\`, and only the container's *own* open/close brackets (it is told
+  which via an `isArray` arg and branches to the `{`/`}` or `[`/`]` splats, so a
+  stray bracket of the other type is never counted — matching `skipObject`/
+  `skipArray` so the SIMD and scalar paths never diverge). 64 bytes/call (vs an
+  earlier 32) halves the call/marshal/`VZEROUPPER` overhead and the
+  `findEscaped`/`prefixXor` frequency; computing only 4 classes (not 6) cuts the
+  per-block movemasks 12→8. A direct A/B (both builds 4-mask type-selected, only the
+  block size differing) measured **64-byte ~5% faster than 32-byte** on amd64
+  `GetSkipHeavy` (12.33 vs 12.95 µs, p=0.000): the fixed per-call costs outweigh
+  64-byte's extra 32-byte load + the `SHLQ`/`ORQ` that folds two 32-bit movemasks
+  into a uint64. (**asm gotcha**: `go vet` asmdecl does *not* validate `maskBlock`'s
+  result offsets — a 32-byte `uint32`-return build silently miscounted because Go
+  8-aligns the result block *after the `isArray bool` arg*, so the first return sits
+  at +32, not +28. Verify `maskBlock`'s masks with a direct dump if you touch the
+  signature; the live 64-byte form returns `uint64`s, which are 8-aligned anyway.)
+  `findEscaped64` (simdjson's branchless odd-run detection)
+  + `prefixXor64` (the carryless-multiply-by-ones done in six shift/XORs — **no
   PCLMULQDQ**, so the bit math is plain Go) build the *inside-string* mask; the
   bracket bitmaps are masked to bytes outside strings and balanced. Strings (keys and
   values) are absorbed into the bulk scan — no per-string call. **`SkipValue` is the
@@ -261,8 +276,10 @@ byte-identical when adding cold paths; push new logic out-of-line.
   ~48% of `BenchmarkGetSkipHeavy` and the fold cut it to ~29%, **−28% end-to-end on that
   benchmark** (30.8→22.2 µs, +39% B/s) and **−30% geomean** across the
   `BenchmarkSkipContainer` shapes (string/number objects and nested records each ≈ −39%,
-  scalar arrays flat since they stay on the `indexStructural` path). The fold keeps the
-  same six-mask `maskBlock` signature, so only `skipfast_arm64.s` changed.
+  scalar arrays flat since they stay on the `indexStructural` path). The fold was made
+  at the then-current six-mask/32-byte `maskBlock`; the routine has since moved to four
+  type-selected masks over a 64-byte block (see the head of this entry), so these M2
+  numbers predate that change and want a re-measure on real arm64.
 
 ## The inline trick — let the generator write hot bodies inline
 

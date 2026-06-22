@@ -8,9 +8,10 @@ package unstable
 // stays on the latter.
 var fastSkipAvail = useAVX2
 
-// maskBlock returns the character-class bitmaps for b[:32] (see skipfast.go).
-// AVX2 implementation in skipfast_amd64.s. NOTE (prototype): assumes AVX2; gate
-// on useAVX2 before productionizing.
+// maskBlock returns the character-class bitmaps for b[:64] (see skipfast.go):
+// quote, backslash, and the container's own open/close brackets (`[`/`]` when
+// isArray, else `{`/`}`). AVX2 implementation in skipfast_amd64.s; used only when
+// fastSkipAvail (AVX2 present).
 //
 //go:noescape
-func maskBlock(b []byte) (quote, bslash, lbrace, rbrace, lbrack, rbrack uint32)
+func maskBlock(b []byte, isArray bool) (quote, bslash, open, close uint64)
