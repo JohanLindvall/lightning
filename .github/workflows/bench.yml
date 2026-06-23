@@ -39,7 +39,11 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: results-${{ matrix.arch }}
-          path: bench/results_${{ matrix.arch }}.md
+          # Both per-arch summaries: the competitor comparison (results_<arch>.md)
+          # and the main-module microbenchmarks (pkg_results_<arch>.md).
+          path: |
+            bench/results_${{ matrix.arch }}.md
+            bench/pkg_results_${{ matrix.arch }}.md
 
   # Collect both architectures' results and commit them in a single push. The
   # [skip ci] marker keeps this commit from triggering the push-driven CI workflow.
@@ -57,14 +61,17 @@ jobs:
       - name: Commit results
         run: |
           set -euo pipefail
-          find artifacts -name 'results_amd64.md' -exec cp {} bench/ \;
-          find artifacts -name 'results_arm64.md' -exec cp {} bench/ \;
+          find artifacts -name 'results_amd64.md'     -exec cp {} bench/ \;
+          find artifacts -name 'results_arm64.md'     -exec cp {} bench/ \;
+          find artifacts -name 'pkg_results_amd64.md' -exec cp {} bench/ \;
+          find artifacts -name 'pkg_results_arm64.md' -exec cp {} bench/ \;
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          if git diff --quiet -- bench/results_amd64.md bench/results_arm64.md; then
+          files="bench/results_amd64.md bench/results_arm64.md bench/pkg_results_amd64.md bench/pkg_results_arm64.md"
+          if git diff --quiet -- $files; then
             echo "Benchmark results unchanged; nothing to commit."
             exit 0
           fi
-          git add bench/results_amd64.md bench/results_arm64.md
+          git add $files
           git commit -m "Update benchmark results [skip ci]"
           git push

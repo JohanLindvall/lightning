@@ -32,15 +32,20 @@ BENCHCOUNT="${BENCHCOUNT:-1}"
 	echo
 } > "$RESULTS"
 
-# -run='^$' disables the unit tests so only benchmarks run; ./... covers every
-# package in the main module (the bench/ comparison suite is a separate module and
-# is not matched). A named benchmark filter can be passed as the first argument.
+# -run='^$' disables the unit tests so only benchmarks run. The target is ./pkg/...,
+# not ./..., on purpose: every main-module Benchmark* lives under pkg/ (pkg/json,
+# pkg/unstable), and the other packages (conformance, the root generator) import
+# *generated* decoders that are gitignored — absent on a fresh checkout (e.g. CI,
+# which does not `make generate` before benchmarking), so `go test ./...` would fail
+# to build them and report a benchmark failure even though no benchmark ran there.
+# The bench/ comparison suite is a separate module and is not matched either way. A
+# named benchmark filter can be passed as the first argument.
 #
 # -timeout=0 disables Go's default 10-minute test timeout: at a long BENCHTIME the
-# whole suite (dozens of sub-benchmarks in one `go test ./...` run) easily exceeds
-# 10 minutes and would otherwise be killed mid-run and reported as a failure.
+# whole suite (dozens of sub-benchmarks in one `go test` run) easily exceeds 10
+# minutes and would otherwise be killed mid-run and reported as a failure.
 status=0
-if go test -run='^$' -bench="${1:-.}" -benchmem -timeout=0 -benchtime="$BENCHTIME" -count="$BENCHCOUNT" ./... >> "$RESULTS" 2>&1; then
+if go test -run='^$' -bench="${1:-.}" -benchmem -timeout=0 -benchtime="$BENCHTIME" -count="$BENCHCOUNT" ./pkg/... >> "$RESULTS" 2>&1; then
 	echo "  ok"
 else
 	echo "  benchmark failed (see ${RESULTS})" >&2
