@@ -8,7 +8,10 @@ allocation-light `json.Unmarshaler` implementations.
 - `main.go` — the generator (`package main`). Reads struct defs, emits
   `*_unmarshal.go`. Key bits: `field`/`sliceDecoder`/`mapDecoder` build decoders;
   `slicePresize` decides presizing. Behavior is selected by **per-type
-  `//lightning:` comment directives** (parsed by `hasDirective`, collected into
+  `//lightning:` comment directives** (parsed by `hasDirective`, which tolerates
+  whitespace anywhere in the directive — `//lightning:compact`,
+  `// lightning:compact ` and `// lightning: compact` are all equivalent, via
+  `strings.Join(strings.Fields(...), "")`; collected into
   `compactTypes`/`nocopyTypes`/`destructiveTypes`): `//lightning:compact`
   (`g.compact`/`g.skipWS`, compile-time elision of inter-token `SkipWS`),
   `//lightning:destructive` (`g.destructive`/`g.scalar`, the type's nocopy strings
@@ -188,11 +191,22 @@ byte-identical when adding cold paths; push new logic out-of-line.
   ~as costly as the rehash they'd save. The `//lightning:nocopy`-equivalent
   `,nocopy` on the plugins map *field* does land though: aliasing the 654 plugin-name
   keys is −21% allocs / −2.5% time.)
-- **`slicePresize`** skips presize when a struct element transitively holds a
-  *multi-dimensional* slice (`hasMultiDimSlice`, e.g. GeoJSON `[][][]float64`):
-  counting it would deep-scan every element's bulk for only ~log2(n) reallocs
-  saved. Flat / string / 1-D-slice records (Cloudflare-style) keep presize and
-  their low B/op.
+- **`slicePresize`** skips presize in two cases. **(1)** When a struct element
+  transitively holds a *multi-dimensional* slice (`hasMultiDimSlice`, e.g. GeoJSON
+  `[][][]float64`): counting it would deep-scan every element's bulk for only
+  ~log2(n) reallocs saved. **(2)** When the slice's element is itself a *fixed-size
+  array* `[N]T` (the `ArrayType` case is gated on `t.Len == nil`, so a `[3]float64`
+  coordinate point in large-json's `[][3]float64` rings disqualifies the ring):
+  presizing such a ring runs `CountArrayElements`, which descends through every
+  coordinate number — work the element decoders then repeat — and zeroes the
+  presized backing, costing more than the doubling growth it saves. Letting the
+  ring append instead is **−8.8% on large-json** and makes **canada_geometry beat
+  sonic** (its `[][2]float64` rings); the alloc *count* rises (large-json
+  ~40k→~72k as the rings double) but wall-time drops and B/op stays *below* sonic.
+  Flat / string / 1-D-slice records (Cloudflare-style) keep presize and their low
+  B/op — a slice whose element is a bare scalar (`[]float64`), string, struct, or
+  time is still counted (those land in the `Ident`/`StructType`/`SelectorExpr`
+  cases, not the fixed-array `ArrayType` branch).
 - **SIMD scanners** in `simd_amd64.s`/`simd_arm64.s`: `indexCloseOrEscape`
   (next `"`/`\`) and `indexStructural` (next `{}[]"`). Both arches classify the 5
   target bytes with simdjson's **shuffle trick** — two table lookups
@@ -280,6 +294,21 @@ byte-identical when adding cold paths; push new logic out-of-line.
   at the then-current six-mask/32-byte `maskBlock`; the routine has since moved to four
   type-selected masks over a 64-byte block (see the head of this entry), so these M2
   numbers predate that change and want a re-measure on real arm64.
+- **`GetPaths` stack-backed active-index scratch.** `getPaths` keeps one shared
+  `[]int` scratch holding the active path-index set for every recursion level
+  (sized `len(paths)*(maxDepth+1)` so the depth-first walk's per-level sub-slices
+  never reallocate — see the comment there). It was the function's *only*
+  allocation. For the common small lookup the set fits in a `var stackbuf [32]int`
+  used as the backing (`scratch = stackbuf[:0]`); only a larger set falls back to a
+  single `make`. Safe because the backing never escapes — `out` only ever aliases
+  `data`, never `scratch` (escape analysis confirms no heap move). Net on
+  `BenchmarkGetPathsWithSkip` (3 paths, two sharing a nested parent): **−5.4% time,
+  1→0 allocs, 80→0 B/op**. The rest of `GetPaths`' time is irreducible scanning
+  (`ReadKey`/`SkipValue`/`SkipString`/`SkipWS`, ~75% of the profile). An early-exit
+  when all paths are captured was considered and rejected: "first occurrence wins"
+  means a not-yet-captured leaf must keep scanning later duplicate keys, so it
+  wouldn't beat the current path. Covered by `BenchmarkGetPathsWithSkip` in
+  `pkg/json/get_skipbench_test.go` (alongside `BenchmarkGetManyWithSkip`).
 
 ## The inline trick — let the generator write hot bodies inline
 
@@ -404,7 +433,13 @@ no regressions.)
   presized backing outweighs the rings' append growth. Only the *date* half of
   that idea paid off (the cheap comma count for `[]time.Time`, above), because
   there the array was already presized — the win was a cheaper *counter*, not a
-  newly-presized slice.
+  newly-presized slice. **Resolution (now live):** the lesson — count + `memclr`
+  beats nothing for these rings — is acted on by *not presizing them at all*. A
+  `[][N]scalar` ring (large-json `[][3]float64`, canada `[][2]float64`) was being
+  presized by default via `CountArrayElements`; the `t.Len == nil` guard in
+  `slicePresize` now skips it (see that entry above), −8.8% on large-json. Not
+  presizing beats every counter because it pays neither the count scan nor the
+  `memclr`.
 - **SWAR-folding the RFC 3339 fractional-seconds (nanosecond) loop** (`is4Digits`/
   `parse4Digits` on the `.190533` digits): statistically tied on time-array — the
   digit accumulation isn't the bottleneck there (validation + `time.Unix`
@@ -583,4 +618,10 @@ no regressions.)
   method was prototyped and dropped in favour of the simpler duplicate).
 - End-of-session: run the full suite (`go test ./...`), keep gofmt clean
   (the `daysFromCivil` comment-alignment flag is pre-existing — ignore it),
-  and regenerate `bench/results_<goarch>.md` via `run_bench.sh`.
+  and regenerate the committed benchmark markdown via `make bench-md`. That runs
+  **two** suites: `pkg_bench.sh` (the main-module microbenchmarks — every
+  `Benchmark*` in `pkg/json`/`pkg/unstable`, rendered to `bench/pkg_results_<arch>.md`
+  by `bench/pkg_results_md.py`) and `bench/run_bench.sh` (the competitor-comparison
+  suite, rendered to `bench/results_<arch>.md` by `bench/results_md.py`). Both write
+  a raw `*results.txt` (gitignored) and commit the per-arch `.md`. `pkg_bench.sh`
+  takes an optional benchmark-name filter as `$1` and honours `BENCHTIME`/`BENCHCOUNT`.

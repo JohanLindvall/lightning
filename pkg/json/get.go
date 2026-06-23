@@ -75,9 +75,13 @@ func getMany(data []byte, keys []string, out [][]byte, compact bool) ([][]byte, 
 		// Distribute this member to every requested key it matches that is still
 		// unset, so the first occurrence in the document wins and duplicate
 		// entries in keys are all filled. Key sets are small, so the linear scan
-		// is cheaper than building a map.
+		// is cheaper than building a map. The string compare is tested before the
+		// out[n] == nil guard: k == key fails on a length mismatch for almost
+		// every member (the document keys rarely match a requested length), so
+		// leading with it skips the out[n] slice-header load and its bounds check
+		// on the overwhelmingly common non-matching member.
 		for n, k := range keys {
-			if out[n] == nil && k == key {
+			if k == key && out[n] == nil {
 				out[n] = data[start:end]
 				found++
 			}
@@ -144,7 +148,18 @@ func getPaths(data []byte, paths [][]string, out [][]byte, compact bool) ([][]by
 			maxDepth = len(p)
 		}
 	}
-	scratch := make([]int, 0, len(paths)*(maxDepth+1))
+	// The shared active-index scratch is len(paths)*(maxDepth+1) ints. For the common
+	// small lookup that fits in a stack array, avoiding the heap allocation entirely;
+	// larger sets fall back to a single make. The backing does not escape — out only
+	// ever aliases data, never scratch.
+	var stackbuf [32]int
+	need := len(paths) * (maxDepth + 1)
+	var scratch []int
+	if need <= len(stackbuf) {
+		scratch = stackbuf[:0]
+	} else {
+		scratch = make([]int, 0, need)
+	}
 	// An empty path selects the whole root value; everything else needs an object to
 	// descend and joins the depth-0 active set.
 	rootCaptured := false

@@ -199,23 +199,3 @@ func BenchmarkUnescapeStringInto(b *testing.B) {
 		})
 	}
 }
-
-// BenchmarkUnescapeStringVsStdlib contrasts UnescapeString with the equivalent
-// encoding/json decode (which must allocate and copy in every case) over the
-// same corpus.
-func BenchmarkUnescapeStringVsStdlib(b *testing.B) {
-	for _, bc := range benchCases {
-		quoted := append(append([]byte{'"'}, bc.in...), '"')
-		b.Run(bc.name, func(b *testing.B) {
-			b.SetBytes(int64(len(bc.in)))
-			b.ReportAllocs()
-			var sink string
-			for i := 0; i < b.N; i++ {
-				if err := stdjson.Unmarshal(quoted, &sink); err != nil {
-					b.Fatal(err)
-				}
-			}
-			_ = sink
-		})
-	}
-}

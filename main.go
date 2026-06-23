@@ -239,13 +239,19 @@ func (g *gen) uniq(base string) string {
 // //<name> directive on its own line — e.g. //lightning:compact. Both the type
 // spec's doc and the enclosing GenDecl's doc are checked, so the directive may sit
 // above the type inside a `type (...)` block or above a standalone `type X`.
+//
+// Whitespace anywhere in the directive is ignored: a space after the //, a
+// trailing space, or spaces around the colon are all tolerated, so
+// "//lightning:compact", "// lightning:compact " and "// lightning: compact" are
+// equivalent. strings.Fields splits on any run of whitespace and joining the
+// pieces with "" collapses it all away before the comparison.
 func hasDirective(name string, groups ...*ast.CommentGroup) bool {
 	for _, cg := range groups {
 		if cg == nil {
 			continue
 		}
 		for _, c := range cg.List {
-			if strings.TrimSpace(strings.TrimPrefix(c.Text, "//")) == name {
+			if strings.Join(strings.Fields(strings.TrimPrefix(c.Text, "//")), "") == name {
 				return true
 			}
 		}

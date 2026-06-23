@@ -19,8 +19,10 @@ bench/*/data_destructive.go
 # easyjson sub-packages: the copied struct and the easyjson output are both generated
 bench/*/ej/
 
-# Benchmark output (machine-specific timings; regenerated each run)
+# Benchmark output (machine-specific timings; regenerated each run). The raw .txt
+# of each suite is ignored; the rendered per-arch .md summaries are committed.
 bench/results.txt
+bench/pkg_results.txt
 
 # Inputs fetched on demand: each case below ships a committed input.url that
 # run_bench.sh downloads (and gunzips) into input.json when absent -- the ~8 MB
