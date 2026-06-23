@@ -54,6 +54,11 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v7
+        # Check out the dispatched branch at its current tip (a real branch, not the
+        # trigger SHA in detached HEAD) so the results commit lands on — and pushes
+        # back to — the branch the workflow was run against, not the default branch.
+        with:
+          ref: ${{ github.ref_name }}
       - name: Download results
         uses: actions/download-artifact@v8
         with:
@@ -74,4 +79,6 @@ jobs:
           fi
           git add $files
           git commit -m "Update benchmark results [skip ci]"
-          git push
+          # Push explicitly to the dispatched branch (not the implicit upstream,
+          # which is how earlier runs landed results on main).
+          git push origin HEAD:${{ github.ref_name }}
