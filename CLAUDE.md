@@ -332,6 +332,20 @@ rare/hard case. See `g.skipWS` and `g.readKey` in `main.go`:
 Why it beats making the pkg/unstable funcs inlinable: the cheap common case skips the
 call entirely, and the shared scanner keeps its tuned dispatch.
 
+The same trick applies by hand in **`StripDefaults`** (`pkg/json/strip_defaults.go`),
+whose hot `handle` reads a key and a value string per object member — `SkipString`
+was ~40% cumulative in the profile, all of it call frames since `SkipString`'s loop
+keeps it un-inlinable. Each of the three `SkipString` call sites (key, value,
+top-level string) now emits the no-escape close-quote scan inline —
+`rest := in[i+1:]; k := unstable.IndexCloseOrEscape(rest); end := i+k+2` with a
+`rest[k] == '"'` test — and falls back to `unstable.SkipString` only for an escaped
+or truncated string. `IndexCloseOrEscape` inlines into the (never-inlined, recursive)
+`handle` at all three sites; a helper wrapping the scan did **not** work — it costs
+102 > the 80 budget once the SIMD scan inlines into it, so it stays a call frame just
+like `SkipString` (the scan must inline *directly* into the big caller). Net:
+**StripDefaults −10.5%, StripDefaultsCompact −12.0%** (geomean −11.3%), still zero
+allocs. Covered by `BenchmarkStripDefaults`/`BenchmarkStripDefaultsCompact`.
+
 **Scope it to once-per-loop reads.** `skipWS`/`readKey` fire once per object member,
 so the inline block stays small. Inlining a *per-field* read (e.g. string values)
 emits the block once per struct field, which bloats a wide struct's decoder

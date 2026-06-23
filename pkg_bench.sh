@@ -35,8 +35,12 @@ BENCHCOUNT="${BENCHCOUNT:-1}"
 # -run='^$' disables the unit tests so only benchmarks run; ./... covers every
 # package in the main module (the bench/ comparison suite is a separate module and
 # is not matched). A named benchmark filter can be passed as the first argument.
+#
+# -timeout=0 disables Go's default 10-minute test timeout: at a long BENCHTIME the
+# whole suite (dozens of sub-benchmarks in one `go test ./...` run) easily exceeds
+# 10 minutes and would otherwise be killed mid-run and reported as a failure.
 status=0
-if go test -run='^$' -bench="${1:-.}" -benchmem -benchtime="$BENCHTIME" -count="$BENCHCOUNT" ./... >> "$RESULTS" 2>&1; then
+if go test -run='^$' -bench="${1:-.}" -benchmem -timeout=0 -benchtime="$BENCHTIME" -count="$BENCHCOUNT" ./... >> "$RESULTS" 2>&1; then
 	echo "  ok"
 else
 	echo "  benchmark failed (see ${RESULTS})" >&2

@@ -38,13 +38,17 @@ bench:
 	go test -run='^$$' -bench=. -benchmem ./...
 	bash bench/run_bench.sh
 
-# Generate the committed benchmark results, running each benchmark for 10s for
-# steadier numbers. Two suites: the main-module microbenchmarks (pkg_bench.sh →
-# bench/pkg_results.txt and the rendered bench/pkg_results_<arch>.md) and the
-# competitor-comparison suite (run_bench.sh → bench/results.txt and
-# bench/results_<arch>.md).
+# Generate the committed benchmark results. Two suites: the main-module
+# microbenchmarks (pkg_bench.sh → bench/pkg_results.txt and the rendered
+# bench/pkg_results_<arch>.md) and the competitor-comparison suite (run_bench.sh →
+# bench/results.txt and bench/results_<arch>.md).
+#
+# The microbenchmarks are short and numerous (dozens of sub-benchmarks in one
+# `go test ./...` run), so they run at 3s each — already millions of iterations,
+# steady enough for the committed table — to keep the whole suite well under the
+# CI wall-clock; the comparison suite runs each case for 10s for steadier numbers.
 bench-md:
-	BENCHTIME=10s bash pkg_bench.sh
+	BENCHTIME=3s bash pkg_bench.sh
 	BENCHTIME=10s bash bench/run_bench.sh
 
 # Force-install the latest version of each developer tool. Unlike a file target,

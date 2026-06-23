@@ -217,9 +217,17 @@ func (s *stripper) handle(read, write int) (int, int) {
 				return eject()
 			}
 			keyStart := read
-			keyEnd, err := unstable.SkipString(in, read)
-			if err != nil {
-				return eject()
+			// Inline the no-escape close-quote scan (one SIMD pass) so the common
+			// unescaped key skips SkipString's non-inlinable call frame; escaped or
+			// truncated keys fall back to SkipString. Same trick on the value reads below.
+			krest := in[read+1:]
+			kk := unstable.IndexCloseOrEscape(krest)
+			keyEnd := read + kk + 2
+			if kk >= len(krest) || krest[kk] != '"' {
+				var err error
+				if keyEnd, err = unstable.SkipString(in, read); err != nil {
+					return eject()
+				}
 			}
 			read = unstable.SkipWSCompact(in, keyEnd, compact)
 			colonPos := read
@@ -236,11 +244,16 @@ func (s *stripper) handle(read, write int) (int, int) {
 			if read < dataLen {
 				switch in[read] {
 				case '"':
-					valEnd, err := unstable.SkipString(in, read)
-					if err != nil {
-						// Bad string: eject from the original position.
-						read, write = tmpRead, localStartWrite
-						return eject()
+					vrest := in[read+1:]
+					vk := unstable.IndexCloseOrEscape(vrest)
+					valEnd := read + vk + 2
+					if vk >= len(vrest) || vrest[vk] != '"' {
+						var err error
+						if valEnd, err = unstable.SkipString(in, read); err != nil {
+							// Bad string: eject from the original position.
+							read, write = tmpRead, localStartWrite
+							return eject()
+						}
 					}
 					if !s.isDefault(in[read+1 : valEnd-1]) {
 						valueEmpty = false
@@ -363,9 +376,14 @@ func (s *stripper) handle(read, write int) (int, int) {
 			}
 		}
 	case '"':
-		send, err := unstable.SkipString(in, read)
-		if err != nil {
-			return eject()
+		srest := in[read+1:]
+		sk := unstable.IndexCloseOrEscape(srest)
+		send := read + sk + 2
+		if sk >= len(srest) || srest[sk] != '"' {
+			var err error
+			if send, err = unstable.SkipString(in, read); err != nil {
+				return eject()
+			}
 		}
 		if s.isDefault(in[read+1 : send-1]) {
 			return send, write
