@@ -2,6 +2,7 @@
 
 - generated 2026-06-23T14:28:08Z
 - go version go1.26.4 linux/amd64
+- cpu: AMD EPYC 7763 64-Core Processor (4 cores)
 
 Lower ns/op is better; throughput (MB/s) and allocations are reported by `-benchmem`. **Speedup** is relative to the `encoding/json` (Stdlib) baseline.
 

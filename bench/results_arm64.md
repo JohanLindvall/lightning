@@ -2,6 +2,7 @@
 
 - generated 2026-06-23T14:28:18Z
 - go version go1.26.4 linux/arm64
+- cpu: unknown (4 cores)
 
 Lower ns/op is better; throughput (MB/s) and allocations are reported by `-benchmem`. **Speedup** is relative to the `encoding/json` (Stdlib) baseline.
 

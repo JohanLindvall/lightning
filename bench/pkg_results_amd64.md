@@ -2,6 +2,7 @@
 
 - generated 2026-06-23T14:24:39Z
 - go version go1.26.4 linux/amd64
+- cpu: AMD EPYC 7763 64-Core Processor (4 cores)
 
 The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstable`, …), as opposed to the competitor-comparison suite in `bench/` (see `results_<arch>.md`). One table per benchmark; lower ns/op is better; throughput (MB/s) and allocations are reported by `-benchmem`.
 
