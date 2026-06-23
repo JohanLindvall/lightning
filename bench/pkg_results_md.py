@@ -14,6 +14,22 @@ with open(src) as f:
 meta = [l[1:].strip() for l in lines if l.startswith("#") and l[1:].strip()]
 meta = [m for m in meta if m.lower().startswith(("generated", "go "))]
 
+# Surface the processor model (Go prints a `cpu:` line) and the core count (the
+# GOMAXPROCS suffix on benchmark names, e.g. `...-16`) at the top of the summary.
+cpu, cores = "", ""
+for l in lines:
+    if not cpu and l.startswith("cpu:"):
+        cpu = l.split(":", 1)[1].strip()
+    if not cores:
+        m = re.match(r"Benchmark\S+?-(\d+)\s", l)
+        if m:
+            cores = m.group(1)
+if cpu or cores:
+    label = "cpu: " + (cpu or "unknown")
+    if cores:
+        label += f" ({cores} cores)"
+    meta.append(label)
+
 # `go test ./...` prints a `pkg: <import path>` header before each package's rows.
 pkg = re.compile(r"^pkg:\s+(\S+)")
 row = re.compile(
