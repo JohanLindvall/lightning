@@ -8,6 +8,9 @@ func indexQuoteOrBackslashNEON(b []byte) int
 //go:noescape
 func indexStructuralNEON(b []byte) int
 
+//go:noescape
+func indexEscapeNEON(b []byte) int
+
 // indexCloseOrEscape returns the index of the first '"' or '\\' byte in b, or
 // len(b) if neither is present. The NEON routine handles every length itself —
 // its 16-byte loop falls through to a scalar tail for the final <16 bytes — so
@@ -18,6 +21,16 @@ func indexStructuralNEON(b []byte) int
 // hottest function in object decoding, where the scanner is ~40% of the work.
 func indexCloseOrEscape(b []byte) int {
 	return indexQuoteOrBackslashNEON(b)
+}
+
+// indexEscape returns the index of the first byte JSON string encoding must escape
+// (control byte < 0x20, '"' or '\\'), or len(b) if none. The NEON routine handles
+// every length (16-byte loop + scalar tail), so the dispatch is a single
+// unconditional call with no feature gate (Advanced SIMD is baseline on ARMv8-A) —
+// inlinable into EscapeStringInto's clean-run scan. The < 0x20 lane test is
+// VUMIN(chunk, 0x1f) == chunk (NEON's form of amd64's PMINUB(v, 0x1f) == v).
+func indexEscape(b []byte) int {
+	return indexEscapeNEON(b)
 }
 
 // structuralPrescan is how many leading bytes indexStructural scans with the

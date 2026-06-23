@@ -309,6 +309,41 @@ byte-identical when adding cold paths; push new logic out-of-line.
   means a not-yet-captured leaf must keep scanning later duplicate keys, so it
   wouldn't beat the current path. Covered by `BenchmarkGetPathsWithSkip` in
   `pkg/json/get_skipbench_test.go` (alongside `BenchmarkGetManyWithSkip`).
+- **SIMD escape scan (`IndexEscape` / `indexEscapeSSE2` / `indexEscapeNEON`).** `EscapeString`/
+  `EscapeStringInto` used a SWAR clean-run scan (`swarHasLess|swarHasByte('"')|
+  swarHasByte('\\')` per 8 bytes); the three SWAR tests were ~80% of a clean-string
+  escape (the two `swarHasByte` alone ~70%). Replaced by an amd64 SSE2/AVX2 scanner
+  `indexEscapeSSE2` (exported `IndexEscape`), structured exactly like
+  `indexQuoteOrBackslashSSE2` (SSE2 first 32 bytes — no VZEROUPPER — then AVX2 once
+  32 bytes are clean, then a 16-byte loop and scalar tail) with one extra per-block
+  test for control bytes: `PMINUB(v, 0x1f) == v` (min(c,0x1f) equals c iff c ≤ 0x1f),
+  `VPMINUB` on the AVX2 path. A `len < 16` short-circuit skips the three splat loads
+  for sub-block buffers. `EscapeStringInto` is now just `i += unstable.IndexEscape(
+  s[i:])` per run. **arm64 has a NEON twin** `indexEscapeNEON` (mirrors
+  `indexQuoteOrBackslashNEON` — 16 bytes/iter, `VDUP`-built splats, `VMOV`+`RBIT`/
+  `CLZ` position recovery, scalar tail) with the control test as `VUMIN(chunk, 0x1f)
+  == chunk` (NEON's form of `PMINUB`); correctness qemu-verified (full pkg/unstable +
+  pkg/json suites, incl. the `indexEscape` arm of `TestIndexFunctionsMatchScalar` and
+  the all-bytes/fuzz `TestEscapeStringIntoReference`), speedup unmeasured on real
+  arm64 (qemu isn't cycle-accurate). Other arches keep the SWAR `indexEscapeScalar`
+  (dispatch in `simd_amd64.go`/`simd_arm64.go`/`simd_scalar.go`, fallback + SWAR
+  helpers in `simd_other.go`). Net (`BenchmarkEscapeStringInto`,
+  amd64): **log_line_clean −80%, mostly_clean_one_quote −73%, url_clean −43%,
+  sentence_clean −15%, short_clean −11%, control_bytes/prose/path −6…−9%**;
+  `EscapeString` (Builder) mirrors it (log_line −52%, mostly_clean −40%). The one
+  regression is **json_in_json +12%** (a 42-byte doc that is almost all `"`-delimited
+  2–4-byte runs): each tiny run pays a non-inlined `indexEscapeSSE2` call that loads
+  splats + a block to find an escape a few bytes in, where the old inline SWAR found
+  it in one word. Every attempt to claw it back regressed the common cases *worse*,
+  because once `EscapeStringInto` makes any call it is non-leaf (stack frame on every
+  path): a SWAR-prescan-in-Go made `indexEscape` non-inlinable (json +33%, control
+  +28%); a gate that kept short runs off SIMD paid the frame without the SIMD win
+  (short_clean +83%); an asm scalar peek added cost to every clean prefix (short_clean
+  +56%, prose +55%). The always-SIMD form is the only one where SIMD *replaces* the
+  SWAR rather than adding to it, so short/clean strings win too — escape-dense
+  JSON-in-a-string is the lone, accepted tradeoff. asm vs scalar locked by the
+  `indexEscape` arm of `TestIndexFunctionsMatchScalar` (control bytes in the inserted
+  set) and the all-bytes + fuzz `TestEscapeStringIntoReference`.
 
 ## The inline trick — let the generator write hot bodies inline
 

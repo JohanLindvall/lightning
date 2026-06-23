@@ -10,7 +10,20 @@ func indexQuoteOrBackslashSSE2(b []byte) int
 //go:noescape
 func indexStructuralAVX2(b []byte) int
 
+//go:noescape
+func indexEscapeSSE2(b []byte) int
+
 var useAVX2 = cpu.X86.HasAVX2
+
+// indexEscape returns the index of the first byte that JSON string encoding must
+// escape — a control byte < 0x20, '"' or '\\' — or len(b) if none. It is a single
+// (inlinable) call into indexEscapeSSE2, which begins in SSE2 (baseline, no
+// VZEROUPPER), switches to AVX2 once 32 bytes are clean (a long unescaped run, e.g.
+// a log line), and drops a sub-block buffer to a scalar tail. The < 0x20 SIMD test
+// is a per-block PMINUB(v, 0x1f) == v.
+func indexEscape(b []byte) int {
+	return indexEscapeSSE2(b)
+}
 
 // indexCloseOrEscape returns the index of the first '"' or '\\' byte in b, or
 // len(b) if neither is present. String scanning begins in SSE2, not AVX2: SSE2 is
