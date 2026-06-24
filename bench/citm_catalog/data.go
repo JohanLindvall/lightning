@@ -31,7 +31,7 @@ type (
 				Areas []struct {
 					AreaID   int   `json:"areaId"`
 					BlockIds []any `json:"blockIds"`
-				} `json:"areas"`
+				} `json:"areas,presize"`
 				SeatCategoryID int `json:"seatCategoryId"`
 			} `json:"seatCategories"`
 			SeatMapImage any    `json:"seatMapImage"`
