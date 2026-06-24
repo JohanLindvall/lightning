@@ -52,9 +52,13 @@ else
 	status=1
 fi
 
+# Detect the CPU brand string via github.com/klauspost/cpuid (in the bench module),
+# which reports a real model on arm64 where Go's benchmark `cpu:` line is "unknown".
+CPUNAME="$( (cd bench && go run ./cpuname) 2>/dev/null || true)"
+
 # Render a markdown summary alongside the raw results.
 if command -v python3 >/dev/null 2>&1; then
-	python3 bench/pkg_results_md.py "$RESULTS" "$RESULTSMD" || true
+	python3 bench/pkg_results_md.py "$RESULTS" "$RESULTSMD" "$CPUNAME" || true
 fi
 
 echo
