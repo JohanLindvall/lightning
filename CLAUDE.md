@@ -279,21 +279,28 @@ byte-identical when adding cold paths; push new logic out-of-line.
   records), flat on scalar arrays, zero allocs. Gated `fastSkipAvail = useAVX2`
   (amd64) / `true` (arm64, NEON baseline) / `false` (other, where the scalar
   `maskBlock` is slower than `indexStructural`). The arm64 NEON `maskBlock` builds the
-  movemask NEON lacks (`PMOVMSKB`) by **weight-and-fold**: `VAND` the 0x00/0xFF compare
-  mask with the `{1,2,4,…,128}`-repeated bit-weight vector, then three pairwise adds
-  (`VADDP`) collapse each 8-lane half to one byte whose bits are that half's mask, so a
-  single halfword `VMOV` lifts the full 16-bit result — one cross-domain move per 16-byte
-  half and no integer multiply. This replaced an earlier per-half `AND/MUL/LSR` byte-LSB
-  gather (`& 0x01…01`, `× 0x0102…80`, `>>56`) that did **two** `VMOV`s and two `MUL`s per
-  half; the fold halves the cross-domain traffic and drops the multiplies. **Now measured
-  on Apple M2** (the routine was previously qemu-correct but unbenched): `maskBlock` was
-  ~48% of `BenchmarkGetSkipHeavy` and the fold cut it to ~29%, **−28% end-to-end on that
-  benchmark** (30.8→22.2 µs, +39% B/s) and **−30% geomean** across the
-  `BenchmarkSkipContainer` shapes (string/number objects and nested records each ≈ −39%,
-  scalar arrays flat since they stay on the `indexStructural` path). The fold was made
-  at the then-current six-mask/32-byte `maskBlock`; the routine has since moved to four
-  type-selected masks over a 64-byte block (see the head of this entry), so these M2
-  numbers predate that change and want a re-measure on real arm64.
+  movemask NEON lacks (`PMOVMSKB`) by **weight-and-fold over an ADDP cascade**, computing
+  each class's full 64-bit mask (all four 16-byte chunks of the block) with **one**
+  vector→GP move. `VAND` each chunk's 0x00/0xFF compare with the `{1,2,4,…,128}`-repeated
+  bit-weight vector (a matching lane becomes its bit value), then a four-step `VADDP`
+  cascade — `P=ADDP(A0,A1)`, `Q=ADDP(A2,A3)`, `R=ADDP(P,Q)`, `S=ADDP(R,R)` — collapses
+  each chunk's two 8-lane halves to one mask-byte and *packs all four chunks* into S's
+  low eight bytes in order `[lo0,hi0,lo1,hi1,lo2,hi2,lo3,hi3]`, which is exactly the
+  uint64 mask (chunk k at bit 16k), so a single `VMOV S.D[0]` lifts it (no per-half
+  extract, no shift/OR stitching). `ADDP(Vn,Vm)` puts Vn's pairwise sums in the low half;
+  a full 8-lane half sums to 255 so no byte overflows. This replaced (1) an `AND/MUL/LSR`
+  byte-LSB gather with two `VMOV`s + two `MUL`s per 16-byte half, then (2) a per-half
+  three-`VADDP` fold that still did one `VMOV` per 16-byte half (four per class for the
+  64-byte block) plus `ORR`-shift stitching. The cascade drops a class from **27 → 13
+  ops** (16→4 cross-domain `VMOV`s, 12→0 `ORR`s for the whole block). On **Apple M2**,
+  successive: the per-half fold cut `BenchmarkGetSkipHeavy` −28% (30.8→22.2 µs); the
+  cascade then cut **another −24…−33% on `BenchmarkSkipContainer`** (stringObj −32%,
+  numberObj −33%, nestedMixed −28%; scalar arrays flat), dropping `maskBlock` from ~76%
+  to ~45% of the skip profile (its bit-math sibling `skipContainerFast` is now the larger
+  share). This directly attacks the skip path, which the bench-md comparison flags as
+  arm64's worst lag vs amd64 (skip-heavy ~0.36 of amd64's speedup-over-stdlib) — the
+  residual gap is intrinsic: NEON is 16-byte and has no `PMOVMSKB`, so even the cascade
+  does more work than amd64's `VPMOVMSKB` over 32-byte AVX2.
 - **`GetPaths` stack-backed active-index scratch.** `getPaths` keeps one shared
   `[]int` scratch holding the active path-index set for every recursion level
   (sized `len(paths)*(maxDepth+1)` so the depth-first walk's per-level sub-slices
@@ -548,6 +555,21 @@ no regressions.)
   `<ABIInternal>` selector outside `package runtime`** ("ABI selector only
   permitted when compiling runtime"), so this is simply unavailable to a
   third-party package. No workaround that doesn't fork the toolchain.
+- **arm64 32-byte-unrolled `indexQuoteOrBackslashNEON` for long strings.** The
+  bench-md flags string_unicode (long unicode text fields) as arm64's #2 lag vs
+  amd64 (~0.68), and the scanner is ~51% of that decode; amd64 wins partly by
+  switching to a 32-byte AVX2 tail. The arm64 analogue: a `loop32` (one 2-register
+  `VLD1` of 32 bytes) reached only when ≥32 bytes remain — so short keys/values keep
+  the latency-tuned 16-byte `loop16` — using the `VUSHR`+`VUZP1` movemask (one
+  cross-domain `VMOV` per 16-byte half instead of two) to cut the throughput-bound
+  long-string scan's `VMOV` traffic in half. **Regressed both**: string_unicode +13%
+  *and* cloudflare +13% — and cloudflare never executes `loop32`, so its regression
+  is pure **code-alignment** shift from inserting the block (the float-array lesson).
+  string_unicode regressing too means the scan isn't `VMOV`-bound — `loop16`'s two D
+  extracts already issue in parallel, so the movemask's extra `VUSHR`+`VUZP1` on the
+  path only adds latency. Confirms the existing "arm64 string scanner is latency-
+  bound and resists mask-reduction" finding; the string_unicode lag is **intrinsic**
+  (NEON 16-byte vs AVX2 32-byte compare width), not closable in the block body.
 - **Key interning / map presizing in the dynamic `any` decoder**
   (`decodeAnyObject`, the `DecodeValue`/`json.DecodeAny` path): twitterescaped's
   `DecodeAny` is bound by building `map[string]any` — `mapassign` plus bucket
