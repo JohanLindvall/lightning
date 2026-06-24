@@ -9,8 +9,19 @@ permissions:
   contents: read
 
 jobs:
+  # Run lint + tests on both architectures. The SIMD scanners have per-arch
+  # implementations (amd64 SSE2/AVX2, arm64 NEON), so both must pass before the tag
+  # job below publishes a release tag.
   check:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
@@ -20,9 +31,13 @@ jobs:
       # conformance package (and its test) would not compile. Generate them before
       # linting; `make test` regenerates as needed via the same Makefile rule.
       - name: Generate
+        if: matrix.arch == 'amd64'
         run: make generate
-      # Prebuilt binary (no source compile) + cached binary and lint cache.
+      # Prebuilt binary (no source compile) + cached binary and lint cache. Lint is
+      # architecture-independent (it analyzes source, not the built binary), so run
+      # it once on amd64 only; both arches still run the tests.
       - name: Lint
+        if: matrix.arch == 'amd64'
         uses: golangci/golangci-lint-action@v9
         with:
           version: v2.12.2
