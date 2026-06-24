@@ -1,6 +1,7 @@
 // Package conformance holds a single struct that exercises every field type the
 // lightning generator supports, plus the field-tag options (nocopy, lax, unwrap,
-// pipe-separated alternate names, and the "-" skip). data_unmarshal.go is the
+// presize, pipe-separated alternate names, and the "-" skip) and the type
+// directives (compact, nocopy, destructive, presize). data_unmarshal.go is the
 // generated decoder; regenerate it with go generate.
 package conformance
 
@@ -130,4 +131,34 @@ type NoCopyMap map[string]string
 type DestructiveDoc struct {
 	Name string   `json:"name,nocopy"`
 	Tags []string `json:"tags,nocopy"`
+}
+
+// PresizeDoc carries //lightning:presize: a slice whose element is a struct of
+// flat scalars plus one-dimensional leaf collections (Areas, mirroring
+// citm_catalog's areas[].blockIds) is preallocated to its counted length, while a
+// multi-dimensional array (Grid) is still left to append. The presize is only a
+// sizing hint, so both must decode identically to the default path. Exercised by
+// TestPresizeDirective.
+//
+//lightning:presize
+type PresizeDoc struct {
+	Areas []struct {
+		AreaID   int   `json:"areaId"`
+		BlockIds []any `json:"blockIds"`
+	} `json:"areas"`
+	Grid [][]int `json:"grid"`
+}
+
+// TagPresize exercises the per-field ,presize tag: only Bones opts into the
+// preallocation; Other (same element type, no tag) keeps append-driven growth.
+// Both must decode identically. Exercised by TestPresizeTag.
+type TagPresize struct {
+	Bones []struct {
+		Name string    `json:"name"`
+		Pos  []float64 `json:"pos"`
+	} `json:"bones,presize"`
+	Other []struct {
+		Name string    `json:"name"`
+		Pos  []float64 `json:"pos"`
+	} `json:"other"`
 }
