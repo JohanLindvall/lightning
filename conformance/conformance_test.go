@@ -187,3 +187,47 @@ func TestDestructiveDirective(t *testing.T) {
 		t.Errorf("input was not mutated; in-place unescape did not write through")
 	}
 }
+
+// TestPresizeDirective covers //lightning:presize: a slice of leaf-collection
+// structs is presized, a multi-dimensional array is not, and both decode
+// correctly — including when an array is longer than any presize estimate and
+// when blockIds is non-empty (so the count's per-element skip really descends).
+func TestPresizeDirective(t *testing.T) {
+	data := []byte(`{"areas":[{"areaId":1,"blockIds":[]},{"areaId":2,"blockIds":[10,20]},{"areaId":3,"blockIds":[]}],"grid":[[1,2],[3,4,5],[]]}`)
+	var d PresizeDoc
+	if err := d.UnmarshalJSON(data); err != nil {
+		t.Fatal(err)
+	}
+	if len(d.Areas) != 3 || d.Areas[0].AreaID != 1 || d.Areas[2].AreaID != 3 {
+		t.Fatalf("areas = %#v", d.Areas)
+	}
+	if len(d.Areas[0].BlockIds) != 0 || len(d.Areas[1].BlockIds) != 2 {
+		t.Fatalf("blockIds = %#v", d.Areas)
+	}
+	// A trailing empty inner array decodes to a nil slice (lightning leaves an
+	// empty array's slice unset), exactly as on the default path.
+	if !reflect.DeepEqual(d.Grid, [][]int{{1, 2}, {3, 4, 5}, nil}) {
+		t.Fatalf("grid = %#v", d.Grid)
+	}
+	// Empty array and null still work through the presize path.
+	var e PresizeDoc
+	if err := e.UnmarshalJSON([]byte(`{"areas":[]}`)); err != nil || e.Areas == nil && len(e.Areas) != 0 {
+		t.Fatalf("empty areas: %#v err %v", e, err)
+	}
+}
+
+// TestPresizeTag covers the per-field ,presize tag: the tagged and untagged
+// slices decode to the same value.
+func TestPresizeTag(t *testing.T) {
+	data := []byte(`{"bones":[{"name":"a","pos":[1,2,3]},{"name":"b","pos":[]}],"other":[{"name":"c","pos":[4]}]}`)
+	var d TagPresize
+	if err := d.UnmarshalJSON(data); err != nil {
+		t.Fatal(err)
+	}
+	if len(d.Bones) != 2 || d.Bones[0].Name != "a" || !reflect.DeepEqual(d.Bones[0].Pos, []float64{1, 2, 3}) {
+		t.Fatalf("bones = %#v", d.Bones)
+	}
+	if len(d.Other) != 1 || d.Other[0].Name != "c" || !reflect.DeepEqual(d.Other[0].Pos, []float64{4}) {
+		t.Fatalf("other = %#v", d.Other)
+	}
+}

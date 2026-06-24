@@ -63,6 +63,7 @@ func generate(inPath string) error {
 		compactTypes:     map[string]bool{},
 		nocopyTypes:      map[string]bool{},
 		destructiveTypes: map[string]bool{},
+		presizeTypes:     map[string]bool{},
 	}
 
 	// Generated helper functions are named "lightning<ImportPath><Type>decode...",
@@ -119,6 +120,9 @@ func generate(inPath string) error {
 			if hasDirective("lightning:destructive", gd.Doc, ts.Doc) {
 				g.destructiveTypes[ts.Name.Name] = true
 			}
+			if hasDirective("lightning:presize", gd.Doc, ts.Doc) {
+				g.presizeTypes[ts.Name.Name] = true
+			}
 		}
 	}
 	if len(g.order) == 0 {
@@ -159,6 +163,7 @@ func generate(inPath string) error {
 		// A destructive root aliases the very buffer it decodes into, so it is nocopy
 		// too; a plain //lightning:nocopy root (slice/map) aliases its keys/elements.
 		g.nocopy = g.destructive || g.nocopyTypes[name]
+		g.presize = g.presizeTypes[name]
 		g.prefix = "lightning" + g.pathFrag + name
 		methods = append(methods, g.genUnmarshal(name))
 	}
@@ -202,15 +207,19 @@ type gen struct {
 	//   //lightning:nocopy       -> nocopyTypes       (slice/map root aliases keys/elements)
 	//   //lightning:destructive  -> destructiveTypes  (unescape strings into the input
 	//                                                   buffer, destroying it; implies nocopy)
+	//   //lightning:presize      -> presizeTypes      (presize slices of structs that hold
+	//                                                   leaf collections; see slicePresize)
 	compactTypes     map[string]bool
 	nocopyTypes      map[string]bool
 	destructiveTypes map[string]bool
+	presizeTypes     map[string]bool
 
 	// Working flags for the root type currently being generated, derived from the
 	// directive sets above.
 	compact     bool
 	destructive bool   // //lightning:destructive: unescape strings in place
 	nocopy      bool   // //lightning:nocopy root, or a destructive root (which aliases what it decodes)
+	presize     bool   // //lightning:presize: presize every leaf-collection-bearing slice in the root
 	pathFrag    string // import path sanitized into an identifier fragment
 	prefix      string // current per-type prefix for generated function names
 
@@ -421,10 +430,10 @@ func (g *gen) genUnmarshal(name string) string {
 	switch {
 	case g.sliceTypes[name] != nil:
 		at := g.sliceTypes[name]
-		call = fmt.Sprintf("%s((*[]%s)(v), data, i)", g.sliceDecoder(at.Elt, name, nocopy, false), g.typeStr(at.Elt))
+		call = fmt.Sprintf("%s((*[]%s)(v), data, i)", g.sliceDecoder(at.Elt, name, nocopy, false, g.presize), g.typeStr(at.Elt))
 	case g.mapTypes[name] != nil:
 		mt := g.mapTypes[name]
-		call = fmt.Sprintf("%s((*map[string]%s)(v), data, i)", g.mapDecoder(mt.Key, mt.Value, name, nocopy, false), g.typeStr(mt.Value))
+		call = fmt.Sprintf("%s((*map[string]%s)(v), data, i)", g.mapDecoder(mt.Key, mt.Value, name, nocopy, false, g.presize), g.typeStr(mt.Value))
 	default:
 		call = g.namedStruct(name) + "(v, data, i)"
 	}
@@ -499,15 +508,16 @@ func (g *gen) anonStruct(t *ast.StructType, hint string) string {
 // name, and the pointer-embed allocation guards that must run before the lvalue
 // is usable.
 type fieldInfo struct {
-	keys   []string
-	dest   string
-	typ    ast.Expr
-	nocopy bool
-	lax    bool
-	unwrap bool
-	tagged bool
-	depth  int
-	allocs []string
+	keys    []string
+	dest    string
+	typ     ast.Expr
+	nocopy  bool
+	lax     bool
+	unwrap  bool
+	presize bool
+	tagged  bool
+	depth   int
+	allocs  []string
 }
 
 // collectFields appends to out the decodable fields of st, flattening embedded
@@ -520,7 +530,7 @@ type fieldInfo struct {
 // depth, and seen guards against the (illegal-in-Go, but cheap to defend) cycle.
 func (g *gen) collectFields(st *ast.StructType, prefix string, depth int, allocs []string, seen map[string]bool, out *[]fieldInfo) {
 	for _, f := range st.Fields.List {
-		tagNames, skip, nocopy, lax, unwrap := jsonTag(f.Tag)
+		tagNames, skip, nocopy, lax, unwrap, presize := jsonTag(f.Tag)
 		if skip {
 			continue
 		}
@@ -552,7 +562,7 @@ func (g *gen) collectFields(st *ast.StructType, prefix string, depth int, allocs
 				keys = []string{name}
 			}
 			*out = append(*out, fieldInfo{keys: keys, dest: prefix + name, typ: f.Type,
-				nocopy: nocopy, lax: lax, unwrap: unwrap, tagged: len(tagNames) > 0, depth: depth, allocs: allocs})
+				nocopy: nocopy, lax: lax, unwrap: unwrap, presize: presize, tagged: len(tagNames) > 0, depth: depth, allocs: allocs})
 			continue
 		}
 		for _, nm := range f.Names {
@@ -564,7 +574,7 @@ func (g *gen) collectFields(st *ast.StructType, prefix string, depth int, allocs
 				keys = []string{nm.Name}
 			}
 			*out = append(*out, fieldInfo{keys: keys, dest: prefix + nm.Name, typ: f.Type,
-				nocopy: nocopy, lax: lax, unwrap: unwrap, tagged: len(tagNames) > 0, depth: depth, allocs: allocs})
+				nocopy: nocopy, lax: lax, unwrap: unwrap, presize: presize, tagged: len(tagNames) > 0, depth: depth, allocs: allocs})
 		}
 	}
 }
@@ -671,9 +681,9 @@ func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
 		hint := f.dest[strings.LastIndexByte(f.dest, '.')+1:]
 		var code string
 		if f.lax {
-			code = g.laxField(f.dest, f.typ, hint, f.nocopy)
+			code = g.laxField(f.dest, f.typ, hint, f.nocopy, f.presize)
 		} else {
-			code = g.field(f.dest, f.typ, hint, f.nocopy, false)
+			code = g.field(f.dest, f.typ, hint, f.nocopy, false, f.presize)
 		}
 		if f.unwrap {
 			code = unwrapField(code)
@@ -741,12 +751,13 @@ func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
 // lvalue dest, advancing i and returning (end, err) on failure. hint suggests a
 // name for any decoder this value needs. nocopy requests that string/raw leaves
 // alias the input bytes; lax requests the lenient time parser for time.Time
-// leaves. Both propagate through slices, maps and pointers but stop at struct
-// boundaries, where each field's own tag governs.
-func (g *gen) field(dest string, expr ast.Expr, hint string, nocopy, lax bool) string {
+// leaves; presize requests that slices reached from here be preallocated to their
+// element count (see slicePresize). All three propagate through slices, maps and
+// pointers but stop at struct boundaries, where each field's own tag governs.
+func (g *gen) field(dest string, expr ast.Expr, hint string, nocopy, lax, presize bool) string {
 	switch t := expr.(type) {
 	case *ast.ParenExpr:
-		return g.field(dest, t.X, hint, nocopy, lax)
+		return g.field(dest, t.X, hint, nocopy, lax, presize)
 
 	case *ast.StarExpr:
 		// new(T) spells the pointee type, so its package must be imported.
@@ -756,7 +767,7 @@ func (g *gen) field(dest string, expr ast.Expr, hint string, nocopy, lax bool) s
 		if isRaw(t.X) {
 			g.needJSON = true
 		}
-		inner := g.field("(*"+dest+")", t.X, hint, nocopy, lax)
+		inner := g.field("(*"+dest+")", t.X, hint, nocopy, lax, presize)
 		return fmt.Sprintf(`if data[i] == 'n' {
 	end, err := unstable.ExpectNull(data, i)
 	if err != nil {
@@ -799,12 +810,12 @@ func (g *gen) field(dest string, expr ast.Expr, hint string, nocopy, lax bool) s
 
 	case *ast.ArrayType:
 		if t.Len != nil {
-			return g.callDecoder(dest, g.arrayDecoder(t, hint, nocopy, lax))
+			return g.callDecoder(dest, g.arrayDecoder(t, hint, nocopy, lax, presize))
 		}
-		return g.callDecoder(dest, g.sliceDecoder(t.Elt, hint, nocopy, lax))
+		return g.callDecoder(dest, g.sliceDecoder(t.Elt, hint, nocopy, lax, presize))
 
 	case *ast.MapType:
-		fn := g.mapDecoder(t.Key, t.Value, hint, nocopy, lax)
+		fn := g.mapDecoder(t.Key, t.Value, hint, nocopy, lax, presize)
 		if fn == "" {
 			return g.skipEmit()
 		}
@@ -842,8 +853,8 @@ func (g *gen) unsupportedf(format string, args ...any) string {
 // any error the input value is skipped and dest left unset. Because a well-formed
 // JSON value of the wrong type is skippable while genuinely malformed JSON is
 // not, only type mismatches are swallowed: a syntax error still propagates.
-func (g *gen) laxField(dest string, expr ast.Expr, hint string, nocopy bool) string {
-	fn := g.valueDecoder(expr, hint, nocopy, true)
+func (g *gen) laxField(dest string, expr ast.Expr, hint string, nocopy, presize bool) string {
+	fn := g.valueDecoder(expr, hint, nocopy, true, presize)
 	if fn == "" {
 		// Unsupported type: skipping already leaves the field unset.
 		return g.skipEmit()
@@ -866,7 +877,7 @@ i = end`, g.typeStr(expr), fn, dest)
 // existing decoders; everything else gets a thin wrapper around the inline field
 // code so a lax field can decode into a scratch value. It returns "" for types
 // whose value would otherwise be skipped (e.g. an unsupported map key type).
-func (g *gen) valueDecoder(expr ast.Expr, hint string, nocopy, lax bool) string {
+func (g *gen) valueDecoder(expr ast.Expr, hint string, nocopy, lax, presize bool) string {
 	switch t := unparen(expr).(type) {
 	case *ast.Ident:
 		if _, ok := g.structTypes[t.Name]; ok {
@@ -876,11 +887,11 @@ func (g *gen) valueDecoder(expr ast.Expr, hint string, nocopy, lax bool) string 
 		return g.anonStruct(t, hint)
 	case *ast.ArrayType:
 		if t.Len == nil {
-			return g.sliceDecoder(t.Elt, hint, nocopy, lax)
+			return g.sliceDecoder(t.Elt, hint, nocopy, lax, presize)
 		}
-		return g.arrayDecoder(t, hint, nocopy, lax)
+		return g.arrayDecoder(t, hint, nocopy, lax, presize)
 	case *ast.MapType:
-		return g.mapDecoder(t.Key, t.Value, hint, nocopy, lax)
+		return g.mapDecoder(t.Key, t.Value, hint, nocopy, lax, presize)
 	}
 	suffix := ""
 	if nocopy {
@@ -888,6 +899,9 @@ func (g *gen) valueDecoder(expr ast.Expr, hint string, nocopy, lax bool) string 
 	}
 	if lax {
 		suffix += "Lax"
+	}
+	if presize {
+		suffix += "Presize"
 	}
 	key := "value:" + suffix + ":" + g.typeStr(expr)
 	if fn, ok := g.memo[key]; ok {
@@ -901,7 +915,7 @@ func (g *gen) valueDecoder(expr ast.Expr, hint string, nocopy, lax bool) string 
 	if isTime(expr) {
 		g.needTime = true
 	}
-	inner := g.field("(*v)", expr, hint, nocopy, lax)
+	inner := g.field("(*v)", expr, hint, nocopy, lax, presize)
 	body := fmt.Sprintf(`func %[1]s(v *%[2]s, data []byte, i int) (int, error) {
 	%[3]s
 	return i, nil
@@ -1082,13 +1096,16 @@ i = bend`, inner)
 // decoded, and any beyond that are discarded. This matches encoding/json — fill
 // the leading elements, leave a short JSON array's tail zero, drop a long JSON
 // array's extras — and, like it, leaves the array untouched on a JSON null.
-func (g *gen) arrayDecoder(t *ast.ArrayType, hint string, nocopy, lax bool) string {
+func (g *gen) arrayDecoder(t *ast.ArrayType, hint string, nocopy, lax, presize bool) string {
 	suffix := ""
 	if nocopy {
 		suffix = "NoCopy"
 	}
 	if lax {
 		suffix += "Lax"
+	}
+	if presize {
+		suffix += "Presize"
 	}
 	arrType := g.typeStr(t)
 	key := g.prefix + g.cmark() + "array:" + suffix + ":" + arrType
@@ -1103,7 +1120,7 @@ func (g *gen) arrayDecoder(t *ast.ArrayType, hint string, nocopy, lax bool) stri
 	if isTime(t.Elt) {
 		g.needTime = true
 	}
-	elem := g.field("(*out)[idx]", t.Elt, hint, nocopy, lax)
+	elem := g.field("(*out)[idx]", t.Elt, hint, nocopy, lax, presize)
 	body := fmt.Sprintf(`func %[1]s(out *%[2]s, data []byte, i int) (int, error) {
 	if i >= len(data) {
 		return i, unstable.ErrTruncated
@@ -1152,13 +1169,21 @@ func (g *gen) arrayDecoder(t *ast.ArrayType, hint string, nocopy, lax bool) stri
 	return fn
 }
 
-func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax bool) string {
+func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax, presize bool) string {
+	// A //lightning:presize root sets presize for every slice it reaches; the
+	// per-field ,presize tag turns it on for one field's subtree. Either way it
+	// only ever relaxes slicePresize's struct-element rule (it never presizes the
+	// multi-dimensional numeric arrays slicePresize deliberately skips).
+	presize = presize || g.presize
 	suffix := ""
 	if nocopy {
 		suffix = "NoCopy"
 	}
 	if lax {
 		suffix += "Lax"
+	}
+	if presize {
+		suffix += "Presize"
 	}
 	key := g.prefix + g.cmark() + "slice:" + suffix + ":" + g.typeStr(elt)
 	if fn, ok := g.memo[key]; ok {
@@ -1178,8 +1203,8 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax bool) string {
 		g.needTime = true
 	}
 	eltStr := g.typeStr(elt)
-	inner := g.field("(*out)[len(*out)-1]", elt, singular(hint)+"Entry", nocopy, lax)
-	presize := g.slicePresize(elt, eltStr)
+	inner := g.field("(*out)[len(*out)-1]", elt, singular(hint)+"Entry", nocopy, lax, presize)
+	presizeCode := g.slicePresize(elt, eltStr, presize)
 	body := fmt.Sprintf(`func %[1]s(out *[]%[2]s, data []byte, i int) (int, error) {
 	if i >= len(data) {
 		return i, unstable.ErrTruncated
@@ -1222,7 +1247,7 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax bool) string {
 		}
 		i++
 	}
-}`, fn, eltStr, inner, presize, g.skipWS("i", "i"))
+}`, fn, eltStr, inner, presizeCode, g.skipWS("i", "i"))
 	g.decoders = append(g.decoders, body)
 	return fn
 }
@@ -1236,7 +1261,7 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax bool) string {
 // whose per-element decode is costly enough to amortize a structural pass, get
 // the general CountArrayElements. Tiny fixed-cost elements where a counting scan
 // would not pay for itself get no presize (an empty string keeps the loop as-is).
-func (g *gen) slicePresize(elt ast.Expr, eltStr string) string {
+func (g *gen) slicePresize(elt ast.Expr, eltStr string, relaxed bool) string {
 	counter := ""
 	switch t := unparen(elt).(type) {
 	case *ast.Ident:
@@ -1267,7 +1292,16 @@ func (g *gen) slicePresize(elt ast.Expr, eltStr string) string {
 			// skipObject that dominates arrays of small {name,version}-style records
 			// (update_center dependencies/developers, apache_builds jobs).
 			counter = "unstable.CountArrayObjects"
-		case g.structSkipIsCheap(t):
+		case g.structSkipIsCheap(t, relaxed):
+			// relaxed (a //lightning:presize root or a ,presize field) also admits a
+			// struct whose only non-flat fields are one-dimensional leaf collections
+			// (citm areas[].blockIds []any, marine_ik bones[].pos []float64). Counting
+			// those stays bounded, so presizing trades the append-doubling reallocs
+			// (decodeAreas is ~19% of citm in growslice) for one make — a large
+			// allocation cut. Off by default because that count, doubling the
+			// per-element scan, can cost more wall-time than the reallocs it saves on
+			// tiny elements (see slicePresize's package notes); the directive/tag lets
+			// a caller that values the allocation drop opt in.
 			counter = "unstable.CountArrayElements"
 		}
 	case *ast.MapType:
@@ -1318,17 +1352,21 @@ func (g *gen) slicePresize(elt ast.Expr, eltStr string) string {
 `, counter, eltStr)
 }
 
-func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy, lax bool) string {
+func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy, lax, presize bool) string {
 	if g.typeStr(keyExpr) != "string" {
 		g.errs = append(g.errs, fmt.Errorf("unsupported map key type %s for %s", g.typeStr(keyExpr), hint))
 		return ""
 	}
+	presize = presize || g.presize
 	suffix := ""
 	if nocopy {
 		suffix = "NoCopy"
 	}
 	if lax {
 		suffix += "Lax"
+	}
+	if presize {
+		suffix += "Presize"
 	}
 	key := g.prefix + g.cmark() + "map:" + suffix + ":" + g.typeStr(valExpr)
 	if fn, ok := g.memo[key]; ok {
@@ -1343,7 +1381,7 @@ func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy, lax boo
 		g.needTime = true
 	}
 	valStr := g.typeStr(valExpr)
-	inner := g.field("val", valExpr, hint+"Value", nocopy, lax)
+	inner := g.field("val", valExpr, hint+"Value", nocopy, lax, presize)
 	// With nocopy the key aliases the input (ReadKey already returns an alias for
 	// an unescaped key); otherwise it is copied so the map owns it.
 	keyAssign := "m[string([]byte(key))] = val"
@@ -1429,25 +1467,38 @@ func (g *gen) isStruct(expr ast.Expr) bool {
 // built only from those, skips in a single bounded SIMD pass; presizing a slice
 // of such records (a Cloudflare log line, say) is worth the count.
 //
-// A slice, array, map, or interface field is not cheap: skipping it is unbounded
-// and recursive, so a counting scan would re-traverse the whole subtree the
-// decoder walks anyway — far more work than the ~log2(n) backing-array
+// A slice, array, map, or interface field is not cheap by default: skipping it is
+// unbounded and recursive, so a counting scan would re-traverse the whole subtree
+// the decoder walks anyway — far more work than the ~log2(n) backing-array
 // reallocations presize would save. That covers a multi-dimensional [][][]float64
 // of GeoJSON coordinates and the citm_catalog performances → seatCategories →
 // areas tree alike.
-func (g *gen) structSkipIsCheap(expr ast.Expr) bool {
-	return g.structSkipIsCheapSeen(expr, map[string]bool{})
+//
+// With relaxed=true (a //lightning:presize root or a ,presize field), a field
+// that is a *one-dimensional* collection of leaf values — a slice/array/map of
+// scalars/strings/any — is treated as cheap. In record-style data such fields
+// hold few or zero elements (citm areas[].blockIds is a []any that is always []),
+// so the count stays bounded and presizing the outer slice spares the
+// append-doubling reallocations. A collection whose element is itself a
+// collection or a struct stays non-cheap even when relaxed, so the multi-
+// dimensional coordinate arrays and nested record lists are never presized.
+func (g *gen) structSkipIsCheap(expr ast.Expr, relaxed bool) bool {
+	return g.structSkipIsCheapSeen(expr, relaxed, map[string]bool{})
 }
 
-func (g *gen) structSkipIsCheapSeen(expr ast.Expr, seen map[string]bool) bool {
+func (g *gen) structSkipIsCheapSeen(expr ast.Expr, relaxed bool, seen map[string]bool) bool {
 	switch t := unparen(expr).(type) {
-	case *ast.ArrayType, *ast.MapType, *ast.InterfaceType:
-		return false
+	case *ast.ArrayType:
+		return relaxed && g.isLeafType(t.Elt)
+	case *ast.MapType:
+		return relaxed && g.isLeafType(t.Value)
+	case *ast.InterfaceType:
+		return relaxed // a single any skips in one bounded SkipValue pass
 	case *ast.StarExpr:
-		return g.structSkipIsCheapSeen(t.X, seen)
+		return g.structSkipIsCheapSeen(t.X, relaxed, seen)
 	case *ast.StructType:
 		for _, f := range t.Fields.List {
-			if !g.structSkipIsCheapSeen(f.Type, seen) {
+			if !g.structSkipIsCheapSeen(f.Type, relaxed, seen) {
 				return false
 			}
 		}
@@ -1458,11 +1509,30 @@ func (g *gen) structSkipIsCheapSeen(expr ast.Expr, seen map[string]bool) bool {
 		}
 		seen[t.Name] = true
 		if st, ok := g.structTypes[t.Name]; ok {
-			return g.structSkipIsCheapSeen(st, seen)
+			return g.structSkipIsCheapSeen(st, relaxed, seen)
 		}
 		return true // a scalar named type (int, string, ...)
 	}
 	return true // selector leaves (time.Time, json.RawMessage)
+}
+
+// isLeafType reports whether expr is a JSON-value leaf — a scalar, string,
+// time/raw selector, or any — as opposed to a collection (slice/array/map) or a
+// struct. A collection of leaves is cheap to count (its per-element skip is short
+// and, in record data, usually empty); a collection of non-leaves is not, because
+// its skip recurses through an unbounded subtree. Used by structSkipIsCheapSeen
+// to admit one-dimensional leaf collections under presize while still rejecting
+// multi-dimensional arrays and nested record lists.
+func (g *gen) isLeafType(expr ast.Expr) bool {
+	switch t := unparen(expr).(type) {
+	case *ast.InterfaceType, *ast.SelectorExpr:
+		return true // any, time.Time, json.RawMessage
+	case *ast.StarExpr:
+		return g.isLeafType(t.X)
+	case *ast.Ident:
+		return t.Name == "any" || isScalar(t.Name)
+	}
+	return false // ArrayType, MapType, StructType, named struct types
 }
 
 func (g *gen) baseName(expr ast.Expr) string {
@@ -1538,21 +1608,21 @@ func (g *gen) assemble(inPath string, methods []string) string {
 // and raw fields alias the input bytes instead of copying them, and "lax", which
 // makes a type mismatch on the field's value a no-op (the value is skipped and
 // the field left unset) rather than an error.
-func jsonTag(tag *ast.BasicLit) (names []string, skip, nocopy, lax, unwrap bool) {
+func jsonTag(tag *ast.BasicLit) (names []string, skip, nocopy, lax, unwrap, presize bool) {
 	if tag == nil {
-		return nil, false, false, false, false
+		return nil, false, false, false, false, false
 	}
 	s, err := strconv.Unquote(tag.Value)
 	if err != nil {
-		return nil, false, false, false, false
+		return nil, false, false, false, false, false
 	}
 	v := reflect.StructTag(s).Get("json")
 	if v == "" {
-		return nil, false, false, false, false
+		return nil, false, false, false, false, false
 	}
 	parts := strings.Split(v, ",")
 	if parts[0] == "-" && len(parts) == 1 {
-		return nil, true, false, false, false
+		return nil, true, false, false, false, false
 	}
 	for _, o := range parts[1:] {
 		switch o {
@@ -1562,6 +1632,8 @@ func jsonTag(tag *ast.BasicLit) (names []string, skip, nocopy, lax, unwrap bool)
 			lax = true
 		case "unwrap":
 			unwrap = true
+		case "presize":
+			presize = true
 		}
 	}
 	for _, n := range strings.Split(parts[0], "|") {
@@ -1569,7 +1641,7 @@ func jsonTag(tag *ast.BasicLit) (names []string, skip, nocopy, lax, unwrap bool)
 			names = append(names, n)
 		}
 	}
-	return names, false, nocopy, lax, unwrap
+	return names, false, nocopy, lax, unwrap, presize
 }
 
 func cap1(s string) string {

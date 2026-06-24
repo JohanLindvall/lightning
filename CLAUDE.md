@@ -12,15 +12,20 @@ allocation-light `json.Unmarshaler` implementations.
   whitespace anywhere in the directive — `//lightning:compact`,
   `// lightning:compact ` and `// lightning: compact` are all equivalent, via
   `strings.Join(strings.Fields(...), "")`; collected into
-  `compactTypes`/`nocopyTypes`/`destructiveTypes`): `//lightning:compact`
+  `compactTypes`/`nocopyTypes`/`destructiveTypes`/`presizeTypes`): `//lightning:compact`
   (`g.compact`/`g.skipWS`, compile-time elision of inter-token `SkipWS`),
   `//lightning:destructive` (`g.destructive`/`g.scalar`, the type's nocopy strings
   unescape into the input buffer instead of allocating — see below; implies nocopy),
-  and `//lightning:nocopy` (`g.nocopy`, a slice/map root aliases its keys/elements).
-  The per-root loop sets the working `g.compact`/`g.destructive`/`g.nocopy` from
-  those sets. `g.cmark`/`g.csuf` keep compact/destructive variants distinct in memo
-  keys / function names (the `Destructive` suffix); nocopy variants are already
-  distinguished by the `nocopy` decoder param / `NoCopy` suffix.
+  `//lightning:nocopy` (`g.nocopy`, a slice/map root aliases its keys/elements),
+  and `//lightning:presize` (`g.presize`, presize slices of leaf-collection structs —
+  see below). The per-root loop sets the working
+  `g.compact`/`g.destructive`/`g.nocopy`/`g.presize` from those sets. `g.cmark`/`g.csuf`
+  keep compact/destructive variants distinct in memo keys / function names (the
+  `Destructive` suffix); nocopy/presize variants are distinguished by the
+  `nocopy`/`presize` decoder params and `NoCopy`/`Presize` suffixes. The field-tag
+  options (`nocopy`, `lax`, `unwrap`, `presize`) are parsed by `jsonTag` and thread
+  through `field`/`valueDecoder`/`sliceDecoder`/`arrayDecoder`/`mapDecoder`, stopping
+  at struct boundaries (each struct's own field tags govern).
 - `pkg/unstable` — the runtime scanning primitives the generated decoders call, plus
   the handful exported for the `pkg/json` toolkit (`SkipWS`/`SkipWSCompact`/`SkipValue`/
   `SkipString`/`ReadKey`/`DecodeValue`/`UnescapeString`/`ParseFloat` and the `Err*`
@@ -207,6 +212,32 @@ byte-identical when adding cold paths; push new logic out-of-line.
   B/op — a slice whose element is a bare scalar (`[]float64`), string, struct, or
   time is still counted (those land in the `Ident`/`StructType`/`SelectorExpr`
   cases, not the fixed-array `ArrayType` branch).
+- **`//lightning:presize` / `,presize` — opt-in presize for leaf-collection structs.**
+  By default `structSkipIsCheap` refuses to presize a slice whose struct element holds
+  *any* slice/map/interface field, because the `CountArrayElements` scan would recurse
+  through an unbounded subtree (the citm performances→seatCategories tree, GeoJSON
+  Features). But when those collection fields are **one-dimensional collections of
+  leaves** (scalars/strings/`any`) they are typically tiny or empty in record data —
+  citm_catalog's `areas[].blockIds` is a `[]any` that is *always* `[]` — so the count
+  stays bounded and the append-doubling reallocations dominate instead (`decodeAreas`
+  alone is **~19% of citm in `growslice`**). The `relaxed` arg to `structSkipIsCheap`
+  (set by the directive on a root, or the `,presize` tag on a field — both fold into
+  `slicePresize`'s `relaxed` via `sliceDecoder`) admits exactly those leaf-collection
+  structs (`isLeafType` gates the element/value), while still rejecting collection-of-
+  collection and collection-of-struct (so the multi-dimensional coordinate arrays of
+  the entry above are *never* presized regardless of the directive — they go through
+  the untouched `ArrayType` branch). Measured on citm with `,presize` on `areas`:
+  **allocs −54%, B/op −46%**, but **time +5.6…7.6%** — the count, doubling the
+  per-element scan over the tiny ~30-byte `areas` elements, costs more wall-time than
+  the reallocs it saves. That is why it is **off by default and opt-in**: the headline
+  microbenchmark measures decode time (where it's a small loss), but a long-running
+  service that cares about GC pressure can trade for the large allocation cut. marine_ik
+  (`bones[].pos []float64`, 64-element arrays) is the case where the realloc savings
+  *do* win on time too (**−3.8%**, −31% B/op) — the split is array-size/element-size
+  dependent and so not statically decidable, hence the explicit opt-in rather than a
+  cost heuristic. Distinct decoders via the `Presize` suffix / memo-key bit. Covered by
+  conformance `TestPresizeDirective` (directive, multi-dim still correct) and
+  `TestPresizeTag` (per-field, tagged vs untagged decode identically).
 - **SIMD scanners** in `simd_amd64.s`/`simd_arm64.s`: `indexCloseOrEscape`
   (next `"`/`\`) and `indexStructural` (next `{}[]"`). Both arches classify the 5
   target bytes with simdjson's **shuffle trick** — two table lookups
@@ -493,7 +524,14 @@ no regressions.)
   +155%, canada +61%, large-json +48%. Counting a nested element costs the same
   as decoding it (`SkipValue` recurses through the whole subtree), and presizing
   at every nesting level re-counts the sub-structure O(depth) times. `growslice`
-  (12–20% on these benchmarks) is the lesser evil; the presize-skip rules stand.
+  (12–20% on these benchmarks) is the lesser evil; the presize-skip rules stand
+  *by default*. **Partial resolution (now live, opt-in):** the *leaf-collection*
+  subset of this — a struct element whose only non-flat fields are 1-D collections
+  of scalars/strings/`any` (citm `areas`, not the multi-dim coordinate arrays,
+  which stay skipped) — is enabled by `//lightning:presize` / `,presize` (see the
+  `slicePresize` opt-in entry above). It cuts allocations hard (citm −54%) but
+  costs a few % decode time on tiny elements, so it stays off by default; blanket
+  forcing remains rejected.
   A follow-up tried presizing *just* the leaf coordinate rings (`[][N]scalar`)
   with a cheap bracket-only counter (`CountNestedScalarElements`, an
   `indexStructural` depth walk that needs no per-element `SkipValue`): still
