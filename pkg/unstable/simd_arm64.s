@@ -94,6 +94,86 @@ tfound:
 	MOVD R2, ret+24(FP)
 	RET
 
+// func indexEscapeNEON(b []byte) int
+//
+// Returns the index of the first byte JSON string encoding must escape — '"'
+// (0x22), '\\' (0x5c) or a control byte < 0x20 — or len(b) if none. Mirrors
+// indexQuoteOrBackslashNEON (16 bytes/iter, scalar tail) with one extra per-block
+// test for control bytes: VUMIN(chunk, 0x1f) == chunk, true exactly when the lane
+// is <= 0x1f (the NEON form of amd64's PMINUB(v, 0x1f) == v). The three compare
+// splats are built with VDUP-from-GPR, no RODATA load.
+TEXT ·indexEscapeNEON(SB), NOSPLIT, $0-32
+	MOVD b_base+0(FP), R0
+	MOVD b_len+8(FP), R1
+	MOVD $0, R2                  // R2 = current offset
+	MOVD $0x22, R3
+	VDUP R3, V0.B16              // V0 = '"' x16
+	MOVD $0x5c, R3
+	VDUP R3, V1.B16              // V1 = '\\' x16
+	MOVD $0x1f, R3
+	VDUP R3, V5.B16              // V5 = 0x1f x16 (largest control byte)
+
+eloop16:
+	SUB  R2, R1, R7              // R7 = remaining = len - offset
+	CMP  $16, R7
+	BLT  etail
+	ADD  R0, R2, R8             // R8 = &b[offset]
+	VLD1 (R8), [V2.B16]
+	VCMEQ V0.B16, V2.B16, V3.B16 // V3 = (chunk == '"')
+	VCMEQ V1.B16, V2.B16, V4.B16 // V4 = (chunk == '\\')
+	VORR  V4.B16, V3.B16, V3.B16
+	VUMIN V5.B16, V2.B16, V4.B16 // V4 = min(chunk, 0x1f)
+	VCMEQ V4.B16, V2.B16, V4.B16 // V4 = (chunk == min) -> control byte (<= 0x1f)
+	VORR  V4.B16, V3.B16, V3.B16 // V3 = any of the three (0xFF per matching lane)
+	VMOV V3.D[0], R9            // low 8 lanes
+	VMOV V3.D[1], R10           // high 8 lanes
+	CBNZ R9, elow8
+	CBNZ R10, ehigh8
+	ADD  $16, R2
+	B    eloop16
+
+elow8:
+	RBIT R9, R11
+	CLZ  R11, R11               // trailing zeros of R9 = first set bit
+	LSR  $3, R11, R11           // /8 -> first matching byte (lane 0..7)
+	ADD  R2, R11, R11
+	MOVD R11, ret+24(FP)
+	RET
+
+ehigh8:
+	RBIT R10, R11
+	CLZ  R11, R11
+	LSR  $3, R11, R11           // lane within high half (0..7)
+	ADD  $8, R11, R11           // lanes 8..15
+	ADD  R2, R11, R11
+	MOVD R11, ret+24(FP)
+	RET
+
+etail:
+	CMP  R1, R2
+	BGE  enotfound
+
+etailloop:
+	ADD   R0, R2, R8
+	MOVBU (R8), R9
+	CMP   $0x20, R9
+	BLO   etfound              // control byte < 0x20 (unsigned)
+	CMP   $0x22, R9
+	BEQ   etfound
+	CMP   $0x5c, R9
+	BEQ   etfound
+	ADD   $1, R2
+	CMP   R1, R2
+	BLT   etailloop
+
+enotfound:
+	MOVD R1, ret+24(FP)
+	RET
+
+etfound:
+	MOVD R2, ret+24(FP)
+	RET
+
 // func indexStructuralNEON(b []byte) int
 //
 // Returns the index of the first '{', '}', '[', ']' or '"' byte, or len(b).

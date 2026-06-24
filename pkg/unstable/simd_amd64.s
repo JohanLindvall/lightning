@@ -13,6 +13,15 @@ DATA bslashMask<>+16(SB)/8, $0x5c5c5c5c5c5c5c5c
 DATA bslashMask<>+24(SB)/8, $0x5c5c5c5c5c5c5c5c
 GLOBL bslashMask<>(SB), RODATA|NOPTR, $32
 
+// 32-byte splat of 0x1f, the largest control byte. indexEscapeSSE2 flags a control
+// byte (< 0x20) per lane with PMINUB(v, 0x1f) == v: min(c, 0x1f) equals c exactly
+// when c <= 0x1f.
+DATA ctrlMask<>+0(SB)/8, $0x1f1f1f1f1f1f1f1f
+DATA ctrlMask<>+8(SB)/8, $0x1f1f1f1f1f1f1f1f
+DATA ctrlMask<>+16(SB)/8, $0x1f1f1f1f1f1f1f1f
+DATA ctrlMask<>+24(SB)/8, $0x1f1f1f1f1f1f1f1f
+GLOBL ctrlMask<>(SB), RODATA|NOPTR, $32
+
 // Shuffle-classification tables for indexStructuralAVX2 (the simdjson
 // find_structurals trick). A byte is one of '{' '}' '[' ']' '"' iff
 // structLoTable[lowNibble] & structHiTable[highNibble] != 0. The two bits encode
@@ -229,4 +238,147 @@ notfounds:
 tfs:
 	MOVQ DI, ret+24(FP)
 	VZEROUPPER
+	RET
+
+// func indexEscapeSSE2(b []byte) int
+//
+// Returns the index of the first byte JSON string encoding must escape — '"'
+// (0x22), '\\' (0x5c) or a control byte < 0x20 — or len(b) if none. It mirrors
+// indexQuoteOrBackslashSSE2's structure (SSE2 first 32 bytes with no VZEROUPPER,
+// switch to AVX2 only for a long clean run, then a 16-byte SSE loop and a scalar
+// tail) and adds, per block, a PMINUB(v, 0x1f) == v test that marks control bytes:
+// min(c, 0x1f) equals c exactly when c <= 0x1f. X0/Y0 = '"' splat, X1/Y1 = '\\'
+// splat, X6/Y6 = 0x1f splat; X7/Y4 are per-block scratch.
+TEXT ·indexEscapeSSE2(SB), NOSPLIT, $0-32
+	MOVQ b_base+0(FP), SI
+	MOVQ b_len+8(FP), CX
+	XORQ DI, DI
+	// Short buffers (fewer than one vector block) skip the three splat loads and go
+	// straight to the scalar tail, which needs no splats.
+	CMPQ CX, $16
+	JL   esc_tail
+	MOVOU quoteMask<>(SB), X0
+	MOVOU bslashMask<>(SB), X1
+	MOVOU ctrlMask<>(SB), X6
+
+esc_loop32:
+	CMPQ CX, $32
+	JL   esc_loop16
+	MOVOU (SI)(DI*1), X2         // first 16 bytes
+	MOVOU X2, X3
+	PCMPEQB X0, X3              // == '"'
+	MOVOU X2, X7
+	PCMPEQB X1, X7             // == '\\'
+	POR     X7, X3
+	MOVOU X2, X7
+	PMINUB X6, X7              // min(v, 0x1f)
+	PCMPEQB X2, X7            // == v  -> control byte
+	POR     X7, X3
+	PMOVMSKB X3, AX
+	TESTL    AX, AX
+	JNZ      esc_found
+	MOVOU 16(SI)(DI*1), X4      // second 16 bytes
+	MOVOU X4, X5
+	PCMPEQB X0, X5
+	MOVOU X4, X7
+	PCMPEQB X1, X7
+	POR     X7, X5
+	MOVOU X4, X7
+	PMINUB X6, X7
+	PCMPEQB X4, X7
+	POR     X7, X5
+	PMOVMSKB X5, AX
+	TESTL    AX, AX
+	JNZ      esc_found16
+	ADDQ     $32, DI
+	SUBQ     $32, CX
+	MOVBLZX ·useAVX2(SB), AX
+	TESTL   AX, AX
+	JNZ     esc_avx_setup
+	JMP     esc_loop32
+
+esc_avx_setup:
+	VMOVDQU quoteMask<>(SB), Y0
+	VMOVDQU bslashMask<>(SB), Y1
+	VMOVDQU ctrlMask<>(SB), Y6
+
+esc_avx_loop:
+	CMPQ CX, $32
+	JL   esc_avx_done
+	VMOVDQU (SI)(DI*1), Y2
+	VPCMPEQB Y0, Y2, Y3
+	VPCMPEQB Y1, Y2, Y4
+	VPOR      Y4, Y3, Y3
+	VPMINUB   Y6, Y2, Y4        // min(v, 0x1f)
+	VPCMPEQB  Y2, Y4, Y4        // == v  -> control byte
+	VPOR      Y4, Y3, Y3
+	VPMOVMSKB Y3, AX
+	TESTL     AX, AX
+	JNZ       esc_avx_found
+	ADDQ      $32, DI
+	SUBQ      $32, CX
+	JMP       esc_avx_loop
+
+esc_avx_found:
+	BSFL AX, AX
+	ADDQ DI, AX
+	MOVQ AX, ret+24(FP)
+	VZEROUPPER
+	RET
+
+esc_avx_done:
+	VZEROUPPER
+
+esc_loop16:
+	CMPQ CX, $16
+	JL   esc_tail
+	MOVOU (SI)(DI*1), X2
+	MOVOU X2, X3
+	PCMPEQB X0, X3
+	MOVOU X2, X7
+	PCMPEQB X1, X7
+	POR     X7, X3
+	MOVOU X2, X7
+	PMINUB X6, X7
+	PCMPEQB X2, X7
+	POR     X7, X3
+	PMOVMSKB X3, AX
+	TESTL    AX, AX
+	JNZ      esc_found
+	ADDQ     $16, DI
+	SUBQ     $16, CX
+	JMP      esc_loop16
+
+esc_found16:
+	ADDQ $16, DI                 // match was in the second 16-byte half
+
+esc_found:
+	BSFL AX, AX
+	ADDQ DI, AX
+	MOVQ AX, ret+24(FP)
+	RET
+
+esc_tail:
+	TESTQ CX, CX
+	JZ    esc_notfound
+
+esc_tailloop:
+	MOVBLZX (SI)(DI*1), AX
+	CMPL    AX, $0x20
+	JL      esc_tfound                 // control byte < 0x20
+	CMPL    AX, $0x22
+	JE      esc_tfound
+	CMPL    AX, $0x5c
+	JE      esc_tfound
+	INCQ    DI
+	DECQ    CX
+	JNZ     esc_tailloop
+
+esc_notfound:
+	MOVQ b_len+8(FP), AX
+	MOVQ AX, ret+24(FP)
+	RET
+
+esc_tfound:
+	MOVQ DI, ret+24(FP)
 	RET

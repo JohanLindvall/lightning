@@ -8,3 +8,5 @@ package unstable
 func indexCloseOrEscape(b []byte) int { return indexCloseOrEscapeScalar(b) }
 
 func indexStructural(b []byte) int { return indexStructuralScalar(b) }
+
+func indexEscape(b []byte) int { return indexEscapeScalar(b) }
