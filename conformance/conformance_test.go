@@ -2,8 +2,10 @@ package conformance
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 	"unsafe"
@@ -186,4 +188,67 @@ func TestDestructiveDirective(t *testing.T) {
 	if string(data) == orig {
 		t.Errorf("input was not mutated; in-place unescape did not write through")
 	}
+}
+
+// TestEarlyExit exercises the //lightning:earlyexit directive: the decoder
+// stops once every declared field has been read and fast-skips the remainder.
+func TestEarlyExit(t *testing.T) {
+	// All fields present, then a duplicate "a" and an unknown field. The decoder
+	// must stop after a,b,c and NOT apply the later "a":99 (encoding/json's
+	// last-wins would give a=99) — proving the early-exit fired.
+	var d EarlyExitDoc
+	if err := d.UnmarshalJSON([]byte(`{"a":1,"b":2,"c":3,"a":99,"x":[1,2,3]}`)); err != nil {
+		t.Fatal(err)
+	}
+	if d.A != 1 || d.B != 2 || d.C != 3 {
+		t.Fatalf(`got %#v, want {1 2 3}: early-exit must ignore the trailing "a":99`, d)
+	}
+
+	// Once all fields are seen, the rest is bracket-balanced, not grammar-checked:
+	// trailing content a strict per-member decode would reject is tolerated.
+	var d2 EarlyExitDoc
+	if err := d2.UnmarshalJSON([]byte(`{"a":1,"b":2,"c":3, not even valid json here }`)); err != nil {
+		t.Fatalf("early-exit should skip unchecked trailing content: %v", err)
+	}
+	if d2.A != 1 || d2.B != 2 || d2.C != 3 {
+		t.Fatalf("got %#v", d2)
+	}
+
+	// A missing field means all-fields-seen never triggers, so the whole object is
+	// decoded normally and the present fields still land.
+	var d3 EarlyExitDoc
+	if err := d3.UnmarshalJSON([]byte(`{"a":1,"b":2,"x":7}`)); err != nil {
+		t.Fatal(err)
+	}
+	if d3.A != 1 || d3.B != 2 || d3.C != 0 {
+		t.Fatalf("got %#v", d3)
+	}
+}
+
+func BenchmarkEarlyExit(b *testing.B) {
+	var sb strings.Builder
+	sb.WriteString(`{"a":1,"b":2,"c":3`)
+	for i := 0; i < 200; i++ {
+		fmt.Fprintf(&sb, `,"field_number_%d":"some string value here %d"`, i, i)
+	}
+	sb.WriteString("}")
+	data := []byte(sb.String())
+	b.Run("normal", func(b *testing.B) {
+		b.SetBytes(int64(len(data)))
+		for i := 0; i < b.N; i++ {
+			var d NormalDoc
+			if err := d.UnmarshalJSON(data); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("earlyexit", func(b *testing.B) {
+		b.SetBytes(int64(len(data)))
+		for i := 0; i < b.N; i++ {
+			var d EarlyExitDoc
+			if err := d.UnmarshalJSON(data); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
 }

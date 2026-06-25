@@ -131,3 +131,23 @@ type DestructiveDoc struct {
 	Name string   `json:"name,nocopy"`
 	Tags []string `json:"tags,nocopy"`
 }
+
+// EarlyExitDoc carries //lightning:earlyexit: once all three declared fields have
+// been read, the decoder abandons the object and fast-skips the rest to the
+// closing '}' instead of decoding (or validating) the remaining members.
+// Exercised by TestEarlyExit.
+//
+//lightning:earlyexit
+type EarlyExitDoc struct {
+	A int `json:"a"`
+	B int `json:"b"`
+	C int `json:"c"`
+}
+
+// NormalDoc is EarlyExitDoc without the directive — the benchmark baseline for
+// //lightning:earlyexit (BenchmarkEarlyExit).
+type NormalDoc struct {
+	A int `json:"a"`
+	B int `json:"b"`
+	C int `json:"c"`
+}

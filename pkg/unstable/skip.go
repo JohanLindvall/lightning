@@ -58,6 +58,56 @@ func SkipValue(data []byte, i int) (int, error) {
 	}
 }
 
+// SkipObjectTail skips from data[i] — assumed to be inside an object at depth 1,
+// just past a member value (at inter-token whitespace, a ',', or the closing
+// '}') — to just past that object's matching '}'. It balances brackets outside
+// strings, skipping strings (escapes included) and nested arrays/objects, so a
+// brace or bracket inside a string value is never miscounted. A truncated input
+// returns ErrTruncated.
+//
+// It is the early-exit primitive for //lightning:earlyexit decoders: once every
+// declared field has been read, the rest of the object is abandoned and handed
+// here. Unlike the per-member loop it replaces, it does not validate the grammar
+// of the skipped members (it only balances), which is why the directive is opt-in.
+//
+// When the SIMD container skip is available it streams the tail with the
+// in-string-mask balance (absorbing the string keys/values into the bulk scan, no
+// per-string call); otherwise it falls back to a scalar per-string walk.
+func SkipObjectTail(data []byte, i int) (int, error) {
+	if fastSkipAvail {
+		return skipBalance(data, i, 1, false)
+	}
+	return skipObjectTailScalar(data, i)
+}
+
+// skipObjectTailScalar is the non-SIMD SkipObjectTail: balance braces/brackets,
+// skipping strings with SkipString. Used where maskBlock has no SIMD routine.
+func skipObjectTailScalar(data []byte, i int) (int, error) {
+	depth := 1
+	for i < len(data) {
+		switch data[i] {
+		case '"':
+			end, err := SkipString(data, i)
+			if err != nil {
+				return end, err
+			}
+			i = end
+		case '{', '[':
+			depth++
+			i++
+		case '}', ']':
+			depth--
+			i++
+			if depth == 0 {
+				return i, nil
+			}
+		default:
+			i++
+		}
+	}
+	return i, ErrTruncated
+}
+
 func SkipString(data []byte, i int) (int, error) {
 	// data[i] == '"'
 	i++
