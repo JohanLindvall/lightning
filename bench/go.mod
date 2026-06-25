@@ -12,6 +12,7 @@ require (
 	github.com/bytedance/sonic v1.15.2
 	github.com/go-json-experiment/json v0.0.0-20260601182631-00ed12fed2a6
 	github.com/goccy/go-json v0.10.6
+	github.com/klauspost/cpuid/v2 v2.2.9
 	github.com/mailru/easyjson v0.9.2
 	github.com/tidwall/gjson v1.19.0
 )
@@ -21,7 +22,6 @@ require (
 	github.com/bytedance/sonic/loader v0.5.1 // indirect
 	github.com/cloudwego/base64x v0.1.6 // indirect
 	github.com/josharian/intern v1.0.0 // indirect
-	github.com/klauspost/cpuid/v2 v2.2.9 // indirect
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.0 // indirect
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect

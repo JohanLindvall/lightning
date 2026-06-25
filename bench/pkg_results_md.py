@@ -2,12 +2,15 @@
 """Render the `go test -bench ./...` output from the main module into a markdown
 summary, one table per top-level benchmark (EscapeString, EscapeStringInto, …).
 
-Usage: pkg_results_md.py <src pkg_results.txt> <dst .md>. pkg_bench.sh passes an
-architecture-specific destination (pkg_results_<goarch>.md)."""
+Usage: pkg_results_md.py <src pkg_results.txt> <dst .md> [cpu-name]. pkg_bench.sh
+passes an architecture-specific destination (pkg_results_<goarch>.md) and, as an
+optional third argument, a CPU brand string detected via github.com/klauspost/cpuid
+(Go's own `cpu:` line is blank — "unknown" — on arm64)."""
 import re
 import sys
 
 src, dst = sys.argv[1], sys.argv[2]
+cpu_override = sys.argv[3].strip() if len(sys.argv) > 3 else ""
 with open(src) as f:
     lines = f.readlines()
 
@@ -24,6 +27,10 @@ for l in lines:
         m = re.match(r"Benchmark\S+?-(\d+)\s", l)
         if m:
             cores = m.group(1)
+# Prefer the cpuid-detected brand string: Go's `cpu:` line is "unknown" on arm64,
+# where cpuid still reports a real model (e.g. "Apple M2").
+if cpu_override and (not cpu or cpu.lower() == "unknown"):
+    cpu = cpu_override
 if cpu or cores:
     label = "cpu: " + (cpu or "unknown")
     if cores:

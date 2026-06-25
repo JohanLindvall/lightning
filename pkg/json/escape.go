@@ -2,37 +2,24 @@ package json
 
 import (
 	"encoding/binary"
+	"math/bits"
 	"strings"
+
+	"github.com/JohanLindvall/lightning/pkg/unstable"
 )
-
-func getTable(falseValues ...int) [256]bool {
-	table := [256]bool{}
-
-	for i := 0; i < 256; i++ {
-		table[i] = true
-	}
-
-	for _, v := range falseValues {
-		table[v] = false
-	}
-
-	return table
-}
-
-var escapeTable = getTable(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, '"', '\\')
 
 const hexAlphabet = "0123456789abcdef"
 
-// SWAR helpers operating on eight packed bytes at once.
+// SWAR (SIMD-within-a-register) helpers operating on eight packed bytes at once,
+// used by EscapeStringInto's first-run probe. swarHasLess reports (high bit per
+// lane) whether any byte lane of v is < n (1 <= n <= 128); swarHasByte reports
+// whether any lane equals b.
 const (
 	swarLo = 0x0101010101010101 // 1 in every byte lane
 	swarHi = 0x8080808080808080 // high bit of every byte lane
 )
 
-// swarHasLess reports (nonzero) whether any byte lane of v is < n, for
-// 1 <= n <= 128. swarHasByte reports whether any lane equals b. Both yield a
-// value with the high bit set in each matching lane.
-func swarHasLess(v uint64, n uint64) uint64 { return (v - swarLo*n) & ^v & swarHi }
+func swarHasLess(v, n uint64) uint64 { return (v - swarLo*n) & ^v & swarHi }
 func swarHasByte(v uint64, b byte) uint64 {
 	x := v ^ (swarLo * uint64(b))
 	return (x - swarLo) & ^x & swarHi
@@ -46,7 +33,7 @@ func swarHasByte(v uint64, b byte) uint64 {
 // a string with no escapes — is written straight to out, with neither a scratch
 // buffer nor a rescan.
 func EscapeString(s []byte, out *strings.Builder) {
-	pos := firstEscape(s)
+	pos := unstable.IndexEscape(s)
 	if pos == len(s) {
 		// Nothing to escape: write the bytes straight to the builder, avoiding
 		// both the scratch buffer and the copy into it.
@@ -57,25 +44,6 @@ func EscapeString(s []byte, out *strings.Builder) {
 	// prefix is neither re-scanned nor copied through a scratch buffer.
 	out.Write(s[:pos])
 	out.Write(EscapeStringInto(s[pos:], make([]byte, 0, len(s)-pos)))
-}
-
-// firstEscape returns the index of the first byte EscapeString would escape (a
-// control byte < 0x20, '"' or '\\'), or len(s) if none do, scanning eight bytes
-// at a time.
-func firstEscape(s []byte) int {
-	i := 0
-	for ; i+8 <= len(s); i += 8 {
-		v := binary.LittleEndian.Uint64(s[i:])
-		if swarHasLess(v, 0x20)|swarHasByte(v, '"')|swarHasByte(v, '\\') != 0 {
-			break
-		}
-	}
-	for ; i < len(s); i++ {
-		if !escapeTable[s[i]] {
-			return i
-		}
-	}
-	return i
 }
 
 // EscapeStringInto appends the JSON-escaped form of s to out and returns the
@@ -90,18 +58,37 @@ func EscapeStringInto(s []byte, out []byte) []byte {
 	i := 0
 
 	for {
-		// Skip over bytes that need no escaping, eight at a time where possible:
-		// a word is clean unless it holds a control byte (< 0x20), a '"' or a
-		// '\\'. Clean runs are copied out in bulk below.
-		for i+8 <= n {
+		// Find the next byte to escape, choosing the scanner by how much input is
+		// left in the run — decided once per run, so there is no per-word bookkeeping
+		// to tax the common short/escape-dense cases.
+		//
+		// minVectorRun: below this the vector scanner cannot amortize its per-call
+		// setup, so short strings and the short runs between escapes (JSON-in-a-
+		// string, Windows paths, prose) walk words with SWAR — exact offset via
+		// TrailingZeros, no vector call. At or above it the run is long enough that
+		// the SIMD pass wins (log lines, URLs, mostly-clean text): probe the first
+		// word with SWAR (so an immediate escape still avoids setup) and hand the
+		// clean bulk to the scanner.
+		const minVectorRun = 48
+		if n-i >= minVectorRun {
 			v := binary.LittleEndian.Uint64(s[i:])
-			if swarHasLess(v, 0x20)|swarHasByte(v, '"')|swarHasByte(v, '\\') != 0 {
-				break
+			if m := swarHasLess(v, 0x20) | swarHasByte(v, '"') | swarHasByte(v, '\\'); m != 0 {
+				i += bits.TrailingZeros64(m) >> 3
+			} else {
+				i += 8 + unstable.IndexEscape(s[i+8:])
 			}
-			i += 8
-		}
-		for i < n && escapeTable[s[i]] {
-			i++
+		} else {
+			for i+8 <= n {
+				v := binary.LittleEndian.Uint64(s[i:])
+				if m := swarHasLess(v, 0x20) | swarHasByte(v, '"') | swarHasByte(v, '\\'); m != 0 {
+					i += bits.TrailingZeros64(m) >> 3
+					break
+				}
+				i += 8
+			}
+			for i < n && s[i] >= 0x20 && s[i] != '"' && s[i] != '\\' {
+				i++
+			}
 		}
 		if i >= n {
 			break

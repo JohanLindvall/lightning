@@ -283,21 +283,28 @@ byte-identical when adding cold paths; push new logic out-of-line.
   records), flat on scalar arrays, zero allocs. Gated `fastSkipAvail = useAVX2`
   (amd64) / `true` (arm64, NEON baseline) / `false` (other, where the scalar
   `maskBlock` is slower than `indexStructural`). The arm64 NEON `maskBlock` builds the
-  movemask NEON lacks (`PMOVMSKB`) by **weight-and-fold**: `VAND` the 0x00/0xFF compare
-  mask with the `{1,2,4,…,128}`-repeated bit-weight vector, then three pairwise adds
-  (`VADDP`) collapse each 8-lane half to one byte whose bits are that half's mask, so a
-  single halfword `VMOV` lifts the full 16-bit result — one cross-domain move per 16-byte
-  half and no integer multiply. This replaced an earlier per-half `AND/MUL/LSR` byte-LSB
-  gather (`& 0x01…01`, `× 0x0102…80`, `>>56`) that did **two** `VMOV`s and two `MUL`s per
-  half; the fold halves the cross-domain traffic and drops the multiplies. **Now measured
-  on Apple M2** (the routine was previously qemu-correct but unbenched): `maskBlock` was
-  ~48% of `BenchmarkGetSkipHeavy` and the fold cut it to ~29%, **−28% end-to-end on that
-  benchmark** (30.8→22.2 µs, +39% B/s) and **−30% geomean** across the
-  `BenchmarkSkipContainer` shapes (string/number objects and nested records each ≈ −39%,
-  scalar arrays flat since they stay on the `indexStructural` path). The fold was made
-  at the then-current six-mask/32-byte `maskBlock`; the routine has since moved to four
-  type-selected masks over a 64-byte block (see the head of this entry), so these M2
-  numbers predate that change and want a re-measure on real arm64. The block-balance
+  movemask NEON lacks (`PMOVMSKB`) by **weight-and-fold over an ADDP cascade**, computing
+  each class's full 64-bit mask (all four 16-byte chunks of the block) with **one**
+  vector→GP move. `VAND` each chunk's 0x00/0xFF compare with the `{1,2,4,…,128}`-repeated
+  bit-weight vector (a matching lane becomes its bit value), then a four-step `VADDP`
+  cascade — `P=ADDP(A0,A1)`, `Q=ADDP(A2,A3)`, `R=ADDP(P,Q)`, `S=ADDP(R,R)` — collapses
+  each chunk's two 8-lane halves to one mask-byte and *packs all four chunks* into S's
+  low eight bytes in order `[lo0,hi0,lo1,hi1,lo2,hi2,lo3,hi3]`, which is exactly the
+  uint64 mask (chunk k at bit 16k), so a single `VMOV S.D[0]` lifts it (no per-half
+  extract, no shift/OR stitching). `ADDP(Vn,Vm)` puts Vn's pairwise sums in the low half;
+  a full 8-lane half sums to 255 so no byte overflows. This replaced (1) an `AND/MUL/LSR`
+  byte-LSB gather with two `VMOV`s + two `MUL`s per 16-byte half, then (2) a per-half
+  three-`VADDP` fold that still did one `VMOV` per 16-byte half (four per class for the
+  64-byte block) plus `ORR`-shift stitching. The cascade drops a class from **27 → 13
+  ops** (16→4 cross-domain `VMOV`s, 12→0 `ORR`s for the whole block). On **Apple M2**,
+  successive: the per-half fold cut `BenchmarkGetSkipHeavy` −28% (30.8→22.2 µs); the
+  cascade then cut **another −24…−33% on `BenchmarkSkipContainer`** (stringObj −32%,
+  numberObj −33%, nestedMixed −28%; scalar arrays flat), dropping `maskBlock` from ~76%
+  to ~45% of the skip profile (its bit-math sibling `skipContainerFast` is now the larger
+  share). This directly attacks the skip path, which the bench-md comparison flags as
+  arm64's worst lag vs amd64 (skip-heavy ~0.36 of amd64's speedup-over-stdlib) — the
+  residual gap is intrinsic: NEON is 16-byte and has no `PMOVMSKB`, so even the cascade
+  does more work than amd64's `VPMOVMSKB` over 32-byte AVX2. The block-balance
   core is factored into `skipBalance(data, pos, depth, isArray)` — `skipContainerFast`
   calls it at `pos = i+1, depth = 1`; the exported `SkipObjectTail` (the
   `//lightning:earlyexit` early-exit, gated on `fastSkipAvail` with a scalar
@@ -320,6 +327,53 @@ byte-identical when adding cold paths; push new logic out-of-line.
   means a not-yet-captured leaf must keep scanning later duplicate keys, so it
   wouldn't beat the current path. Covered by `BenchmarkGetPathsWithSkip` in
   `pkg/json/get_skipbench_test.go` (alongside `BenchmarkGetManyWithSkip`).
+- **SIMD escape scan (`IndexEscape` / `indexEscapeSSE2` / `indexEscapeNEON`).** `EscapeString`/
+  `EscapeStringInto` used a SWAR clean-run scan (`swarHasLess|swarHasByte('"')|
+  swarHasByte('\\')` per 8 bytes); the three SWAR tests were ~80% of a clean-string
+  escape (the two `swarHasByte` alone ~70%). Replaced by an amd64 SSE2/AVX2 scanner
+  `indexEscapeSSE2` (exported `IndexEscape`), structured exactly like
+  `indexQuoteOrBackslashSSE2` (SSE2 first 32 bytes — no VZEROUPPER — then AVX2 once
+  32 bytes are clean, then a 16-byte loop and scalar tail) with one extra per-block
+  test for control bytes: `PMINUB(v, 0x1f) == v` (min(c,0x1f) equals c iff c ≤ 0x1f),
+  `VPMINUB` on the AVX2 path. A `len < 16` short-circuit skips the three splat loads
+  for sub-block buffers. **arm64 has a NEON twin** `indexEscapeNEON` (mirrors
+  `indexQuoteOrBackslashNEON` — 16 bytes/iter, `VDUP`-built splats, `VMOV`+`RBIT`/
+  `CLZ` position recovery, scalar tail) with the control test as `VUMIN(chunk, 0x1f)
+  == chunk` (NEON's form of `PMINUB`); correctness verified (full pkg/unstable +
+  pkg/json suites, incl. the `indexEscape` arm of `TestIndexFunctionsMatchScalar` and
+  the all-bytes/fuzz `TestEscapeStringIntoReference`). Other arches keep the SWAR
+  `indexEscapeScalar` (dispatch in `simd_amd64.go`/`simd_arm64.go`/`simd_scalar.go`,
+  fallback + SWAR helpers in `simd_other.go`). Net (`BenchmarkEscapeStringInto`,
+  amd64): **log_line_clean −80%, mostly_clean_one_quote −73%, url_clean −43%,
+  sentence_clean −15%, short_clean −11%, control_bytes/prose/path −6…−9%**;
+  `EscapeString` (Builder) mirrors it (log_line −52%, mostly_clean −40%).
+- **`EscapeStringInto`'s per-run length gate** (the SWAR/vector chooser, shared by
+  all arches). The pure always-vector form (`i += unstable.IndexEscape(s[i:])` per
+  run) made escape-*dense* input regress: each short run between escapes pays the
+  scanner's per-call setup (3 splats + a block + position recovery) to find an
+  escape a few bytes in, where SWAR finds it in one word. The cost is intrinsic to
+  the vector call and is **worse on arm64 than amd64** — NEON's setup + `VMOV`/`RBIT`
+  recovery is heavier than SSE2's `PMOVMSKB`/`BSF`, so on **Apple M2** the dense
+  cases ran **json_in_json +19%, path +34%, prose +43%** vs the SWAR baseline (amd64
+  saw a milder +12% on json). The fix decides the scanner **once per run** by how
+  much input is left: a run with `< minVectorRun` (48) bytes remaining — every short
+  string and every short gap between escapes — is walked a word at a time with SWAR
+  (exact offset via `TrailingZeros`, no vector call); only a longer run probes its
+  first word with SWAR and hands the clean bulk to `IndexEscape`. Crucially the gate
+  is **one length compare per run**, not per word, and leaves `indexEscape` inlinable
+  — which is why it succeeds where earlier clawbacks failed (a per-word budget taxed
+  pure-SWAR strings; a SWAR-prescan *inside* `indexEscape` broke its inlining, json
+  +33%; an asm scalar peek added cost to every clean prefix, short_clean +56%). M2,
+  vs the SWAR baseline (`main`): dense fixed — **path −4%, json −4.4%, prose +3.3%**
+  (from +34/+19/+43%) — clean wins kept — **log_line_clean −58%, mostly_clean −51%**
+  — small residual +3…+5% on short/medium clean (the lone gate compare on a 5–13 ns
+  op); geomean −16%. `EscapeString` (Builder) is all wins (geomean −13.5%), its
+  scratch alloc hiding the gate. The vector-vs-SWAR boundary is a heuristic — a
+  *long* escape-dense run (rare; real escape-dense strings are short or
+  frequently-escaped) can still take a vector call — but it only ever costs speed,
+  never correctness, both paths gated by the all-bytes + fuzz
+  `TestEscapeStringIntoReference`. asm vs scalar locked by the `indexEscape` arm of
+  `TestIndexFunctionsMatchScalar` (control bytes in the inserted set).
 
 ## The inline trick — let the generator write hot bodies inline
 
@@ -559,6 +613,21 @@ no regressions.)
   `<ABIInternal>` selector outside `package runtime`** ("ABI selector only
   permitted when compiling runtime"), so this is simply unavailable to a
   third-party package. No workaround that doesn't fork the toolchain.
+- **arm64 32-byte-unrolled `indexQuoteOrBackslashNEON` for long strings.** The
+  bench-md flags string_unicode (long unicode text fields) as arm64's #2 lag vs
+  amd64 (~0.68), and the scanner is ~51% of that decode; amd64 wins partly by
+  switching to a 32-byte AVX2 tail. The arm64 analogue: a `loop32` (one 2-register
+  `VLD1` of 32 bytes) reached only when ≥32 bytes remain — so short keys/values keep
+  the latency-tuned 16-byte `loop16` — using the `VUSHR`+`VUZP1` movemask (one
+  cross-domain `VMOV` per 16-byte half instead of two) to cut the throughput-bound
+  long-string scan's `VMOV` traffic in half. **Regressed both**: string_unicode +13%
+  *and* cloudflare +13% — and cloudflare never executes `loop32`, so its regression
+  is pure **code-alignment** shift from inserting the block (the float-array lesson).
+  string_unicode regressing too means the scan isn't `VMOV`-bound — `loop16`'s two D
+  extracts already issue in parallel, so the movemask's extra `VUSHR`+`VUZP1` on the
+  path only adds latency. Confirms the existing "arm64 string scanner is latency-
+  bound and resists mask-reduction" finding; the string_unicode lag is **intrinsic**
+  (NEON 16-byte vs AVX2 32-byte compare width), not closable in the block body.
 - **Key interning / map presizing in the dynamic `any` decoder**
   (`decodeAnyObject`, the `DecodeValue`/`json.DecodeAny` path): twitterescaped's
   `DecodeAny` is bound by building `map[string]any` — `mapassign` plus bucket

@@ -11,3 +11,10 @@ package unstable
 // no-escape fast path — instead of paying a ReadKey call; ReadKey stays the
 // escape/error fallback.
 func IndexCloseOrEscape(b []byte) int { return indexCloseOrEscape(b) }
+
+// IndexEscape returns the index of the first byte that JSON string encoding must
+// escape — a control byte < 0x20, '"' or '\\' — or len(b) if none. It is the
+// scan behind EscapeString/EscapeStringInto: a clean run is copied out in bulk and
+// only the escape byte at the returned index is expanded. SIMD (SSE2/AVX2) on
+// amd64, SWAR elsewhere.
+func IndexEscape(b []byte) int { return indexEscape(b) }
