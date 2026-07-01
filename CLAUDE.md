@@ -333,6 +333,49 @@ byte-identical when adding cold paths; push new logic out-of-line.
   arm64's worst lag vs amd64 (skip-heavy ~0.36 of amd64's speedup-over-stdlib) — the
   residual gap is intrinsic: NEON is 16-byte and has no `PMOVMSKB`, so even the cascade
   does more work than amd64's `VPMOVMSKB` over 32-byte AVX2.
+- **amd64 whole-loop skip assembly (`skipBlocksAVX2`/`skipBlocksAVX512`) + Go-loop
+  fast paths.** Profiling the fast skip showed `maskBlock` (the vector kernel) at
+  only ~15%: the loop was **latency-bound on the loop-carried
+  escaped→inStr→prevInString chain** (each block's in-string mask depends on the
+  previous block's through `findEscaped64`'s add-carry plus `prefixXor64`'s six
+  serial shift-XORs — those few ALU lines out-sample the SIMD), plus a full asm
+  call, four results through memory, five splat loads and an `isArray` branch *per
+  block*. Two layers of fix. **(1) Go-loop fast paths** (all arches, and the
+  amd64 fallback): skip `findEscaped64` when `bslash|prevEscaped == 0` (escapes
+  are rare), skip the prefix-XOR when the block has no unescaped quote (the mask
+  is the carried `prevInString`), and replace the per-bit bracket walk with
+  **popcount bulk updates** whenever the block cannot cross depth 0 (`cl == 0`,
+  or `depth > popcount(cl)` — opens only raise depth, so the running minimum
+  stays ≥ 1); only genuinely-might-close blocks walk bits. Alone: numberObj −22%,
+  nestedMixed −23% (amd64 single-run; arm64 inherits, unmeasured). **(2) The
+  whole block loop in assembly** (`useSkipBlocks`, amd64): splats loaded once,
+  depth/prevEscaped/prevInString carried in registers, the same fast paths and
+  popcount bulk in GP code, and the prefix XOR as **one `VPCLMULQDQ` carryless
+  multiply by all-ones** (the reason the Go form is six shift-XORs is exactly
+  that CLMUL isn't reachable from Go without a call). The shared per-block bit
+  math is one `BLOCKTAIL` macro expanded into both variants (labels are
+  function-scoped). The **AVX-512 variant** (`useSkipBlocks512`, needs
+  AVX512BW) does one 64-byte load and a `VPCMPEQB`→k-mask→`KMOVQ` per class (2
+  instructions vs AVX2's 7); measured on Zen 4: goloop→AVX2 −36…−45%,
+  AVX2→AVX-512 **another −18…−30%** — it earns the gate. Net vs the maskBlock
+  Go loop (interleaved n=8): **stringObj −62.8%, numberObj −66.9%, nestedMixed
+  −58.8%**; scalar arrays flat (they keep the `indexStructural` path by design).
+  The real-workload suite is **flat** — its unknown-field skips are small and
+  skip-heavy's content is scalar-array-dominated (~49 GB/s on the
+  `indexStructural` path already), so this win is for Get/GetPaths/Set-style
+  callers skipping big object/record containers, which is what
+  `BenchmarkSkipContainer` models; cloudflare's apparent +4% was rechecked at
+  n=10 and is alignment noise (p=0.225). Gates
+  `useAVX2 && HasPCLMULQDQ && HasBMI1 && HasPOPCNT` (all universal with AVX2 —
+  correctness belts). arm64 keeps the Go loop over the NEON `maskBlock` (its
+  gap is the documented no-`PMOVMSKB` intrinsic one; the fast paths above apply
+  there too). Correctness: `TestSkipBlocksVariants` flips the dispatch flags and
+  differentially tests **goloop, AVX2 and AVX-512 each** against the scalar
+  oracle over the random fuzz corpus plus `boundaryDocs()` — backslash runs of
+  every parity crossing the 64-byte block boundary at every offset (the
+  `prevEscaped` carry), quotes on the boundary, deep bracket runs, close-dense
+  blocks, closes at exact block multiples — plus per-variant truncation safety;
+  `BenchmarkSkipBlocksVariant` is the standing AVX2-vs-512-vs-Go comparison.
 - **`GetPaths` stack-backed active-index scratch.** `getPaths` keeps one shared
   `[]int` scratch holding the active path-index set for every recursion level
   (sized `len(paths)*(maxDepth+1)` so the depth-first walk's per-level sub-slices
