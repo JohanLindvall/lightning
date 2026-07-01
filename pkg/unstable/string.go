@@ -235,7 +235,12 @@ func Unwrap(data []byte, i int) ([]byte, int, error) {
 		end, err := ExpectNull(data, i)
 		return nil, end, err
 	}
-	s, end, err := ReadStringOrNull(data, i)
+	// The nocopy read hands back an alias for an escape-free string (and a
+	// fresh buffer for an escaped one); the []byte conversion below is then the
+	// single copy that establishes the returned slice's freshly-allocated,
+	// never-retained contract. Reading with ReadStringOrNull here copied
+	// escape-free bodies twice — once into the string, once into the slice.
+	s, end, err := ReadStringNoCopyOrNull(data, i)
 	if err != nil {
 		return nil, end, err
 	}
