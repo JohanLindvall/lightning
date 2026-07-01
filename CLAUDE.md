@@ -367,10 +367,22 @@ byte-identical when adding cold paths; push new logic out-of-line.
   `BenchmarkSkipContainer` models; cloudflare's apparent +4% was rechecked at
   n=10 and is alignment noise (p=0.225). Gates
   `useAVX2 && HasPCLMULQDQ && HasBMI1 && HasPOPCNT` (all universal with AVX2 —
-  correctness belts). arm64 keeps the Go loop over the NEON `maskBlock` (its
-  gap is the documented no-`PMOVMSKB` intrinsic one; the fast paths above apply
-  there too). Correctness: `TestSkipBlocksVariants` flips the dispatch flags and
-  differentially tests **goloop, AVX2 and AVX-512 each** against the scalar
+  correctness belts). **arm64 has the same whole-loop form** (`skipBlocksNEON`,
+  unconditional — NEON is baseline): splats and the bit-weight vector hoisted
+  out of the loop, state in registers, the CLASS/ADDP-cascade movemask per
+  block, popcounts via `CNT`/`UADDLV` (no GP popcount on arm64), the bit walk
+  via `RBIT`+`CLZ`. Deliberately **no PMULL prefix XOR**: the mask is in the GP
+  domain by then (the escape math needs GP add-with-carry) and a GP→SIMD→GP
+  round trip costs more on M-class cores than the shift-XOR chain — which
+  arm64's shifted-register `EOR` does in six single instructions anyway. What
+  the arm64 loop saves vs the Go loop is the per-block call, four results
+  through memory and five per-call `VDUP` splats. Verified under qemu (full
+  pkg/unstable + pkg/json suites, all variants); **its speedup is unmeasured on
+  real arm64** — run `BenchmarkSkipBlocksVariant` on an M-series machine before
+  trusting a number (estimate −20…−35% on the object shapes; qemu is not
+  cycle-accurate). Correctness: `TestSkipBlocksVariants` flips the dispatch flags and
+  differentially tests **goloop, AVX2 and AVX-512 each** (goloop and NEON on
+  arm64) against the scalar
   oracle over the random fuzz corpus plus `boundaryDocs()` — backslash runs of
   every parity crossing the 64-byte block boundary at every offset (the
   `prevEscaped` carry), quotes on the boundary, deep bracket runs, close-dense

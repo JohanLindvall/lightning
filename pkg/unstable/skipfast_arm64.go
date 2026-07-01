@@ -20,12 +20,18 @@ const fastSkipAvail = true
 //go:noescape
 func maskBlock(b []byte, isArray bool) (quote, bslash, open, close uint64)
 
-// useSkipBlocks: the whole-loop assembly block scan is amd64-only; arm64 keeps
-// the Go loop over the NEON maskBlock (its per-call cost is the documented
-// intrinsic gap — no PMOVMSKB — and the Go loop's escape/quote fast paths and
-// popcount bracket updates apply there too).
-const useSkipBlocks = false
+// useSkipBlocks gates the whole-loop NEON block scan (skipBlocksNEON): the
+// character classes, escape/in-string bit math and bracket balancing run in
+// one assembly loop with the splats and bit-weight vector loaded once and the
+// carried state in registers — removing the per-block maskBlock call, its four
+// results through memory, and its five per-call VDUP splats. NEON is baseline
+// on arm64, so this is unconditional; it is a var (not const) so the variant
+// tests can force the Go maskBlock loop for differential comparison.
+var useSkipBlocks = true
 
 func skipBlocks(data []byte, pos, depth int, isArray bool) (end, ndepth int, prevEscaped, prevInString uint64) {
-	panic("unstable: skipBlocks unavailable")
+	return skipBlocksNEON(data, pos, depth, isArray)
 }
+
+//go:noescape
+func skipBlocksNEON(data []byte, pos, depth int, isArray bool) (end, ndepth int, prevEscaped, prevInString uint64)

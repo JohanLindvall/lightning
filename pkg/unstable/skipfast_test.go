@@ -185,6 +185,49 @@ func TestSkipContainerBoundaries(t *testing.T) {
 	}
 }
 
+// testSkipVariantCorpus runs the boundary corpus plus a randomized document
+// fuzz through whatever skip implementation the dispatch flags currently
+// select, comparing each result (and truncation behavior) against the scalar
+// oracle. The per-arch variant tests flip the flags and call this once per
+// implementation, which is what locks the assembly loops (and their FP result
+// offsets, which the asmdecl vet pass cannot check — see the maskBlock gotcha
+// in CLAUDE.md) to the tested Go bit math.
+func testSkipVariantCorpus(t *testing.T, name string) {
+	t.Helper()
+	docs := boundaryDocs()
+	r := rand.New(rand.NewSource(7))
+	for iter := 0; iter < 4000; iter++ {
+		v := randValue(r, 4)
+		doc, err := json.Marshal(v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(doc) > 0 && (doc[0] == '{' || doc[0] == '[') {
+			docs = append(docs, string(doc))
+		}
+	}
+	for _, c := range docs {
+		for _, pad := range []int{0, 70} {
+			data := []byte(c + strings.Repeat(" ", pad))
+			want, werr := refSkip(data, 0)
+			got, gerr := skipContainerFast(data, 0, data[0])
+			if got != want || (werr == nil) != (gerr == nil) {
+				t.Fatalf("%s: %q pad %d: fast=(%d,%v) ref=(%d,%v)",
+					name, c, pad, got, gerr, want, werr)
+			}
+			// Truncation safety per variant: cut anywhere, must error not panic.
+			if len(data) > 2 {
+				tr := data[:1+len(data)/2]
+				_, e1 := refSkip(tr, 0)
+				_, e2 := skipContainerFast(tr, 0, tr[0])
+				if (e1 == nil) != (e2 == nil) {
+					t.Fatalf("%s: %q truncated: ref err=%v fast err=%v", name, c, e1, e2)
+				}
+			}
+		}
+	}
+}
+
 // bigStringObject builds a string-heavy object: many "key":"value" pairs, the
 // shape Get/GetPaths skips over and where per-string SkipString calls dominate.
 func bigStringObject(pairs int) []byte {
