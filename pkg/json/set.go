@@ -17,17 +17,25 @@ import "github.com/JohanLindvall/lightning/pkg/unstable"
 // out is filled from out[:0] and returned; pass a reusable buffer to avoid
 // allocation (a nil out allocates). out must not alias in.
 func Set(in, out, rawVal []byte, keys []string) []byte {
-	start, end, insert, member, comma := setSpan(in, rawVal, keys)
+	start, end, insert, member, comma, nested := setSpan(in, rawVal, keys)
 	out = append(out[:0], in[:start]...)
-	if member != nil {
+	switch {
+	case member == nil:
+		out = append(out, insert...)
+	case nested:
+		// A non-object intermediate is replaced by the remaining path built as
+		// nested objects — appendMember's member form wrapped in braces —
+		// streamed straight into out instead of materializing a temporary.
+		out = append(out, '{')
+		out = appendMember(out, member, rawVal)
+		out = append(out, '}')
+	default:
 		// Append the new member straight into out (which keeps its capacity across
 		// calls) instead of materializing a throwaway insert buffer per call.
 		if comma {
 			out = append(out, ',')
 		}
 		out = appendMember(out, member, rawVal)
-	} else {
-		out = append(out, insert...)
 	}
 	return append(out, in[end:]...)
 }
@@ -38,18 +46,20 @@ func Set(in, out, rawVal []byte, keys []string) []byte {
 // (replace) or the insertion point in its parent object (create), and on a
 // missing or non-object intermediate it builds the remaining path as nested
 // objects.
-// The insert to make is either a byte span (insert, with member nil) or a new
-// object member to append (member = the remaining key path, comma = whether a
-// leading separator is needed); Set appends the latter directly into its output
-// buffer rather than setSpan allocating a throwaway slice.
-func setSpan(in, rawVal []byte, keys []string) (start, end int, insert []byte, member []string, comma bool) {
+// The insert to make is either a byte span (insert, with member nil) or built
+// from the remaining key path member: an object member to append (comma =
+// whether a leading separator is needed) or, with nested set, a nested-object
+// value replacing a non-object intermediate. Set streams both member forms
+// directly into its output buffer rather than setSpan allocating a throwaway
+// slice.
+func setSpan(in, rawVal []byte, keys []string) (start, end int, insert []byte, member []string, comma, nested bool) {
 	i := unstable.SkipWS(in, 0)
 	for level := 0; level < len(keys); level++ {
 		j := unstable.SkipWS(in, i)
 		if j >= len(in) || in[j] != '{' {
 			// The path still needs to descend but there is no object here: replace
 			// this value with the remaining keys built as nested objects.
-			return i, skipValueOrEnd(in, i), nestValue(keys[level:], rawVal), nil, false
+			return i, skipValueOrEnd(in, i), nil, keys[level:], false, true
 		}
 		afterBrace := j + 1
 		p := unstable.SkipWS(in, afterBrace)
@@ -82,7 +92,7 @@ func setSpan(in, rawVal []byte, keys []string) (start, end int, insert []byte, m
 		}
 		if found {
 			if level == len(keys)-1 {
-				return valStart, valEnd, rawVal, nil, false
+				return valStart, valEnd, rawVal, nil, false, false
 			}
 			i = valStart // descend into the existing value
 			continue
@@ -91,41 +101,33 @@ func setSpan(in, rawVal []byte, keys []string) (start, end int, insert []byte, m
 		// goes right after '{' (no separator); otherwise it is appended after the
 		// last member (with a leading comma). Set writes the member directly.
 		if empty {
-			return afterBrace, afterBrace, nil, keys[level:], false
+			return afterBrace, afterBrace, nil, keys[level:], false, false
 		}
-		return lastValEnd, lastValEnd, nil, keys[level:], true
+		return lastValEnd, lastValEnd, nil, keys[level:], true, false
 	}
 	// No keys: replace the whole document value.
-	return i, skipValueOrEnd(in, i), rawVal, nil, false
+	return i, skipValueOrEnd(in, i), rawVal, nil, false, false
 }
 
-// nestValue builds the JSON value for a key path: rawVal itself when keys is
-// empty, otherwise rawVal wrapped in one object per key, outermost first
-// (["a","b"] -> {"a":{"b":rawVal}}).
-func nestValue(keys []string, rawVal []byte) []byte {
-	if len(keys) == 0 {
-		return rawVal
-	}
-	out := make([]byte, 0, len(rawVal)+len(keys)*8)
-	for _, k := range keys {
-		out = append(out, '{', '"')
-		out = append(out, k...)
-		out = append(out, '"', ':')
-	}
-	out = append(out, rawVal...)
-	for range keys {
-		out = append(out, '}')
-	}
-	return out
-}
-
-// appendMember appends the object member `"keys[0]":<nestValue(keys[1:])>` used
-// when inserting a fresh key into an existing object.
+// appendMember appends the object member `"keys[0]":{"keys[1]":...rawVal...}`
+// used when inserting a fresh key into an existing object: the deeper keys are
+// written as nested objects around rawVal, streamed directly into dst — no
+// intermediate buffer, so a multi-key create allocates nothing beyond dst's own
+// growth.
 func appendMember(dst []byte, keys []string, rawVal []byte) []byte {
 	dst = append(dst, '"')
 	dst = append(dst, keys[0]...)
 	dst = append(dst, '"', ':')
-	return append(dst, nestValue(keys[1:], rawVal)...)
+	for _, k := range keys[1:] {
+		dst = append(dst, '{', '"')
+		dst = append(dst, k...)
+		dst = append(dst, '"', ':')
+	}
+	dst = append(dst, rawVal...)
+	for range keys[1:] {
+		dst = append(dst, '}')
+	}
+	return dst
 }
 
 // skipValueOrEnd is SkipValue but tolerant: on a malformed value it returns the
@@ -170,7 +172,15 @@ func SetMany(in, out []byte, rawVal [][]byte, keys []string) []byte {
 		}
 		return append(out, '}')
 	}
-	found := make([]bool, n)
+	// The found flags live on the stack for the common small key set; only an
+	// oversized set falls back to a heap slice. The backing never escapes.
+	var foundBuf [64]bool
+	var found []bool
+	if n <= len(foundBuf) {
+		found = foundBuf[:n]
+	} else {
+		found = make([]bool, n)
+	}
 	prev := 0 // bytes of in already copied into out
 	afterBrace := j + 1
 	p := unstable.SkipWS(in, afterBrace)
@@ -191,9 +201,11 @@ func SetMany(in, out []byte, rawVal [][]byte, keys []string) []byte {
 		lastValEnd = ve
 		// Replace this member's value if its key was requested and not yet set
 		// (the first occurrence wins, as in GetMany). Key sets are small, so the
-		// linear scan is cheaper than a map.
+		// linear scan is cheaper than a map. As in getMany, the string compare
+		// leads: it fails on a length mismatch for almost every member, skipping
+		// the found[m] load on the overwhelmingly common non-matching key.
 		for m := 0; m < n; m++ {
-			if !found[m] && keys[m] == k {
+			if keys[m] == k && !found[m] {
 				out = append(out, in[prev:vs]...) // copy through up to the old value
 				out = append(out, rawVal[m]...)   // ... and substitute it
 				prev = ve
@@ -258,6 +270,9 @@ func SetPaths(in, out []byte, rawVal [][]byte, paths [][]string) []byte {
 	if n == 0 {
 		return append(out, in...)
 	}
+	// The walk's transient index sets (idx here; matched/recurse/create in
+	// setObject; sub in appendMembers) are all small non-escaping locals the
+	// compiler keeps on the stack, so a SetPaths call allocates nothing but out.
 	idx := make([]int, n)
 	for m := range idx {
 		idx[m] = m
@@ -361,7 +376,15 @@ func setObject(in, out []byte, i, depth int, active []int, paths [][]string, raw
 // shared prefix yields one member. Per key it uses a path that ends there (its
 // rawVal) or a freshly built nested object for the deeper paths. If lead is true a
 // comma precedes the first member (to follow members already written).
+//
+// The per-key sub-set of deeper paths is built in a small per-frame stack array:
+// grown with `var sub []int` appends it was the one set in the walk the compiler
+// heap-allocated (append growth from nil defeats stack placement even though the
+// slice never escapes), costing an allocation per created level. A key sharing
+// more than eight deeper paths overflows the array and append falls back to the
+// heap — rare, and only ever a spill, never a correctness issue.
 func appendMembers(out []byte, paths [][]string, rawVal [][]byte, idx []int, depth int, lead bool) []byte {
+	var subbuf [8]int
 	for pos, a := range idx {
 		key := paths[a][depth]
 		dup := false
@@ -382,7 +405,7 @@ func appendMembers(out []byte, paths [][]string, rawVal [][]byte, idx []int, dep
 		out = append(out, key...)
 		out = append(out, '"', ':')
 		ending := -1
-		var sub []int
+		sub := subbuf[:0]
 		for _, b := range idx {
 			if paths[b][depth] != key {
 				continue

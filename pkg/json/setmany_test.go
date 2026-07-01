@@ -132,6 +132,36 @@ func TestSetPathsDoesNotMutateInputAndReusesBuffer(t *testing.T) {
 	}
 }
 
+// BenchmarkSetMany measures the single-pass multi-key edit with a reused output
+// buffer: one existing key replaced and two members appended. With the
+// stack-backed found flags this is zero allocs/op.
+func BenchmarkSetMany(b *testing.B) {
+	in := []byte(`{"ClientIP":"1.2.3.4","EdgeResponseStatus":200,"Host":"example.com","Method":"GET"}`)
+	vals := setManyVals(`500`, `"eu"`, `true`)
+	keys := []string{"EdgeResponseStatus", "Region", "Cached"}
+	out := make([]byte, 0, 256)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		out = SetMany(in, out[:0], vals, keys)
+	}
+}
+
+// BenchmarkSetPaths measures the one-pass multi-path edit with a reused output
+// buffer, mixing a nested replace, a created sibling under an existing parent,
+// a second nested replace, and a created two-level path. With the shared
+// stack-backed scratch (active/recurse/create/sub sets and matched flags) this
+// is zero allocs/op.
+func BenchmarkSetPaths(b *testing.B) {
+	in := []byte(`{"a":{"b":1,"keep":[1,2,3]},"d":{"e":"x"},"tail":true}`)
+	paths := [][]string{{"a", "b"}, {"a", "c"}, {"d", "e"}, {"f", "g"}}
+	vals := setManyVals(`9`, `8`, `"y"`, `7`)
+	out := make([]byte, 0, 256)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		out = SetPaths(in, out[:0], vals, paths)
+	}
+}
+
 // TestSetPathsMatchesSequentialSet checks SetPaths equals folding Set over the
 // paths one at a time, for a mix of replaced and created (prefix-sharing) paths.
 func TestSetPathsMatchesSequentialSet(t *testing.T) {

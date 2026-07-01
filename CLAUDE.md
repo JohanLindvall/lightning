@@ -348,6 +348,29 @@ byte-identical when adding cold paths; push new logic out-of-line.
   means a not-yet-captured leaf must keep scanning later duplicate keys, so it
   wouldn't beat the current path. Covered by `BenchmarkGetPathsWithSkip` in
   `pkg/json/get_skipbench_test.go` (alongside `BenchmarkGetManyWithSkip`).
+- **Zero-alloc `Set`/`SetMany`/`SetPaths`** (`pkg/json/set.go`). Three pieces.
+  **(1)** All creation streams into `out`: `appendMember` writes a multi-key
+  member's nesting directly (open-braces loop, rawVal, close-braces), and the
+  non-object-intermediate case is signaled out of `setSpan` (`member` + `nested`
+  flag) instead of returning a `nestValue` temporary — completing the
+  member-append streaming that removed the single-key temp. Set create_nested
+  **−46%**, overwrite_nonobject **−46%**, both 1–2 → 0 allocs; append_empty −15%
+  from the same restructure. **(2)** `SetMany`'s found flags are a stack `[64]bool`
+  (heap fallback beyond) and the key test leads with the string compare like
+  `getMany`: **−4.7%**. **(3)** `SetPaths`' one heap set — `appendMembers`' per-key
+  `sub`, whose append-from-nil growth defeats stack placement inside the
+  `appendMembers`↔`appendMergedObject` mutual recursion — is built in a per-frame
+  `[8]int` stack array instead (spilling to heap only past 8 deeper paths per
+  key): **−1.6% time, 1→0 allocs**. Important negative result baked into that
+  shape: porting `getPaths`' *shared* stack-backed scratch (threading
+  active/recurse/create/matched through `setObject`) measured **+2–4%** — escape
+  analysis already keeps `setObject`'s own `make([]bool, len(active))`, `recurse`,
+  `create`, and `idx` locals on the stack (verified by alloc profile: `sub` was
+  the *only* heap set), so the threading replaced free allocations with real
+  bookkeeping and a 256-byte stackbuf memclr per call. Don't re-port it; check
+  the alloc profile before assuming a `make` in this file is heap. Covered by
+  `BenchmarkSet` (append/append_empty/replace/create_nested/overwrite_nonobject),
+  `BenchmarkSetMany`, `BenchmarkSetPaths` — all zero allocs with a reused `out`.
 - **SIMD escape scan (`IndexEscape` / `indexEscapeSSE2` / `indexEscapeNEON`).** `EscapeString`/
   `EscapeStringInto` used a SWAR clean-run scan (`swarHasLess|swarHasByte('"')|
   swarHasByte('\\')` per 8 bytes); the three SWAR tests were ~80% of a clean-string

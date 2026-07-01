@@ -75,6 +75,10 @@ var setBenchCases = []struct {
 	{"append_empty", `{}`, `"checkout"`, []string{"Account"}},
 	// Replace an existing member's value in place.
 	{"replace", `{"ClientIP":"1.2.3.4","EdgeResponseStatus":200,"Host":"example.com"}`, `500`, []string{"EdgeResponseStatus"}},
+	// Create a deep path under an absent key: the member's nesting streams into out.
+	{"create_nested", `{"ClientIP":"1.2.3.4"}`, `"checkout"`, []string{"Meta", "Origin", "Service"}},
+	// Path continues through a non-object value: replaced by nested objects.
+	{"overwrite_nonobject", `{"ClientIP":"1.2.3.4","Meta":7}`, `"eu"`, []string{"Meta", "Region"}},
 }
 
 // BenchmarkSet measures Set with a reused output buffer. The append cases exercise the
@@ -84,7 +88,8 @@ func BenchmarkSet(b *testing.B) {
 	for _, bc := range setBenchCases {
 		b.Run(bc.name, func(b *testing.B) {
 			in, raw := []byte(bc.in), []byte(bc.raw)
-			out := make([]byte, 0, len(bc.in)+len(bc.raw)+16)
+			out := make([]byte, 0, 256) // roomy enough that no case grows it
+
 			b.ReportAllocs()
 			var sink []byte
 			for i := 0; i < b.N; i++ {
