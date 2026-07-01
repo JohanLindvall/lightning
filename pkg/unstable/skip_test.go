@@ -90,3 +90,40 @@ func TestSkipWS(t *testing.T) {
 		})
 	}
 }
+
+func TestSkipObjectTail(t *testing.T) {
+	// from is the index just past the first member's value (where a earlyexit
+	// decoder would early-exit); want is the index just past the matching '}'.
+	cases := []struct {
+		doc  string
+		from int
+		want int
+	}{
+		{`{"a":1,"b":2}`, 6, 13},                   // ',' before "b"
+		{`{"a":1}`, 6, 7},                          // already at '}'
+		{`{"a":1,"b":{"c":2},"d":3}`, 6, 25},       // nested object
+		{`{"a":1,"b":[1,2,{"x":3}],"c":4}`, 6, 31}, // nested array+object
+		{`{"a":1,"b":"}{][\"x"}`, 6, 21},           // braces/brackets/escapes inside a string
+		{`{"a":1}TRAILING`, 6, 7},                  // stops at '}', ignores trailing
+	}
+	// Check both the dispatched path (SIMD where available) and the scalar fallback
+	// directly, so neither diverges regardless of fastSkipAvail.
+	impls := []struct {
+		name string
+		fn   func([]byte, int) (int, error)
+	}{
+		{"SkipObjectTail", SkipObjectTail},
+		{"scalar", skipObjectTailScalar},
+	}
+	for _, im := range impls {
+		for _, c := range cases {
+			got, err := im.fn([]byte(c.doc), c.from)
+			if err != nil || got != c.want {
+				t.Errorf("%s(%q, %d) = (%d, %v), want (%d, nil)", im.name, c.doc, c.from, got, err, c.want)
+			}
+		}
+		if _, err := im.fn([]byte(`{"a":1,"b":2`), 6); err == nil {
+			t.Errorf("%s: truncated object: want error", im.name)
+		}
+	}
+}

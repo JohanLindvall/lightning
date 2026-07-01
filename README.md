@@ -296,6 +296,32 @@ documents with many keys this is a real saving: tagging the GeoSciences `gsoc_20
 corpus's root map cut its allocations ~21%. (Only slice and map roots take the
 directive; a struct root uses per-field `nocopy` tags.)
 
+### `//lightning:earlyexit`
+
+For a struct where you only need the declared fields out of a *larger* object,
+mark it `//lightning:earlyexit`. The decoder tracks which fields it has read in
+a bitmask; once **every declared field has been seen**, it abandons the object and
+fast-skips the rest to the closing `}` (one SIMD bracket-balance pass) instead of
+reading and decoding the remaining members:
+
+```go
+//lightning:earlyexit
+type Header struct {
+	ID   int    `json:"id"`
+	Kind string `json:"kind"`
+} // a 200-field log line whose id+kind come first decodes ~2.5× faster
+```
+
+It only helps when the object carries **more** keys than the struct and the wanted
+ones appear early; a struct that consumes most of its object never triggers the
+early-exit and decodes normally. Because it changes observable behavior, it is
+opt-in: once the fields are complete the trailing members are only **bracket-
+balanced, not grammar-checked** (malformed trailing content is tolerated, not
+rejected), and a **duplicate key** appearing after the struct is full is *not*
+applied — `encoding/json`'s last-wins becomes first-complete-wins for keys that
+repeat past the cutoff. It applies to every struct the type reaches and to structs
+with up to 64 fields (a single `uint64` mask); a wider struct decodes normally.
+
 ## Generated function names
 
 The `UnmarshalJSON` methods keep their exact name (the `json.Unmarshaler`

@@ -12,15 +12,19 @@ allocation-light `json.Unmarshaler` implementations.
   whitespace anywhere in the directive — `//lightning:compact`,
   `// lightning:compact ` and `// lightning: compact` are all equivalent, via
   `strings.Join(strings.Fields(...), "")`; collected into
-  `compactTypes`/`nocopyTypes`/`destructiveTypes`): `//lightning:compact`
+  `compactTypes`/`nocopyTypes`/`destructiveTypes`/`earlyExitTypes`): `//lightning:compact`
   (`g.compact`/`g.skipWS`, compile-time elision of inter-token `SkipWS`),
   `//lightning:destructive` (`g.destructive`/`g.scalar`, the type's nocopy strings
   unescape into the input buffer instead of allocating — see below; implies nocopy),
-  and `//lightning:nocopy` (`g.nocopy`, a slice/map root aliases its keys/elements).
-  The per-root loop sets the working `g.compact`/`g.destructive`/`g.nocopy` from
-  those sets. `g.cmark`/`g.csuf` keep compact/destructive variants distinct in memo
-  keys / function names (the `Destructive` suffix); nocopy variants are already
-  distinguished by the `nocopy` decoder param / `NoCopy` suffix.
+  `//lightning:nocopy` (`g.nocopy`, a slice/map root aliases its keys/elements), and
+  `//lightning:earlyexit` (`g.earlyExit`, an object decoder tracks read fields in a
+  `seen` uint64 bitmask and early-exits via `unstable.SkipObjectTail` once all are
+  set, skipping the rest to the `}`; ≤64-field structs, opt-in because it tolerates
+  malformed trailing members and makes duplicate keys first-complete-wins). The
+  per-root loop sets the working `g.compact`/`g.destructive`/`g.nocopy`/`g.earlyExit` from
+  those sets. `g.cmark`/`g.csuf` keep compact/destructive/earlyexit variants distinct
+  in memo keys / function names (the `Destructive`/`EarlyExit` suffix); nocopy variants
+  are already distinguished by the `nocopy` decoder param / `NoCopy` suffix.
 - `pkg/unstable` — the runtime scanning primitives the generated decoders call, plus
   the handful exported for the `pkg/json` toolkit (`SkipWS`/`SkipWSCompact`/`SkipValue`/
   `SkipString`/`ReadKey`/`DecodeValue`/`UnescapeString`/`ParseFloat` and the `Err*`
@@ -300,7 +304,14 @@ byte-identical when adding cold paths; push new logic out-of-line.
   share). This directly attacks the skip path, which the bench-md comparison flags as
   arm64's worst lag vs amd64 (skip-heavy ~0.36 of amd64's speedup-over-stdlib) — the
   residual gap is intrinsic: NEON is 16-byte and has no `PMOVMSKB`, so even the cascade
-  does more work than amd64's `VPMOVMSKB` over 32-byte AVX2.
+  does more work than amd64's `VPMOVMSKB` over 32-byte AVX2. The block-balance
+  core is factored into `skipBalance(data, pos, depth, isArray)` — `skipContainerFast`
+  calls it at `pos = i+1, depth = 1`; the exported `SkipObjectTail` (the
+  `//lightning:earlyexit` early-exit, gated on `fastSkipAvail` with a scalar
+  per-string fallback) calls it at `pos = i, depth = 1` to balance to the enclosing
+  object's `}` from *inside* it. Wiring it into `SkipObjectTail` turned the
+  earlyexit skip from a per-`SkipString` walk (only ~6% over a normal decode of a
+  200-trailing-field object) into the bulk in-string-mask balance (**−59%, 2.46×**).
 - **`GetPaths` stack-backed active-index scratch.** `getPaths` keeps one shared
   `[]int` scratch holding the active path-index set for every recursion level
   (sized `len(paths)*(maxDepth+1)` so the depth-first walk's per-level sub-slices

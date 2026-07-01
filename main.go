@@ -63,6 +63,7 @@ func generate(inPath string) error {
 		compactTypes:     map[string]bool{},
 		nocopyTypes:      map[string]bool{},
 		destructiveTypes: map[string]bool{},
+		earlyExitTypes:   map[string]bool{},
 	}
 
 	// Generated helper functions are named "lightning<ImportPath><Type>decode...",
@@ -119,6 +120,9 @@ func generate(inPath string) error {
 			if hasDirective("lightning:destructive", gd.Doc, ts.Doc) {
 				g.destructiveTypes[ts.Name.Name] = true
 			}
+			if hasDirective("lightning:earlyexit", gd.Doc, ts.Doc) {
+				g.earlyExitTypes[ts.Name.Name] = true
+			}
 		}
 	}
 	if len(g.order) == 0 {
@@ -159,6 +163,7 @@ func generate(inPath string) error {
 		// A destructive root aliases the very buffer it decodes into, so it is nocopy
 		// too; a plain //lightning:nocopy root (slice/map) aliases its keys/elements.
 		g.nocopy = g.destructive || g.nocopyTypes[name]
+		g.earlyExit = g.earlyExitTypes[name]
 		g.prefix = "lightning" + g.pathFrag + name
 		methods = append(methods, g.genUnmarshal(name))
 	}
@@ -202,15 +207,20 @@ type gen struct {
 	//   //lightning:nocopy       -> nocopyTypes       (slice/map root aliases keys/elements)
 	//   //lightning:destructive  -> destructiveTypes  (unescape strings into the input
 	//                                                   buffer, destroying it; implies nocopy)
+	//   //lightning:earlyexit -> earlyExitTypes         (stop decoding an object once every
+	//                                                   declared field has been read; skip
+	//                                                   the rest to the closing '}')
 	compactTypes     map[string]bool
 	nocopyTypes      map[string]bool
 	destructiveTypes map[string]bool
+	earlyExitTypes   map[string]bool
 
 	// Working flags for the root type currently being generated, derived from the
 	// directive sets above.
 	compact     bool
 	destructive bool   // //lightning:destructive: unescape strings in place
 	nocopy      bool   // //lightning:nocopy root, or a destructive root (which aliases what it decodes)
+	earlyExit   bool   // //lightning:earlyexit: early-exit an object once all fields are seen
 	pathFrag    string // import path sanitized into an identifier fragment
 	prefix      string // current per-type prefix for generated function names
 
@@ -394,6 +404,9 @@ func (g *gen) cmark() string {
 	if g.destructive {
 		m += "destructive:"
 	}
+	if g.earlyExit {
+		m += "earlyexit:"
+	}
 	return m
 }
 
@@ -404,6 +417,9 @@ func (g *gen) csuf() string {
 	}
 	if g.destructive {
 		s += "Destructive"
+	}
+	if g.earlyExit {
+		s += "EarlyExit"
 	}
 	return s
 }
@@ -652,8 +668,13 @@ func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
 		}
 	}
 
-	// Emit one case per field, in collection order, listing the names it won.
-	var cases strings.Builder
+	// Collect, in collection order, the fields that win at least one JSON name (one
+	// switch case each).
+	type emitCase struct {
+		f      fieldInfo
+		quoted []string
+	}
+	var toEmit []emitCase
 	for i, f := range fields {
 		var won []string
 		for _, k := range f.keys {
@@ -668,6 +689,19 @@ func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
 		for j, k := range won {
 			quoted[j] = strconv.Quote(k)
 		}
+		toEmit = append(toEmit, emitCase{f, quoted})
+	}
+
+	// //lightning:earlyexit: each case sets its bit in `seen`; once every declared
+	// field has been read (seen == allMask) the object is abandoned and fast-skipped
+	// to its '}' via SkipObjectTail, sparing the decode of the remaining members. The
+	// mask is a single uint64, so this applies only to structs with <= 64 cases; a
+	// wider one decodes normally (the directive is a no-op).
+	useEarlyExit := g.earlyExit && len(toEmit) >= 1 && len(toEmit) <= 64
+
+	var cases strings.Builder
+	for bitIdx, e := range toEmit {
+		f := e.f
 		hint := f.dest[strings.LastIndexByte(f.dest, '.')+1:]
 		var code string
 		if f.lax {
@@ -681,7 +715,22 @@ func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
 		if len(f.allocs) > 0 {
 			code = strings.Join(f.allocs, "\n") + "\n" + code
 		}
-		fmt.Fprintf(&cases, "\tcase %s:\n%s\n", strings.Join(quoted, ", "), code)
+		if useEarlyExit {
+			code += fmt.Sprintf("\nseen |= 1 << %d", bitIdx)
+		}
+		fmt.Fprintf(&cases, "\tcase %s:\n%s\n", strings.Join(e.quoted, ", "), code)
+	}
+
+	// Early-exit scaffolding, empty unless useEarlyExit: the `seen` declaration before the
+	// loop and the all-fields-found check after the switch.
+	var seenDecl, stopCheck string
+	if useEarlyExit {
+		mask := "^uint64(0)"
+		if len(toEmit) < 64 {
+			mask = fmt.Sprintf("0x%x", uint64(1)<<uint(len(toEmit))-1)
+		}
+		seenDecl = "var seen uint64"
+		stopCheck = fmt.Sprintf("if seen == %s {\nreturn unstable.SkipObjectTail(data, i)\n}", mask)
 	}
 
 	body := fmt.Sprintf(`func %[1]s(v %[2]s, data []byte, i int) (int, error) {
@@ -695,6 +744,7 @@ func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
 		return i, unstable.ErrExpectObject
 	}
 	i++
+	%[9]s
 	for {
 		%[4]s
 		if i >= len(data) {
@@ -721,6 +771,7 @@ func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
 			}
 			i = end
 		}
+		%[10]s
 		%[7]s
 		if i >= len(data) {
 			return i, unstable.ErrTruncated
@@ -733,7 +784,7 @@ func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
 		}
 		i++
 	}
-}`, fn, paramType, cases.String(), g.skipWS("i", "i"), g.skipWS("i", "ni"), g.skipWS("i", "i+1"), g.skipWS("i", "i"), g.readKey())
+}`, fn, paramType, cases.String(), g.skipWS("i", "i"), g.skipWS("i", "ni"), g.skipWS("i", "i+1"), g.skipWS("i", "i"), g.readKey(), seenDecl, stopCheck)
 	g.decoders = append(g.decoders, body)
 }
 

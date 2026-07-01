@@ -61,15 +61,24 @@ func findEscaped64(backslash uint64, prevEscaped *uint64) uint64 {
 // bracket of the other type is ignored, exactly as skipObject/skipArray do. A
 // truncated/malformed container returns ErrTruncated.
 func skipContainerFast(data []byte, i int, open byte) (int, error) {
-	close := byte('}')
-	if open == '[' {
-		close = ']'
+	return skipBalance(data, i+1, 1, open == '[')
+}
+
+// skipBalance balances the bracket pair selected by isArray ('{'/'}' for an
+// object, '['/']' for an array) outside strings, starting at data[pos] with the
+// given starting depth, and returns the index just past the bracket that brings
+// depth to zero. The other bracket type is ignored, matching skipObject/skipArray.
+// It is shared by skipContainerFast (pos just past an opening bracket, depth 1)
+// and SkipObjectTail (pos already inside an object, depth 1). It uses maskBlock,
+// so callers must gate on fastSkipAvail (the amd64 asm is AVX2). Truncation
+// returns ErrTruncated.
+func skipBalance(data []byte, pos, depth int, isArray bool) (int, error) {
+	open, close := byte('{'), byte('}')
+	if isArray {
+		open, close = '[', ']'
 	}
-	depth := 1
-	pos := i + 1
 	var prevEscaped, prevInString uint64
 
-	isArray := open == '['
 	for pos+64 <= len(data) {
 		quote, bslash, op, cl := maskBlock(data[pos:], isArray)
 		escaped := findEscaped64(bslash, &prevEscaped)

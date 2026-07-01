@@ -3,6 +3,7 @@ package bench
 import json "encoding/json"
 
 //lightning:compact
+//lightning:earlyexit
 type Benchmark struct {
 	EdgeStartTimestamp json.RawMessage `json:"EdgeStartTimestamp,nocopy"`
 	EventTimestampMs   int64           `json:"EventTimestampMs"`
