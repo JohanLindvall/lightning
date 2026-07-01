@@ -25,7 +25,8 @@ allocation-light `json.Unmarshaler` implementations.
   the handful exported for the `pkg/json` toolkit (`SkipWS`/`SkipWSCompact`/`SkipValue`/
   `SkipString`/`ReadKey`/`DecodeValue`/`UnescapeString`/`ParseFloat` and the `Err*`
   sentinels). This is where almost all performance work happens. Split into topical
-  files: `read.go` (the `Read*` readers), `skip.go`, `skipfast.go` (+ `skipfast_{amd64,arm64,noasm}`,
+  files: `read.go` (the `Read*` readers), `batch.go` (the batched scalar-array
+  readers), `skip.go`, `skipfast.go` (+ `skipfast_{amd64,arm64,noasm}`,
   the SIMD container skip), `count.go` (slice-presize counters), `numeric.go` (`scanFloat`
   + Eisel-Lemire), `string.go` (unescape/`Unwrap`), `date.go`/`time.go`, `any.go` (the
   dynamic `DecodeValue`), and the `simd_*` SIMD kernels; `unstable.go` holds the rest.
@@ -99,6 +100,37 @@ byte-identical when adding cold paths; push new logic out-of-line.
   overhead is diluted by the surrounding string/object work. citm_catalog is flat
   despite the most 9-digit IDs: its bottleneck is key reading and map building, not
   int parsing.
+- **Batched scalar-array readers** (`batch.go`: `DecodeFloat64Slice`, the generic
+  `DecodeIntSlice`/`DecodeUintSlice`, and the fixed-size `DecodeFloat64Array`/
+  `DecodeIntArray`). The generated per-element loop paid a non-inlinable reader
+  call per number — two frames for floats (`ReadFloat64OrNull` → `scanFloat`) —
+  plus its own append/branch machinery; ~18% of the canada profile was that
+  dispatch. The generator (`batchSliceFn`/`batchArrayFn` in `main.go`) now routes
+  any slice or fixed-size-array field whose element is a bare float64/int/uint
+  kind to these pkg/unstable loops, which call the private `scanFloat` directly
+  (one frame per float) and inline the SWAR digit fold (no call at all per int).
+  Presize (`CountArrayScalars`, only when `*out == nil`) and null handling live
+  inside; semantics match the generated loop exactly — null root → nil slice /
+  untouched fixed array, null element → zero, overflow wrap, tolerated truncated
+  fraction — locked by parity tests against `ReadInt64OrNull` in `batch_test.go`.
+  float32/bool elements keep the generated loop. Interleaved A/B (n=8, amd64):
+  **numbers −9.2%, float-array −8.5%, marine_ik −6.4%, float-array-slow −5.4%,
+  mesh −5.3%, mesh_pretty −3.7%**; canada/canada_geometry/large-json flat (their
+  `[N]float64` ring points are scanFloat-bound, so the saved frame is a small
+  fraction) and citm/cloudflare/twitter/synthea flat — no regressions. Toolchain
+  note discovered here: the Go 1.25 inliner now inlines functions *with loops*
+  (`SkipWS` cost 16, `SkipWSRun` 62), so `SkipWSRun` inlines straight into these
+  readers — but a tiny `skipws` helper wrapping the two-compare fast path +
+  `SkipWSRun` exceeds the budget (cost 97 > 80), which is why the whitespace fast
+  path is expanded manually at each site, generator-style.
+- **Named-struct slice presize parity.** `slicePresize`'s `*ast.Ident` case now
+  resolves a named struct element through `g.structTypes` and applies the same
+  `isFlatScalarStringStruct`/`structSkipIsCheap` decision as an anonymous struct
+  element; previously a schema that *named* a shared record type (a FHIR coding)
+  silently lost the `CountArrayObjects`/`CountArrayElements` presize its inline
+  twin received. synthea_fhir (the only bench with named struct slices):
+  allocs/op −1.8%, B/op −0.3%, time statistically flat (p=0.065; its coding
+  arrays are almost all single-element, so the win is bounded there).
 - **Escaped-string decoding** (`decodeEscaped` / `readUnicodeEscape` /
   `decodeStringEscaped`) — three things make densely-escaped text fast
   (`\uXXXX`-per-character CJK, the twitterescaped workload): **(1)** the

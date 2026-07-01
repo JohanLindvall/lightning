@@ -799,6 +799,16 @@ func (g *gen) field(dest string, expr ast.Expr, hint string, nocopy, lax bool) s
 
 	case *ast.ArrayType:
 		if t.Len != nil {
+			if fn := batchArrayFn(t.Elt); fn != "" {
+				// Batched fixed-array read: pass the array as a slice; one call
+				// per point instead of a generated decoder call plus a reader
+				// call per element.
+				return fmt.Sprintf(`end, err := %s((%s)[:], data, i)
+	if err != nil {
+		return end, err
+	}
+	i = end`, fn, dest)
+			}
 			return g.callDecoder(dest, g.arrayDecoder(t, hint, nocopy, lax))
 		}
 		return g.callDecoder(dest, g.sliceDecoder(t.Elt, hint, nocopy, lax))
@@ -1152,7 +1162,52 @@ func (g *gen) arrayDecoder(t *ast.ArrayType, hint string, nocopy, lax bool) stri
 	return fn
 }
 
+// batchSliceFn returns the pkg/unstable batched reader that decodes a whole
+// []T in one call when T is a bare float64/int/uint kind, or "" when the
+// element needs a generated loop. The batched readers keep the element loop
+// next to the private scanFloat / inlined SWAR digit parse, so each number
+// costs at most one call instead of the generated loop's per-element reader
+// call; presize (CountArrayScalars) and null handling live inside them, and
+// nocopy/lax are no-ops for these element kinds. The generic Int/Uint readers
+// infer T from the *[]T argument, so no instantiation is spelled.
+func batchSliceFn(elt ast.Expr) string {
+	id, ok := unparen(elt).(*ast.Ident)
+	if !ok {
+		return ""
+	}
+	switch {
+	case id.Name == "float64":
+		return "unstable.DecodeFloat64Slice"
+	case intKinds[id.Name]:
+		return "unstable.DecodeIntSlice"
+	case uintKinds[id.Name]:
+		return "unstable.DecodeUintSlice"
+	}
+	return ""
+}
+
+// batchArrayFn is batchSliceFn for a fixed-size array element ([N]float64
+// coordinate points and the like); the reader takes the array as a slice
+// (dest[:]) and zeroes/fills/skips exactly as the generated fixed-array
+// decoder did.
+func batchArrayFn(elt ast.Expr) string {
+	id, ok := unparen(elt).(*ast.Ident)
+	if !ok {
+		return ""
+	}
+	switch {
+	case id.Name == "float64":
+		return "unstable.DecodeFloat64Array"
+	case intKinds[id.Name]:
+		return "unstable.DecodeIntArray"
+	}
+	return ""
+}
+
 func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax bool) string {
+	if fn := batchSliceFn(elt); fn != "" {
+		return fn
+	}
 	suffix := ""
 	if nocopy {
 		suffix = "NoCopy"
@@ -1246,6 +1301,20 @@ func (g *gen) slicePresize(elt ast.Expr, eltStr string) string {
 			counter = "unstable.CountArrayScalars"
 		case t.Name == "string":
 			counter = "unstable.CountArrayElements"
+		default:
+			// A *named* struct element gets the same presize decision as the
+			// equivalent anonymous struct below; without this a schema that
+			// names a shared record type (a FHIR coding, say) silently lost
+			// the CountArrayObjects/CountArrayElements presize its inline twin
+			// receives.
+			if st, ok := g.structTypes[t.Name]; ok {
+				switch {
+				case isFlatScalarStringStruct(st):
+					counter = "unstable.CountArrayObjects"
+				case g.structSkipIsCheap(st):
+					counter = "unstable.CountArrayElements"
+				}
+			}
 		}
 		// Presize a slice of structs only when each element is cheap to skip — a
 		// flat record of scalars and strings, like a Cloudflare log line. If an
