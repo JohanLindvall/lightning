@@ -17,9 +17,18 @@ import "github.com/JohanLindvall/lightning/pkg/unstable"
 // out is filled from out[:0] and returned; pass a reusable buffer to avoid
 // allocation (a nil out allocates). out must not alias in.
 func Set(in, out, rawVal []byte, keys []string) []byte {
-	start, end, insert := setSpan(in, rawVal, keys)
+	start, end, insert, member, comma := setSpan(in, rawVal, keys)
 	out = append(out[:0], in[:start]...)
-	out = append(out, insert...)
+	if member != nil {
+		// Append the new member straight into out (which keeps its capacity across
+		// calls) instead of materializing a throwaway insert buffer per call.
+		if comma {
+			out = append(out, ',')
+		}
+		out = appendMember(out, member, rawVal)
+	} else {
+		out = append(out, insert...)
+	}
 	return append(out, in[end:]...)
 }
 
@@ -29,14 +38,18 @@ func Set(in, out, rawVal []byte, keys []string) []byte {
 // (replace) or the insertion point in its parent object (create), and on a
 // missing or non-object intermediate it builds the remaining path as nested
 // objects.
-func setSpan(in, rawVal []byte, keys []string) (start, end int, insert []byte) {
+// The insert to make is either a byte span (insert, with member nil) or a new
+// object member to append (member = the remaining key path, comma = whether a
+// leading separator is needed); Set appends the latter directly into its output
+// buffer rather than setSpan allocating a throwaway slice.
+func setSpan(in, rawVal []byte, keys []string) (start, end int, insert []byte, member []string, comma bool) {
 	i := unstable.SkipWS(in, 0)
 	for level := 0; level < len(keys); level++ {
 		j := unstable.SkipWS(in, i)
 		if j >= len(in) || in[j] != '{' {
 			// The path still needs to descend but there is no object here: replace
 			// this value with the remaining keys built as nested objects.
-			return i, skipValueOrEnd(in, i), nestValue(keys[level:], rawVal)
+			return i, skipValueOrEnd(in, i), nestValue(keys[level:], rawVal), nil, false
 		}
 		afterBrace := j + 1
 		p := unstable.SkipWS(in, afterBrace)
@@ -69,20 +82,21 @@ func setSpan(in, rawVal []byte, keys []string) (start, end int, insert []byte) {
 		}
 		if found {
 			if level == len(keys)-1 {
-				return valStart, valEnd, rawVal
+				return valStart, valEnd, rawVal, nil, false
 			}
 			i = valStart // descend into the existing value
 			continue
 		}
 		// Key absent at this level: create the member. Into an empty object it
-		// goes right after '{'; otherwise it is appended after the last member.
+		// goes right after '{' (no separator); otherwise it is appended after the
+		// last member (with a leading comma). Set writes the member directly.
 		if empty {
-			return afterBrace, afterBrace, appendMember(nil, keys[level:], rawVal)
+			return afterBrace, afterBrace, nil, keys[level:], false
 		}
-		return lastValEnd, lastValEnd, appendMember([]byte{','}, keys[level:], rawVal)
+		return lastValEnd, lastValEnd, nil, keys[level:], true
 	}
 	// No keys: replace the whole document value.
-	return i, skipValueOrEnd(in, i), rawVal
+	return i, skipValueOrEnd(in, i), rawVal, nil, false
 }
 
 // nestValue builds the JSON value for a key path: rawVal itself when keys is

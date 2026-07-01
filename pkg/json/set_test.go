@@ -63,3 +63,34 @@ func TestSetReusesBuffer(t *testing.T) {
 		t.Fatalf("expected Set to reuse the provided buffer")
 	}
 }
+
+var setBenchCases = []struct {
+	name    string
+	in, raw string
+	keys    []string
+}{
+	// Append a fresh top-level member into a populated object (the common inject case).
+	{"append", `{"ClientIP":"1.2.3.4","EdgeResponseStatus":200,"Host":"example.com"}`, `"checkout"`, []string{"Account"}},
+	// Append into an empty object (no leading separator).
+	{"append_empty", `{}`, `"checkout"`, []string{"Account"}},
+	// Replace an existing member's value in place.
+	{"replace", `{"ClientIP":"1.2.3.4","EdgeResponseStatus":200,"Host":"example.com"}`, `500`, []string{"EdgeResponseStatus"}},
+}
+
+// BenchmarkSet measures Set with a reused output buffer. The append cases exercise the
+// member-insertion path, which writes the new member straight into out (no per-call
+// throwaway allocation); with a warm buffer they should report zero allocs/op.
+func BenchmarkSet(b *testing.B) {
+	for _, bc := range setBenchCases {
+		b.Run(bc.name, func(b *testing.B) {
+			in, raw := []byte(bc.in), []byte(bc.raw)
+			out := make([]byte, 0, len(bc.in)+len(bc.raw)+16)
+			b.ReportAllocs()
+			var sink []byte
+			for i := 0; i < b.N; i++ {
+				sink = Set(in, out[:0], raw, bc.keys)
+			}
+			_ = sink
+		})
+	}
+}
