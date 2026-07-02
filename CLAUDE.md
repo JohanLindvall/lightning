@@ -377,10 +377,12 @@ byte-identical when adding cold paths; push new logic out-of-line.
   arm64's shifted-register `EOR` does in six single instructions anyway. What
   the arm64 loop saves vs the Go loop is the per-block call, four results
   through memory and five per-call `VDUP` splats. Verified under qemu (full
-  pkg/unstable + pkg/json suites, all variants); **its speedup is unmeasured on
-  real arm64** — run `BenchmarkSkipBlocksVariant` on an M-series machine before
-  trusting a number (estimate −20…−35% on the object shapes; qemu is not
-  cycle-accurate). Correctness: `TestSkipBlocksVariants` flips the dispatch flags and
+  pkg/unstable + pkg/json suites, all variants) and natively on **Apple M2**
+  (full suite + `TestSkipBlocksVariants`), where `BenchmarkSkipBlocksVariant`
+  (n=8, benchstat) measures NEON-loop vs Go maskBlock loop **stringObj −34.0%,
+  numberObj −34.7%, nestedMixed −28.7%** (geomean −32.5%, all p=0.000) —
+  10–15 GB/s end-to-end on the object shapes, scalar arrays flat by design.
+  Correctness: `TestSkipBlocksVariants` flips the dispatch flags and
   differentially tests **goloop, AVX2 and AVX-512 each** (goloop and NEON on
   arm64) against the scalar
   oracle over the random fuzz corpus plus `boundaryDocs()` — backslash runs of
