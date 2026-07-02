@@ -572,6 +572,23 @@ no regressions.)
   escape-heavy input. Lesson: never size an allocation-reduction idea with
   `GOGC=off`; measure against actually not allocating. A general arena for the
   non-owned *copy* variant may still be worth it; size it that way before building.
+- **Inline clean-string fast path in the unknown-field `default:` skip** (the
+  readKey inline trick applied to the generated `SkipValue` branch: emit
+  `IndexCloseOrEscape` + close-quote test inline, fall back to `SkipValue` for a
+  non-string, escaped, or truncated value). Motivated by an M2 cloudflare profile
+  showing `SkipValue` 17% / `SkipString` 11% cumulative, with 26 of the doc's 42
+  skipped values being clean strings. The fast path *worked* — all 16
+  `IndexCloseOrEscape` sites still inlined, and the opt profile showed
+  `SkipValue`/`SkipString` gone from the top-10 — yet interleaved A/B (n=8, M2)
+  measured **cloudflare +0.48% (p=0.000)**, citm flat, string_unicode +0.19%. The
+  two saved call frames were never on the critical path: each skip is
+  latency-bound on the SIMD scan (identical either way), and the M-class OoO
+  window hides call overhead behind it — the same "latency-bound, not call-bound"
+  lesson as the NEON scanner micro-opts. Lesson: a profile's *cumulative* % for a
+  call chain is not the saveable overhead; only the frames were removable and
+  they cost ~nothing. The readKey/StripDefaults inline trick pays where the
+  inline path *skips work* (no-escape key alias, WS fast path), not where it
+  merely removes a call around identical work.
 - **SWAR / uint64 key matching in the generated field switch.** The thought was to
   load a key's bytes as a `uint64` and compare against precomputed constants instead
   of `memcmp`. Already done — by the Go compiler: `key == "8bytechars"` against a
