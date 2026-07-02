@@ -200,3 +200,27 @@ func BenchmarkUnescapeStringInto(b *testing.B) {
 		})
 	}
 }
+
+func TestValid(t *testing.T) {
+	valid := []string{
+		`null`, `true`, `42`, `-3.14e2`, `"hi\n"`, `[]`, `{}`,
+		`[1,"a",true,null,{"x":[2,3]}]`, "  \n { \"a\" : 1 } \t",
+	}
+	for _, s := range valid {
+		if !Valid([]byte(s)) {
+			t.Errorf("Valid(%q) = false, want true", s)
+		}
+		// Cross-check against the standard library.
+		if !stdjson.Valid([]byte(s)) {
+			t.Fatalf("bad test case %q: stdlib disagrees", s)
+		}
+	}
+	invalid := []string{
+		``, `   `, `{`, `[1,]`, `"unterminated`, `1 2`, `truue`, `{"a":}`,
+	}
+	for _, s := range invalid {
+		if Valid([]byte(s)) {
+			t.Errorf("Valid(%q) = true, want false", s)
+		}
+	}
+}

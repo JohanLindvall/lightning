@@ -3,7 +3,15 @@
 //
 // Usage:
 //
-//	go run . bench/1/data.go
+//	lightning <file.go> [more.go ...]
+//
+// It is normally run from a //go:generate directive:
+//
+//	//go:generate go run github.com/JohanLindvall/lightning $GOFILE
+//
+// or after go install github.com/JohanLindvall/lightning@latest:
+//
+//	//go:generate lightning $GOFILE
 //
 // For each input file FOO.go it writes FOO_unmarshal.go next to it, containing
 // an UnmarshalJSON method for every top-level struct type. The generated code
@@ -13,6 +21,27 @@
 // float64, json.Number, time.Time, json.RawMessage, nested (named or anonymous)
 // structs, slices, maps with string keys, pointers, and interface{}/any (decoded
 // into the usual Go representation of an arbitrary JSON value).
+//
+// Field mapping follows the `json:"..."` struct tag: a tag renames the key,
+// `json:"-"` omits the field, and a `Name|Alias` tag maps several JSON keys onto
+// one field. Untagged exported fields use the Go field name as the key. Unlike
+// encoding/json, key matching is EXACT and case-sensitive — there is no
+// case-insensitive fallback — which is both faster and less surprising. Unknown
+// members in the input are skipped.
+//
+// Per-type behavior is selected by `//lightning:` doc-comment directives on the
+// type: `//lightning:compact` (assume whitespace-free input), `//lightning:nocopy`
+// (alias string/[]byte leaves into the input instead of copying — the caller must
+// then keep the input alive and unchanged), and `//lightning:destructive`
+// (unescape strings in place, mutating and destroying the input buffer; implies
+// nocopy). See README.md for the full directive and struct-tag reference.
+//
+// Non-goals. lightning is decode-only: it generates UnmarshalJSON, not
+// MarshalJSON. It operates on a complete []byte, not an io.Reader — the zero-copy
+// design lets generated decoders and the pkg/json toolkit alias the input rather
+// than stream it, so the whole document must be in memory. For dynamic reads,
+// edits, and reshaping of JSON whose schema is not known at generate time, use the
+// pkg/json toolkit.
 package main
 
 import (

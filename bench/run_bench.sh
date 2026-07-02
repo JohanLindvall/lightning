@@ -245,7 +245,7 @@ func BenchmarkLightningDecodeAny(b *testing.B) {
 	b.SetBytes(int64(len(benchInputCompact)))
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		if _, err := ljson.DecodeAny(benchInputCompact, true); err != nil {
+		if _, err := ljson.DecodeAnyCompact(benchInputCompact); err != nil {
 			b.Fatal(err)
 		}
 	}

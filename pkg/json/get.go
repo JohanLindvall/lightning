@@ -290,6 +290,25 @@ func GetCompact(data []byte, keys ...string) ([]byte, int, error) {
 	return get(data, true, keys...)
 }
 
+// Lookup is Get without the offset return: it walks the object-key path keys into
+// data and returns just the raw bytes of the value found there (aliasing data,
+// following Get's conventions). Use it when the value's position in data is not
+// needed — the common read-only case — and Get when it is (for example to splice
+// the value back into the document). ErrKeyNotFound reports a missing key.
+func Lookup(data []byte, keys ...string) ([]byte, error) {
+	v, _, err := get(data, false, keys...)
+	return v, err
+}
+
+// LookupCompact is Lookup for compact JSON — input with no whitespace between
+// tokens — skipping the inter-token whitespace scans (leading whitespace at the
+// document start is still tolerated). Faster on compact input; may report an
+// error on input that does contain inter-token whitespace.
+func LookupCompact(data []byte, keys ...string) ([]byte, error) {
+	v, _, err := get(data, true, keys...)
+	return v, err
+}
+
 func get(data []byte, compact bool, keys ...string) ([]byte, int, error) {
 	i := unstable.SkipWS(data, 0)
 	for _, key := range keys {

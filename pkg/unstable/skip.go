@@ -58,6 +58,11 @@ func SkipValue(data []byte, i int) (int, error) {
 	}
 }
 
+// SkipString advances past the JSON string starting at data[i] (data[i] must be
+// '"') and returns the index just past its closing quote. Escapes are honored so
+// an escaped quote (\") does not end the string; the scan itself does not
+// validate or decode the escapes. It returns ErrTruncated if the closing quote
+// is missing before the end of data.
 func SkipString(data []byte, i int) (int, error) {
 	// data[i] == '"'
 	i++

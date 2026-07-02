@@ -322,6 +322,9 @@ its surrounding quotes with escapes intact, an object or array spans the whole
   path `keys` one level per key and returns the value's raw bytes (and the offset
   it starts at), without reporting a value type. With no keys it returns the whole
   root value; a missing key returns `ErrKeyNotFound`.
+- `Lookup(data []byte, keys ...string) ([]byte, error)` — `Get` without the
+  offset return, for the common read-only case where the value's position in
+  `data` isn't needed (use `Get` when it is, e.g. to splice the value back in).
 - `GetMany(data []byte, keys []string, out [][]byte) ([][]byte, error)` — looks up
   several *top-level* keys in a **single pass** over the object, where N separate
   `Get` calls would rescan it N times. Results are written into `out[:0]` (pass a
@@ -349,8 +352,9 @@ vals, err := json.GetMany(data, keys, scratch[:0])
 // vals[0] == []byte(`"203.0.113.23"`), vals[1] == []byte("599"), …
 ```
 
-Each function has a **compact counterpart** — `GetCompact`, `GetManyCompact`,
-`ObjectEachCompact` — with the identical signature and result. Like the
+Each function has a **compact counterpart** — `GetCompact`, `LookupCompact`,
+`GetManyCompact`, `GetPathsCompact`, `ObjectEachCompact` — with the identical
+signature and result. Like the
 [`//lightning:compact`](#lightningcompact) directive, they assume the input has
 no whitespace *between* tokens (the form `encoding/json`'s `Marshal` and most
 wire protocols emit) and skip the inter-token `SkipWS` scans, running about 10%
@@ -367,13 +371,28 @@ representation `encoding/json` produces for `interface{}`: `nil`, `bool`,
 counterpart to a generated unmarshaler, using the same scanner but with no target
 type.
 
-- `DecodeAny(data []byte, compact bool) (any, error)` — decodes the single JSON
-  value in `data`. `compact` assumes no inter-token whitespace and skips the
-  `SkipWS` scans (as [`GetCompact`](#key-lookups) does), faster on minified
-  input. Whitespace around the whole document is tolerated; trailing
+- `DecodeAny(data []byte) (any, error)` — decodes the single JSON value in
+  `data`. Whitespace around the whole document is tolerated; trailing
   non-whitespace content after the value is an error. Unlike the key-lookup
   helpers it builds Go values (so strings are unescaped and copied, numbers
   parsed), allocating the maps and slices the result needs.
+- `DecodeAnyCompact(data []byte) (any, error)` — the same for compact input,
+  skipping the inter-token `SkipWS` scans (as [`GetCompact`](#key-lookups) does),
+  faster on minified input; may error if the input does contain inter-token
+  whitespace.
+
+To check well-formedness without a target type, `Valid(data []byte) bool` reports
+whether `data` is one well-formed JSON value (optionally whitespace-surrounded, no
+trailing content). It matches `encoding/json.Valid`'s strictness — rejecting
+trailing commas, malformed numbers, and trailing bytes — by parsing with the same
+scanner as `DecodeAny` and discarding the result (so it allocates the intermediate
+values for a document containing objects or arrays; it deliberately does not use
+the lenient bracket-balancing skip path, which would accept a trailing comma).
+
+Errors returned by these helpers are the package's exported sentinels —
+`ErrKeyNotFound`, `ErrInvalidJSON`, `ErrTruncated`, `ErrExpectObject`,
+`ErrExpectArray`, `ErrExpectColon` — so callers can match them with `errors.Is`
+without importing the internal `pkg/unstable` package.
 
 ## String escaping and unescaping
 
@@ -604,7 +623,7 @@ Representative numbers for a 1.8 KB Cloudflare log (Go 1.26, amd64):
 |---|---|
 | [`main.go`](main.go) | the generator (`package main`) |
 | [`pkg/unstable`](pkg/unstable) | the (unstable, do-not-import) runtime the generated decoders call into |
-| [`pkg/json`](pkg/json) | small public API over the scanner (`Get`/`GetMany`/`GetPaths`/`ObjectEach`, `DecodeAny`, `UnescapeString`, `ParseFloat`, `StripDefaults`, `Set`/`SetMany`/`SetPaths`) |
+| [`pkg/json`](pkg/json) | small public API over the scanner (`Get`/`Lookup`/`GetMany`/`GetPaths`/`ObjectEach`, `Valid`, `DecodeAny`, `UnescapeString`, `ParseFloat`, `StripDefaults`, `Set`/`SetMany`/`SetPaths`) |
 | [`bench/`](bench) | benchmark module: hand-written `data.go` + `input.json` per case, plus the generated decoders, harness, and results |
 
 Generated files (`*_unmarshal.go`, `bench/*/bench_test.go`, `bench/*/ej/`, and

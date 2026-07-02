@@ -58,6 +58,24 @@ func TestGet(t *testing.T) {
 	}
 }
 
+func TestLookup(t *testing.T) {
+	doc := []byte(`{"a": {"b": {"c": 42}}, "name": "widget"}`)
+	// Lookup must return exactly Get's value (and error), just without the offset.
+	for _, keys := range [][]string{nil, {"name"}, {"a", "b", "c"}, {"a", "b"}, {"nope"}} {
+		want, _, wantErr := Get(doc, keys...)
+		got, err := Lookup(doc, keys...)
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("Lookup(%v) err = %v, want %v", keys, err, wantErr)
+		}
+		if string(got) != string(want) {
+			t.Fatalf("Lookup(%v) = %q, want %q", keys, got, want)
+		}
+	}
+	if _, err := LookupCompact([]byte(`{"a":1,"b":2}`), "b"); err != nil {
+		t.Fatalf("LookupCompact: %v", err)
+	}
+}
+
 func TestGetMany(t *testing.T) {
 	doc := []byte(`{
 		"a": 1,
