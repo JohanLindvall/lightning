@@ -684,6 +684,14 @@ func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
 		fmt.Fprintf(&cases, "\tcase %s:\n%s\n", strings.Join(quoted, ", "), code)
 	}
 
+	// The loop top is reached only after '{' (first iteration) or after a
+	// comma, and a '}' after a member returns from the post-value check — so a
+	// '}' at the loop top on a non-first iteration is exactly a trailing comma
+	// ({"a":1,}), rejected as encoding/json does. The `first` flag keeps the
+	// loop shape byte-identical to the lenient form otherwise (one register
+	// move per member): a *rotated* loop (closer checked before the loop and
+	// after each member only) measured cloudflare +11% — the wide decoder is
+	// that layout-sensitive — so don't restructure, flag.
 	body := fmt.Sprintf(`func %[1]s(v %[2]s, data []byte, i int) (int, error) {
 	if i >= len(data) {
 		return i, unstable.ErrTruncated
@@ -695,13 +703,16 @@ func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
 		return i, unstable.ErrExpectObject
 	}
 	i++
-	for {
+	for first := true; ; first = false {
 		%[4]s
 		if i >= len(data) {
 			return i, unstable.ErrTruncated
 		}
 		if data[i] == '}' {
-			return i + 1, nil
+			if first {
+				return i + 1, nil
+			}
+			return i, unstable.ErrInvalidJSON
 		}
 		%[8]s
 		%[5]s
@@ -1114,6 +1125,8 @@ func (g *gen) arrayDecoder(t *ast.ArrayType, hint string, nocopy, lax bool) stri
 		g.needTime = true
 	}
 	elem := g.field("(*out)[idx]", t.Elt, hint, nocopy, lax)
+	// Trailing commas are rejected by the first-iteration flag, as in
+	// genStructBody.
 	body := fmt.Sprintf(`func %[1]s(out *%[2]s, data []byte, i int) (int, error) {
 	if i >= len(data) {
 		return i, unstable.ErrTruncated
@@ -1127,13 +1140,16 @@ func (g *gen) arrayDecoder(t *ast.ArrayType, hint string, nocopy, lax bool) stri
 	*out = %[2]s{}
 	i++
 	idx := 0
-	for {
+	for first := true; ; first = false {
 		%[3]s
 		if i >= len(data) {
 			return i, unstable.ErrTruncated
 		}
 		if data[i] == ']' {
-			return i + 1, nil
+			if first {
+				return i + 1, nil
+			}
+			return i, unstable.ErrInvalidJSON
 		}
 		if idx < len(out) {
 			%[4]s
@@ -1200,6 +1216,8 @@ func batchArrayFn(elt ast.Expr) string {
 		return "unstable.DecodeFloat64Array"
 	case intKinds[id.Name]:
 		return "unstable.DecodeIntArray"
+	case uintKinds[id.Name]:
+		return "unstable.DecodeUintArray"
 	}
 	return ""
 }
@@ -1253,6 +1271,8 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax bool) string {
 			*out = append(*out, zero)
 		}`, eltStr)
 	}
+	// Trailing commas ([1,]) are rejected by the first-iteration flag, as in
+	// genStructBody (see there — a rotated loop regressed cloudflare +11%).
 	body := fmt.Sprintf(`func %[1]s(out *[]%[2]s, data []byte, i int) (int, error) {
 	if i >= len(data) {
 		return i, unstable.ErrTruncated
@@ -1269,13 +1289,16 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax bool) string {
 		return i, unstable.ErrExpectArray
 	}
 %[4]s	i++
-	for {
+	for first := true; ; first = false {
 		%[5]s
 		if i >= len(data) {
 			return i, unstable.ErrTruncated
 		}
 		if data[i] == ']' {
-			return i + 1, nil
+			if first {
+				return i + 1, nil
+			}
+			return i, unstable.ErrInvalidJSON
 		}
 		// Grow the slice by one zero element and decode in place into the new
 		// slot, so the element never lives in an escaping local (which would
@@ -1377,6 +1400,12 @@ func (g *gen) slicePresize(elt ast.Expr, eltStr string) string {
 				counter = "unstable.CountArrayElements"
 			}
 		}
+	case *ast.StarExpr:
+		// A []*T presizes by the same rules as []T: the pointer wrapper changes
+		// per-element allocation, not the JSON shape being counted. Without this
+		// a []*Foo silently lost the presize its []Foo twin gets (the same class
+		// of gap the named-struct-element case above closed).
+		return g.slicePresize(t.X, eltStr)
 	case *ast.SelectorExpr:
 		switch {
 		case isNumber(t):
@@ -1436,6 +1465,8 @@ func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy, lax boo
 	if nocopy {
 		keyAssign = "m[key] = val"
 	}
+	// Trailing commas are rejected by the first-iteration flag, as in
+	// genStructBody.
 	body := fmt.Sprintf(`func %[1]s(out *map[string]%[2]s, data []byte, i int) (int, error) {
 	if i >= len(data) {
 		return i, unstable.ErrTruncated
@@ -1456,14 +1487,17 @@ func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy, lax boo
 	if m == nil {
 		m = make(map[string]%[2]s)
 	}
-	for {
+	for first := true; ; first = false {
 		%[4]s
 		if i >= len(data) {
 			return i, unstable.ErrTruncated
 		}
 		if data[i] == '}' {
-			*out = m
-			return i + 1, nil
+			if first {
+				*out = m
+				return i + 1, nil
+			}
+			return i, unstable.ErrInvalidJSON
 		}
 		%[7]s
 		%[5]s

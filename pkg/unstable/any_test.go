@@ -134,6 +134,12 @@ func TestDecodeValue(t *testing.T) {
 		{"arr truncated after value", `[1`, ErrTruncated},
 		{"arr missing comma", `[1 2]`, ErrInvalidJSON},
 		{"arr bad value", `[}]`, ErrBadNumber},
+		// Trailing commas are rejected (the first-iteration flag: a closer at
+		// the loop top is only reachable after a comma), as in encoding/json.
+		{"obj trailing comma", `{"a":1,}`, ErrInvalidJSON},
+		{"arr trailing comma", `[1,]`, ErrInvalidJSON},
+		{"obj truncated after comma", `{"a":1,`, ErrTruncated},
+		{"arr truncated after comma", `[1,`, ErrTruncated},
 	}
 	for _, tt := range objErrs {
 		t.Run(tt.name, func(t *testing.T) {

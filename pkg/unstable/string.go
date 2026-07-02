@@ -65,9 +65,12 @@ func UnescapeStringInto(in, out []byte) (string, error) {
 // the dense-escape strings that made SkipString costly never take that branch.
 func decodeStringEscaped(data []byte, start, i int) (string, int, error) {
 	capHint := i - start // fallback: the escape-free prefix; append grows the rest
-	if rel := bytes.IndexByte(data[start:], '"'); rel >= 0 {
-		if rel == 0 || data[start+rel-1] != '\\' {
-			capHint = rel // unescaped quote: exact body length
+	// data[start:i] is already proven clean (i is the first '"'/'\\' the caller's
+	// scan found), so the close-quote search starts at i instead of re-scanning
+	// the prefix; the first '"' at or after start is necessarily at or after i.
+	if rel := bytes.IndexByte(data[i:], '"'); rel >= 0 {
+		if rel == 0 || data[i+rel-1] != '\\' {
+			capHint = i - start + rel // unescaped quote: exact body length
 		} else if end, err := SkipString(data, start-1); err == nil {
 			capHint = end - 1 - start // escaped \" up front; find the true close
 		}
@@ -128,32 +131,15 @@ func decodeEscaped(buf, data []byte, start, i int, quoted bool) (string, int, er
 		if i >= len(data) {
 			return "", i, ErrTruncated
 		}
-		switch data[i] {
-		case '"':
-			buf = append(buf, '"')
+		// One table load dispatches the eight single-byte escapes; a Go switch
+		// lowers to a comparison tree that reaches 'u' — the hottest case on
+		// \uXXXX-dense unicode text — last, so 'u' lives in the table's fallback
+		// instead. 0 marks both 'u' and invalid escape bytes; no single-byte escape
+		// produces NUL, so 0 is unambiguous.
+		if r := unescByte[data[i]]; r != 0 {
+			buf = append(buf, r)
 			i++
-		case '\\':
-			buf = append(buf, '\\')
-			i++
-		case '/':
-			buf = append(buf, '/')
-			i++
-		case 'b':
-			buf = append(buf, '\b')
-			i++
-		case 'f':
-			buf = append(buf, '\f')
-			i++
-		case 'n':
-			buf = append(buf, '\n')
-			i++
-		case 'r':
-			buf = append(buf, '\r')
-			i++
-		case 't':
-			buf = append(buf, '\t')
-			i++
-		case 'u':
+		} else if data[i] == 'u' {
 			r, ni, err := readUnicodeEscape(data, i+1)
 			if err != nil {
 				return "", ni, err
@@ -172,7 +158,7 @@ func decodeEscaped(buf, data []byte, start, i int, quoted bool) (string, int, er
 				}
 			}
 			buf = utf8.AppendRune(buf, r)
-		default:
+		} else {
 			return "", i, ErrBadEscape
 		}
 	}
@@ -184,39 +170,63 @@ func decodeEscaped(buf, data []byte, start, i int, quoted bool) (string, int, er
 	return unsafeStr(buf), i, nil
 }
 
-// hexNibble maps a byte to its hex value (0–15), or 0xFF if it is not a hex
-// digit. Four table loads replace the four 3-way comparison chains the
-// digit-at-a-time parse ran, and validation falls out of the lookup: a non-hex
-// byte yields 0xFF, whose high bit survives the OR in readUnicodeEscape.
-var hexNibble = func() [256]uint8 {
-	var t [256]uint8
+// unescByte maps the byte after a backslash to the byte its single-character
+// escape denotes (\" \\ \/ \b \f \n \r \t), or 0 for anything else — both 'u'
+// (the \uXXXX path) and invalid escapes, which decodeEscaped's fallback tells
+// apart. No single-byte escape produces NUL, so 0 is unambiguous.
+var unescByte = func() [256]byte {
+	var t [256]byte
+	t['"'] = '"'
+	t['\\'] = '\\'
+	t['/'] = '/'
+	t['b'] = '\b'
+	t['f'] = '\f'
+	t['n'] = '\n'
+	t['r'] = '\r'
+	t['t'] = '\t'
+	return t
+}()
+
+// hexNibble maps a byte to its hex value (0–15), or the invalid marker 1<<16
+// if it is not a hex digit. Four table loads replace the four 3-way comparison
+// chains the digit-at-a-time parse ran, and validation falls out of the
+// lookup: the marker sits at bit 16, which none of readUnicodeEscape's shifts
+// (12/8/4/0) can move below bit 16, while four valid nibbles total at most
+// 0xFFFF — so a single >= 1<<16 compare on the combined value validates all
+// four digits. (A marker below bit 16, e.g. 0xFF, would be wrong: an invalid
+// second nibble gives 0xFF<<8 = 0xFF00 < 1<<16 and slips through.) uint32
+// entries fold the shifts into the combine, which is also what pulls
+// readUnicodeEscape under the inlining budget.
+var hexNibble = func() [256]uint32 {
+	var t [256]uint32
 	for i := range t {
-		t[i] = 0xFF
+		t[i] = 1 << 16
 	}
 	for c := byte('0'); c <= '9'; c++ {
-		t[c] = c - '0'
+		t[c] = uint32(c - '0')
 	}
 	for c := byte('a'); c <= 'f'; c++ {
-		t[c] = c - 'a' + 10
+		t[c] = uint32(c-'a') + 10
 	}
 	for c := byte('A'); c <= 'F'; c++ {
-		t[c] = c - 'A' + 10
+		t[c] = uint32(c-'A') + 10
 	}
 	return t
 }()
 
+// readUnicodeEscape parses the four hex digits of a \uXXXX escape (data[i] is
+// the first digit). It must stay under the inlining budget: it is called per
+// escape from decodeEscaped's loop, and as a call frame it was the loop's only
+// non-inlined step.
 func readUnicodeEscape(data []byte, i int) (rune, int, error) {
 	if i+4 > len(data) {
 		return 0, i, ErrTruncated
 	}
-	a := hexNibble[data[i]]
-	b := hexNibble[data[i+1]]
-	c := hexNibble[data[i+2]]
-	d := hexNibble[data[i+3]]
-	if a|b|c|d >= 0x80 { // some byte was not a hex digit (mapped to 0xFF)
+	v := hexNibble[data[i]]<<12 | hexNibble[data[i+1]]<<8 | hexNibble[data[i+2]]<<4 | hexNibble[data[i+3]]
+	if v >= 1<<16 { // some byte was not a hex digit (mapped to the bit-16 marker)
 		return 0, i, ErrBadUnicode
 	}
-	return rune(a)<<12 | rune(b)<<8 | rune(c)<<4 | rune(d), i + 4, nil
+	return rune(v), i + 4, nil
 }
 
 // Unwrap reads the JSON string at data[i] and returns the JSON document embedded
