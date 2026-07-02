@@ -239,6 +239,24 @@ byte-identical when adding cold paths; push new logic out-of-line.
   B/op — a slice whose element is a bare scalar (`[]float64`), string, struct, or
   time is still counted (those land in the `Ident`/`StructType`/`SelectorExpr`
   cases, not the fixed-array `ArrayType` branch).
+- **Static first-append capacity hint for un-presized slices** (`sliceDecoder`,
+  the `presize == ""` case). Every slice `slicePresize` declines to count (struct
+  elements nesting a slice/map/any — the citm areas tree — plus the `[][N]T`
+  rings and multi-dim slices above) used to grow from nil by pure append-doubling
+  (1→2→4→…); an M2 alloc profile put that one `append` line at **69% of
+  citm_catalog's allocated objects** (~4k tiny growslice allocs/op — its areas
+  arrays are mostly 6–11 elements of a 32-byte struct). The first append now
+  allocates `max(4, 256/sizeof(elem))` capacity — a compile-time constant via
+  `unsafe.Sizeof`, ~256 bytes of elements — which is *not* the rejected counting
+  presize: no extra scan, no full-array memclr; a too-large hint wastes only
+  spare cap, a too-small one regrows as before. `[]` still yields nil (the hint
+  fires only when an element exists) and reuse-append is unchanged. Interleaved
+  A/B (n=8, M2): **citm_catalog −7.7%, canada_geometry −5.3%, golang_source
+  −2.7%, canada −1.7%, marine_ik −1.1%**, mesh/large-json/cloudflare flat — no
+  time regressions; allocs/op geomean **−41%** (citm −52%, canada −62%,
+  large-json −60%). B/op trade: mostly down (citm −20%), but the rings carry
+  spare cap (canada_geometry +13%, large-json +4.4% B/op) — the same
+  time-over-B/op trade the ring presize-skip already accepted.
 - **SIMD scanners** in `simd_amd64.s`/`simd_arm64.s`: `indexCloseOrEscape`
   (next `"`/`\`) and `indexStructural` (next `{}[]"`). Both arches classify the 5
   target bytes with simdjson's **shuffle trick** — two table lookups

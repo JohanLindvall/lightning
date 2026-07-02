@@ -1235,6 +1235,24 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax bool) string {
 	eltStr := g.typeStr(elt)
 	inner := g.field("(*out)[len(*out)-1]", elt, singular(hint)+"Entry", nocopy, lax)
 	presize := g.slicePresize(elt, eltStr)
+	grow := fmt.Sprintf(`var zero %[1]s
+		*out = append(*out, zero)`, eltStr)
+	if presize == "" {
+		// No cheap counter sizes this array (see slicePresize), so instead of
+		// letting append grow the backing 1→2→4→…, the *first* element brings a
+		// static capacity hint sized to ~256 bytes of elements (a compile-time
+		// constant via unsafe.Sizeof). Unlike the rejected counting presizes this
+		// costs no extra scan: a too-large hint only wastes spare cap on a short
+		// array, a too-small one regrows exactly as before. Empty arrays never
+		// reach the first append, so `[]` still yields a nil slice, and decoding
+		// into a reused non-nil slice keeps appending unchanged.
+		grow = fmt.Sprintf(`var zero %[1]s
+		if *out == nil {
+			*out = make([]%[1]s, 1, max(4, 256/max(1, int(unsafe.Sizeof(zero)))))
+		} else {
+			*out = append(*out, zero)
+		}`, eltStr)
+	}
 	body := fmt.Sprintf(`func %[1]s(out *[]%[2]s, data []byte, i int) (int, error) {
 	if i >= len(data) {
 		return i, unstable.ErrTruncated
@@ -1262,8 +1280,7 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax bool) string {
 		// Grow the slice by one zero element and decode in place into the new
 		// slot, so the element never lives in an escaping local (which would
 		// cost a heap allocation per element for slices of structs/pointers).
-		var zero %[2]s
-		*out = append(*out, zero)
+		%[6]s
 		%[3]s
 		%[5]s
 		if i >= len(data) {
@@ -1277,7 +1294,7 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax bool) string {
 		}
 		i++
 	}
-}`, fn, eltStr, inner, presize, g.skipWS("i", "i"))
+}`, fn, eltStr, inner, presize, g.skipWS("i", "i"), grow)
 	g.decoders = append(g.decoders, body)
 	return fn
 }
@@ -1584,6 +1601,9 @@ func (g *gen) assemble(inPath string, methods []string) string {
 	}
 	if strings.Contains(code, "time.Time") {
 		imports = append(imports, `"time"`)
+	}
+	if strings.Contains(code, "unsafe.Sizeof") {
+		imports = append(imports, `"unsafe"`)
 	}
 
 	var b strings.Builder
