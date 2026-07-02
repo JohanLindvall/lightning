@@ -6,20 +6,30 @@ import (
 )
 
 // Batched scalar-array readers: each decodes a whole JSON array of numbers in
-// one call. The generated per-element loop pays a non-inlinable call (or two:
-// ReadFloat64OrNull → scanFloat) per number plus its own append/branch
-// machinery; on number-array-heavy documents (canada, numbers, mesh) that
-// dispatch is a measurable slice of the decode. Keeping the loop here lets it
-// call the private scanFloat directly — one frame per float instead of two —
-// and folds the integer SWAR digit parse into the loop body, so integers cost
-// no call at all. Semantics match the generated loop exactly: a null root
-// yields a nil slice (fixed arrays are left untouched), a null element a zero
-// value, error identities and positions match the Read* readers, and a nil
-// *out is presized with CountArrayScalars just as slicePresize emitted.
+// one call. The generated per-element loop paid a non-inlinable reader call
+// per number — two frames for floats (ReadFloat64OrNull → scanFloat) — plus
+// its own append/branch machinery; on number-array-heavy documents (canada,
+// numbers, mesh) that dispatch is a measurable slice of the decode. Keeping
+// the loop here lets it call the private scanFloat directly (one frame per
+// float) and inline the SWAR digit fold (no call at all per int). Semantics
+// match the generated loop exactly: a null root yields a nil slice (fixed
+// arrays are left untouched), a null element a zero value, error identities
+// and positions match the Read* readers, a nil *out is presized with
+// CountArrayScalars just as slicePresize emitted, and a trailing comma is
+// rejected by the same first-iteration flag (a ']' at the loop top on a
+// non-first iteration is only reachable after a comma).
 //
 // The generator routes a slice or fixed-size-array field here whenever the
 // element is a bare float64/int/uint kind; other element types (float32, bool,
 // strings, structs, ...) keep the generated loop.
+//
+// The slice readers work on a local copy of the slice header, not through
+// *out: the compiler cannot prove *out doesn't alias data, so appending via
+// the pointer reloads ptr/len/cap and stores the new len every element. The
+// local keeps the header in registers across the (call-free, for integers)
+// loop. The price is that every return — errors included — must write the
+// local back, to preserve the partial-progress-on-error behavior the parity
+// tests lock.
 
 // intKind and uintKind are the integer element kinds the generic readers
 // stencil over. rune and byte are covered as aliases of int32 and uint8.
@@ -50,13 +60,14 @@ func DecodeFloat64Slice(out *[]float64, data []byte, i int) (int, error) {
 	if data[i] != '[' {
 		return i, ErrExpectArray
 	}
-	if *out == nil {
+	s := *out
+	if s == nil {
 		if n := CountArrayScalars(data, i); n > 0 {
-			*out = make([]float64, 0, n)
+			s = make([]float64, 0, n)
 		}
 	}
 	i++
-	for {
+	for first := true; ; first = false {
 		// Inter-token whitespace, in the shape the generator inlines: 0-1 bytes
 		// resolve in one or two compares; only a real indentation run reaches the
 		// SWAR SkipWSRun (which the compiler inlines here too — no call).
@@ -67,21 +78,28 @@ func DecodeFloat64Slice(out *[]float64, data []byte, i int) (int, error) {
 			}
 		}
 		if i >= len(data) {
+			*out = s
 			return i, ErrTruncated
 		}
 		if data[i] == ']' {
-			return i + 1, nil
+			*out = s
+			if first {
+				return i + 1, nil
+			}
+			return i, ErrInvalidJSON // trailing comma
 		}
 		var f float64
 		if data[i] == 'n' {
 			end, err := ExpectNull(data, i)
 			if err != nil {
+				*out = s
 				return end, err
 			}
 			i = end
 		} else {
 			v, end, fast, ok := scanFloat(data, i)
 			if !ok {
+				*out = s
 				return end, ErrBadNumber
 			}
 			if !fast {
@@ -89,6 +107,7 @@ func DecodeFloat64Slice(out *[]float64, data []byte, i int) (int, error) {
 				// token to strconv. unsafeStr avoids copying the token.
 				v2, perr := strconv.ParseFloat(unsafeStr(data[i:end]), 64)
 				if perr != nil {
+					*out = s
 					return end, ErrBadNumber
 				}
 				v = v2
@@ -96,7 +115,7 @@ func DecodeFloat64Slice(out *[]float64, data []byte, i int) (int, error) {
 			f = v
 			i = end
 		}
-		*out = append(*out, f)
+		s = append(s, f)
 		// Inter-token whitespace, in the shape the generator inlines: 0-1 bytes
 		// resolve in one or two compares; only a real indentation run reaches the
 		// SWAR SkipWSRun (which the compiler inlines here too — no call).
@@ -107,12 +126,15 @@ func DecodeFloat64Slice(out *[]float64, data []byte, i int) (int, error) {
 			}
 		}
 		if i >= len(data) {
+			*out = s
 			return i, ErrTruncated
 		}
 		if data[i] == ']' {
+			*out = s
 			return i + 1, nil
 		}
 		if data[i] != ',' {
+			*out = s
 			return i, ErrInvalidJSON
 		}
 		i++
@@ -140,13 +162,14 @@ func DecodeIntSlice[T intKind](out *[]T, data []byte, i int) (int, error) {
 	if data[i] != '[' {
 		return i, ErrExpectArray
 	}
-	if *out == nil {
+	s := *out
+	if s == nil {
 		if n := CountArrayScalars(data, i); n > 0 {
-			*out = make([]T, 0, n)
+			s = make([]T, 0, n)
 		}
 	}
 	i++
-	for {
+	for first := true; ; first = false {
 		// Inter-token whitespace, in the shape the generator inlines: 0-1 bytes
 		// resolve in one or two compares; only a real indentation run reaches the
 		// SWAR SkipWSRun (which the compiler inlines here too — no call).
@@ -157,15 +180,21 @@ func DecodeIntSlice[T intKind](out *[]T, data []byte, i int) (int, error) {
 			}
 		}
 		if i >= len(data) {
+			*out = s
 			return i, ErrTruncated
 		}
 		if data[i] == ']' {
-			return i + 1, nil
+			*out = s
+			if first {
+				return i + 1, nil
+			}
+			return i, ErrInvalidJSON // trailing comma
 		}
 		var n int64
 		if data[i] == 'n' {
 			end, err := ExpectNull(data, i)
 			if err != nil {
+				*out = s
 				return end, err
 			}
 			i = end
@@ -175,10 +204,12 @@ func DecodeIntSlice[T intKind](out *[]T, data []byte, i int) (int, error) {
 				neg = true
 				i++
 				if i >= len(data) {
+					*out = s
 					return i, ErrBadNumber
 				}
 			}
 			if data[i]-'0' > 9 { // unsigned: a byte below '0' wraps high
+				*out = s
 				return i, ErrBadNumber
 			}
 			for i+4 <= len(data) {
@@ -211,7 +242,7 @@ func DecodeIntSlice[T intKind](out *[]T, data []byte, i int) (int, error) {
 				n = -n
 			}
 		}
-		*out = append(*out, T(n))
+		s = append(s, T(n))
 		// Inter-token whitespace, in the shape the generator inlines: 0-1 bytes
 		// resolve in one or two compares; only a real indentation run reaches the
 		// SWAR SkipWSRun (which the compiler inlines here too — no call).
@@ -222,12 +253,15 @@ func DecodeIntSlice[T intKind](out *[]T, data []byte, i int) (int, error) {
 			}
 		}
 		if i >= len(data) {
+			*out = s
 			return i, ErrTruncated
 		}
 		if data[i] == ']' {
+			*out = s
 			return i + 1, nil
 		}
 		if data[i] != ',' {
+			*out = s
 			return i, ErrInvalidJSON
 		}
 		i++
@@ -251,13 +285,14 @@ func DecodeUintSlice[T uintKind](out *[]T, data []byte, i int) (int, error) {
 	if data[i] != '[' {
 		return i, ErrExpectArray
 	}
-	if *out == nil {
+	s := *out
+	if s == nil {
 		if n := CountArrayScalars(data, i); n > 0 {
-			*out = make([]T, 0, n)
+			s = make([]T, 0, n)
 		}
 	}
 	i++
-	for {
+	for first := true; ; first = false {
 		// Inter-token whitespace, in the shape the generator inlines: 0-1 bytes
 		// resolve in one or two compares; only a real indentation run reaches the
 		// SWAR SkipWSRun (which the compiler inlines here too — no call).
@@ -268,20 +303,27 @@ func DecodeUintSlice[T uintKind](out *[]T, data []byte, i int) (int, error) {
 			}
 		}
 		if i >= len(data) {
+			*out = s
 			return i, ErrTruncated
 		}
 		if data[i] == ']' {
-			return i + 1, nil
+			*out = s
+			if first {
+				return i + 1, nil
+			}
+			return i, ErrInvalidJSON // trailing comma
 		}
 		var n uint64
 		if data[i] == 'n' {
 			end, err := ExpectNull(data, i)
 			if err != nil {
+				*out = s
 				return end, err
 			}
 			i = end
 		} else {
 			if data[i]-'0' > 9 {
+				*out = s
 				return i, ErrBadNumber
 			}
 			for i+4 <= len(data) {
@@ -311,7 +353,7 @@ func DecodeUintSlice[T uintKind](out *[]T, data []byte, i int) (int, error) {
 				}
 			}
 		}
-		*out = append(*out, T(n))
+		s = append(s, T(n))
 		// Inter-token whitespace, in the shape the generator inlines: 0-1 bytes
 		// resolve in one or two compares; only a real indentation run reaches the
 		// SWAR SkipWSRun (which the compiler inlines here too — no call).
@@ -322,12 +364,15 @@ func DecodeUintSlice[T uintKind](out *[]T, data []byte, i int) (int, error) {
 			}
 		}
 		if i >= len(data) {
+			*out = s
 			return i, ErrTruncated
 		}
 		if data[i] == ']' {
+			*out = s
 			return i + 1, nil
 		}
 		if data[i] != ',' {
+			*out = s
 			return i, ErrInvalidJSON
 		}
 		i++
@@ -354,7 +399,7 @@ func DecodeFloat64Array(out []float64, data []byte, i int) (int, error) {
 	clear(out)
 	i++
 	idx := 0
-	for {
+	for first := true; ; first = false {
 		// Inter-token whitespace, in the shape the generator inlines: 0-1 bytes
 		// resolve in one or two compares; only a real indentation run reaches the
 		// SWAR SkipWSRun (which the compiler inlines here too — no call).
@@ -368,7 +413,10 @@ func DecodeFloat64Array(out []float64, data []byte, i int) (int, error) {
 			return i, ErrTruncated
 		}
 		if data[i] == ']' {
-			return i + 1, nil
+			if first {
+				return i + 1, nil
+			}
+			return i, ErrInvalidJSON // trailing comma
 		}
 		if idx < len(out) {
 			if data[i] == 'n' {
@@ -437,7 +485,7 @@ func DecodeIntArray[T intKind](out []T, data []byte, i int) (int, error) {
 	clear(out)
 	i++
 	idx := 0
-	for {
+	for first := true; ; first = false {
 		// Inter-token whitespace, in the shape the generator inlines: 0-1 bytes
 		// resolve in one or two compares; only a real indentation run reaches the
 		// SWAR SkipWSRun (which the compiler inlines here too — no call).
@@ -451,7 +499,10 @@ func DecodeIntArray[T intKind](out []T, data []byte, i int) (int, error) {
 			return i, ErrTruncated
 		}
 		if data[i] == ']' {
-			return i + 1, nil
+			if first {
+				return i + 1, nil
+			}
+			return i, ErrInvalidJSON // trailing comma
 		}
 		if idx < len(out) {
 			if data[i] == 'n' {
@@ -501,6 +552,110 @@ func DecodeIntArray[T intKind](out []T, data []byte, i int) (int, error) {
 				}
 				if neg {
 					n = -n
+				}
+				out[idx] = T(n)
+			}
+		} else {
+			end, err := SkipValue(data, i)
+			if err != nil {
+				return end, err
+			}
+			i = end
+		}
+		idx++
+		// Inter-token whitespace, in the shape the generator inlines: 0-1 bytes
+		// resolve in one or two compares; only a real indentation run reaches the
+		// SWAR SkipWSRun (which the compiler inlines here too — no call).
+		if i < len(data) && data[i] <= ' ' {
+			i++
+			if i < len(data) && data[i] <= ' ' {
+				i = SkipWSRun(data, i+1)
+			}
+		}
+		if i >= len(data) {
+			return i, ErrTruncated
+		}
+		if data[i] == ']' {
+			return i + 1, nil
+		}
+		if data[i] != ',' {
+			return i, ErrInvalidJSON
+		}
+		i++
+	}
+}
+
+// DecodeUintArray is DecodeIntArray for the unsigned kinds; the element parse
+// mirrors ReadUint64OrNull (inlined, as in DecodeUintSlice).
+func DecodeUintArray[T uintKind](out []T, data []byte, i int) (int, error) {
+	if i >= len(data) {
+		return i, ErrTruncated
+	}
+	if data[i] == 'n' {
+		return ExpectNull(data, i)
+	}
+	if data[i] != '[' {
+		return i, ErrExpectArray
+	}
+	clear(out)
+	i++
+	idx := 0
+	for first := true; ; first = false {
+		// Inter-token whitespace, in the shape the generator inlines: 0-1 bytes
+		// resolve in one or two compares; only a real indentation run reaches the
+		// SWAR SkipWSRun (which the compiler inlines here too — no call).
+		if i < len(data) && data[i] <= ' ' {
+			i++
+			if i < len(data) && data[i] <= ' ' {
+				i = SkipWSRun(data, i+1)
+			}
+		}
+		if i >= len(data) {
+			return i, ErrTruncated
+		}
+		if data[i] == ']' {
+			if first {
+				return i + 1, nil
+			}
+			return i, ErrInvalidJSON // trailing comma
+		}
+		if idx < len(out) {
+			if data[i] == 'n' {
+				end, err := ExpectNull(data, i)
+				if err != nil {
+					return end, err
+				}
+				i = end
+			} else {
+				if data[i]-'0' > 9 {
+					return i, ErrBadNumber
+				}
+				var n uint64
+				for i+4 <= len(data) {
+					w := binary.LittleEndian.Uint32(data[i : i+4])
+					if !is4Digits(w) {
+						break
+					}
+					n = n*10000 + uint64(parse4Digits(w))
+					i += 4
+				}
+				for i < len(data) {
+					d := data[i] - '0'
+					if d > 9 {
+						break
+					}
+					n = n*10 + uint64(d)
+					i++
+				}
+				if i < len(data) && (data[i] == '.' || data[i] == 'e' || data[i] == 'E') {
+					for i < len(data) {
+						c := data[i]
+						if (c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-' {
+							i++
+							continue
+						}
+						break
+					}
 				}
 				out[idx] = T(n)
 			}

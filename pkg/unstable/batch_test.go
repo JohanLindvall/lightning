@@ -82,6 +82,11 @@ func TestDecodeFloat64SliceErrors(t *testing.T) {
 		{`["x"]`, ErrBadNumber},
 		{`[1.2.3]`, ErrBadNumber},
 		{`nul`, ErrInvalidJSON},
+		// Trailing commas are rejected (the first-iteration flag: ']' at the
+		// loop top is only reachable after a comma), as in encoding/json.
+		{`[1,]`, ErrInvalidJSON},
+		{`[1, ]`, ErrInvalidJSON},
+		{`[1,`, ErrTruncated},
 	}
 	for _, c := range cases {
 		var got []float64
@@ -270,6 +275,81 @@ func TestDecodeIntArray(t *testing.T) {
 	}
 	if want := [3]int{0, 5, 6}; arr != want {
 		t.Errorf("got %v, want %v", arr, want)
+	}
+}
+
+func TestDecodeUintArray(t *testing.T) {
+	arr := [3]uint32{9, 9, 9}
+	if _, err := DecodeUintArray(arr[:], []byte(` [ 1 , 4000000000 ] `), 1); err != nil {
+		t.Fatal(err)
+	}
+	if want := [3]uint32{1, 4000000000, 0}; arr != want {
+		t.Errorf("got %v, want %v", arr, want)
+	}
+
+	arr = [3]uint32{1, 1, 1}
+	if _, err := DecodeUintArray(arr[:], []byte(`[null,5,6,7,8]`), 0); err != nil {
+		t.Fatal(err)
+	}
+	if want := [3]uint32{0, 5, 6}; arr != want {
+		t.Errorf("got %v, want %v", arr, want)
+	}
+
+	// Null root leaves the array untouched; overflow wraps like ReadUint64OrNull.
+	arr = [3]uint32{7, 8, 9}
+	if _, err := DecodeUintArray(arr[:], []byte(`null`), 0); err != nil {
+		t.Fatal(err)
+	}
+	if want := [3]uint32{7, 8, 9}; arr != want {
+		t.Errorf("null: got %v, want %v", arr, want)
+	}
+	arr = [3]uint32{}
+	if _, err := DecodeUintArray(arr[:], []byte(`[4294967297]`), 0); err != nil {
+		t.Fatal(err)
+	}
+	if want := [3]uint32{1, 0, 0}; arr != want {
+		t.Errorf("wrap: got %v, want %v", arr, want)
+	}
+	if _, err := DecodeUintArray(arr[:], []byte(`[-1]`), 0); !errors.Is(err, ErrBadNumber) {
+		t.Errorf("negative err = %v", err)
+	}
+}
+
+// TestBatchTrailingComma locks the first-iteration flag across every batched
+// reader: a trailing comma before ']' is an error, as in encoding/json.
+func TestBatchTrailingComma(t *testing.T) {
+	var f []float64
+	if _, err := DecodeFloat64Slice(&f, []byte(`[1.5,]`), 0); !errors.Is(err, ErrInvalidJSON) {
+		t.Errorf("float slice err = %v", err)
+	}
+	var n []int
+	if _, err := DecodeIntSlice(&n, []byte(`[1,]`), 0); !errors.Is(err, ErrInvalidJSON) {
+		t.Errorf("int slice err = %v", err)
+	}
+	var u []uint
+	if _, err := DecodeUintSlice(&u, []byte(`[1,]`), 0); !errors.Is(err, ErrInvalidJSON) {
+		t.Errorf("uint slice err = %v", err)
+	}
+	fa := [2]float64{}
+	if _, err := DecodeFloat64Array(fa[:], []byte(`[1,]`), 0); !errors.Is(err, ErrInvalidJSON) {
+		t.Errorf("float array err = %v", err)
+	}
+	ia := [2]int{}
+	if _, err := DecodeIntArray(ia[:], []byte(`[1,]`), 0); !errors.Is(err, ErrInvalidJSON) {
+		t.Errorf("int array err = %v", err)
+	}
+	ua := [2]uint{}
+	if _, err := DecodeUintArray(ua[:], []byte(`[1,]`), 0); !errors.Is(err, ErrInvalidJSON) {
+		t.Errorf("uint array err = %v", err)
+	}
+	// Also past the fixed array's length (the extras-skipped branch).
+	sa := [1]int{}
+	if _, err := DecodeIntArray(sa[:], []byte(`[1,2,]`), 0); !errors.Is(err, ErrInvalidJSON) {
+		t.Errorf("skip branch err = %v", err)
+	}
+	// Empty arrays are unaffected.
+	if _, err := DecodeIntSlice(&n, []byte(`[]`), 0); err != nil {
+		t.Errorf("empty: %v", err)
 	}
 }
 

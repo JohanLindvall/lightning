@@ -72,7 +72,9 @@ func TestConformance(t *testing.T) {
 		{"Floats", d.Floats, []float64{1.5, 2.5, 3.5}},
 		{"Grid", d.Grid, [][]int{{1, 2}, {3, 4, 5}}},
 		{"Items", d.Items, []Nested{{Name: "i1", Count: 1}, {Name: "i2", Count: 2}}},
+		{"PtrItems", d.PtrItems, []*Nested{{Name: "p1", Count: 1}, nil, {Name: "p2", Count: 2}}},
 		{"Arr", d.Arr, [3]int{10, 20, 30}},
+		{"UArr", d.UArr, [3]uint32{7, 8, 4000000000}},
 
 		{"M", d.M, map[string]int{"x": 1, "y": 2}},
 		{"MM", d.MM, map[string][]uint64{"p": {1, 2}, "q": {3}}},
@@ -105,6 +107,42 @@ func TestConformance(t *testing.T) {
 	}
 	if !d.TimeLax.Equal(wantTime) {
 		t.Errorf("TimeLax = %v, want %v", d.TimeLax, wantTime)
+	}
+}
+
+// TestTrailingCommaRejected locks the rotated member/element loops: a trailing
+// comma before a closing bracket is an error in every decoder shape — object,
+// slice (generated and batched), fixed array, map, and the dynamic any path —
+// exactly as encoding/json rejects it.
+func TestTrailingCommaRejected(t *testing.T) {
+	cases := []string{
+		`{"str":"x",}`,                        // object member loop
+		`{"ints":[1,2,]}`,                     // batched int slice
+		`{"floats":[1.5,]}`,                   // batched float slice
+		`{"strs":["a",]}`,                     // generated slice loop
+		`{"items":[{"name":"a","count":1},]}`, // struct-element slice loop
+		`{"arr":[10,20,30,]}`,                 // fixed-size array loop
+		`{"uarr":[1,2,3,]}`,                   // batched uint fixed array
+		`{"m":{"x":1,}}`,                      // map member loop
+		`{"grid":[[1,2],]}`,                   // nested slice loop
+		`{"anys":[1,]}`,                       // dynamic array
+		`{"any":{"k":1,}}`,                    // dynamic object
+	}
+	for _, in := range cases {
+		if json.Unmarshal([]byte(in), new(map[string]any)) == nil {
+			t.Fatalf("stdlib accepted %q — test premise wrong", in)
+		}
+		var d Doc
+		if err := d.UnmarshalJSON([]byte(in)); err == nil {
+			t.Errorf("UnmarshalJSON(%q) accepted a trailing comma", in)
+		}
+	}
+	// Empty containers are unaffected by the loop rotation.
+	for _, in := range []string{`{}`, `{"ints":[]}`, `{"strs":[]}`, `{"m":{}}`, `{"anys":[]}`, `{"arr":[]}`} {
+		var d Doc
+		if err := d.UnmarshalJSON([]byte(in)); err != nil {
+			t.Errorf("UnmarshalJSON(%q): %v", in, err)
+		}
 	}
 }
 

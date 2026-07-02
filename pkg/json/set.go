@@ -77,12 +77,18 @@ func setSpan(in, rawVal []byte, keys []string) (start, end int, insert []byte, m
 			}
 			p = unstable.SkipWS(in, p+1)
 			vs := p
-			ve := skipValueOrEnd(in, p)
-			lastValEnd = ve
 			if k == keys[level] {
-				found, valStart, valEnd = true, vs, ve
+				found, valStart = true, vs
+				if level == len(keys)-1 {
+					valEnd = skipValueOrEnd(in, p)
+				}
+				// Not the leaf: descending into this value — the next level walks
+				// it member by member anyway, so don't pre-skip the whole subtree
+				// here (that would scan every on-path container twice).
 				break
 			}
+			ve := skipValueOrEnd(in, p)
+			lastValEnd = ve
 			p = unstable.SkipWS(in, ve)
 			if p < len(in) && in[p] == ',' {
 				p = unstable.SkipWS(in, p+1)
@@ -312,8 +318,6 @@ func setObject(in, out []byte, i, depth int, active []int, paths [][]string, raw
 		}
 		q = unstable.SkipWS(in, q+1)
 		vs := q
-		ve := skipValueOrEnd(in, q)
-		lastValEnd = ve
 
 		ending := -1 // an active path ending at this key (replace its value)
 		var recurse []int
@@ -330,20 +334,29 @@ func setObject(in, out []byte, i, depth int, active []int, paths [][]string, raw
 				recurse = append(recurse, a)
 			}
 		}
+		var ve int
 		if ending >= 0 {
+			ve = skipValueOrEnd(in, q)
 			out = append(out, in[prev:vs]...) // copy through up to the old value...
 			out = append(out, rawVal[ending]...)
 			prev = ve
-		} else if len(recurse) > 0 {
+		} else if len(recurse) > 0 && vs < len(in) && in[vs] == '{' {
+			// Recursing into this object: the recursion walks it member by member
+			// and reports where it ends, so don't pre-skip the whole subtree here
+			// (that would scan every on-path container twice).
 			out = append(out, in[prev:vs]...)
-			if vs < len(in) && in[vs] == '{' {
-				out, _ = setObject(in, out, vs, depth+1, recurse, paths, rawVal)
-			} else {
-				// Path continues but this value is not an object: replace it.
-				out = appendMergedObject(out, paths, rawVal, recurse, depth+1)
-			}
+			out, ve = setObject(in, out, vs, depth+1, recurse, paths, rawVal)
 			prev = ve
+		} else if len(recurse) > 0 {
+			// Path continues but this value is not an object: replace it.
+			ve = skipValueOrEnd(in, q)
+			out = append(out, in[prev:vs]...)
+			out = appendMergedObject(out, paths, rawVal, recurse, depth+1)
+			prev = ve
+		} else {
+			ve = skipValueOrEnd(in, q)
 		}
+		lastValEnd = ve
 
 		p = unstable.SkipWS(in, ve)
 		if p < len(in) && in[p] == ',' {

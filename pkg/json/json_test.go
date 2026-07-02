@@ -157,6 +157,7 @@ var benchCases = []struct {
 	{"json_in_json", []byte(`{\"id\":42,\"name\":\"widget\",\"tags\":[\"a\",\"b\"]}`)},
 	{"prose_with_quotes", []byte(`She said \"hello\" and then\nwalked away.`)},
 	{"unicode_heavy", []byte(`café naïve ☃ résumé 😀`)},
+	{"unicode_escaped_dense", []byte(strings.Repeat(`\u4e16\u754c\u60a8\u597d`, 8))}, // \uXXXX-per-char CJK
 	{"mostly_clean_one_escape", []byte(strings.Repeat("plain text content ", 16) + `\n`)},
 }
 

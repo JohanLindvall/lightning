@@ -102,7 +102,7 @@ byte-identical when adding cold paths; push new logic out-of-line.
   int parsing.
 - **Batched scalar-array readers** (`batch.go`: `DecodeFloat64Slice`, the generic
   `DecodeIntSlice`/`DecodeUintSlice`, and the fixed-size `DecodeFloat64Array`/
-  `DecodeIntArray`). The generated per-element loop paid a non-inlinable reader
+  `DecodeIntArray`/`DecodeUintArray`). The generated per-element loop paid a non-inlinable reader
   call per number — two frames for floats (`ReadFloat64OrNull` → `scanFloat`) —
   plus its own append/branch machinery; ~18% of the canada profile was that
   dispatch. The generator (`batchSliceFn`/`batchArrayFn` in `main.go`) now routes
@@ -122,7 +122,13 @@ byte-identical when adding cold paths; push new logic out-of-line.
   (`SkipWS` cost 16, `SkipWSRun` 62), so `SkipWSRun` inlines straight into these
   readers — but a tiny `skipws` helper wrapping the two-compare fast path +
   `SkipWSRun` exceeds the budget (cost 97 > 80), which is why the whitespace fast
-  path is expanded manually at each site, generator-style.
+  path is expanded manually at each site, generator-style. The slice readers work
+  on a **local copy of the slice header** (`s := *out`), not through the pointer:
+  the compiler cannot prove `*out` doesn't alias `data`, so `*out = append(...)`
+  reloaded ptr/len/cap and stored the new len every element; the local keeps the
+  header in registers across the call-free int loop, at the price of writing
+  `*out = s` back on *every* return (errors included — the parity tests lock
+  partial progress on error).
 - **Named-struct slice presize parity.** `slicePresize`'s `*ast.Ident` case now
   resolves a named struct element through `g.structTypes` and applies the same
   `isFlatScalarStringStruct`/`structSkipIsCheap` decision as an anonymous struct
@@ -138,13 +144,25 @@ byte-identical when adding cold paths; push new logic out-of-line.
   escapes land on a `\` every other byte, so calling the SSE2
   `indexCloseOrEscape` each time just to find `\` at offset 0 was pure call
   overhead; **(2)** `readUnicodeEscape` parses the four hex digits through a
-  256-byte `hexNibble` table (nibble value, or `0xFF` for a non-hex byte) — four
-  loads + one `a|b|c|d >= 0x80` test replace four 3-way comparison chains, and
-  validation falls out of the lookup because the `0xFF`'s high bit survives the
-  OR; **(3)** the buffer cap hint in `decodeStringEscaped` finds the body end
+  `hexNibble` table of `uint32` entries (nibble value, or the invalid marker
+  `1<<16`) and **inlines into `decodeEscaped`'s loop** (cost 65): the shifts fold
+  into the combine — `t[a]<<12|t[b]<<8|t[c]<<4|t[d]`, one `>= 1<<16` compare
+  validates all four digits — which is what pulled it under the budget (the
+  earlier `uint8`/`0xFF` form cost 89 and was the loop's only non-inlined call,
+  a frame per `\uXXXX`). The marker must sit at bit 16: an `0xFF`-style marker
+  is wrong because `0xFF<<8 = 0xFF00 < 1<<16` slips through the combined test.
+  Measured −8.8% on a dense-`\uXXXX` body; **(2b)** the escape *dispatch* is one
+  `unescByte[256]` load for the eight single-byte escapes with `'u'` in the
+  fallback — a Go `switch` lowers to a comparison tree that reached `'u'`, the
+  hottest case on unicode text, *last*. Another −15.3% dense (combined with (2):
+  **dense −22.9%, mixed −1.9%, sparse flat**, micro A/B n=8 M2); **(3)** the
+  buffer cap hint in `decodeStringEscaped` finds the body end
   with a plain `bytes.IndexByte('"')` (one vectorized pass) instead of the
   escape-aware `skipString`, which stops at *every* backslash and re-scans the
-  whole string. A `"` not preceded by `\` is definitively the unescaped close, so
+  whole string — and the scan starts **at the first escape `i`, not at `start`**
+  (the prefix `data[start:i]` is already proven clean by the caller's scan, so
+  re-scanning it was pure waste). A `"` not preceded by `\` is definitively the
+  unescaped close, so
   its offset is the exact body length (decoded ≤ escaped, always); only when the
   found `"` *is* preceded by `\` (a possible `\"`, rare) does it fall back to
   `skipString` for the true end — and the dense-escape strings that made
@@ -423,7 +441,7 @@ byte-identical when adding cold paths; push new logic out-of-line.
   means a not-yet-captured leaf must keep scanning later duplicate keys, so it
   wouldn't beat the current path. Covered by `BenchmarkGetPathsWithSkip` in
   `pkg/json/get_skipbench_test.go` (alongside `BenchmarkGetManyWithSkip`).
-- **Zero-alloc `Set`/`SetMany`/`SetPaths`** (`pkg/json/set.go`). Three pieces.
+- **Zero-alloc `Set`/`SetMany`/`SetPaths`** (`pkg/json/set.go`). Four pieces.
   **(1)** All creation streams into `out`: `appendMember` writes a multi-key
   member's nesting directly (open-braces loop, rawVal, close-braces), and the
   non-object-intermediate case is signaled out of `setSpan` (`member` + `nested`
@@ -443,7 +461,18 @@ byte-identical when adding cold paths; push new logic out-of-line.
   `create`, and `idx` locals on the stack (verified by alloc profile: `sub` was
   the *only* heap set), so the threading replaced free allocations with real
   bookkeeping and a 256-byte stackbuf memclr per call. Don't re-port it; check
-  the alloc profile before assuming a `make` in this file is heap. Covered by
+  the alloc profile before assuming a `make` in this file is heap. **(4)** Both
+  walkers used to scan every on-path container **twice**: `setSpan` pre-skipped
+  each member's value (`skipValueOrEnd`) *before* the key test and then descended
+  into that same value on a match, and `setObject`'s recurse branch *discarded*
+  the recursion's returned end and used the pre-computed skip. Now the key test
+  runs first (a non-leaf match descends without pre-skipping — the next level
+  walks it member by member anyway) and the recurse branch takes its end from the
+  recursion's return; only the leaf-replace/no-match/non-object branches skip.
+  Measured **SetPaths −20.8%, overwrite_nonobject −9.8%**, and −80% on a
+  deep-descend shape (descend keys first in a ~60 KB doc) no committed bench
+  covered — the reason a 2× walk went unnoticed. A first draft that key-compared
+  twice cost `replace` +4.4%; keep the single compare. Covered by
   `BenchmarkSet` (append/append_empty/replace/create_nested/overwrite_nonobject),
   `BenchmarkSetMany`, `BenchmarkSetPaths` — all zero allocs with a reused `out`.
 - **SIMD escape scan (`IndexEscape` / `indexEscapeSSE2` / `indexEscapeNEON`).** `EscapeString`/
@@ -493,6 +522,53 @@ byte-identical when adding cold paths; push new logic out-of-line.
   never correctness, both paths gated by the all-bytes + fuzz
   `TestEscapeStringIntoReference`. asm vs scalar locked by the `indexEscape` arm of
   `TestIndexFunctionsMatchScalar` (control bytes in the inserted set).
+- **`EscapeString`'s escaped-tail scratch is stack-backed** (`escape.go`): the
+  Builder path used `make([]byte, 0, len(s)-pos)` per escaped string — a heap
+  alloc whose cap *under*-estimates (escaping lengthens, `\u00XX` is 6
+  bytes/byte), so dense tails regrew, 3–4 allocs/op. A `var buf [128]byte;
+  EscapeStringInto(s[pos:], buf[:0])` never escapes (`EscapeStringInto` leaks its
+  buffer only into the result, and `Builder.Write`'s param doesn't escape —
+  verified with `-m`); only the escaped *tail* must fit since the clean prefix is
+  written directly, and a longer tail regrows on the heap exactly as before.
+  Measured (M2, n=8): **path_with_backslash −26.8%, json_in_json −20.1%,
+  mostly_clean_one_quote −19.7%, prose −18.5%, control_bytes −15.1%**, B/op
+  −46…−70%; clean cases exactly flat (they never reach the scratch).
+- **Dynamic `any` path (`any.go`)**: the number case calls the private
+  `scanFloat` directly (strconv fallback inlined at the site, mirroring
+  `ReadFloat64OrNull` byte for byte) instead of going through the non-inlinable
+  `ReadFloat64OrNull` — two frames per number plus re-checks of the truncation
+  and `'n'` cases `decodeValue`'s switch already excludes; the same mechanism as
+  the batched array readers. And `decodeAnyArray` gets the generated decoders'
+  static first-append capacity hint (`cap(a)==0` → `make([]any, 0, 16)`, ~256
+  bytes) instead of append growing 1→2→4→…; `[]` still returns the non-nil empty
+  slice. The dynamic path remains ~2.8× the typed path (map+boxing, intrinsic —
+  see the rejected key-interning entry); these only shave the removable overhead.
+- **Trailing commas are rejected (first-iteration flag), matching
+  encoding/json.** Every container loop — generated object/slice/fixed-array/map
+  (`genStructBody`/`sliceDecoder`/`arrayDecoder`/`mapDecoder` in `main.go`), the
+  batched readers, and `decodeAnyObject`/`decodeAnyArray` — used to check the
+  closer at the loop *top*, so control flowed from `,` back to that check and
+  `{"a":1,}` / `[1,]` silently decoded. The fix exploits an invariant of the
+  existing shape: the loop top is reached only after the opener (first
+  iteration) or after a comma, and a closer *after a member* returns from the
+  post-value check — so a closer at the loop top on a non-first iteration ⇔
+  trailing comma. `for first := true; ; first = false` + a branch inside the
+  loop-top closer case (taken once per container) rejects it with
+  `ErrInvalidJSON`, keeping the loop structure byte-identical otherwise (one
+  register move per member). **Do not fix this by rotating the loop instead**
+  (closer checked once pre-loop and post-value only, post-comma flowing straight
+  into the key/element read): that shape was built first, is per-member-cheaper
+  on paper, and measured **cloudflare +11% (p=0.000, n=8, isolated to the
+  generated code — old runtime + new codegen reproduced it, new runtime + old
+  codegen was +0.8%)** — the wide 45-field decoder is that sensitive to
+  restructuring/layout; the flag form measures cloudflare +0.95% (within the
+  runtime-only baseline) and citm flat. Locked by `TestTrailingCommaRejected`
+  (conformance, incl. stdlib premise checks), `TestBatchTrailingComma`, and the
+  `objErrs` trailing-comma arms in `any_test.go`. The same change closed two
+  parity gaps: `slicePresize` resolves a `*ast.StarExpr` element (`[]*Foo`
+  presizes by `[]Foo`'s rules — previously silently skipped), and
+  `batchArrayFn` routes uint kinds to the new `DecodeUintArray` (a `[N]uint32`
+  field used to keep the generated loop).
 
 ## The inline trick — let the generator write hot bodies inline
 
@@ -588,8 +664,15 @@ no regressions.)
   cost. Eliminating the allocations outright (`//lightning:destructive`) is **−41% time
   / −86% B/op on gsoc_2018** — allocation reduction *is* a large lever for
   escape-heavy input. Lesson: never size an allocation-reduction idea with
-  `GOGC=off`; measure against actually not allocating. A general arena for the
-  non-owned *copy* variant may still be worth it; size it that way before building.
+  `GOGC=off`; measure against actually not allocating. **Sized properly (2026-07),
+  the general arena is dead**: the bench suite is nocopy-dominated and the pure
+  copy workload (cloudflare) allocates only 144 B / 10 allocs/op — nothing to
+  batch. The arena's real target is escaped-string scratch buffers on nocopy
+  workloads (twitter_status 312 allocs/op, gsoc_2018 1 709), but a fresh-chunk
+  arena allocates the same total *bytes* — GC rate and zeroing unchanged — saving
+  only mallocgc *count*: ~25 ns × count ≈ **1.4% on twitter_status, 2.4% on
+  gsoc** for signature churn through every `Read*` and generated decoder. The
+  destructive directive already owns the eliminate-the-bytes win. Don't build it.
 - **Inline clean-string fast path in the unknown-field `default:` skip** (the
   readKey inline trick applied to the generated `SkipValue` branch: emit
   `IndexCloseOrEscape` + close-quote test inline, fall back to `SkipValue` for a
@@ -607,6 +690,17 @@ no regressions.)
   they cost ~nothing. The readKey/StripDefaults inline trick pays where the
   inline path *skips work* (no-escape key alias, WS fast path), not where it
   merely removes a call around identical work.
+- **The readKey inline trick in pkg/json's `get.go`** (`getMany`/`walkPaths`/
+  `objectEach`/`objectField` pay a non-inlined `unstable.ReadKey`, cost 212, per
+  member; `SkipWS`/`SkipWSCompact`/`IndexCloseOrEscape` already inline there).
+  Implemented the inline no-escape fast path at all four sites, confirmed the
+  SIMD scan inlined at each — and measured `BenchmarkGetManyWithSkip`/
+  `BenchmarkGetPathsWithSkip` **statistically flat on M2** (−0.14% geomean,
+  p≥0.06): each member read is latency-bound on the SIMD scan and the M-class
+  OoO window hides the frame, the same outcome as the unknown-field-skip inline
+  above. The identical trick won 6–7% in generated code on amd64, so one
+  interleaved A/B on an amd64 box could still justify it — don't land it on
+  arm64 evidence.
 - **SWAR / uint64 key matching in the generated field switch.** The thought was to
   load a key's bytes as a `uint64` and compare against precomputed constants instead
   of `memcmp`. Already done — by the Go compiler: `key == "8bytechars"` against a

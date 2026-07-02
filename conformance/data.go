@@ -69,15 +69,19 @@ type Doc struct {
 		Y string `json:"y"`
 	} `json:"anon"`
 
-	// Slices: scalar, string, float, slice-of-slice, and struct elements.
-	Ints   []int     `json:"ints"`
-	Strs   []string  `json:"strs"`
-	Floats []float64 `json:"floats"`
-	Grid   [][]int   `json:"grid"`
-	Items  []Nested  `json:"items"`
+	// Slices: scalar, string, float, slice-of-slice, struct, and
+	// pointer-to-struct elements (the last also exercises the []*T presize).
+	Ints     []int     `json:"ints"`
+	Strs     []string  `json:"strs"`
+	Floats   []float64 `json:"floats"`
+	Grid     [][]int   `json:"grid"`
+	Items    []Nested  `json:"items"`
+	PtrItems []*Nested `json:"ptrItems"`
 
-	// Fixed-size array.
-	Arr [3]int `json:"arr"`
+	// Fixed-size arrays: signed and unsigned element kinds (the latter routes
+	// to the batched DecodeUintArray).
+	Arr  [3]int    `json:"arr"`
+	UArr [3]uint32 `json:"uarr"`
 
 	// Maps with string keys, scalar and slice values.
 	M  map[string]int      `json:"m"`

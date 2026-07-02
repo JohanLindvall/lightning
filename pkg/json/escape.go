@@ -41,9 +41,13 @@ func EscapeString(s []byte, out *strings.Builder) {
 		return
 	}
 	// Write the clean prefix directly and escape only the remainder, so the
-	// prefix is neither re-scanned nor copied through a scratch buffer.
+	// prefix is neither re-scanned nor copied through a scratch buffer. The
+	// scratch for the escaped tail is stack-backed: it never escapes (the
+	// Builder copies it), so when the escaped tail fits it costs no allocation;
+	// a longer tail regrows on the heap as before.
 	out.Write(s[:pos])
-	out.Write(EscapeStringInto(s[pos:], make([]byte, 0, len(s)-pos)))
+	var buf [128]byte
+	out.Write(EscapeStringInto(s[pos:], buf[:0]))
 }
 
 // EscapeStringInto appends the JSON-escaped form of s to out and returns the
