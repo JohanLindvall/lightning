@@ -70,26 +70,70 @@ func skipContainerFast(data []byte, i int, open byte) (int, error) {
 	var prevEscaped, prevInString uint64
 
 	isArray := open == '['
+	if useSkipBlocks && pos+64 <= len(data) {
+		// amd64: the whole block loop runs in assembly (skipBlocks) — splats
+		// loaded once, depth/escape/in-string state carried in registers, the
+		// prefix XOR done with one carryless multiply — eliminating the
+		// per-block maskBlock call/marshaling that dominated the Go loop. It
+		// consumes every full 64-byte block: either it finds the close (end >=
+		// 0) or it hands the carried state to the shared scalar tail below.
+		end, d, pe, pis := skipBlocks(data, pos, depth, isArray)
+		if end >= 0 {
+			return end, nil
+		}
+		pos += (len(data) - pos) &^ 63
+		depth, prevEscaped, prevInString = d, pe, pis
+	}
 	for pos+64 <= len(data) {
 		quote, bslash, op, cl := maskBlock(data[pos:], isArray)
-		escaped := findEscaped64(bslash, &prevEscaped)
-		inStr := prefixXor64(quote&^escaped) ^ prevInString
-		prevInString = uint64(int64(inStr) >> 63) // carry: inside-string at byte 63
+
+		// The escaped -> inStr -> prevInString computation is a loop-carried
+		// dependency chain (each block's in-string mask depends on the previous
+		// block's), and the block loop is latency-bound on it — the profile puts
+		// these few ALU lines well above the vector kernel. Two predictable
+		// branches keep the common cases off that chain:
+		//
+		// Escapes are rare: a block with no backslash and none pending from the
+		// previous block has nothing escaped, skipping findEscaped64's add-carry
+		// steps. And a block with no (unescaped) quote cannot change the
+		// in-string state — the mask is just the carried prevInString — skipping
+		// the six-step prefix-XOR chain (number/bracket-dense blocks).
+		var escaped uint64
+		if bslash|prevEscaped != 0 {
+			escaped = findEscaped64(bslash, &prevEscaped)
+		}
+		inStr := prevInString
+		if q := quote &^ escaped; q != 0 {
+			inStr = prefixXor64(q) ^ prevInString
+			prevInString = uint64(int64(inStr) >> 63) // carry: inside-string at byte 63
+		}
 
 		op &^= inStr
 		cl &^= inStr
-		brackets := op | cl
-		for brackets != 0 {
-			j := bits.TrailingZeros64(brackets)
-			if op&(uint64(1)<<uint(j)) != 0 {
-				depth++
-			} else {
-				depth--
-				if depth == 0 {
-					return pos + j + 1, nil
+		// The per-bit walk exists only to spot the depth-0 crossing. A block
+		// with no close bracket cannot cross, and neither can one with fewer
+		// closes than the current depth (opens only raise it, so the running
+		// minimum is at least depth - popcount(cl) >= 1): both update depth with
+		// popcounts in bulk. Only a block that might actually close the
+		// container walks its bracket bits in order.
+		if cl == 0 {
+			depth += bits.OnesCount64(op)
+		} else if nc := bits.OnesCount64(cl); depth > nc {
+			depth += bits.OnesCount64(op) - nc
+		} else {
+			brackets := op | cl
+			for brackets != 0 {
+				j := bits.TrailingZeros64(brackets)
+				if op&(uint64(1)<<uint(j)) != 0 {
+					depth++
+				} else {
+					depth--
+					if depth == 0 {
+						return pos + j + 1, nil
+					}
 				}
+				brackets &= brackets - 1
 			}
-			brackets &= brackets - 1
 		}
 		pos += 64
 	}

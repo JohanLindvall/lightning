@@ -131,6 +131,103 @@ func TestSkipContainerFastMatches(t *testing.T) {
 	}
 }
 
+// boundaryDocs builds containers engineered around the 64-byte block grid: a
+// backslash run of every parity crossing the block boundary at every offset
+// (the prevEscaped carry between blocks), quotes landing exactly on the
+// boundary, deep bracket runs (the popcount bulk path and >64 depth), close
+// brackets at exact block edges, and close-heavy blocks that must take the
+// per-bit walk.
+func boundaryDocs() []string {
+	var docs []string
+	// Escape runs straddling the boundary at every alignment and parity. The
+	// container scan starts at index 1, so pad lengths 40..80 sweep the run and
+	// its terminating quote across bytes 56..72 of the first block.
+	for pad := 40; pad <= 80; pad++ {
+		for nbs := 0; nbs <= 5; nbs++ {
+			body := strings.Repeat("x", pad) + strings.Repeat(`\`, nbs) + `"`
+			if nbs%2 == 1 {
+				body += `tail"` // the quote was escaped; close the string for real
+			}
+			docs = append(docs, `{"a":"`+body+`,"b":{"c":[1,"]"]}}`)
+		}
+	}
+	// Deep pure-bracket nesting: block-spanning open runs (bulk adds), then a
+	// close run that walks depth back down across blocks (bulk subtract until
+	// depth <= popcount, then the bit walk finds the crossing).
+	for n := 1; n <= 200; n += 7 {
+		docs = append(docs, strings.Repeat("[", n)+"1"+strings.Repeat("]", n))
+	}
+	// Close-dense blocks: many sibling empty objects, so op/cl interleave and
+	// depth stays low (the per-bit path fires every block).
+	docs = append(docs, "["+strings.TrimSuffix(strings.Repeat("{},", 100), ",")+"]")
+	// Containers whose close lands at/around exact block multiples.
+	for _, n := range []int{62, 63, 64, 65, 126, 127, 128, 129, 191, 192, 193} {
+		docs = append(docs, "["+strings.Repeat(" ", n)+"]")
+		docs = append(docs, `{"k":"`+strings.Repeat("y", n)+`"}`)
+	}
+	return docs
+}
+
+// TestSkipContainerBoundaries runs the crafted block-boundary corpus through the
+// production skipContainerFast (whatever implementation is live on this arch)
+// against the scalar oracle, with and without trailing slack so both the block
+// and tail paths see every case.
+func TestSkipContainerBoundaries(t *testing.T) {
+	for _, c := range boundaryDocs() {
+		for _, pad := range []int{0, 70} {
+			data := []byte(c + strings.Repeat(" ", pad))
+			want, werr := refSkip(data, 0)
+			got, gerr := skipContainerFast(data, 0, data[0])
+			if got != want || (werr == nil) != (gerr == nil) {
+				t.Fatalf("%q pad %d: fast=(%d,%v) ref=(%d,%v)", c, pad, got, gerr, want, werr)
+			}
+		}
+	}
+}
+
+// testSkipVariantCorpus runs the boundary corpus plus a randomized document
+// fuzz through whatever skip implementation the dispatch flags currently
+// select, comparing each result (and truncation behavior) against the scalar
+// oracle. The per-arch variant tests flip the flags and call this once per
+// implementation, which is what locks the assembly loops (and their FP result
+// offsets, which the asmdecl vet pass cannot check — see the maskBlock gotcha
+// in CLAUDE.md) to the tested Go bit math.
+func testSkipVariantCorpus(t *testing.T, name string) {
+	t.Helper()
+	docs := boundaryDocs()
+	r := rand.New(rand.NewSource(7))
+	for iter := 0; iter < 4000; iter++ {
+		v := randValue(r, 4)
+		doc, err := json.Marshal(v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(doc) > 0 && (doc[0] == '{' || doc[0] == '[') {
+			docs = append(docs, string(doc))
+		}
+	}
+	for _, c := range docs {
+		for _, pad := range []int{0, 70} {
+			data := []byte(c + strings.Repeat(" ", pad))
+			want, werr := refSkip(data, 0)
+			got, gerr := skipContainerFast(data, 0, data[0])
+			if got != want || (werr == nil) != (gerr == nil) {
+				t.Fatalf("%s: %q pad %d: fast=(%d,%v) ref=(%d,%v)",
+					name, c, pad, got, gerr, want, werr)
+			}
+			// Truncation safety per variant: cut anywhere, must error not panic.
+			if len(data) > 2 {
+				tr := data[:1+len(data)/2]
+				_, e1 := refSkip(tr, 0)
+				_, e2 := skipContainerFast(tr, 0, tr[0])
+				if (e1 == nil) != (e2 == nil) {
+					t.Fatalf("%s: %q truncated: ref err=%v fast err=%v", name, c, e1, e2)
+				}
+			}
+		}
+	}
+}
+
 // bigStringObject builds a string-heavy object: many "key":"value" pairs, the
 // shape Get/GetPaths skips over and where per-string SkipString calls dominate.
 func bigStringObject(pairs int) []byte {

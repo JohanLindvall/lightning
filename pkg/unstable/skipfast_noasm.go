@@ -6,6 +6,13 @@ package unstable
 // slower than the indexStructural skip), so SkipValue stays on the current path.
 const fastSkipAvail = false
 
+// useSkipBlocks: the whole-loop assembly block scan is amd64-only.
+const useSkipBlocks = false
+
+func skipBlocks(data []byte, pos, depth int, isArray bool) (end, ndepth int, prevEscaped, prevInString uint64) {
+	panic("unstable: skipBlocks unavailable")
+}
+
 // maskBlock returns the character-class bitmaps for the 64 bytes at b[:64] (the
 // caller guarantees len(b) >= 64): quote, backslash, and the container's own open
 // and close brackets — `[`/`]` when isArray, else `{`/`}`. Bit j is set when b[j]
