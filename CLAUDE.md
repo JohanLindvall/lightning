@@ -647,6 +647,48 @@ no regressions.)
 
 ## Tried and rejected (don't re-attempt without a new idea)
 
+- **Replacing `CountArrayScalars`' two vectorized calls with a fused inline scan.**
+  A marine_ik CPU profile puts `CountArrayScalars` at **9.5% cum** (`bytes.Count`
+  4.95% + `indexbytebody` 2.80%), and the reason looks damning: for the 3- and
+  4-element `[]float64` coordinate arrays that dominate that document (`Pos`/`Rot`/
+  `Scl`, ~20 bytes each) it makes **two SIMD library calls** — `bytes.IndexByte`
+  for the `]`, then `bytes.Count` for the commas, two passes over the same 20
+  bytes — where one inline pass could find both. Tried twice, both **net-negative**
+  (interleaved A/B, n=8, amd64). **(1) A byte-at-a-time fused loop** (bounded at 64
+  bytes, falling back to the vectorized path): float-array **+14.4%**,
+  float-array-slow +9.8%, time-array +5.2%, mesh_pretty +3.3%, and marine_ik itself
+  **+3.9% — worse**. Two flaws: the per-byte cost is ~6 compares (the 4-way
+  whitespace test dominates), so a 20-byte array costs ~120 ops — *more* than the
+  two calls it replaced; and `float-array` is a **~157-byte** array (293 ns/op), so
+  it lands in the worst zone where the 64-byte prescan fails to find `]` and the
+  fallback then **rescans from zero**. **(2) A SWAR fused loop** (8 bytes/iter,
+  has-byte masks + `OnesCount64` for the commas, `TrailingZeros64` for the `]`,
+  with the fallback *resuming* from where the prescan stopped rather than
+  restarting — both flaws of (1) fixed): still net-negative — float-array **+6.1%**,
+  time-array +2.5%, citm +2.3%, and marine_ik merely **flat (p=0.083)**. The lesson:
+  Go's `bytes.IndexByte`/`bytes.Count` have cheap short-input fast paths, so the
+  "call overhead" being blamed is a few ns, and *neither a scalar nor a SWAR loop
+  can beat them even on a 20-byte buffer*. The 9.5% profile share is **not
+  removable overhead** — it is the irreducible cost of reading those bytes, the
+  same "a profile's cumulative % for a call chain is not the saveable overhead"
+  trap as the unknown-field-skip inline above. Don't re-attempt by tuning the cap:
+  the fast path measured *equal*, not slower, on exactly the short arrays it was
+  built for, so there is no cap at which it starts winning.
+  **The real lever on marine_ik is allocation, not counting** — see the next entry.
+- **Un-landed opportunity: a slab for small `[]float64` backings.** The same
+  marine_ik profile shows `DecodeFloat64Slice` is **93% of all allocated objects**
+  (29 356 allocs/op — one tiny `make([]float64, 0, n)` per `Pos`/`Rot`/`Scl`), with
+  `mallocgc` at **14%** of CPU and `memclrNoHeapPointers` another **4.5%** (the
+  presized backing is zeroed, then immediately overwritten — unavoidable for a heap
+  slice in Go). Unlike the *string* arena rejected below (whose target was only
+  ~1.4–2.4%), this is an ~18% target on marine_ik/mesh-shaped documents, because
+  the allocations are numerous *and* tiny. Carving these backings from a chunked
+  slab would be safe (set `cap == len` so a caller's later `append` reallocates
+  rather than clobbering a neighbour), but it needs an arena threaded through
+  `DecodeFloat64Slice`'s signature and therefore through generated code, and it
+  changes retention semantics (one surviving 3-float slice pins its whole chunk).
+  Not attempted — it is a design decision, not a local optimization.
+
 - **A string arena / batched allocation for copied & escaped strings.** The alloc
   *count* looks addressable — on nocopy twitter_status `decodeStringEscaped` is
   **36% of allocations** (every escaped string — tweets are full of `\/`, `\"`,
