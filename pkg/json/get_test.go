@@ -336,3 +336,25 @@ func TestGetObjectCheck(t *testing.T) {
 		t.Fatalf("leaf should not look like an object: %q", v)
 	}
 }
+
+// TestGetPathsTruncated pins the bounds guard in walkPaths: a truncated
+// object whose last key has no value ("{\"a\":") left start == len(data), and
+// peeking data[start] for a nested object panicked. Truncated input must
+// report an error, never crash — GetPaths runs over untrusted content (log
+// lines).
+func TestGetPathsTruncated(t *testing.T) {
+	for _, in := range []string{
+		`{"a":`,
+		`{"a"`,
+		`{"a":{"b":`,
+		`{"a":{`,
+		`{"a":1,"b":`,
+		`{`,
+		`{"a":[`,
+	} {
+		raws := make([][]byte, 1)
+		if _, err := GetPaths([]byte(in), [][]string{{"a"}}, raws); err == nil {
+			t.Errorf("GetPaths(%q) = nil error, want a truncation error", in)
+		}
+	}
+}

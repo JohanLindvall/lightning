@@ -234,9 +234,11 @@ func walkPaths(data []byte, i, depth int, active, free []int, paths [][]string, 
 		}
 
 		var end int
-		if len(recurse) > 0 && data[start] == '{' {
+		if len(recurse) > 0 && start < len(data) && data[start] == '{' {
 			end, err = walkPaths(data, start, depth+1, recurse, free[len(recurse):], paths, out, compact)
 		} else {
+			// start may be past the end here (a truncated "key:" with no
+			// value); SkipValue bounds-checks and returns ErrTruncated.
 			end, err = unstable.SkipValue(data, start)
 		}
 		if err != nil {
