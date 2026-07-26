@@ -214,12 +214,21 @@ func SkipWSRun(data []byte, i int) int {
 		lo = ^uint64(0) / 255 // 0x0101...01
 		hi = lo << 7          // 0x8080...80
 		g  = lo*' ' | hi      // 0xA0...A0: ' ' with a per-lane borrow guard
+		sp = lo * ' '         // 0x2020...20: a word of eight literal spaces
 	)
 	for i+8 <= len(data) {
 		w := binary.LittleEndian.Uint64(data[i:])
-		ws := (g - w&^hi) &^ w & hi
-		if ws != hi {
-			return i + bits.TrailingZeros64(ws^hi)/8
+		// Eight literal spaces is the overwhelmingly common word inside an
+		// indentation run, and equality against the splat answers it with one
+		// compare instead of the five-op classify below. It is a *sufficient*
+		// condition — every byte is exactly 0x20 — so this only skips work; the
+		// exact SWAR still decides every other word, including the one that ends
+		// the run, so nothing about which input is accepted changes.
+		if w != sp {
+			ws := (g - w&^hi) &^ w & hi
+			if ws != hi {
+				return i + bits.TrailingZeros64(ws^hi)/8
+			}
 		}
 		i += 8
 	}

@@ -429,6 +429,36 @@ byte-identical when adding cold paths; push new logic out-of-line.
   `prevEscaped` carry), quotes on the boundary, deep bracket runs, close-dense
   blocks, closes at exact block multiples — plus per-variant truncation safety;
   `BenchmarkSkipBlocksVariant` is the standing AVX2-vs-512-vs-Go comparison.
+- **All-spaces equality fast path in `SkipWSRun`** — the whitespace attempt that
+  finally worked, after three that did not. The loop's per-word classify
+  `ws := (g - w&^hi) &^ w & hi` answers "are all eight bytes `<= 0x20`", but inside
+  an indentation run the overwhelmingly common word is **eight literal spaces**, so
+  a single `w != sp` compare against the `0x2020…20` splat now guards it and the
+  exact SWAR runs only for the other words. Sound by construction: equality with
+  the splat is a *sufficient* test (every byte is exactly `0x20`), so the fast path
+  can only skip work — the exact classify still decides every other word, including
+  the run-terminating one, and no input changes acceptance. All-space word share of
+  the corpus: citm 68%, marine_ik 66%, instruments 50%, mesh_pretty 49%, synthea 43%.
+  **Why this is orthogonal to the three rejections** above — and the reason to keep
+  it distinct from them: it changes neither the loop *width* (still 8 bytes, still
+  the same number of loads, so "more loads than needed when the run ends mid-chunk"
+  cannot apply), nor uses any vector instruction or call (so unamortised per-call
+  setup cannot apply), and `SkipWSRun` still inlines (cost 62 → **66**, budget 80 —
+  re-check `-gcflags=-m` after any edit here, the whole `g.skipWS` design depends on
+  it). What it attacks is the *cost of classifying one word*, which none of the
+  earlier attempts touched. Interleaved A/B (n=10, pinned to one core): **mesh_pretty
+  −5.61%, instruments −4.42%, citm_catalog −4.11%** (all p≤0.002), synthea_fhir
+  −3.2% (p=0.143); marine_ik flat despite 66% all-space words, because `SkipWSRun`
+  is only ~2.5% of its profile. Compact cases (cloudflare, canada, large-json) are
+  flat **by construction** — they never enter `SkipWSRun` — which is what makes this
+  unusually safe to A/B: an apparent regression there can only be alignment noise.
+  Equivalence to the byte loop is not left to the soundness argument:
+  `TestSkipWSRunMatchesOracle` checks every byte value at every lane offset for
+  every start offset, each whitespace byte as filler, `>= 0x80` bytes (which must
+  *not* count as whitespace), and random mixtures, plus
+  `FuzzSkipWSRunMatchesOracle` (2.4M execs). A tab-indented document takes the
+  general path always and pays one extra compare per word; a second equality
+  against `0x0909…` would cover it if that ever matters.
 - **Slice reuse replaces, and the reset is guarded.** Every slice decoder — the
   generated `sliceDecoder` loop and `batch.go`'s three readers — used to start from
   `*out`, so decoding into a **non-nil** slice *appended* to it. `[1,2]` decoded
@@ -940,7 +970,9 @@ no regressions.)
   regressed everywhere it was tried (citm +5%, twitter +3%, synthea +4.5%). The
   wide loop reads 32 bytes (four loads) even when the run ends mid-chunk, so it
   does *more* loads than the 8-byte loop that stops as soon as a non-space chunk
-  appears. The plain 8-byte SWAR is already near-optimal for these run lengths.
+  appears. The plain 8-byte SWAR is already near-optimal for these run lengths. (Its
+  per-word *constant* was not near-optimal, though — see the landed all-spaces
+  equality fast path above, which is orthogonal to width.)
 - **SSE2 `skipNonWS` continuation for long whitespace runs** (`SkipWSRun` keeps
   its 8-byte SWAR word for ≤8-byte runs but, when the first 8 bytes are all
   whitespace, calls an SSE2 `PMINUB`+`PCMPEQB`+`PMOVMSKB` find-first-non-space for
