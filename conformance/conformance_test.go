@@ -2,11 +2,14 @@ package conformance
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"reflect"
 	"testing"
 	"time"
 	"unsafe"
+
+	"github.com/JohanLindvall/lightning/pkg/unstable"
 )
 
 // TestConformance decodes test.json with the generated UnmarshalJSON and checks
@@ -223,5 +226,115 @@ func TestDestructiveDirective(t *testing.T) {
 	// ...and the input must have been mutated by the in-place unescape.
 	if string(data) == orig {
 		t.Errorf("input was not mutated; in-place unescape did not write through")
+	}
+}
+
+// nestTree builds a JSON document of n nested Tree levels: {"kids":[{"kids":[…]}]}.
+func nestTree(n int) []byte {
+	var b []byte
+	for i := 0; i < n; i++ {
+		b = append(b, `{"name":"x","kids":[`...)
+	}
+	b = append(b, `{"name":"leaf"}`...)
+	for i := 0; i < n; i++ {
+		b = append(b, ']', '}')
+	}
+	return b
+}
+
+// TestRecursiveTypeDepthLimit covers the generator's cycle detection. Tree's
+// decoder and its []*Tree slice decoder call each other, so a nested document
+// recurses once per level; before the depth counter, input like the 2-million-level
+// case below overflowed the goroutine stack — a *fatal* error that recover cannot
+// catch, taking the process down rather than returning an error. The generator now
+// detects the cycle and threads a depth parameter through exactly those decoders.
+func TestRecursiveTypeDepthLimit(t *testing.T) {
+	// A moderate nesting decodes normally, all the way down.
+	var tr Tree
+	if err := tr.UnmarshalJSON(nestTree(100)); err != nil {
+		t.Fatalf("100 levels should decode: %v", err)
+	}
+	depth, n := 0, &tr
+	for n != nil {
+		depth++
+		if len(n.Kids) == 0 {
+			break
+		}
+		n = n.Kids[0]
+	}
+	if depth != 101 { // 100 wrappers plus the leaf
+		t.Errorf("decoded depth = %d, want 101", depth)
+	}
+	if n.Name != "leaf" {
+		t.Errorf("deepest node Name = %q, want \"leaf\"", n.Name)
+	}
+
+	// Past the bound it reports an error instead of crashing. The 2-million case is
+	// the regression test: that is the shape that used to be fatal.
+	for _, levels := range []int{unstable.MaxDepth + 1, 2_000_000} {
+		var deep Tree
+		err := deep.UnmarshalJSON(nestTree(levels))
+		if !errors.Is(err, unstable.ErrMaxDepth) {
+			t.Errorf("%d levels: err = %v, want ErrMaxDepth", levels, err)
+		}
+	}
+}
+
+// TestMutuallyRecursiveTypeDepthLimit is the two-type cycle: Ring1 -> Ring2 ->
+// Ring1, reached through RingRoot, which is itself not on the cycle and so only
+// passes the counter down. It checks the cycle search follows edges rather than
+// only spotting a direct self-reference.
+func TestMutuallyRecursiveTypeDepthLimit(t *testing.T) {
+	nest := func(n int) []byte {
+		var b []byte
+		b = append(b, `{"start":`...)
+		for i := 0; i < n; i++ {
+			b = append(b, `{"name":"a","next":{"count":1,"back":`...)
+		}
+		b = append(b, `null`...)
+		for i := 0; i < n; i++ {
+			b = append(b, '}', '}')
+		}
+		b = append(b, '}')
+		return b
+	}
+
+	var r RingRoot
+	if err := r.UnmarshalJSON(nest(50)); err != nil {
+		t.Fatalf("50 rings should decode: %v", err)
+	}
+	if r.Start == nil || r.Start.Name != "a" || r.Start.Next == nil || r.Start.Next.Count != 1 {
+		t.Fatalf("got %#v", r.Start)
+	}
+
+	var deep RingRoot
+	if err := deep.UnmarshalJSON(nest(1_000_000)); !errors.Is(err, unstable.ErrMaxDepth) {
+		t.Errorf("1M rings: err = %v, want ErrMaxDepth", err)
+	}
+}
+
+// TestNonRecursiveTypesTakeNoDepthParam is the other half of the contract: the
+// depth counter is threaded *only* through decoders that can reach a cycle, so a
+// schema without one generates exactly the code it did before and pays nothing.
+// Doc is large and cycle-free, so its decoder must still have the three-parameter
+// signature — asserted by the compiler here, since a depth parameter would make
+// this call fail to build.
+func TestNonRecursiveTypesTakeNoDepthParam(t *testing.T) {
+	raw, err := os.ReadFile("test.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var d Doc
+	if err := d.UnmarshalJSON(raw); err != nil {
+		t.Fatal(err)
+	}
+	// PointList and ScoreMap are cycle-free roots too.
+	var pl PointList
+	if err := pl.UnmarshalJSON([]byte(`[{"x":1,"y":2,"tag":"a"}]`)); err != nil {
+		t.Fatal(err)
+	}
+	var sm ScoreMap
+	if err := sm.UnmarshalJSON([]byte(`{"a":1}`)); err != nil {
+		t.Fatal(err)
 	}
 }

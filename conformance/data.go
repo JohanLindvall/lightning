@@ -135,3 +135,36 @@ type DestructiveDoc struct {
 	Name string   `json:"name,nocopy"`
 	Tags []string `json:"tags,nocopy"`
 }
+
+// Tree is a self-referential type: its decoder and the decoder for its []*Tree
+// field call each other, so decoding recurses once per level of the document.
+// Because the generator detects the cycle, both carry a depth counter and refuse
+// to descend past unstable.MaxDepth — without which deeply nested input would
+// exhaust the goroutine stack, a fatal error recover cannot catch. Exercised by
+// TestRecursiveTypeDepthLimit.
+type Tree struct {
+	Name string  `json:"name"`
+	Kids []*Tree `json:"kids"`
+}
+
+// RingRoot is the entry point for the mutually recursive pair below. Ring1 and
+// Ring2 each reference the other, so both count as "nested in another type" and
+// neither gets its own UnmarshalJSON — a cycle with no member outside it needs a
+// root above it. RingRoot also checks that a type which merely *reaches* a cycle
+// threads the depth counter down into it. Exercised by
+// TestMutuallyRecursiveTypeDepthLimit.
+type RingRoot struct {
+	Start *Ring1 `json:"start"`
+}
+
+// Ring1 and Ring2 form a two-type cycle rather than a self-reference, so the
+// generator's cycle search must follow an edge before the cycle closes.
+type Ring1 struct {
+	Name string `json:"name"`
+	Next *Ring2 `json:"next"`
+}
+
+type Ring2 struct {
+	Count int    `json:"count"`
+	Back  *Ring1 `json:"back"`
+}

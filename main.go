@@ -92,6 +92,7 @@ func generate(inPath string) error {
 		compactTypes:     map[string]bool{},
 		nocopyTypes:      map[string]bool{},
 		destructiveTypes: map[string]bool{},
+		depthFns:         map[string]bool{},
 	}
 
 	// Generated helper functions are named "lightning<ImportPath><Type>decode...",
@@ -178,6 +179,10 @@ func generate(inPath string) error {
 	}
 	allReferenced := len(referenced) == len(g.order) // degenerate (fully cyclic); emit all
 
+	// Decide, before any code is emitted, which decoders must thread a recursion
+	// depth: only those belonging to a type graph that loops back on itself.
+	g.computeDepthThreading()
+
 	var methods []string
 	for _, name := range g.order {
 		if referenced[name] && !allReferenced {
@@ -242,6 +247,19 @@ type gen struct {
 	nocopy      bool   // //lightning:nocopy root, or a destructive root (which aliases what it decodes)
 	pathFrag    string // import path sanitized into an identifier fragment
 	prefix      string // current per-type prefix for generated function names
+
+	// Recursion-depth threading, for schemas whose type graph has a cycle (a tree
+	// node: type Node struct { Kids []*Node }). Such a schema's decoders call each
+	// other in a loop, so a deeply nested document recurses once per level — and a
+	// Go stack overflow is fatal, beyond recover's reach. threadDepth marks the
+	// named types that can reach a cycle; every decoder generated for one of them
+	// takes an extra `depth int`, and the struct decoders among them refuse to
+	// descend past unstable.MaxDepth. A schema with no cycle (the overwhelmingly
+	// common case, and every benchmark) is unaffected: not one signature changes,
+	// so the hot paths are byte-identical. See computeDepthThreading.
+	threadDepth map[string]bool // named type -> its decoders carry depth
+	depthFns    map[string]bool // generated function name -> takes a depth param
+	depthArg    string          // what a call site inside the current body passes
 
 	decoders []string // generated decoder functions, in creation order
 	errs     []error  // generation errors; reported together after the walk
@@ -447,15 +465,21 @@ func (g *gen) genUnmarshal(name string) string {
 	// converted to it.
 	var call string
 	nocopy := g.nocopy // //lightning:nocopy or :destructive root: alias the slice/map root's keys/elements
+	// The root call seeds the recursion depth at 0 (g.depthArg's zero value outside
+	// any body), and contributes nothing when the schema has no cycle.
+	g.depthArg = "0"
 	switch {
 	case g.sliceTypes[name] != nil:
 		at := g.sliceTypes[name]
-		call = fmt.Sprintf("%s((*[]%s)(v), data, i)", g.sliceDecoder(at.Elt, name, nocopy, false), g.typeStr(at.Elt))
+		fn := g.sliceDecoder(at.Elt, name, nocopy, false)
+		call = fmt.Sprintf("%s((*[]%s)(v), data, i%s)", fn, g.typeStr(at.Elt), g.depthArgFor(fn))
 	case g.mapTypes[name] != nil:
 		mt := g.mapTypes[name]
-		call = fmt.Sprintf("%s((*map[string]%s)(v), data, i)", g.mapDecoder(mt.Key, mt.Value, name, nocopy, false), g.typeStr(mt.Value))
+		fn := g.mapDecoder(mt.Key, mt.Value, name, nocopy, false)
+		call = fmt.Sprintf("%s((*map[string]%s)(v), data, i%s)", fn, g.typeStr(mt.Value), g.depthArgFor(fn))
 	default:
-		call = g.namedStruct(name) + "(v, data, i)"
+		fn := g.namedStruct(name)
+		call = fmt.Sprintf("%s(v, data, i%s)", fn, g.depthArgFor(fn))
 	}
 	var doc string
 	if g.destructive {
@@ -504,6 +528,10 @@ func (g *gen) namedStruct(name string) string {
 	fn := g.decFn("decode" + name + g.csuf())
 	g.used[fn] = true
 	g.memo[key] = fn // set before body so recursive types terminate
+	// Likewise set before the body: a recursive schema calls back into fn while
+	// fn's own body is still being generated, and that call must spell the same
+	// signature.
+	g.markDepthFn(fn, g.threadDepth[name])
 	g.genStructBody(fn, "*"+name, g.structTypes[name])
 	return fn
 }
@@ -517,6 +545,7 @@ func (g *gen) anonStruct(t *ast.StructType, hint string) string {
 	}
 	fn := g.uniq(g.decFn("decode" + cap1(hint) + g.csuf()))
 	g.memo[key] = fn
+	g.markDepthFn(fn, g.exprThreadsDepth(t))
 	g.genStructBody(fn, "*"+g.typeStr(t), t)
 	return fn
 }
@@ -636,6 +665,11 @@ func (g *gen) embeddedStruct(expr ast.Expr) (st *ast.StructType, pointee string,
 }
 
 func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
+	// A struct frame is the one that repeats as a recursive document nests, so
+	// inside this body a callee's depth argument is depth+1 (see enterBody).
+	prevDepth := g.enterBody(fn, true)
+	defer func() { g.depthArg = prevDepth }()
+
 	var fields []fieldInfo
 	g.collectFields(st, "v.", 0, nil, map[string]bool{}, &fields)
 
@@ -721,8 +755,8 @@ func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
 	// move per member): a *rotated* loop (closer checked before the loop and
 	// after each member only) measured cloudflare +11% — the wide decoder is
 	// that layout-sensitive — so don't restructure, flag.
-	body := fmt.Sprintf(`func %[1]s(v %[2]s, data []byte, i int) (int, error) {
-	if i >= len(data) {
+	body := fmt.Sprintf(`func %[1]s(v %[2]s, data []byte, i int%[9]s) (int, error) {
+	%[10]sif i >= len(data) {
 		return i, unstable.ErrTruncated
 	}
 	if data[i] == 'n' {
@@ -773,7 +807,7 @@ func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
 		}
 		i++
 	}
-}`, fn, paramType, cases.String(), g.skipWS("i", "i"), g.skipWS("i", "ni"), g.skipWS("i", "i+1"), g.skipWS("i", "i"), g.readKey())
+}`, fn, paramType, cases.String(), g.skipWS("i", "i"), g.skipWS("i", "ni"), g.skipWS("i", "i+1"), g.skipWS("i", "i"), g.readKey(), g.depthParam(fn), g.depthGuard(fn))
 	g.decoders = append(g.decoders, body)
 }
 
@@ -868,13 +902,14 @@ func (g *gen) field(dest string, expr ast.Expr, hint string, nocopy, lax bool) s
 	}
 }
 
-// callDecoder invokes a (struct/slice/map) decoder function on &dest.
+// callDecoder invokes a (struct/slice/map) decoder function on &dest, passing the
+// recursion depth on when fn is one of the decoders that thread it.
 func (g *gen) callDecoder(dest, fn string) string {
-	return fmt.Sprintf(`end, err := %s(&%s, data, i)
+	return fmt.Sprintf(`end, err := %s(&%s, data, i%s)
 if err != nil {
 	return end, err
 }
-i = end`, fn, dest)
+i = end`, fn, dest, g.depthArgFor(fn))
 }
 
 // unsupportedf records a generation error for a type the generator cannot decode
@@ -899,7 +934,7 @@ func (g *gen) laxField(dest string, expr ast.Expr, hint string, nocopy bool) str
 		return g.skipEmit()
 	}
 	return fmt.Sprintf(`var lax %[1]s
-end, err := %[2]s(&lax, data, i)
+end, err := %[2]s(&lax, data, i%[4]s)
 if err != nil {
 	end, err = unstable.SkipValue(data, i)
 	if err != nil {
@@ -908,7 +943,7 @@ if err != nil {
 } else {
 	%[3]s = lax
 }
-i = end`, g.typeStr(expr), fn, dest)
+i = end`, g.typeStr(expr), fn, dest, g.depthArgFor(fn))
 }
 
 // valueDecoder returns the name of a function decoding the JSON value at data[i]
@@ -945,17 +980,20 @@ func (g *gen) valueDecoder(expr ast.Expr, hint string, nocopy, lax bool) string 
 	}
 	fn := g.uniq("decode" + g.baseName(expr) + suffix + "Value")
 	g.memo[key] = fn
+	g.markDepthFn(fn, g.exprThreadsDepth(expr))
 	if isRaw(expr) {
 		g.needJSON = true
 	}
 	if isTime(expr) {
 		g.needTime = true
 	}
+	prevDepth := g.enterBody(fn, false)
 	inner := g.field("(*v)", expr, hint, nocopy, lax)
-	body := fmt.Sprintf(`func %[1]s(v *%[2]s, data []byte, i int) (int, error) {
+	g.depthArg = prevDepth
+	body := fmt.Sprintf(`func %[1]s(v *%[2]s, data []byte, i int%[4]s) (int, error) {
 	%[3]s
 	return i, nil
-}`, fn, g.typeStr(expr), inner)
+}`, fn, g.typeStr(expr), inner, g.depthParam(fn))
 	g.decoders = append(g.decoders, body)
 	return fn
 }
@@ -1147,16 +1185,19 @@ func (g *gen) arrayDecoder(t *ast.ArrayType, hint string, nocopy, lax bool) stri
 	}
 	fn := g.uniq(g.decFn("decode" + cap1(hint) + suffix + "Array" + g.csuf()))
 	g.memo[key] = fn
+	g.markDepthFn(fn, g.exprThreadsDepth(t.Elt))
 	if isRaw(t.Elt) {
 		g.needJSON = true
 	}
 	if isTime(t.Elt) {
 		g.needTime = true
 	}
+	prevDepth := g.enterBody(fn, false)
 	elem := g.field("(*out)[idx]", t.Elt, hint, nocopy, lax)
+	g.depthArg = prevDepth
 	// Trailing commas are rejected by the first-iteration flag, as in
 	// genStructBody.
-	body := fmt.Sprintf(`func %[1]s(out *%[2]s, data []byte, i int) (int, error) {
+	body := fmt.Sprintf(`func %[1]s(out *%[2]s, data []byte, i int%[5]s) (int, error) {
 	if i >= len(data) {
 		return i, unstable.ErrTruncated
 	}
@@ -1202,7 +1243,7 @@ func (g *gen) arrayDecoder(t *ast.ArrayType, hint string, nocopy, lax bool) stri
 		}
 		i++
 	}
-}`, fn, arrType, g.skipWS("i", "i"), elem)
+}`, fn, arrType, g.skipWS("i", "i"), elem, g.depthParam(fn))
 	g.decoders = append(g.decoders, body)
 	return fn
 }
@@ -1273,6 +1314,7 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax bool) string {
 		fn = g.uniq(g.decFn("decode" + g.baseName(elt) + suffix + "Slice" + g.csuf()))
 	}
 	g.memo[key] = fn
+	g.markDepthFn(fn, g.exprThreadsDepth(elt))
 	if isRaw(elt) {
 		g.needJSON = true
 	}
@@ -1280,7 +1322,9 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax bool) string {
 		g.needTime = true
 	}
 	eltStr := g.typeStr(elt)
+	prevDepth := g.enterBody(fn, false)
 	inner := g.field("(*out)[len(*out)-1]", elt, singular(hint)+"Entry", nocopy, lax)
+	g.depthArg = prevDepth
 	presize := g.slicePresize(elt, eltStr)
 	grow := fmt.Sprintf(`var zero %[1]s
 		*out = append(*out, zero)`, eltStr)
@@ -1302,7 +1346,7 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax bool) string {
 	}
 	// Trailing commas ([1,]) are rejected by the first-iteration flag, as in
 	// genStructBody (see there — a rotated loop regressed cloudflare +11%).
-	body := fmt.Sprintf(`func %[1]s(out *[]%[2]s, data []byte, i int) (int, error) {
+	body := fmt.Sprintf(`func %[1]s(out *[]%[2]s, data []byte, i int%[7]s) (int, error) {
 	if i >= len(data) {
 		return i, unstable.ErrTruncated
 	}
@@ -1346,7 +1390,7 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax bool) string {
 		}
 		i++
 	}
-}`, fn, eltStr, inner, presize, g.skipWS("i", "i"), grow)
+}`, fn, eltStr, inner, presize, g.skipWS("i", "i"), grow, g.depthParam(fn))
 	g.decoders = append(g.decoders, body)
 	return fn
 }
@@ -1480,6 +1524,7 @@ func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy, lax boo
 	}
 	fn := g.uniq(g.decFn("decode" + cap1(hint) + suffix + "Map" + g.csuf()))
 	g.memo[key] = fn
+	g.markDepthFn(fn, g.exprThreadsDepth(valExpr))
 	if isRaw(valExpr) {
 		g.needJSON = true
 	}
@@ -1487,7 +1532,9 @@ func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy, lax boo
 		g.needTime = true
 	}
 	valStr := g.typeStr(valExpr)
+	prevDepth := g.enterBody(fn, false)
 	inner := g.field("val", valExpr, hint+"Value", nocopy, lax)
+	g.depthArg = prevDepth
 	// With nocopy the key aliases the input (ReadKey already returns an alias for
 	// an unescaped key); otherwise it is copied so the map owns it.
 	keyAssign := "m[string([]byte(key))] = val"
@@ -1496,7 +1543,7 @@ func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy, lax boo
 	}
 	// Trailing commas are rejected by the first-iteration flag, as in
 	// genStructBody.
-	body := fmt.Sprintf(`func %[1]s(out *map[string]%[2]s, data []byte, i int) (int, error) {
+	body := fmt.Sprintf(`func %[1]s(out *map[string]%[2]s, data []byte, i int%[9]s) (int, error) {
 	if i >= len(data) {
 		return i, unstable.ErrTruncated
 	}
@@ -1553,7 +1600,7 @@ func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy, lax boo
 		}
 		i++
 	}
-}`, fn, valStr, inner, g.skipWS("i", "i"), g.skipWS("i", "ni"), g.skipWS("i", "i+1"), g.readKey(), keyAssign)
+}`, fn, valStr, inner, g.skipWS("i", "i"), g.skipWS("i", "ni"), g.skipWS("i", "i+1"), g.readKey(), keyAssign, g.depthParam(fn))
 	g.decoders = append(g.decoders, body)
 	return fn
 }
@@ -1741,6 +1788,191 @@ func singular(s string) string {
 		return s[:len(s)-1]
 	}
 	return s
+}
+
+// namedRefs returns the top-level named types referenced directly by name's own
+// definition — through fields, pointers, slices, arrays, maps and anonymous
+// structs. Unlike markReferenced it *keeps* a self-reference (a self-recursive type
+// is exactly what the cycle search is looking for) and it stops at named types
+// rather than recursing through them, so the result is the type graph's edge set
+// out of name.
+func (g *gen) namedRefs(name string) map[string]bool {
+	out := map[string]bool{}
+	var walk func(ast.Expr)
+	walk = func(expr ast.Expr) {
+		switch t := unparen(expr).(type) {
+		case *ast.Ident:
+			if g.structTypes[t.Name] != nil || g.sliceTypes[t.Name] != nil || g.mapTypes[t.Name] != nil {
+				out[t.Name] = true
+			}
+		case *ast.StarExpr:
+			walk(t.X)
+		case *ast.ArrayType:
+			walk(t.Elt)
+		case *ast.MapType:
+			walk(t.Value)
+		case *ast.StructType:
+			for _, f := range t.Fields.List {
+				walk(f.Type)
+			}
+		}
+	}
+	switch {
+	case g.structTypes[name] != nil:
+		for _, f := range g.structTypes[name].Fields.List {
+			walk(f.Type)
+		}
+	case g.sliceTypes[name] != nil:
+		walk(g.sliceTypes[name].Elt)
+	case g.mapTypes[name] != nil:
+		walk(g.mapTypes[name].Value)
+	}
+	return out
+}
+
+// computeDepthThreading fills g.threadDepth with the named types whose decoders
+// must carry a recursion depth: those lying on a reference cycle, plus those that
+// can reach one (they sit above it in the call chain and have to pass the counter
+// down).
+//
+// A cycle is found by asking, for each type, whether it can reach itself. The
+// graphs here are a single file's type declarations — a handful of nodes — so the
+// naive per-node DFS closure is far cheaper than its own setup, and it needs no
+// SCC bookkeeping.
+//
+// Only reaching a cycle earns the parameter, so a schema without one generates
+// exactly the code it did before.
+func (g *gen) computeDepthThreading() {
+	g.threadDepth = map[string]bool{}
+
+	refs := make(map[string]map[string]bool, len(g.order))
+	for _, n := range g.order {
+		refs[n] = g.namedRefs(n)
+	}
+	reach := make(map[string]map[string]bool, len(g.order))
+	for _, n := range g.order {
+		seen := map[string]bool{}
+		var dfs func(string)
+		dfs = func(cur string) {
+			for u := range refs[cur] {
+				if !seen[u] {
+					seen[u] = true
+					dfs(u)
+				}
+			}
+		}
+		dfs(n)
+		reach[n] = seen
+	}
+	// A type on a cycle is one that reaches itself.
+	cyclic := map[string]bool{}
+	for _, n := range g.order {
+		if reach[n][n] {
+			cyclic[n] = true
+		}
+	}
+	for _, n := range g.order {
+		if cyclic[n] {
+			g.threadDepth[n] = true
+			continue
+		}
+		for u := range reach[n] {
+			if cyclic[u] {
+				g.threadDepth[n] = true
+				break
+			}
+		}
+	}
+}
+
+// exprThreadsDepth reports whether a decoder generated for the type expression
+// expr must carry a depth parameter — that is, whether expr mentions a named type
+// that can reach a cycle. It is the composite-helper counterpart of a
+// g.threadDepth lookup on a named type.
+func (g *gen) exprThreadsDepth(expr ast.Expr) bool {
+	switch t := unparen(expr).(type) {
+	case *ast.Ident:
+		return g.threadDepth[t.Name]
+	case *ast.StarExpr:
+		return g.exprThreadsDepth(t.X)
+	case *ast.ArrayType:
+		return g.exprThreadsDepth(t.Elt)
+	case *ast.MapType:
+		return g.exprThreadsDepth(t.Value)
+	case *ast.StructType:
+		for _, f := range t.Fields.List {
+			if g.exprThreadsDepth(f.Type) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// markDepthFn records that fn takes a depth parameter, and must be called before
+// fn's body is generated so that a recursive call reached while generating it sees
+// the right signature — the same reason the memo entry is set early.
+func (g *gen) markDepthFn(fn string, threads bool) {
+	if threads {
+		g.depthFns[fn] = true
+	}
+}
+
+// depthParam is the extra parameter fn's signature carries, and depthArg what a
+// call site inside the body currently being generated passes for it. Both are ""
+// for a decoder that does not thread depth, which is why a cycle-free schema
+// produces byte-identical output.
+func (g *gen) depthParam(fn string) string {
+	if g.depthFns[fn] {
+		return ", depth int"
+	}
+	return ""
+}
+
+func (g *gen) depthArgFor(fn string) string {
+	if !g.depthFns[fn] {
+		return ""
+	}
+	arg := g.depthArg
+	if arg == "" {
+		arg = "0"
+	}
+	return ", " + arg
+}
+
+// enterBody sets what call sites in fn's body pass for a callee's depth parameter,
+// returning the previous value for the caller to restore (bodies are generated
+// recursively, so this is a stack discipline).
+//
+// A struct decoder passes depth+1: its frame is the one that repeats as the
+// document nests, so it is where a level is counted. A composite helper (slice,
+// array, map, lax value wrapper) threads depth unchanged — it sits between two
+// struct frames rather than adding a level of its own.
+func (g *gen) enterBody(fn string, isStruct bool) string {
+	prev := g.depthArg
+	switch {
+	case !g.depthFns[fn]:
+		g.depthArg = "0"
+	case isStruct:
+		g.depthArg = "depth+1"
+	default:
+		g.depthArg = "depth"
+	}
+	return prev
+}
+
+// depthGuard is the bound itself, emitted at the top of a depth-threading struct
+// decoder. Every cycle in a decodable schema runs through a named struct — a named
+// slice or map type is only decodable at the root, not as a field type — so
+// guarding the struct decoders bounds every cycle.
+func (g *gen) depthGuard(fn string) string {
+	if !g.depthFns[fn] {
+		return ""
+	}
+	return `if depth >= unstable.MaxDepth {
+		return i, unstable.ErrMaxDepth
+	}
+	`
 }
 
 // markReferenced records, in ref, every top-level struct type named anywhere
