@@ -58,9 +58,26 @@ func getMany(data []byte, keys []string, out [][]byte, compact bool) ([][]byte, 
 		if data[i] == '}' {
 			return out, nil
 		}
-		key, ni, err := unstable.ReadKey(data, i)
-		if err != nil {
-			return out, err
+		// The key read with its no-escape fast path inline, the trick the generated
+		// decoders use (see g.readKey in main.go): unstable.ReadKey costs 212 and so
+		// never inlines, but the common case — a quoted key with no backslash — is
+		// just an IndexCloseOrEscape scan and an UnsafeStr alias, both of which do
+		// inline here. Only an escaped key or an error calls ReadKey. A helper
+		// wrapping this does not work: it exceeds the inline budget once the SIMD
+		// scan inlines into it, so the block is expanded at each site.
+		var key string
+		var ni int
+		if i >= len(data) || data[i] != '"' {
+			return out, unstable.ErrInvalidJSON
+		}
+		ks := i + 1
+		if k := unstable.IndexCloseOrEscape(data[ks:]); ks+k < len(data) && data[ks+k] == '"' {
+			key, ni = unstable.UnsafeStr(data[ks:ks+k]), ks+k+1
+		} else {
+			var err error
+			if key, ni, err = unstable.ReadKey(data, i); err != nil {
+				return out, err
+			}
 		}
 		i = unstable.SkipWSCompact(data, ni, compact)
 		if i >= len(data) || data[i] != ':' {
@@ -205,9 +222,20 @@ func walkPaths(data []byte, i, depth int, active, free []int, paths [][]string, 
 		if data[i] == '}' {
 			return i + 1, nil
 		}
-		key, ni, err := unstable.ReadKey(data, i)
-		if err != nil {
-			return ni, err
+		// Key read with the no-escape fast path inline; see getMany.
+		var key string
+		var ni int
+		if i >= len(data) || data[i] != '"' {
+			return i, unstable.ErrInvalidJSON
+		}
+		ks := i + 1
+		if k := unstable.IndexCloseOrEscape(data[ks:]); ks+k < len(data) && data[ks+k] == '"' {
+			key, ni = unstable.UnsafeStr(data[ks:ks+k]), ks+k+1
+		} else {
+			var err error
+			if key, ni, err = unstable.ReadKey(data, i); err != nil {
+				return ni, err
+			}
 		}
 		i = unstable.SkipWSCompact(data, ni, compact)
 		if i >= len(data) || data[i] != ':' {
@@ -234,6 +262,7 @@ func walkPaths(data []byte, i, depth int, active, free []int, paths [][]string, 
 		}
 
 		var end int
+		var err error
 		if len(recurse) > 0 && start < len(data) && data[start] == '{' {
 			end, err = walkPaths(data, start, depth+1, recurse, free[len(recurse):], paths, out, compact)
 		} else {
@@ -378,9 +407,20 @@ func objectEach(data []byte, fn func(key string, value []byte) error, compact bo
 		if data[i] == '}' {
 			return nil
 		}
-		key, ni, err := unstable.ReadKey(data, i)
-		if err != nil {
-			return err
+		// Key read with the no-escape fast path inline; see getMany.
+		var key string
+		var ni int
+		if i >= len(data) || data[i] != '"' {
+			return unstable.ErrInvalidJSON
+		}
+		ks := i + 1
+		if k := unstable.IndexCloseOrEscape(data[ks:]); ks+k < len(data) && data[ks+k] == '"' {
+			key, ni = unstable.UnsafeStr(data[ks:ks+k]), ks+k+1
+		} else {
+			var err error
+			if key, ni, err = unstable.ReadKey(data, i); err != nil {
+				return err
+			}
 		}
 		i = unstable.SkipWSCompact(data, ni, compact)
 		if i >= len(data) || data[i] != ':' {
@@ -433,9 +473,20 @@ func objectField(data []byte, i int, key string, compact bool) (int, error) {
 		if data[i] == '}' {
 			return i, unstable.ErrKeyNotFound
 		}
-		k, ni, err := unstable.ReadKey(data, i)
-		if err != nil {
-			return ni, err
+		// Key read with the no-escape fast path inline; see getMany.
+		var k string
+		var ni int
+		if i >= len(data) || data[i] != '"' {
+			return i, unstable.ErrInvalidJSON
+		}
+		ks := i + 1
+		if n := unstable.IndexCloseOrEscape(data[ks:]); ks+n < len(data) && data[ks+n] == '"' {
+			k, ni = unstable.UnsafeStr(data[ks:ks+n]), ks+n+1
+		} else {
+			var err error
+			if k, ni, err = unstable.ReadKey(data, i); err != nil {
+				return ni, err
+			}
 		}
 		i = unstable.SkipWSCompact(data, ni, compact)
 		if i >= len(data) || data[i] != ':' {
