@@ -22,6 +22,16 @@
 //     string body; [DecodeAny] decodes a whole document into the generic
 //     nil/bool/float64/string/[]any/map[string]any representation; [ParseFloat]
 //     parses a single JSON number.
+//   - Check — [Valid] reports whether a document is one well-formed JSON value,
+//     without allocating or building the decoded value. It accepts exactly what
+//     this library's decoders accept, which differs in a few documented ways from
+//     encoding/json.Valid.
+//
+// The edit and transform operations are best effort: they return only a []byte and
+// pass input they cannot interpret through rather than failing. For untrusted input
+// each has a checked counterpart that validates its arguments and result and
+// returns an error — [SetChecked], [SetManyChecked], [SetPathsChecked],
+// [StripDefaultsChecked].
 //
 // The *Compact variants assume the input has no inter-token whitespace (the form
 // compact serializers emit) and skip the scans that look for it — faster on
@@ -56,7 +66,19 @@ var (
 	ErrExpectArray = unstable.ErrExpectArray
 	// ErrExpectColon reports a ':' was expected after an object key.
 	ErrExpectColon = unstable.ErrExpectColon
+	// ErrMaxDepth reports input nested deeper than MaxDepth.
+	ErrMaxDepth = unstable.ErrMaxDepth
 )
+
+// MaxDepth is how deeply nested a document may be before DecodeAny, Valid and the
+// generated decoders for recursive schemas give up with ErrMaxDepth. It matches
+// encoding/json's limit.
+//
+// The bound exists because these walks recurse once per nesting level, and a Go
+// stack overflow is a fatal error that recover cannot catch: without it, deeply
+// nested input would end the process rather than return an error. Get, Lookup,
+// GetMany, GetPaths and Set walk iteratively and are not subject to it.
+const MaxDepth = unstable.MaxDepth
 
 // UnescapeString decodes the body of a JSON string (the bytes that sit between
 // the surrounding quotes, with escape sequences such as \n, \" and \uXXXX still
@@ -134,18 +156,5 @@ func decodeAny(data []byte, compact bool) (any, error) {
 	return v, nil
 }
 
-// Valid reports whether data is a single well-formed JSON document: exactly one
-// value, optionally surrounded by whitespace, with no trailing content. It is the
-// analogue of encoding/json.Valid, matching its strictness — trailing commas,
-// malformed numbers, and unexpected bytes are all rejected.
-//
-// Validity is checked by parsing the document with the same strict scanner as
-// DecodeAny and discarding the result, so for a document containing objects or
-// arrays it allocates the intermediate values it builds. It does not use the
-// lenient SkipValue skip path (which only balances brackets and would accept, for
-// example, a trailing comma). Like encoding/json it validates structure but not
-// every semantic detail — duplicate object keys, for instance, are not rejected.
-func Valid(data []byte) bool {
-	_, err := decodeAny(data, false)
-	return err == nil
-}
+// Valid lives in valid.go, which checks the JSON grammar directly rather than
+// decoding the document.
