@@ -168,3 +168,28 @@ type Ring2 struct {
 	Count int    `json:"count"`
 	Back  *Ring1 `json:"back"`
 }
+
+// LongKeys exercises the `switch len(key)` dispatch the generator emits once a
+// struct has a JSON name longer than 16 bytes (cmd/compile's inline-comparison
+// limit), where names are matched in <=16-byte chunks so no comparison calls
+// runtime.memequal. Every tricky case for that scheme is represented:
+//
+//   - names of exactly 16, 17 and 33+ bytes (one, two and three chunks);
+//   - SharedPrefixA/B, whose names are the same length AND share their whole first
+//     16-byte chunk, so a bug that compares only the first chunk swaps them;
+//   - two distinct names of the same length in one bucket;
+//   - Alt, whose pipe-separated names straddle the 16-byte boundary (one bucket
+//     each), the case that duplicates a field's decode code;
+//   - Short, so a bucket that keeps its nested `switch key` is covered too.
+//
+// Exercised by TestLongKeyDispatch.
+type LongKeys struct {
+	Short            int    `json:"s"`
+	Exactly16Bytes__ int    `json:"exactly16bytes__"`
+	SeventeenBytes_1 int    `json:"seventeenBytes_17"`
+	SharedPrefixA    int    `json:"sharedPrefix16xxA"`
+	SharedPrefixB    int    `json:"sharedPrefix16xxB"`
+	SameLenOther     int    `json:"differentButSame"`
+	ThirtyThreePlus  string `json:"aKeyOfThirtyThreeBytesExactly_333"`
+	Alt              int    `json:"shortAlt|aVeryMuchLongerAlternateName"`
+}

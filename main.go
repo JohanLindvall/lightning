@@ -55,6 +55,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode"
@@ -664,6 +665,145 @@ func (g *gen) embeddedStruct(expr ast.Expr) (st *ast.StructType, pointee string,
 	return nil, "", false, false
 }
 
+// fieldArm is one field's dispatch entry: the JSON names it answers to (already
+// resolved through Go's promotion rules) and the code that decodes it.
+type fieldArm struct {
+	keys []string
+	code string
+}
+
+// maxInlineCmp is cmd/compile's maxRewriteLen: the longest string constant it will
+// compare with inline word loads (2 * RegSize on amd64/arm64). A comparison against
+// a longer constant becomes a CALL to runtime.memequal, which also forces the live
+// registers to be spilled and reloaded around it and gives the caller a stack frame.
+const maxInlineCmp = 16
+
+// skipUnknown is the code that skips an object member whose key matched no field.
+const skipUnknown = `end, err := unstable.SkipValue(data, i)
+		if err != nil {
+			return end, err
+		}
+		i = end`
+
+// keyDispatch emits the statement that matches key against each field's names and
+// runs that field's decode, skipping the value when nothing matches.
+//
+// When every name fits maxInlineCmp it is a plain `switch key`, which is already
+// optimal: cmd/compile buckets the cases by length itself and compares each with
+// inline word loads. That keeps the emitted code byte-identical for the great
+// majority of schemas.
+//
+// A name longer than maxInlineCmp is the case worth restructuring, because `switch
+// key` compiles it to a runtime.memequal call — cloudflare's 45-field decoder made 20
+// such calls, and memeqbody plus memequal were ~5% of its profile. Then the dispatch
+// becomes `switch len(key)`, and inside each length bucket the names are compared in
+// <=maxInlineCmp-byte chunks, so no comparison ever calls memequal. Buckets whose
+// names all fit keep a nested `switch key` so short keys are dispatched exactly as
+// well as before.
+//
+// Non-matching keys reach the skip through a goto rather than a copy of it per
+// bucket: a wide struct has many buckets, and duplicating the skip in each would add
+// real code to the hot loop for no benefit. The matched path costs nothing — it falls
+// out of the switch — which is why this is a goto and not a `handled` flag.
+func (g *gen) keyDispatch(arms []fieldArm) string {
+	maxLen := 0
+	for _, a := range arms {
+		for _, k := range a.keys {
+			if len(k) > maxLen {
+				maxLen = len(k)
+			}
+		}
+	}
+	if maxLen <= maxInlineCmp {
+		var cases strings.Builder
+		for _, a := range arms {
+			quoted := make([]string, len(a.keys))
+			for j, k := range a.keys {
+				quoted[j] = strconv.Quote(k)
+			}
+			fmt.Fprintf(&cases, "\tcase %s:\n%s\n", strings.Join(quoted, ", "), a.code)
+		}
+		return fmt.Sprintf("switch key {\n%s\n\t\tdefault:\n\t\t\t%s\n\t\t}", cases.String(), skipUnknown)
+	}
+
+	// Group each field's names by length. A field whose names differ in length (a
+	// pipe-separated alternate spelling) appears in more than one bucket, which
+	// duplicates its decode code — rare, and the alternative is a second dispatch.
+	byLen := map[int][]fieldArm{}
+	var lens []int
+	for _, a := range arms {
+		perLen := map[int][]string{}
+		for _, k := range a.keys {
+			perLen[len(k)] = append(perLen[len(k)], k)
+		}
+		for l, ks := range perLen {
+			if _, seen := byLen[l]; !seen {
+				lens = append(lens, l)
+			}
+			byLen[l] = append(byLen[l], fieldArm{keys: ks, code: a.code})
+		}
+	}
+	sort.Ints(lens)
+
+	var b strings.Builder
+	b.WriteString("switch len(key) {\n")
+	for _, l := range lens {
+		fmt.Fprintf(&b, "\t\tcase %d:\n", l)
+		if l <= maxInlineCmp {
+			b.WriteString("\t\t\tswitch key {\n")
+			for _, a := range byLen[l] {
+				quoted := make([]string, len(a.keys))
+				for j, k := range a.keys {
+					quoted[j] = strconv.Quote(k)
+				}
+				fmt.Fprintf(&b, "\t\t\tcase %s:\n%s\n", strings.Join(quoted, ", "), a.code)
+			}
+			b.WriteString("\t\t\tdefault:\n\t\t\t\tgoto lightningSkipKey\n\t\t\t}\n")
+			continue
+		}
+		for n, a := range byLen[l] {
+			kw := "if"
+			if n > 0 {
+				kw = "} else if"
+			}
+			conds := make([]string, len(a.keys))
+			for j, k := range a.keys {
+				conds[j] = chunkedKeyEq(k)
+			}
+			fmt.Fprintf(&b, "\t\t\t%s %s {\n%s\n", kw, strings.Join(conds, " || "), a.code)
+		}
+		b.WriteString("\t\t\t} else {\n\t\t\t\tgoto lightningSkipKey\n\t\t\t}\n")
+	}
+	b.WriteString("\t\tdefault:\n\t\t\tgoto lightningSkipKey\n\t\t}\n")
+	// The matched path jumps clear of the skip. The skip sits in its own block so
+	// that jump does not cross a variable declaration, which Go forbids.
+	b.WriteString("\t\tgoto lightningKeyDone\n")
+	b.WriteString("\tlightningSkipKey:\n\t\t{\n\t\t\t" + skipUnknown + "\n\t\t}\n")
+	b.WriteString("\tlightningKeyDone:")
+	return b.String()
+}
+
+// chunkedKeyEq compares key against the constant k without ever exceeding
+// maxInlineCmp bytes in one comparison, so cmd/compile keeps every piece as inline
+// word loads instead of a runtime.memequal call. The caller has already established
+// len(key) == len(k) by switching on it, which is also what lets the slice bounds be
+// proved and their checks elided.
+func chunkedKeyEq(k string) string {
+	if len(k) <= maxInlineCmp {
+		return "key == " + strconv.Quote(k)
+	}
+	var parts []string
+	for off := 0; off < len(k); off += maxInlineCmp {
+		end := off + maxInlineCmp
+		if end >= len(k) {
+			parts = append(parts, fmt.Sprintf("key[%d:] == %s", off, strconv.Quote(k[off:])))
+			break
+		}
+		parts = append(parts, fmt.Sprintf("key[%d:%d] == %s", off, end, strconv.Quote(k[off:end])))
+	}
+	return strings.Join(parts, " && ")
+}
+
 func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
 	// A struct frame is the one that repeats as a recursive document nests, so
 	// inside this body a callee's depth argument is depth+1 (see enterBody).
@@ -715,8 +855,9 @@ func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
 		}
 	}
 
-	// Emit one case per field, in collection order, listing the names it won.
-	var cases strings.Builder
+	// Collect the winning key names and decode code for each field, in collection
+	// order, then let dispatch decide how to match a key against them.
+	var arms []fieldArm
 	for i, f := range fields {
 		var won []string
 		for _, k := range f.keys {
@@ -726,10 +867,6 @@ func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
 		}
 		if len(won) == 0 {
 			continue
-		}
-		quoted := make([]string, len(won))
-		for j, k := range won {
-			quoted[j] = strconv.Quote(k)
 		}
 		hint := f.dest[strings.LastIndexByte(f.dest, '.')+1:]
 		var code string
@@ -744,8 +881,9 @@ func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
 		if len(f.allocs) > 0 {
 			code = strings.Join(f.allocs, "\n") + "\n" + code
 		}
-		fmt.Fprintf(&cases, "\tcase %s:\n%s\n", strings.Join(quoted, ", "), code)
+		arms = append(arms, fieldArm{keys: won, code: code})
 	}
+	dispatch := g.keyDispatch(arms)
 
 	// The loop top is reached only after '{' (first iteration) or after a
 	// comma, and a '}' after a member returns from the post-value check — so a
@@ -786,15 +924,7 @@ func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
 		if i >= len(data) {
 			return i, unstable.ErrTruncated
 		}
-		switch key {
-%[3]s
-		default:
-			end, err := unstable.SkipValue(data, i)
-			if err != nil {
-				return end, err
-			}
-			i = end
-		}
+		%[3]s
 		%[7]s
 		if i >= len(data) {
 			return i, unstable.ErrTruncated
@@ -807,7 +937,7 @@ func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
 		}
 		i++
 	}
-}`, fn, paramType, cases.String(), g.skipWS("i", "i"), g.skipWS("i", "ni"), g.skipWS("i", "i+1"), g.skipWS("i", "i"), g.readKey(), g.depthParam(fn), g.depthGuard(fn))
+}`, fn, paramType, dispatch, g.skipWS("i", "i"), g.skipWS("i", "ni"), g.skipWS("i", "i+1"), g.skipWS("i", "i"), g.readKey(), g.depthParam(fn), g.depthGuard(fn))
 	g.decoders = append(g.decoders, body)
 }
 

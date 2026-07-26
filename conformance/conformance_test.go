@@ -445,3 +445,83 @@ func TestSliceReuseKeepsBacking(t *testing.T) {
 		t.Errorf("reuse allocated %v times per decode, want 0", n)
 	}
 }
+
+// TestLongKeyDispatch covers the `switch len(key)` dispatch the generator emits for
+// a struct with a JSON name longer than 16 bytes, where names are compared in
+// <=16-byte chunks so no comparison becomes a runtime.memequal call.
+//
+// The chunking is the part that can go subtly wrong, so the cases are chosen to
+// break a careless implementation rather than to look representative:
+// sharedPrefix16xxA and sharedPrefix16xxB are the same length and share their entire
+// first 16-byte chunk, so comparing only the first chunk would swap them; the 33-byte
+// name needs three chunks (16 + 16 + 1); exactly16bytes__ sits on the boundary where
+// the compiler still inlines; and Alt's pipe-separated names fall either side of it,
+// so its decode code is emitted in two different length buckets.
+func TestLongKeyDispatch(t *testing.T) {
+	full := []byte(`{
+		"s": 1,
+		"exactly16bytes__": 2,
+		"seventeenBytes_17": 3,
+		"sharedPrefix16xxA": 4,
+		"sharedPrefix16xxB": 5,
+		"differentButSame": 6,
+		"aKeyOfThirtyThreeBytesExactly_333": "x",
+		"shortAlt": 7
+	}`)
+	var lk LongKeys
+	if err := lk.UnmarshalJSON(full); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		name string
+		got  int
+		want int
+	}{
+		{"Short", lk.Short, 1},
+		{"Exactly16Bytes__", lk.Exactly16Bytes__, 2},
+		{"SeventeenBytes_1", lk.SeventeenBytes_1, 3},
+		{"SharedPrefixA", lk.SharedPrefixA, 4},
+		{"SharedPrefixB", lk.SharedPrefixB, 5},
+		{"SameLenOther", lk.SameLenOther, 6},
+		{"Alt (short spelling)", lk.Alt, 7},
+	} {
+		if c.got != c.want {
+			t.Errorf("%s = %d, want %d", c.name, c.got, c.want)
+		}
+	}
+	if lk.ThirtyThreePlus != "x" {
+		t.Errorf("ThirtyThreePlus = %q, want \"x\"", lk.ThirtyThreePlus)
+	}
+
+	// The long alternate spelling fills the same field, from the other bucket.
+	var alt LongKeys
+	if err := alt.UnmarshalJSON([]byte(`{"aVeryMuchLongerAlternateName":9}`)); err != nil {
+		t.Fatal(err)
+	}
+	if alt.Alt != 9 {
+		t.Errorf("Alt via long alternate name = %d, want 9", alt.Alt)
+	}
+
+	// Unknown keys must be skipped, not misrouted: each of these is a near miss
+	// against a real name — differing in the last chunk, one byte too long or short,
+	// or sharing a 16-byte prefix — and none may set any field.
+	for _, doc := range []string{
+		`{"sharedPrefix16xxC":1}`,                 // same length, last chunk differs
+		`{"sharedPrefix16xx":1}`,                  // one byte short of two names
+		`{"sharedPrefix16xxAB":1}`,                // one byte long
+		`{"exactly16bytes_":1}`,                   // 15 bytes
+		`{"exactly16bytes___":1}`,                 // 17 bytes
+		`{"aKeyOfThirtyThreeBytesExactly_33x":1}`, // 33 bytes, last chunk differs
+		`{"aVeryMuchLongerAlternateNam":1}`,       // 27 bytes
+		`{"differentButSamX":1}`,                  // 16 bytes, last byte differs
+	} {
+		var z LongKeys
+		if err := z.UnmarshalJSON([]byte(doc)); err != nil {
+			t.Errorf("%s: unexpected error %v", doc, err)
+			continue
+		}
+		if z != (LongKeys{}) {
+			t.Errorf("%s: set a field (%+v), want all zero", doc, z)
+		}
+	}
+}
