@@ -426,6 +426,86 @@ byte-identical when adding cold paths; push new logic out-of-line.
   `prevEscaped` carry), quotes on the boundary, deep bracket runs, close-dense
   blocks, closes at exact block multiples — plus per-variant truncation safety;
   `BenchmarkSkipBlocksVariant` is the standing AVX2-vs-512-vs-Go comparison.
+- **`Valid` is a grammar walk, not a decode** (`pkg/json/valid.go`). It used to be
+  `_, err := decodeAny(data, false); return err == nil` — which built the entire
+  `map[string]any`/`[]any` tree just to throw it away: **8065 ns / 13312 B / 201
+  allocs** on a 1.1 KB record, i.e. *slower than `encoding/json.Valid`* (2760 ns,
+  0 allocs), the one place this library lost to the stdlib. `validValue` now checks
+  the document in place: **1220 ns, 0 allocs** (6.6× the old form, ~2.3× the
+  stdlib). Three load-bearing choices. **(1)** It is a **flat loop with a bitset**,
+  not recursion — one bit per open container (set = object, clear = array) in a
+  fixed `[MaxDepth/64+1]uint64` local, so nesting costs bits instead of stack
+  frames. Three `goto` labels are the states (`scanValue`/`scanKey`/`scanAfter`);
+  all locals are declared up front because Go forbids a goto jumping over a
+  declaration. The empty-container case is handled *at the open bracket*, which is
+  precisely what lets `scanKey` reject a `}` as a trailing comma with no extra
+  flag. **(2)** Its contract is **agreement with lightning's own decoder, not with
+  `encoding/json`** — `Valid(data)` answers "will `DecodeAny`/a generated
+  `UnmarshalJSON` accept this?", which is the useful question for a gate in front
+  of them. So numbers go through the decoder's own `ReadFloat64OrNull` (same
+  Clinger/EL/strconv tiers, same span consumed, same overflow rejection) rather
+  than a reimplemented grammar check: agreement is by construction, and
+  `1e309` is *invalid* here though `encoding/json.Valid` accepts it. Strings are
+  the one hand-written part (the decoder's readers unescape, so they allocate) and
+  deliberately mirror the scanners' leniency — `IndexCloseOrEscape` stops at `"`
+  and `\` only, so a **raw control byte is accepted**, and unpaired surrogates are
+  not checked. Locked by `FuzzValidMatchesDecodeAny` (20M execs, zero divergence)
+  plus `TestValidDivergesFromStdlib`, which pins each deliberate disagreement so
+  neither side drifts silently. **(3)** It needs its own `skipWSStrict`… **no** —
+  it needs the opposite: it uses `unstable.SkipWS`, whose `<= 0x20` test is a
+  deliberate one-compare-instead-of-four shortcut, *because* matching the decoder
+  means inheriting that leniency (a NUL between tokens is whitespace here). An
+  earlier draft aimed at `encoding/json` parity and did add a strict four-byte
+  skip; the differential fuzz against the stdlib is what exposed the `<= 0x20`
+  divergence in the first place. Don't "fix" `SkipWS` — the decode path is tuned.
+- **Depth bound on the recursive walkers** (`unstable.MaxDepth` = 10000, matching
+  `encoding/json`). `decodeValue`↔`decodeAnyObject`/`decodeAnyArray` and
+  `stripper.handle` recurse once per nesting level and had **no bound**: measured,
+  `StripDefaults` died at ~1M nesting and `DecodeAny` at ~4M with
+  `fatal error: stack overflow` — which `recover` **cannot** catch, so one hostile
+  document took the process down instead of returning an error. Both now carry a
+  `depth` param: `decodeAny*` returns the new `ErrMaxDepth`, and `handle` ejects
+  (its existing best-effort response to input it cannot interpret, keeping
+  `StripDefaults`' no-error signature). Cost is one compare per `{`/`[` — citm
+  `DecodeAny` measured flat (p=0.161, n=8). `Get`/`Set`/`SkipValue` are iterative
+  or path-bounded and needed nothing.
+- **Cycle-gated depth threading in the generator** (`computeDepthThreading`,
+  `exprThreadsDepth`, `enterBody`/`depthParam`/`depthArgFor`/`depthGuard` in
+  `main.go`) — the generated-code half of the bound above. A self-referential
+  schema (`type Node struct { Kids []*Node }`) emits decoders that call each other
+  in a loop, so decoding recurses per document level: measured, a 4M-level document
+  died with `fatal error: stack overflow` (2M survived — Go grows the stack to 1 GB
+  first, which is why the crash threshold is high and the naive test looks fine).
+  The fix is **gated on a cycle actually existing**, which is what makes it free:
+  `computeDepthThreading` builds the named-type reference graph (`namedRefs`, which
+  unlike `markReferenced` keeps self-edges), marks types that reach themselves as
+  cyclic, and threads `depth int` only through decoders for types that reach a
+  cycle. Everything else is emitted byte-identically — verified by regenerating all
+  30 bench cases + conformance under the old and new generator and diffing: **27 of
+  30 identical**, the three that differ (`twitter_status`'s `twitterURL` nests
+  `[]twitterURL`, `golang_source`'s `golangNode`, `synthea_fhir`'s
+  `syntheaExtension`) being genuinely recursive — they were live crash vectors *in
+  the benchmark corpus*. Two design points worth keeping: **(1)** the guard lives in
+  the **struct** decoders only, because every cycle in a decodable schema must pass
+  through a named struct — a named slice/map type is only decodable at the *root*,
+  never as a field type (`field`'s `*ast.Ident` case rejects it), so an
+  all-slice/map cycle cannot be generated. Struct frames pass `depth+1`, composite
+  helpers (slice/array/map/lax-value) thread `depth` unchanged, so depth counts
+  document levels rather than frames. **(2)** `markDepthFn` must be called
+  **before** the body is generated, for the same reason `g.memo[key]` is: a
+  recursive schema calls back into the function while its own body is still being
+  built, and that call has to spell the same signature. Cost on the three recursive
+  cases (interleaved A/B, n=8–16): twitter_status geomean −0.74%, synthea_fhir
+  −1.24%, golang_source **+1.3%** (its `Lightning` p=0.270, `Destructive` +1.55%
+  p=0.019) — golang_source is the deepest tree so it takes the most guard checks;
+  under the 2% noise floor and the price of closing a fatal crash on exactly that
+  shape. Locked by `TestRecursiveTypeDepthLimit` (self-reference) and
+  `TestMutuallyRecursiveTypeDepthLimit` (Ring1↔Ring2 reached through a
+  non-cyclic `RingRoot` — note a cycle with no member outside it gets *no*
+  `UnmarshalJSON` at all, since `referenced` marks every member, so such a test
+  needs a root above the cycle) plus
+  `TestNonRecursiveTypesTakeNoDepthParam`, whose value is that it fails to
+  *compile* if `Doc` ever grows a depth parameter.
 - **`GetPaths` stack-backed active-index scratch.** `getPaths` keeps one shared
   `[]int` scratch holding the active path-index set for every recursion level
   (sized `len(paths)*(maxDepth+1)` so the depth-first walk's per-level sub-slices
@@ -958,6 +1038,15 @@ no regressions.)
 
 ## Conventions
 
+- **The edit/transform API is deliberately two-tier.** `Set`/`SetMany`/`SetPaths`/
+  `StripDefaults` return only a `[]byte` and are best effort — bracket balancers,
+  not parsers, that pass uninterpretable input through rather than failing. That is
+  what keeps them zero-alloc on the hot path, and it is not a defect to be fixed by
+  adding error returns to them. Untrusted input is served by the `…Checked`
+  counterparts in `pkg/json/checked.go`, which wrap the unchanged fast functions
+  with `Valid` on the arguments and on the result (plus `ErrValueCount` for a short
+  `rawVal`). Keep new edit operations to that shape: fast and silent, with a checked
+  wrapper — never a validity check inside the hot walker.
 - Bench `data.go` files use a single top-level `Benchmark` with **anonymous**
   nested structs, so only `Benchmark` gets a generated method and
   `type benchmarkStd Benchmark` gives a clean reflection-only baseline for the

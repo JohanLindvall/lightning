@@ -15,7 +15,8 @@ a struct at all: pull a few fields out of a document
 ([`Get`/`GetMany`](#key-lookups)), edit values in place
 ([`Set`/`SetMany`](#setting-a-value)), prune default members
 ([`StripDefaults`](#stripping-default-fields)), decode into a generic value
-([`DecodeAny`](#decoding-into-any)), and escape, unescape, or parse a JSON number
+([`DecodeAny`](#decoding-into-any)), check a document without decoding it
+([`Valid`](#checking-validity)), and escape, unescape, or parse a JSON number
 on its own — each an allocation-light, single-pass operation over the raw bytes.
 See [Layout](#layout) for the full list.
 
@@ -296,6 +297,41 @@ documents with many keys this is a real saving: tagging the GeoSciences `gsoc_20
 corpus's root map cut its allocations ~21%. (Only slice and map roots take the
 directive; a struct root uses per-field `nocopy` tags.)
 
+## Recursive schemas
+
+A schema may refer back to itself — a tree node, a comment thread, a FHIR
+extension — either directly or through a chain of types:
+
+```go
+type Node struct {
+    Name string  `json:"name"`
+    Kids []*Node `json:"kids"` // decoded by recursion
+}
+```
+
+The decoders such a type needs call each other in a loop, so decoding recurses
+once per level of the document. Since a Go stack overflow is **fatal** — `recover`
+cannot catch it — unbounded recursion here would mean a deeply nested document
+could kill the process rather than return an error.
+
+So the generator looks for cycles in the type graph before emitting anything. Types
+on a cycle (and those that can reach one, which must pass the counter down) get
+their decoders threaded with a recursion depth, and the struct decoders among them
+refuse to descend past `unstable.MaxDepth`, returning `ErrMaxDepth`:
+
+```go
+// {"kids":[{"kids":[ … 4 million levels … ]}]}
+err := node.UnmarshalJSON(deeplyNested)
+// err is unstable.ErrMaxDepth — previously: fatal error: stack overflow
+```
+
+**A schema without a cycle is completely unaffected** — not one signature changes,
+so the generated code is byte-for-byte what it was and the hot paths pay nothing.
+Of the 30 benchmark cases only three (`twitter_status`, whose `twitterURL` nests
+`[]twitterURL`; `golang_source`; `synthea_fhir`) contain a cycle at all, and on
+those the counter costs ~1–1.5%. Nothing is required of you: the cycle is detected
+from the types themselves, with no annotation.
+
 ## Generated function names
 
 The `UnmarshalJSON` methods keep their exact name (the `json.Unmarshaler`
@@ -381,18 +417,60 @@ type.
   faster on minified input; may error if the input does contain inter-token
   whitespace.
 
-To check well-formedness without a target type, `Valid(data []byte) bool` reports
-whether `data` is one well-formed JSON value (optionally whitespace-surrounded, no
-trailing content). It matches `encoding/json.Valid`'s strictness — rejecting
-trailing commas, malformed numbers, and trailing bytes — by parsing with the same
-scanner as `DecodeAny` and discarding the result (so it allocates the intermediate
-values for a document containing objects or arrays; it deliberately does not use
-the lenient bracket-balancing skip path, which would accept a trailing comma).
+A document nested deeper than 10 000 levels is rejected with `ErrMaxDepth` rather
+than descended into — the same bound `encoding/json` applies, and for the same
+reason: `DecodeAny` recurses once per nesting level, and a Go stack overflow is a
+*fatal* error that `recover` cannot catch, so without the bound a hostile document
+would take the process down instead of returning an error. `Get`, `Set` and the
+`Skip` path are iterative and unaffected.
+
+## Checking validity
+
+`Valid(data []byte) bool` reports whether `data` is one well-formed JSON value
+(optionally whitespace-surrounded, no trailing content), checking the document in
+place — **no allocation, and no decoded value built**.
+
+`Valid` answers *"will lightning decode this?"*: it accepts exactly what
+[`DecodeAny`](#decoding-into-any) and a generated `UnmarshalJSON` accept, which is
+what makes it useful as a gate in front of them (a 20-million-execution
+differential fuzz against `DecodeAny` keeps the two in step). That is a
+deliberately different question from `encoding/json.Valid`'s *"does this match the
+JSON grammar?"*, and the two disagree in a few places because the decoder's
+scanners are tuned for input already known to be JSON:
+
+| Input | `Valid` | `encoding/json.Valid` | Why |
+|---|:--:|:--:|---|
+| `01`, `+1`, `.5`, `5.` | ✅ | ❌ | `scanFloat` does arithmetic, not grammar checking |
+| `"…<0x09>…"` (raw control byte) | ✅ | ❌ | the string scanners stop at `"` and `\` only |
+| `{"a":<0x00>1}` | ✅ | ❌ | inter-token whitespace is every byte `<= 0x20` — one compare, not four |
+| `1e309` | ❌ | ✅ | overflows `float64`, so the decoder cannot represent it |
+
+Everything else is checked strictly, as the decoder checks it: trailing commas,
+non-string object keys, missing colons, unknown escapes, a `\u` without four hex
+digits, unterminated strings, mismatched brackets, bad keywords, and trailing
+bytes are all rejected. Semantics are not checked — duplicate keys are accepted,
+and neither UTF-8 well-formedness nor surrogate pairing is verified (an unpaired
+`\uD800` decodes to U+FFFD rather than failing, as in `encoding/json`).
+
+Because it checks the document in place rather than decoding it, it is also
+considerably faster than the standard library's validator on the same bytes:
+
+| | ns/op | B/op | allocs/op |
+|---|--:|--:|--:|
+| `json.Valid` | ~1220 | 0 | 0 |
+| `encoding/json.Valid` | ~2760 | 0 | 0 |
+
+(1.1 KB record, amd64 — ~2.3× faster, and 6.6× faster than checking a document by
+running `DecodeAny` and discarding the result, which also costs ~200 allocations.
+`Valid` does *not* use the lenient bracket-balancing `SkipValue` path, which would
+accept a trailing comma.)
+
+## Errors
 
 Errors returned by these helpers are the package's exported sentinels —
 `ErrKeyNotFound`, `ErrInvalidJSON`, `ErrTruncated`, `ErrExpectObject`,
-`ErrExpectArray`, `ErrExpectColon` — so callers can match them with `errors.Is`
-without importing the internal `pkg/unstable` package.
+`ErrExpectArray`, `ErrExpectColon`, `ErrMaxDepth` — so callers can match them with
+`errors.Is` without importing the internal `pkg/unstable` package.
 
 ## String escaping and unescaping
 
@@ -426,8 +504,12 @@ the result is in use.
   (escaping can grow a string up to 6× for control bytes). Pass `out[:0]` to
   reuse a buffer across calls.
 
-Clean runs are skipped eight bytes at a time (SWAR), so strings that need little
-or no escaping cost roughly one `memcpy`.
+Clean runs are skipped with a vectorized scan (`indexEscapeSSE2`/`indexEscapeNEON`,
+which classify `"`, `\` and control bytes in one pass), so a string needing little
+or no escaping costs roughly one `memcpy`. The scanner is chosen per run by how
+much input is left: a run shorter than 48 bytes — every short string, and every
+short gap between two escapes — is walked a word at a time with SWAR instead, since
+the vector call's setup would cost more than it saves there.
 
 ## Number parsing
 
@@ -537,6 +619,48 @@ avoid keys needing it). `out` is filled from `out[:0]` and returned — pass a
 reusable buffer to avoid allocation; `out` must not alias `in`, which is never
 modified. Inter-token whitespace in `in` is preserved outside the edited spans.
 
+## Checked edits
+
+`Set`, `SetMany`, `SetPaths` and `StripDefaults` are **best effort by design**:
+they return only a `[]byte`, walk the input with a bracket balancer rather than a
+parser, and on input they can't make sense of they produce *something* — a
+passthrough, a partial rewrite — instead of complaining. That is what keeps them
+allocation-free on the hot path, where the input is typically a document you just
+produced or already validated. It also means malformed input, or a `rawVal` that
+isn't a single JSON value, propagates silently into the result.
+
+For input you don't trust, each has a `…Checked` counterpart that returns an
+error. They validate their arguments with [`Valid`](#checking-validity) before the
+edit and validate the result afterwards, so a bad document, a bad inserted value,
+or a result that somehow came out malformed is reported instead of returned:
+
+- `SetChecked(in, out, rawVal []byte, keys []string) ([]byte, error)`
+- `SetManyChecked(in, out []byte, rawVal [][]byte, keys []string) ([]byte, error)`
+- `SetPathsChecked(in, out []byte, rawVal [][]byte, paths [][]string) ([]byte, error)`
+- `StripDefaultsChecked(input, output []byte, defaults, keep [][]byte, ws WhitespaceMode) ([]byte, error)`
+
+```go
+out, err := json.SetChecked(untrusted, out[:0], []byte(`{"ok":true}`), []string{"result"})
+if err != nil { // ErrInvalidJSON: untrusted wasn't one well-formed value
+    return err
+}
+```
+
+They return `ErrInvalidJSON` for a malformed document, inserted value, or result,
+and `ErrValueCount` when `rawVal` has fewer entries than `keys`/`paths` — the case
+the unchecked forms handle by silently ignoring the surplus. On error the returned
+slice is `nil`, so there's no half-edited buffer to mistake for a result.
+
+Two things they deliberately don't check. The compactness *assertion* is still a
+promise you make: `AssumeCompact` is not verified, as nowhere else in this package
+verifies a `Compact` claim. And stripping a document down to **nothing** is a
+documented outcome rather than an error — when every member of the root is a
+default, the empty containers cascade up and `StripDefaults` returns zero bytes,
+so test `len()` before forwarding the result.
+
+The cost is the extra `Valid` passes, which allocate nothing; the unchecked
+functions are untouched, so code that doesn't call these pays nothing for them.
+
 ## SIMD scanning
 
 Several hot scan loops use a single vectorized pass instead of byte-at-a-time
@@ -554,13 +678,20 @@ work, with kernels in `pkg/unstable/simd_{amd64,arm64}.s` and
   >50 GB/s, ~230× `encoding/json`).
 - **whole-container skip** — when an object or array must be skipped (a non-target
   value during a `Get`, an unknown struct field, a slice element counted for
-  presizing), `SkipValue` reads 32 bytes at a time, builds an *inside-string*
+  presizing), `SkipValue` reads **64 bytes at a time**, builds an *inside-string*
   bitmask so `{`/`}`/`[`/`]`/`"` within string values are ignored, and balances
   brackets to the matching close — absorbing string contents into the bulk scan
   instead of a separate scan per string. This makes `Get` on a document where the
   wanted key sits behind many nested-object siblings about **2× faster**. Objects
   and arrays of objects/strings take this path; a flat scalar array (`[1,2,…]`)
   keeps the structural-byte scan above, which already reaches the close in one pass.
+
+  The whole block loop is itself assembly, so the per-block state (bracket depth,
+  the escape and in-string carries) stays in registers rather than crossing the
+  Go/asm boundary each block: `skipBlocksAVX2`, an **AVX-512** variant that classifies
+  a 64-byte block with one load and a k-mask per class, and `skipBlocksNEON` on
+  arm64. Measured against the per-block Go loop: −59…−67% on object-shaped
+  containers (amd64), −29…−35% (Apple M2).
 
 ### CPU requirements
 
@@ -574,16 +705,29 @@ each architecture's **baseline, mandatory** vector ISA — no runtime gate:
   uses it directly. (This unconditional call is also what lets the dispatch
   inline into its callers.)
 
-The only **optional** feature is **AVX2** (amd64), used for the structural-byte
-scanner and the whole-container skip, and runtime-detected via
-`golang.org/x/sys/cpu`; without it the structural scan falls back to scalar code
-and `SkipValue` stays on the structural-byte skip. On arm64 both use NEON
-directly. Inputs shorter than the vector width, and platforms other than
-amd64/arm64, also take the scalar (`bytes.IndexByte`-based) path. Behavior is
-identical across paths — verified by fuzzing each primitive against a reference
-and by `SkipValue`/decode round-trips vs `encoding/json`, on amd64 and on arm64
-under qemu (the arm64 container-skip kernel is correctness-verified there, but its
-speed on real hardware is unmeasured).
+The **optional** features are all on amd64 and all runtime-detected via
+`golang.org/x/sys/cpu`:
+
+- **AVX2** drives the structural-byte scanner and the whole-container skip. Without
+  it the structural scan falls back to scalar code and `SkipValue` stays on the
+  structural-byte skip.
+- **AVX-512** (specifically AVX512BW), when present, selects the faster
+  `skipBlocksAVX512` container-skip kernel.
+- **PCLMULQDQ, BMI1 and POPCNT** gate the assembly skip loop, which uses a
+  carryless multiply for the in-string prefix XOR. All three are universally
+  present alongside AVX2; the gate is a correctness belt, not a real branch.
+
+On arm64 everything uses NEON directly, with no gate. Inputs shorter than the
+vector width, and platforms other than amd64/arm64, take the scalar
+(`bytes.IndexByte`-based) path.
+
+Behavior is identical across every path, and that is tested rather than assumed:
+each primitive is fuzzed against a scalar reference, `SkipValue`/decode round-trips
+are checked against `encoding/json`, and `TestSkipBlocksVariants` flips the dispatch
+flags to run the Go loop, AVX2 and AVX-512 kernels *each* against a scalar oracle
+over the fuzz corpus plus boundary documents (backslash runs of every parity
+crossing the 64-byte block boundary at every offset, quotes on the boundary,
+close-dense blocks). Verified on amd64, on Apple M2, and on arm64 under qemu.
 
 ## Benchmarks
 
@@ -623,12 +767,41 @@ Representative numbers for a 1.8 KB Cloudflare log (Go 1.26, amd64):
 |---|---|
 | [`main.go`](main.go) | the generator (`package main`) |
 | [`pkg/unstable`](pkg/unstable) | the (unstable, do-not-import) runtime the generated decoders call into |
-| [`pkg/json`](pkg/json) | small public API over the scanner (`Get`/`Lookup`/`GetMany`/`GetPaths`/`ObjectEach`, `Valid`, `DecodeAny`, `UnescapeString`, `ParseFloat`, `StripDefaults`, `Set`/`SetMany`/`SetPaths`) |
+| [`pkg/json`](pkg/json) | small public API over the scanner (`Get`/`Lookup`/`GetMany`/`GetPaths`/`ObjectEach`, `Valid`, `DecodeAny`, `Escape`/`UnescapeString`, `ParseFloat`, `StripDefaults`, `Set`/`SetMany`/`SetPaths` and their `…Checked` forms) |
 | [`bench/`](bench) | benchmark module: hand-written `data.go` + `input.json` per case, plus the generated decoders, harness, and results |
 
 Generated files (`*_unmarshal.go`, `bench/*/bench_test.go`, `bench/*/ej/`, and
 the `bench/results.*` outputs) are reproducible and excluded from version
 control via [`.gitignore`](.gitignore).
+
+## Limits and untrusted input
+
+Worth knowing before pointing this at input you don't control:
+
+- **Nesting is bounded at 10 000 levels** (`unstable.MaxDepth`, matching
+  `encoding/json`); past that the decode returns `ErrMaxDepth` instead of
+  descending. `DecodeAny`, `Valid`, `StripDefaults` and generated decoders for
+  recursive schemas (below) all enforce it; `Get`/`Lookup`/`GetMany`/`GetPaths`/
+  `Set` walk iteratively and are unaffected.
+
+  The bound exists because a Go stack overflow is a **fatal** error that `recover`
+  cannot catch — so without it, deeply nested input would take the process down
+  instead of returning an error. That was measurable: a 4-million-level document
+  aimed at a recursive schema used to die with `fatal error: stack overflow`, and
+  now reports `ErrMaxDepth`.
+- **Invalid UTF-8 is passed through**, not replaced. `encoding/json` substitutes
+  U+FFFD for malformed bytes; lightning returns them verbatim, so a decoded
+  `string` is not guaranteed to be valid UTF-8. (Unpaired `\uXXXX` surrogates *are*
+  replaced with U+FFFD, matching `encoding/json`.) This is lossless rather than
+  lenient, but check with `utf8.Valid` if you need the guarantee.
+- **Numbers are validated by arithmetic, not by grammar** — see the table under
+  [Checking validity](#checking-validity) for what that accepts.
+- `nocopy` results alias the input buffer and `//lightning:destructive` **overwrites
+  it**; neither is safe for a buffer you don't own or intend to reuse.
+
+## License
+
+[MIT](LICENSE) © Johan Lindvall
 
 ## Credits
 
