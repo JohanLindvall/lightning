@@ -889,6 +889,35 @@ no regressions.)
   changes retention semantics (one surviving 3-float slice pins its whole chunk).
   Not attempted — it is a design decision, not a local optimization.
 
+- **Sized, un-landed opportunity: a `switch len(key)` field dispatch that never
+  calls `runtime.memequal`.** `cmd/compile` inlines a string-vs-constant comparison
+  as word compares only while the constant is <= `maxRewriteLen` = 2*RegSize = **16
+  bytes**; past that it emits `CALL runtime.memequal`, which also forces `key` and
+  everything else live to be spilled and reloaded around each failed compare and
+  gives the decoder a stack frame. Verified: `go tool objdump -s decodeBenchmark` on
+  the cloudflare test binary contains **20** `CALL runtime.memequal`, one per compare
+  against each of its 10 keys longer than 16 bytes; keys <= 16 are already fully
+  inline, so the compiler does the SWAR match itself up to that width (which is why
+  the separate "SWAR key matching" idea is rightly rejected — but only *below* 16
+  bytes). **Sized with a real isolated measurement**, not arithmetic: generating both
+  dispatch forms over cloudflare's actual 43-key set and benchmarking them alone gives
+  plain `switch key` ~158 ns vs a `switch len(key)` form with <=16-byte chunked
+  compares (`key[:16] == "EdgeStartTimesta" && key[16:] == "mp"`) ~113 ns, i.e.
+  **-28% on the dispatch and 20 -> 0 memequal calls**. At 3.7 ns/key x 43 keys that is
+  ~45 ns of cloudflare's ~785 ns decode, so the ceiling is **~5%** — consistent with
+  `memeqbody` 3.4% + `runtime.memequal` 1.6% in its profile. Only wide structs with
+  long key names benefit; citm's short keys are already inline, so it is flat there.
+  **Why it is not landed:** it restructures the dispatch in `genStructBody`, the one
+  function CLAUDE.md records as brutally layout-sensitive (a *rotated* loop measured
+  **cloudflare +11%**), and a field with pipe-separated alternate names of different
+  lengths (`EdgeResponseStatus|AnotherField`, 18 and 12) straddles two length buckets,
+  so the naive form duplicates that field's body — bad on a 45-field decoder. The
+  workable shapes are (a) two-phase `key -> small int id` then `switch id`, which adds
+  a second dispatch that may eat the win, or (b) one label per field with the length
+  switch `goto`-ing to it, which avoids both duplication and the second dispatch but
+  needs each body wrapped in its own block so Go's "goto jumps over declaration" rule
+  is not tripped. Worth doing, but as its own careful change with an interleaved A/B
+  on cloudflare, cloudflare-compact and string_unicode — not bolted onto anything else.
 - **A string arena / batched allocation for copied & escaped strings.** The alloc
   *count* looks addressable — on nocopy twitter_status `decodeStringEscaped` is
   **36% of allocations** (every escaped string — tweets are full of `\/`, `\"`,
