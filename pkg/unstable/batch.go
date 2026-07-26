@@ -60,7 +60,15 @@ func DecodeFloat64Slice(out *[]float64, data []byte, i int) (int, error) {
 	if data[i] != '[' {
 		return i, ErrExpectArray
 	}
-	s := *out
+	// Reset the length, keeping the backing array: decoding an array into a slice
+	// replaces its contents rather than appending to them, as encoding/json
+	// documents ("Unmarshal resets the slice length to zero and then appends each
+	// element"). Without this, decoding twice into the same value accumulated —
+	// [1,2] read into a reused target became [1,2,1,2] — and a caller reusing a
+	// target to avoid allocation (the reason to reuse one) grew it without bound.
+	// A nil slice stays nil through [:0], so the presize below still fires for the
+	// fresh case and is correctly skipped for a reused one, which already has cap.
+	s := (*out)[:0]
 	if s == nil {
 		if n := CountArrayScalars(data, i); n > 0 {
 			s = make([]float64, 0, n)
@@ -162,7 +170,15 @@ func DecodeIntSlice[T intKind](out *[]T, data []byte, i int) (int, error) {
 	if data[i] != '[' {
 		return i, ErrExpectArray
 	}
-	s := *out
+	// Reset the length, keeping the backing array: decoding an array into a slice
+	// replaces its contents rather than appending to them, as encoding/json
+	// documents ("Unmarshal resets the slice length to zero and then appends each
+	// element"). Without this, decoding twice into the same value accumulated —
+	// [1,2] read into a reused target became [1,2,1,2] — and a caller reusing a
+	// target to avoid allocation (the reason to reuse one) grew it without bound.
+	// A nil slice stays nil through [:0], so the presize below still fires for the
+	// fresh case and is correctly skipped for a reused one, which already has cap.
+	s := (*out)[:0]
 	if s == nil {
 		if n := CountArrayScalars(data, i); n > 0 {
 			s = make([]T, 0, n)
@@ -285,7 +301,15 @@ func DecodeUintSlice[T uintKind](out *[]T, data []byte, i int) (int, error) {
 	if data[i] != '[' {
 		return i, ErrExpectArray
 	}
-	s := *out
+	// Reset the length, keeping the backing array: decoding an array into a slice
+	// replaces its contents rather than appending to them, as encoding/json
+	// documents ("Unmarshal resets the slice length to zero and then appends each
+	// element"). Without this, decoding twice into the same value accumulated —
+	// [1,2] read into a reused target became [1,2,1,2] — and a caller reusing a
+	// target to avoid allocation (the reason to reuse one) grew it without bound.
+	// A nil slice stays nil through [:0], so the presize below still fires for the
+	// fresh case and is correctly skipped for a reused one, which already has cap.
+	s := (*out)[:0]
 	if s == nil {
 		if n := CountArrayScalars(data, i); n > 0 {
 			s = make([]T, 0, n)

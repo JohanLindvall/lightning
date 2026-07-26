@@ -268,7 +268,10 @@ byte-identical when adding cold paths; push new logic out-of-line.
   `unsafe.Sizeof`, ~256 bytes of elements — which is *not* the rejected counting
   presize: no extra scan, no full-array memclr; a too-large hint wastes only
   spare cap, a too-small one regrows as before. `[]` still yields nil (the hint
-  fires only when an element exists) and reuse-append is unchanged. Interleaved
+  fires only when an element exists). (The hint's `*out == nil` test still works
+  after the length reset described in **Slice reuse replaces** below — `nil[:0]`
+  is still nil — so a fresh decode gets the hint and a reused slice appends into
+  the capacity it already has.) Interleaved
   A/B (n=8, M2): **citm_catalog −7.7%, canada_geometry −5.3%, golang_source
   −2.7%, canada −1.7%, marine_ik −1.1%**, mesh/large-json/cloudflare flat — no
   time regressions; allocs/op geomean **−41%** (citm −52%, canada −62%,
@@ -426,6 +429,36 @@ byte-identical when adding cold paths; push new logic out-of-line.
   `prevEscaped` carry), quotes on the boundary, deep bracket runs, close-dense
   blocks, closes at exact block multiples — plus per-variant truncation safety;
   `BenchmarkSkipBlocksVariant` is the standing AVX2-vs-512-vs-Go comparison.
+- **Slice reuse replaces, and the reset is guarded.** Every slice decoder — the
+  generated `sliceDecoder` loop and `batch.go`'s three readers — used to start from
+  `*out`, so decoding into a **non-nil** slice *appended* to it. `[1,2]` decoded
+  twice into one value became `[1,2,1,2]`, silently and with no error, and a caller
+  reusing a target to avoid allocation (the only reason to reuse one) grew it
+  without bound. It contradicted `encoding/json`, which documents "Unmarshal resets
+  the slice length to zero and then appends each element to the slice". **This was
+  deliberate, not an oversight** — `TestDecodeFloat64SliceAppends` asserted "a
+  non-nil `*out` is appended to, not reset" — which is why it survived; that test
+  now locks the opposite. No benchmark caught it either, because every benchmark
+  decodes into a freshly declared `var v Benchmark`. Found only by reading
+  `DecodeFloat64Slice` while chasing marine_ik's allocation profile.
+  The fix is `(*out)[:0]`, which keeps the backing array so reuse stays
+  allocation-free. Two details worth keeping: **(1)** the generated reset is
+  **guarded** — `if len(*out) != 0 { *out = (*out)[:0] }` — because an
+  unconditional store of the 3-word slice header measured **cloudflare +1.26%
+  (p=0.001, n=8)** for its three slice fields; the guard makes a fresh decode pay a
+  load and a not-taken branch instead, and every slice-heavy case (cloudflare,
+  marine_ik, citm_catalog, mesh, canada, large-json) is then **flat**. So this is a
+  correctness fix that costs nothing. **(2)** Only slices were wrong: maps
+  *merge* existing entries, which is exactly what `encoding/json` does (verified
+  with different keys per round); fixed arrays are zeroed then index-filled; and a
+  slice reached as a **map value** or through `lax` was already correct, since both
+  decode through a fresh scratch variable. Locked by `TestSliceReuseReplaces` /
+  `TestSliceReuseKeepsBacking` (conformance, incl. a named slice root and a nocopy
+  slice) and the `batch.go` trio above; all fail against the pre-fix code.
+  Codegen gotcha found here: the reset text sits inside a `fmt.Sprintf` template,
+  so a `%` written into that comment is emitted into every generated file as
+  `%!(MISSING)` — `go vet` catches it, which is why measurement notes live in
+  `sliceDecoder`'s Go doc comment rather than in the emitted comment.
 - **`Valid` is a grammar walk, not a decode** (`pkg/json/valid.go`). It used to be
   `_, err := decodeAny(data, false); return err == nil` — which built the entire
   `map[string]any`/`[]any` tree just to throw it away: **8065 ns / 13312 B / 201

@@ -96,15 +96,77 @@ func TestDecodeFloat64SliceErrors(t *testing.T) {
 	}
 }
 
-// TestDecodeFloat64SliceAppends checks the reuse contract shared with the
-// generated loop: a non-nil *out is appended to, not reset.
-func TestDecodeFloat64SliceAppends(t *testing.T) {
+// TestDecodeFloat64SliceReplaces checks the reuse contract shared with the
+// generated loop: a non-nil *out has its length reset and is then filled, so
+// decoding replaces its contents rather than appending to them. This is the rule
+// encoding/json documents ("Unmarshal resets the slice length to zero and then
+// appends each element to the slice").
+//
+// This test previously asserted the opposite — that a non-nil *out was appended to
+// — which made decoding twice into one value accumulate ([1,2] read twice became
+// [1,2,1,2]) and made a caller reusing a target to avoid allocation grow it without
+// bound. The backing array is still reused, which is what keeps that pattern
+// allocation-free; TestDecodeFloat64SliceReusesBacking covers that half.
+func TestDecodeFloat64SliceReplaces(t *testing.T) {
 	got := []float64{9}
 	if _, err := DecodeFloat64Slice(&got, []byte(`[1,2]`), 0); err != nil {
 		t.Fatal(err)
 	}
-	if want := []float64{9, 1, 2}; !reflect.DeepEqual(got, want) {
+	if want := []float64{1, 2}; !reflect.DeepEqual(got, want) {
 		t.Errorf("got %v, want %v", got, want)
+	}
+	// Decoding again must be idempotent, not cumulative.
+	if _, err := DecodeFloat64Slice(&got, []byte(`[1,2]`), 0); err != nil {
+		t.Fatal(err)
+	}
+	if want := []float64{1, 2}; !reflect.DeepEqual(got, want) {
+		t.Errorf("second decode got %v, want %v", got, want)
+	}
+	// A shorter array must shrink the result, not leave a stale tail.
+	if _, err := DecodeFloat64Slice(&got, []byte(`[7]`), 0); err != nil {
+		t.Fatal(err)
+	}
+	if want := []float64{7}; !reflect.DeepEqual(got, want) {
+		t.Errorf("shorter array got %v, want %v", got, want)
+	}
+}
+
+// TestDecodeFloat64SliceReusesBacking is the performance half of the reset above:
+// the length is reset but the backing array is kept, so repeated decoding into one
+// slice never reallocates. Resetting by assigning a fresh slice instead would have
+// turned the correctness fix into a per-decode allocation.
+func TestDecodeFloat64SliceReusesBacking(t *testing.T) {
+	var got []float64
+	if _, err := DecodeFloat64Slice(&got, []byte(`[1,2,3,4,5,6,7,8]`), 0); err != nil {
+		t.Fatal(err)
+	}
+	addr, capBefore := &got[0], cap(got)
+	for i := 0; i < 3; i++ {
+		if _, err := DecodeFloat64Slice(&got, []byte(`[1,2,3,4,5,6,7,8]`), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if &got[0] != addr || cap(got) != capBefore {
+		t.Errorf("backing array replaced on reuse (cap %d -> %d)", capBefore, cap(got))
+	}
+}
+
+// TestDecodeIntUintSliceReplace covers the same reset for the generic integer
+// readers, which share the shape but not the code path.
+func TestDecodeIntUintSliceReplace(t *testing.T) {
+	ints := []int64{99, 98}
+	if _, err := DecodeIntSlice(&ints, []byte(`[1,2]`), 0); err != nil {
+		t.Fatal(err)
+	}
+	if want := []int64{1, 2}; !reflect.DeepEqual(ints, want) {
+		t.Errorf("DecodeIntSlice got %v, want %v", ints, want)
+	}
+	uints := []uint32{99}
+	if _, err := DecodeUintSlice(&uints, []byte(`[5]`), 0); err != nil {
+		t.Fatal(err)
+	}
+	if want := []uint32{5}; !reflect.DeepEqual(uints, want) {
+		t.Errorf("DecodeUintSlice got %v, want %v", uints, want)
 	}
 }
 

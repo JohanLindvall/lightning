@@ -1292,6 +1292,21 @@ func batchArrayFn(elt ast.Expr) string {
 	return ""
 }
 
+// sliceDecoder returns (generating on first use) the decoder for a slice of elt.
+//
+// The emitted body resets the slice's length before the loop, because decoding an
+// array into a slice replaces its contents rather than appending to them (the rule
+// encoding/json documents). The reset is *guarded* on a non-empty length rather
+// than done unconditionally: a fresh decode — the common case, where the slice is
+// already empty — then pays a load and a not-taken branch instead of a three-word
+// slice-header store. Storing unconditionally measured cloudflare +1.26%
+// (p=0.001, n=8) for its three slice fields; with the guard every slice-heavy case
+// (cloudflare, marine_ik, citm_catalog, mesh, canada, large-json) is flat.
+//
+// Note the reset text lives inside a fmt.Sprintf template, so any '%' written into
+// it must be doubled — an unescaped one is silently emitted into every generated
+// file as "%!(MISSING)", which is why the measurement note above is here and not
+// in the generated comment.
 func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax bool) string {
 	if fn := batchSliceFn(elt); fn != "" {
 		return fn
@@ -1360,6 +1375,14 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax bool) string {
 	}
 	if data[i] != '[' {
 		return i, unstable.ErrExpectArray
+	}
+	// Decoding an array into a slice replaces its contents rather than appending
+	// to them, matching encoding/json ("Unmarshal resets the slice length to zero
+	// and then appends each element"). The backing array is kept, so reuse stays
+	// allocation-free; a nil slice stays nil through [:0], leaving the presize and
+	// first-append capacity hint below to fire only for the fresh case.
+	if len(*out) != 0 {
+		*out = (*out)[:0]
 	}
 %[4]s	i++
 	for first := true; ; first = false {

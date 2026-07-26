@@ -100,6 +100,31 @@ A fixed-size array follows `encoding/json`: the leading elements are filled, a
 shorter JSON array leaves the remaining elements zero, and a longer one's extras
 are discarded.
 
+### Reusing a decode target
+
+Decoding repeatedly into the same value is supported and is the cheapest way to
+decode a stream of documents — the slices and maps already allocated get reused, so
+a steady-state decode allocates nothing for them:
+
+```go
+var v Log
+for _, doc := range docs {
+    if err := v.UnmarshalJSON(doc); err != nil { // reuses v's backing arrays
+        return err
+    }
+    use(&v)
+}
+```
+
+Reuse follows `encoding/json` exactly. A slice has its length **reset** and is then
+filled, so it holds only the current document's elements (the backing array is kept,
+which is what makes the reuse free). A map **keeps** its existing entries and the
+document's members are merged over them — so clear or replace a map field yourself
+if you need it to hold only the latest document. A fixed-size array is zeroed first.
+
+Note that fields absent from a later document keep their previous values, exactly as
+with `encoding/json`; zero the value first if you need absent-means-zero.
+
 Embedded struct fields are promoted like `encoding/json`: an embedded struct's
 exported fields decode as if they were the outer struct's own (an embedded
 pointer is allocated on demand), a name present on both the outer struct and an

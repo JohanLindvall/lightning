@@ -338,3 +338,110 @@ func TestNonRecursiveTypesTakeNoDepthParam(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestSliceReuseReplaces locks the rule that decoding an array into a slice
+// *replaces* its contents rather than appending to them, which is what
+// encoding/json documents: "Unmarshal resets the slice length to zero and then
+// appends each element to the slice."
+//
+// It is a regression test for a real bug: every slice decoder started from
+// `*out` rather than `(*out)[:0]`, so decoding a second document into the same
+// value accumulated — [1,2] read twice became [1,2,1,2] — silently, with no error,
+// and a caller reusing a target to avoid allocation (the whole reason to reuse one)
+// grew it without bound. No benchmark caught it because every benchmark decodes
+// into a freshly declared value.
+//
+// The backing array must still be kept, or reuse would start allocating; that half
+// is checked by TestSliceReuseKeepsBacking below.
+func TestSliceReuseReplaces(t *testing.T) {
+	first := []byte(`{"ints":[1,2,3],"strs":["a","b","c"],"floats":[1.5,2.5],` +
+		`"grid":[[1,2],[3,4]],"items":[{"name":"x","count":1},{"name":"y","count":2}],` +
+		`"ptrItems":[{"name":"p","count":9}],"anys":[1,2,3]}`)
+	second := []byte(`{"ints":[9],"strs":["z"],"floats":[9.5],"grid":[[9]],` +
+		`"items":[{"name":"q","count":8}],"ptrItems":[{"name":"r","count":7}],"anys":[9]}`)
+
+	var d Doc
+	if err := d.UnmarshalJSON(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.UnmarshalJSON(second); err != nil {
+		t.Fatal(err)
+	}
+
+	if got, want := d.Ints, []int{9}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Ints = %v, want %v (accumulated instead of replaced)", got, want)
+	}
+	if got, want := d.Strs, []string{"z"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Strs = %v, want %v", got, want)
+	}
+	if got, want := d.Floats, []float64{9.5}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Floats = %v, want %v", got, want)
+	}
+	if got, want := d.Grid, [][]int{{9}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Grid = %v, want %v", got, want)
+	}
+	if len(d.Items) != 1 || d.Items[0].Name != "q" || d.Items[0].Count != 8 {
+		t.Errorf("Items = %+v, want one element {q 8}", d.Items)
+	}
+	if len(d.PtrItems) != 1 || d.PtrItems[0].Name != "r" {
+		t.Errorf("PtrItems = %+v, want one element {r 7}", d.PtrItems)
+	}
+	if got, want := d.Anys, []any{9.0}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Anys = %v, want %v", got, want)
+	}
+
+	// A named slice root type takes the same path and the same rule.
+	var pl PointList
+	if err := pl.UnmarshalJSON([]byte(`[{"x":1,"y":1,"tag":"a"},{"x":2,"y":2,"tag":"b"}]`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := pl.UnmarshalJSON([]byte(`[{"x":9,"y":9,"tag":"z"}]`)); err != nil {
+		t.Fatal(err)
+	}
+	if len(pl) != 1 || pl[0].Tag != "z" {
+		t.Errorf("PointList = %+v, want one element tagged z", pl)
+	}
+
+	// A nocopy slice (DestructiveDoc.Tags) too. Its own input must stay writable,
+	// so give each decode its own buffer.
+	var dd DestructiveDoc
+	for _, s := range []string{`{"tags":["a","b"]}`, `{"tags":["z"]}`} {
+		if err := dd.UnmarshalJSON([]byte(s)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, want := dd.Tags, []string{"z"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("nocopy Tags = %v, want %v", got, want)
+	}
+}
+
+// TestSliceReuseKeepsBacking is the performance half of the reuse rule: resetting
+// the length must reuse the backing array, so decoding repeatedly into one value
+// stays allocation-free. Throwing the array away would make the correctness fix a
+// performance regression.
+func TestSliceReuseKeepsBacking(t *testing.T) {
+	doc := []byte(`{"ints":[1,2,3,4,5,6,7,8],"floats":[1,2,3,4]}`)
+	var d Doc
+	if err := d.UnmarshalJSON(doc); err != nil {
+		t.Fatal(err)
+	}
+	intsAddr, intsCap := &d.Ints[0], cap(d.Ints)
+	fltAddr, fltCap := &d.Floats[0], cap(d.Floats)
+
+	if err := d.UnmarshalJSON(doc); err != nil {
+		t.Fatal(err)
+	}
+	if &d.Ints[0] != intsAddr || cap(d.Ints) != intsCap {
+		t.Errorf("Ints backing array replaced on reuse (cap %d -> %d)", intsCap, cap(d.Ints))
+	}
+	if &d.Floats[0] != fltAddr || cap(d.Floats) != fltCap {
+		t.Errorf("Floats backing array replaced on reuse (cap %d -> %d)", fltCap, cap(d.Floats))
+	}
+	if n := testing.AllocsPerRun(50, func() {
+		if err := d.UnmarshalJSON(doc); err != nil {
+			t.Fatal(err)
+		}
+	}); n != 0 {
+		t.Errorf("reuse allocated %v times per decode, want 0", n)
+	}
+}
