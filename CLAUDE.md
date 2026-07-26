@@ -429,6 +429,30 @@ byte-identical when adding cold paths; push new logic out-of-line.
   `prevEscaped` carry), quotes on the boundary, deep bracket runs, close-dense
   blocks, closes at exact block multiples — plus per-variant truncation safety;
   `BenchmarkSkipBlocksVariant` is the standing AVX2-vs-512-vs-Go comparison.
+- **Un-presized slices grow at a flat 2×, not Go's damped 1.25×**
+  (`unstable.GrowSlice` in `pkg/unstable/grow.go`, emitted by `sliceDecoder`'s
+  `presize == ""` path). Bare `append` lets `runtime.nextslicecap` decide capacity,
+  and it doubles only while cap is under **256 elements**, then grows
+  `cap += (cap+768)>>2` ≈ 1.25×. The total bytes a growing slice allocates come to
+  `final_cap × f/(f−1)`, so the damped regime allocates ~5× the final size and
+  memmoves ~4× it, where a flat 2× allocates 2× and memmoves 1×. That is exactly
+  where large-json's 10k-element `features` array and canada's long rings live —
+  large-json's profile showed **memmove 8.8% + `memclrNoHeapPointersChunked` 5.6%**,
+  i.e. the growth itself, not the parsing. The generated loop now does
+  `if len(*out) == cap(*out) { *out = unstable.GrowSlice(*out) }` before the append.
+  Interleaved A/B (n=10, pinned): **large-json −10.74% time / −24.70% B/op**
+  (p=0.000), **canada −2.13% / −15.80%** (p=0.029), marine_ik −3.84% B/op,
+  citm −0.30% B/op, all times flat elsewhere. **Arrays under 256 elements are
+  untouched either way** — citm's areas (≤16), mesh, cloudflare are byte-identical —
+  which is what makes this safe; the only cost is spare capacity on a mid-sized
+  array (canada_geometry **+1.11% B/op**, time flat). **4× was measured and
+  rejected**: it buys *no further time* on large-json or canada while pushing
+  canada_geometry to **+7.10% B/op**, so 2× captures the whole win with the least
+  waste. Note this is orthogonal to the rejected *counting* presizes and to the
+  static first-append hint: it changes the growth **factor**, not whether a scan
+  sizes the array. Locked by `TestGrowSlice` (length/contents preserved, capacity at
+  least doubled either side of the 256-element threshold, no aliasing of the old
+  backing).
 - **All-spaces equality fast path in `SkipWSRun`** — the whitespace attempt that
   finally worked, after three that did not. The loop's per-word classify
   `ws := (g - w&^hi) &^ w & hi` answers "are all eight bytes `<= 0x20`", but inside
@@ -790,6 +814,24 @@ no regressions.)
 
 ## Tried and rejected (don't re-attempt without a new idea)
 
+- **Dropping the up-front `clear(out)` in the batched fixed-size-array readers**
+  (`DecodeFloat64Array`/`DecodeIntArray`/`DecodeUintArray`) in favour of zeroing only
+  the unfilled tail. The setup looks compelling: `out`'s length is dynamic to the
+  callee, so `clear` cannot be sized at compile time and really does emit
+  `CALL runtime.memclrNoHeapPointers` once per array — i.e. once per coordinate
+  *point* for canada's `[][2]float64` and large-json's `[][3]float64` rings — and the
+  clear is redundant whenever the JSON array fills every slot. **Rejected on
+  sizing, before writing it.** `memclrNoHeapPointers` is 2.71% of canada and 9.04%
+  of large-json, but `pprof -peek` attributes only **0.02s/2.58s = 0.78%** (canada)
+  and **0.06s/3.54s = 1.69%** (large-json) to `DecodeFloat64Array`; the rest is
+  `growslice`, `mallocgc` and `memclrNoHeapPointersChunked` — slice-backing zeroing,
+  a different cost with a different fix (see the flat-2× growth entry, which is what
+  that share was actually worth). So the achievable win is **below the 2% noise
+  floor** while the change needs a labelled-break restructure of a hot loop to get a
+  single exit for the tail clear, against the documented layout sensitivity. The
+  lesson is the recurring one: an estimate built from "a CALL plus a 16-byte memclr
+  is ~12–20 cycles × N points" predicted −4…−7%; the *attributed* profile says
+  ~1%. Size a candidate with `pprof -peek`, not with cycle arithmetic.
 - **Replacing `CountArrayScalars`' two vectorized calls with a fused inline scan.**
   A marine_ik CPU profile puts `CountArrayScalars` at **9.5% cum** (`bytes.Count`
   4.95% + `indexbytebody` 2.80%), and the reason looks damning: for the 3- and

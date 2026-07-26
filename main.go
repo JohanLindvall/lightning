@@ -1356,6 +1356,9 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax bool) string {
 		if *out == nil {
 			*out = make([]%[1]s, 1, max(4, 256/max(1, int(unsafe.Sizeof(zero)))))
 		} else {
+			if len(*out) == cap(*out) {
+				*out = unstable.GrowSlice(*out)
+			}
 			*out = append(*out, zero)
 		}`, eltStr)
 	}
