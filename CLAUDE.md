@@ -483,6 +483,21 @@ byte-identical when adding cold paths; push new logic out-of-line.
   `FuzzSkipWSRunMatchesOracle` (2.4M execs). A tab-indented document takes the
   general path always and pays one extra compare per word; a second equality
   against `0x0909…` would cover it if that ever matters.
+
+  **Companion micro-change, same loop: the mask is computed complemented.** The
+  loop builds `nws := ^((g - w&^hi) &^ w) & hi` — a bit per lane that is *not*
+  whitespace — rather than the whitespace mask, exploiting
+  `(x & hi) ^ hi == (^x) & hi`. It pays off only at the run-terminating exit, which
+  runs once per whitespace run: there is no `XOR` to invert the mask, and testing
+  `nws != 0` *proves* the `TrailingZeros64` operand non-zero, so the compiler stops
+  materialising 64 and `CMOVE`-ing it as the all-zero guard. Verified in the emitted
+  code: the exit collapses to `TESTQ` / `BSFQ` / `SHRQ` with **zero** `CMOVQEQ` or
+  `MOVL $64` remaining, and the inline cost drops 66 → **65**. Honest sizing: it is
+  **below the 2% noise floor** — instruments −1.84% (p=0.001) is the only
+  significant result; citm −0.8% (p=0.075), mesh_pretty −1.2% (p=0.105), synthea
+  −1.6% (p=0.280), large-json and canada flat. Kept anyway because it is strictly
+  less code, provably equivalent (the identity plus the exhaustive oracle test), and
+  favourable in direction on every case measured — not because it is a measured win.
 - **Slice reuse replaces, and the reset is guarded.** Every slice decoder — the
   generated `sliceDecoder` loop and `batch.go`'s three readers — used to start from
   `*out`, so decoding into a **non-nil** slice *appended* to it. `[1,2]` decoded

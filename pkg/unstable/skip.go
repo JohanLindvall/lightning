@@ -225,9 +225,16 @@ func SkipWSRun(data []byte, i int) int {
 		// exact SWAR still decides every other word, including the one that ends
 		// the run, so nothing about which input is accepted changes.
 		if w != sp {
-			ws := (g - w&^hi) &^ w & hi
-			if ws != hi {
-				return i + bits.TrailingZeros64(ws^hi)/8
+			// The complement mask — a bit set per lane that is NOT whitespace —
+			// rather than the whitespace mask. Algebraically the same thing, since
+			// (x & hi) ^ hi == (^x) & hi, but it makes the run-terminating exit
+			// cheaper twice over: there is no XOR to invert the mask, and the
+			// non-zero test in front of TrailingZeros64 *proves* the operand is
+			// non-zero, so the compiler stops materialising 64 and CMOVE-ing it as
+			// the all-zero guard.
+			nws := ^((g - w&^hi) &^ w) & hi
+			if nws != 0 {
+				return i + bits.TrailingZeros64(nws)/8
 			}
 		}
 		i += 8
