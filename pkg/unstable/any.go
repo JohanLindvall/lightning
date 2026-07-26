@@ -5,7 +5,7 @@ import "strconv"
 // DecodeValue decodes an arbitrary JSON value at data[i] into the standard Go
 // representation (nil, bool, float64, string, []any, map[string]any).
 func DecodeValue(data []byte, i int) (any, int, error) {
-	return decodeValue(data, i, false)
+	return decodeValue(data, i, false, 0)
 }
 
 // DecodeValueCompact is DecodeValue for compact JSON — input with no whitespace
@@ -15,10 +15,15 @@ func DecodeValue(data []byte, i int) (any, int, error) {
 // identically to DecodeValue but faster; given inter-token whitespace it may
 // report an error.
 func DecodeValueCompact(data []byte, i int) (any, int, error) {
-	return decodeValue(data, i, true)
+	return decodeValue(data, i, true, 0)
 }
 
-func decodeValue(data []byte, i int, compact bool) (any, int, error) {
+// decodeValue decodes the value at data[i]. depth is the number of enclosing
+// objects/arrays; the two container cases pass depth+1 and refuse to descend past
+// MaxDepth, which is what keeps a deeply nested document from exhausting the
+// stack (see MaxDepth). Only container entry pays for the bound — one compare per
+// '{' or '[', nothing on the scalar paths.
+func decodeValue(data []byte, i int, compact bool, depth int) (any, int, error) {
 	if i >= len(data) {
 		return nil, i, ErrTruncated
 	}
@@ -27,9 +32,9 @@ func decodeValue(data []byte, i int, compact bool) (any, int, error) {
 		s, end, err := ReadStringOrNull(data, i)
 		return s, end, err
 	case '{':
-		return decodeAnyObject(data, i, compact)
+		return decodeAnyObject(data, i, compact, depth+1)
 	case '[':
-		return decodeAnyArray(data, i, compact)
+		return decodeAnyArray(data, i, compact, depth+1)
 	case 't', 'f':
 		b, end, err := ReadBoolOrNull(data, i)
 		return b, end, err
@@ -59,7 +64,10 @@ func decodeValue(data []byte, i int, compact bool) (any, int, error) {
 	}
 }
 
-func decodeAnyObject(data []byte, i int, compact bool) (any, int, error) {
+func decodeAnyObject(data []byte, i int, compact bool, depth int) (any, int, error) {
+	if depth > MaxDepth {
+		return nil, i, ErrMaxDepth
+	}
 	// data[i] == '{'
 	i++
 	m := map[string]any{}
@@ -88,7 +96,7 @@ func decodeAnyObject(data []byte, i int, compact bool) (any, int, error) {
 			return nil, i, ErrExpectColon
 		}
 		i = SkipWSCompact(data, i+1, compact)
-		val, end, err := decodeValue(data, i, compact)
+		val, end, err := decodeValue(data, i, compact, depth)
 		if err != nil {
 			return nil, end, err
 		}
@@ -107,7 +115,10 @@ func decodeAnyObject(data []byte, i int, compact bool) (any, int, error) {
 	}
 }
 
-func decodeAnyArray(data []byte, i int, compact bool) (any, int, error) {
+func decodeAnyArray(data []byte, i int, compact bool, depth int) (any, int, error) {
+	if depth > MaxDepth {
+		return nil, i, ErrMaxDepth
+	}
 	// data[i] == '['
 	i++
 	a := []any{}
@@ -124,7 +135,7 @@ func decodeAnyArray(data []byte, i int, compact bool) (any, int, error) {
 			}
 			return nil, i, ErrInvalidJSON
 		}
-		val, end, err := decodeValue(data, i, compact)
+		val, end, err := decodeValue(data, i, compact, depth)
 		if err != nil {
 			return nil, end, err
 		}

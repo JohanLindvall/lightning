@@ -29,7 +29,19 @@ var (
 	ErrExpectArray  = errors.New("json: expected '['")
 	ErrBadTime      = errors.New("json: invalid time")
 	ErrKeyNotFound  = errors.New("json: key path not found")
+	ErrMaxDepth     = errors.New("json: exceeded max depth")
 )
+
+// MaxDepth bounds how deeply the recursive walkers — DecodeValue and the
+// validator — will descend into nested objects and arrays before giving up with
+// ErrMaxDepth. Those walkers recurse once per nesting level, so without a bound a
+// document of a few hundred thousand brackets exhausts the goroutine stack, and a
+// Go stack overflow is a *fatal* error that recover cannot catch: hostile input
+// would take the process down rather than return an error.
+//
+// The limit matches encoding/json's, so input this package accepts is input
+// encoding/json would also accept depth-wise.
+const MaxDepth = 10000
 
 // UnsafeStr returns a string that aliases b without copying, so the caller must
 // keep b unchanged while the result is in use. Exported for the same inlined
