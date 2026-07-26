@@ -67,7 +67,7 @@ func StripDefaults(input, output []byte, defaults, keep [][]byte, ws WhitespaceM
 	if ws == PreserveWhitespace {
 		write = copy(output, input[:start])
 	}
-	read, write := s.handle(start, write)
+	read, write := s.handle(start, write, 0)
 	if ws == PreserveWhitespace {
 		write += copy(output[write:], input[read:]) // trailing whitespace
 	}
@@ -178,7 +178,13 @@ func (s *stripper) emitField(write, wsStart, keyStart, keyEnd, colonPos, valStar
 // out[write], and returns the read and write offsets just past it. A value that
 // strips away to nothing leaves write unchanged, which is how callers detect a
 // dropped member or an emptied container.
-func (s *stripper) handle(read, write int) (int, int) {
+//
+// depth is the number of enclosing containers. handle recurses once per nesting
+// level, so the bound below is what keeps a deeply nested document from
+// exhausting the stack — a Go stack overflow being fatal and unrecoverable. Past
+// unstable.MaxDepth it stops stripping and ejects, which is the same best-effort
+// response this walker already gives malformed input.
+func (s *stripper) handle(read, write, depth int) (int, int) {
 	in, out := s.in, s.out
 	// compact: don't scan for whitespace (input asserted to have none).
 	// preserve: copy surviving inter-token whitespace through to the output.
@@ -193,6 +199,9 @@ func (s *stripper) handle(read, write int) (int, int) {
 	// best-effort response to a byte the walk cannot interpret.
 	eject := func() (int, int) {
 		return dataLen, write + copy(out[write:], in[read:])
+	}
+	if depth > unstable.MaxDepth {
+		return eject()
 	}
 
 	switch in[read] {
@@ -279,7 +288,7 @@ func (s *stripper) handle(read, write int) (int, int) {
 						write++
 					}
 					tmpWrite := write
-					read, write = s.handle(read, write)
+					read, write = s.handle(read, write, depth+1)
 					if tmpWrite != write {
 						valueEmpty = false
 					} else {
@@ -347,7 +356,7 @@ func (s *stripper) handle(read, write int) (int, int) {
 				write += copy(out[write:], in[wsStart:read]) // element's leading whitespace
 			}
 			tmpWrite := write
-			read, write = s.handle(read, write)
+			read, write = s.handle(read, write, depth+1)
 			if tmpWrite == write {
 				write = localStartWrite // element stripped away; rewind
 			} else {
