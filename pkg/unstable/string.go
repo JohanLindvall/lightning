@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"unicode/utf16"
 	"unicode/utf8"
+	"unsafe"
 )
 
 // UnescapeString decodes the body of a JSON string (the bytes that sit between
@@ -59,21 +60,44 @@ func UnescapeStringInto(in, out []byte) (string, error) {
 // with a plain IndexByte rather than an escape-aware SkipString: on densely
 // escaped text (\uXXXX-per-character CJK) SkipString stops at every backslash,
 // scanning the string a second time, while IndexByte sweeps to the quote in one
-// pass. When that quote is not preceded by a backslash it is unescaped — the
-// real close — so its offset is the exact body length. Only when it might be an
-// escaped \" (rare) is the escape-aware SkipString needed to find the true end;
-// the dense-escape strings that made SkipString costly never take that branch.
+// pass. Whether a found quote is the real close is decided by backslash-run
+// parity — an odd run of '\' immediately before it makes it an escaped \" —
+// and an escaped quote resumes the IndexByte scan just past it, rather than
+// falling back to SkipString from the string start, which re-scanned the whole
+// proven-clean prefix and stopped at every backslash. Only when no true close
+// exists by the end of data (truncated input) does SkipString run, keeping the
+// fallback sizing identical to before; the hint only ever sizes the buffer,
+// never changes which inputs are accepted.
 func decodeStringEscaped(data []byte, start, i int) (string, int, error) {
 	capHint := i - start // fallback: the escape-free prefix; append grows the rest
 	// data[start:i] is already proven clean (i is the first '"'/'\\' the caller's
 	// scan found), so the close-quote search starts at i instead of re-scanning
 	// the prefix; the first '"' at or after start is necessarily at or after i.
-	if rel := bytes.IndexByte(data[i:], '"'); rel >= 0 {
-		if rel == 0 || data[i+rel-1] != '\\' {
-			capHint = i - start + rel // unescaped quote: exact body length
-		} else if end, err := SkipString(data, start-1); err == nil {
-			capHint = end - 1 - start // escaped \" up front; find the true close
+	for j := i; ; {
+		rel := bytes.IndexByte(data[j:], '"')
+		if rel < 0 {
+			// No quote left: unterminated string. SkipString agrees (it errs here
+			// too, leaving the prefix fallback), but it is kept so the estimate on
+			// malformed input stays exactly what the pre-parity code computed.
+			if end, err := SkipString(data, start-1); err == nil {
+				capHint = end - 1 - start
+			}
+			break
 		}
+		q := j + rel
+		// Count the consecutive '\' immediately before the quote: an odd run
+		// escapes it (the even prefix pairs off as \\), an even run means it is
+		// the true close. The run cannot extend below i — data[start:i] holds no
+		// backslash — so the backward count is bounded.
+		bs := 0
+		for k := q - 1; k >= i && data[k] == '\\'; k-- {
+			bs++
+		}
+		if bs&1 == 0 {
+			capHint = q - start // unescaped quote: exact body length
+			break
+		}
+		j = q + 1 // escaped \": resume the scan just past it
 	}
 	return decodeEscaped(make([]byte, 0, capHint), data, start, i, true)
 }
@@ -156,8 +180,30 @@ func decodeEscaped(buf, data []byte, start, i int, quoted bool) (string, int, er
 						i = ni2
 					}
 				}
+				if utf16.IsSurrogate(r) {
+					// Still a lone half (nothing pairable followed): utf8.AppendRune
+					// encoded these as utf8.RuneError; normalizing up front keeps the
+					// inline 3-byte arm below surrogate-free and its output
+					// byte-identical to AppendRune's.
+					r = utf8.RuneError
+				}
 			}
-			buf = utf8.AppendRune(buf, r)
+			// The UTF-8 encode is inlined for the BMP: utf8.AppendRune's non-ASCII
+			// side is the non-inlinable appendRuneNonASCII, a call per rune that
+			// profiled at 5.9% flat on \uXXXX-dense text. Every \uXXXX yields a BMP
+			// rune (surrogates were normalized to RuneError above), so only a
+			// surrogate-paired supplementary rune (r > 0xFFFF, rare) still pays the
+			// AppendRune call.
+			switch {
+			case r < 0x80:
+				buf = append(buf, byte(r))
+			case r < 0x800:
+				buf = append(buf, byte(0xC0|r>>6), byte(0x80|r&0x3F))
+			case r < 0x10000:
+				buf = append(buf, byte(0xE0|r>>12), byte(0x80|(r>>6)&0x3F), byte(0x80|r&0x3F))
+			default:
+				buf = utf8.AppendRune(buf, r)
+			}
 		} else {
 			return "", i, ErrBadEscape
 		}
@@ -246,24 +292,37 @@ func Unwrap(data []byte, i int) ([]byte, int, error) {
 		return nil, end, err
 	}
 	// The nocopy read hands back an alias for an escape-free string (and a
-	// fresh buffer for an escaped one); the []byte conversion below is then the
-	// single copy that establishes the returned slice's freshly-allocated,
-	// never-retained contract. Reading with ReadStringOrNull here copied
-	// escape-free bodies twice — once into the string, once into the slice.
+	// fresh buffer for an escaped one); the probes below run against that alias
+	// directly, so the base64 arm never copies the embedded document it is
+	// about to replace with its decode. The []byte conversion — the single copy
+	// that establishes the returned slice's freshly-allocated, never-retained
+	// contract — is made only in the arms that return the body bytes
+	// themselves. Reading with ReadStringOrNull here copied escape-free bodies
+	// twice — once into the string, once into the slice.
 	s, end, err := ReadStringNoCopyOrNull(data, i)
 	if err != nil {
 		return nil, end, err
 	}
-	body := []byte(s)
+	body := unsafeBytes(s)
 	if startsJSON(body) {
-		return body, end, nil
+		return []byte(s), end, nil
 	}
 	if dec, ok := decodeBase64(body); ok {
 		return dec, end, nil
 	}
 	// Neither plainly JSON nor valid base64; hand the body back so the caller's
 	// decode reports a meaningful error on it.
-	return body, end, nil
+	return []byte(s), end, nil
+}
+
+// unsafeBytes returns a []byte that aliases s without copying — the mirror of
+// unsafeStr. The result must not be written through and s's backing must stay
+// reachable while it is in use; Unwrap only reads it and never returns it.
+func unsafeBytes(s string) []byte {
+	if len(s) == 0 {
+		return nil
+	}
+	return unsafe.Slice(unsafe.StringData(s), len(s))
 }
 
 // startsJSON reports whether b begins, after any leading whitespace, with the
