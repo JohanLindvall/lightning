@@ -2,6 +2,7 @@ package json
 
 import (
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"testing"
 )
@@ -156,6 +157,48 @@ func BenchmarkSetPaths(b *testing.B) {
 	paths := [][]string{{"a", "b"}, {"a", "c"}, {"d", "e"}, {"f", "g"}}
 	vals := setManyVals(`9`, `8`, `"y"`, `7`)
 	out := make([]byte, 0, 256)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		out = SetPaths(in, out[:0], vals, paths)
+	}
+}
+
+// setEarlyExitDoc builds a ~45-member compact cloudflare-like record whose
+// first three members are the ones the early-exit benchmarks edit, so the
+// all-found/all-matched exits fire after three members and the remaining ~42
+// are spliced verbatim instead of scanned.
+func setEarlyExitDoc() []byte {
+	b := []byte(`{"ClientIP":"203.0.113.7","EdgeResponseStatus":200,"CacheCacheStatus":"hit"`)
+	for i := 0; i < 42; i++ {
+		b = append(b, fmt.Sprintf(`,"EdgeField%02d":"value-%02d"`, i, i)...)
+	}
+	return append(b, '}')
+}
+
+// BenchmarkSetManyEarlyExit measures SetMany's all-found early exit: every
+// requested key sits in the document's first three members, so the walk stops
+// there and copies the rest of the wide record verbatim. Zero allocs with the
+// reused out buffer.
+func BenchmarkSetManyEarlyExit(b *testing.B) {
+	in := setEarlyExitDoc()
+	vals := setManyVals(`"198.51.100.9"`, `503`, `"miss"`)
+	keys := []string{"ClientIP", "EdgeResponseStatus", "CacheCacheStatus"}
+	out := make([]byte, 0, len(in)+64)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		out = SetMany(in, out[:0], vals, keys)
+	}
+}
+
+// BenchmarkSetPathsEarlyExit is the SetPaths form of the same shape: three
+// root-level paths matched by the first three members, so the root frame's
+// all-matched early exit splices the remaining ~42 members verbatim. Zero
+// allocs with the reused out buffer.
+func BenchmarkSetPathsEarlyExit(b *testing.B) {
+	in := setEarlyExitDoc()
+	vals := setManyVals(`"198.51.100.9"`, `503`, `"miss"`)
+	paths := [][]string{{"ClientIP"}, {"EdgeResponseStatus"}, {"CacheCacheStatus"}}
+	out := make([]byte, 0, len(in)+64)
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		out = SetPaths(in, out[:0], vals, paths)

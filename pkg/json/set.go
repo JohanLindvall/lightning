@@ -67,9 +67,25 @@ func setSpan(in, rawVal []byte, keys []string) (start, end int, insert []byte, m
 		found, valStart, valEnd := false, 0, 0
 		lastValEnd := afterBrace // end of the last member's value, for appending
 		for p < len(in) && in[p] != '}' {
-			k, np, err := unstable.ReadKey(in, p)
-			if err != nil {
+			// The key read with its no-escape fast path inline, as in getMany
+			// (see get.go): unstable.ReadKey never inlines, but the common case —
+			// a quoted key with no backslash — is just an IndexCloseOrEscape scan
+			// and an UnsafeStr alias, both of which do inline here. Only an
+			// escaped key or an error calls ReadKey; a non-quote byte breaks out
+			// exactly as ReadKey's ErrInvalidJSON did.
+			var k string
+			var np int
+			if in[p] != '"' {
 				break
+			}
+			ks := p + 1
+			if kk := unstable.IndexCloseOrEscape(in[ks:]); ks+kk < len(in) && in[ks+kk] == '"' {
+				k, np = unstable.UnsafeStr(in[ks:ks+kk]), ks+kk+1
+			} else {
+				var err error
+				if k, np, err = unstable.ReadKey(in, p); err != nil {
+					break
+				}
 			}
 			p = unstable.SkipWS(in, np)
 			if p >= len(in) || in[p] != ':' {
@@ -187,15 +203,27 @@ func SetMany(in, out []byte, rawVal [][]byte, keys []string) []byte {
 	} else {
 		found = make([]bool, n)
 	}
-	prev := 0 // bytes of in already copied into out
+	prev := 0   // bytes of in already copied into out
+	nfound := 0 // requested keys found so far, for the all-found early exit
 	afterBrace := j + 1
 	p := unstable.SkipWS(in, afterBrace)
 	empty := p >= len(in) || in[p] == '}'
 	lastValEnd := afterBrace // insertion point for new members: after the last value
 	for p < len(in) && in[p] != '}' {
-		k, np, err := unstable.ReadKey(in, p)
-		if err != nil {
+		// Key read with the no-escape fast path inline; see setSpan.
+		var k string
+		var np int
+		if in[p] != '"' {
 			break
+		}
+		ks := p + 1
+		if kk := unstable.IndexCloseOrEscape(in[ks:]); ks+kk < len(in) && in[ks+kk] == '"' {
+			k, np = unstable.UnsafeStr(in[ks:ks+kk]), ks+kk+1
+		} else {
+			var err error
+			if k, np, err = unstable.ReadKey(in, p); err != nil {
+				break
+			}
 		}
 		q := unstable.SkipWS(in, np)
 		if q >= len(in) || in[q] != ':' {
@@ -216,8 +244,18 @@ func SetMany(in, out []byte, rawVal [][]byte, keys []string) []byte {
 				out = append(out, rawVal[m]...)   // ... and substitute it
 				prev = ve
 				found[m] = true
+				nfound++
 				break
 			}
+		}
+		if nfound == n {
+			// Every requested key has been found and replaced, so no member
+			// remains to append at the close, and no later member can be edited
+			// (a document duplicate of a found key is left as-is either way —
+			// first occurrence wins). The rest of the input passes through
+			// verbatim; copy it and skip the scan, as in getMany's all-found
+			// early exit.
+			return append(out, in[prev:]...)
 		}
 		p = unstable.SkipWS(in, ve)
 		if p < len(in) && in[p] == ',' {
@@ -307,10 +345,22 @@ func setObject(in, out []byte, i, depth int, active []int, paths [][]string, raw
 	empty := p >= len(in) || in[p] == '}'
 	lastValEnd := i + 1 // insertion point for created members: after the last value
 	matched := make([]bool, len(active))
+	nmatched := 0 // active paths matched so far, for the root all-matched early exit
 	for p < len(in) && in[p] != '}' {
-		k, np, err := unstable.ReadKey(in, p)
-		if err != nil {
+		// Key read with the no-escape fast path inline; see setSpan.
+		var k string
+		var np int
+		if in[p] != '"' {
 			break
+		}
+		ks := p + 1
+		if kk := unstable.IndexCloseOrEscape(in[ks:]); ks+kk < len(in) && in[ks+kk] == '"' {
+			k, np = unstable.UnsafeStr(in[ks:ks+kk]), ks+kk+1
+		} else {
+			var err error
+			if k, np, err = unstable.ReadKey(in, p); err != nil {
+				break
+			}
 		}
 		q := unstable.SkipWS(in, np)
 		if q >= len(in) || in[q] != ':' {
@@ -325,7 +375,10 @@ func setObject(in, out []byte, i, depth int, active []int, paths [][]string, raw
 			if paths[a][depth] != k {
 				continue
 			}
-			matched[m] = true
+			if !matched[m] {
+				matched[m] = true
+				nmatched++
+			}
 			if depth+1 == len(paths[a]) {
 				if ending < 0 {
 					ending = a
@@ -357,6 +410,24 @@ func setObject(in, out []byte, i, depth int, active []int, paths [][]string, raw
 			ve = skipValueOrEnd(in, q)
 		}
 		lastValEnd = ve
+
+		if depth == 0 && nmatched == len(active) {
+			// Root-frame early exit, the all-found exit of getMany/SetMany:
+			// every path routed through this frame has been consumed — a path
+			// ending at a matched key had its value replaced (or was ignored
+			// under the shorter-prefix-wins rule), and a path continuing past
+			// it was finished by the recursion or merged replacement, which
+			// create their own missing members at the deeper close. create
+			// below only ever holds unmatched paths, so nothing remains to
+			// append at this frame's close, and the rest of the input passes
+			// through verbatim (a document duplicate of a matched key is left
+			// as-is — first occurrence wins, as in Set/SetMany). Only the root
+			// frame can splice-and-return: it needs no end offset beyond "copy
+			// the tail" (end = len(in) makes SetPaths' in[end:] append a
+			// no-op), while a nested frame would still have to locate its '}'
+			// for the parent — a scan as costly as the walk this exit skips.
+			return append(out, in[prev:]...), len(in)
+		}
 
 		p = unstable.SkipWS(in, ve)
 		if p < len(in) && in[p] == ',' {
