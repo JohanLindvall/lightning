@@ -285,7 +285,10 @@ func ReadFloat64OrNull(data []byte, i int) (float64, int, error) {
 	return f, end, nil
 }
 
-// ReadBoolOrNull reads a JSON boolean (or null) at data[i].
+// ReadBoolOrNull reads a JSON boolean (or null) at data[i]. The literals are
+// matched with constant-string compares (a word load + compare each, see
+// ExpectNull) rather than byte at a time; a partial literal returns i, as
+// before.
 func ReadBoolOrNull(data []byte, i int) (bool, int, error) {
 	if i >= len(data) {
 		return false, i, ErrTruncated
@@ -295,12 +298,12 @@ func ReadBoolOrNull(data []byte, i int) (bool, int, error) {
 		end, err := ExpectNull(data, i)
 		return false, end, err
 	case 't':
-		if i+4 <= len(data) && data[i+1] == 'r' && data[i+2] == 'u' && data[i+3] == 'e' {
+		if i+4 <= len(data) && string(data[i:i+4]) == "true" {
 			return true, i + 4, nil
 		}
 		return false, i, ErrInvalidJSON
 	case 'f':
-		if i+5 <= len(data) && data[i+1] == 'a' && data[i+2] == 'l' && data[i+3] == 's' && data[i+4] == 'e' {
+		if i+5 <= len(data) && string(data[i:i+5]) == "false" {
 			return false, i + 5, nil
 		}
 		return false, i, ErrInvalidJSON

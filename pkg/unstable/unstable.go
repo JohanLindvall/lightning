@@ -48,9 +48,13 @@ const MaxDepth = 10000
 // read path; escaped or copied results still go through ReadKey/ReadString*.
 func UnsafeStr(b []byte) string { return unsafeStr(b) }
 
-// ExpectNull consumes the literal null at data[i].
+// ExpectNull consumes the literal null at data[i]. The constant-string compare
+// compiles to a single word load and compare (no allocation, no memequal call
+// for constants <= 16 bytes) instead of four byte compares; a partial literal
+// ("nul" at end of input) fails the bounds test and returns i, exactly as the
+// byte-at-a-time form did.
 func ExpectNull(data []byte, i int) (int, error) {
-	if i+4 > len(data) || data[i] != 'n' || data[i+1] != 'u' || data[i+2] != 'l' || data[i+3] != 'l' {
+	if i+4 > len(data) || string(data[i:i+4]) != "null" {
 		return i, ErrInvalidJSON
 	}
 	return i + 4, nil

@@ -29,6 +29,19 @@ func decodeValue(data []byte, i int, compact bool, depth int) (any, int, error) 
 	}
 	switch data[i] {
 	case '"':
+		// Inline no-escape string fast path (the readKey inline trick, applied
+		// by hand): decodeValue is recursive and never inlines, so the added
+		// body is free, while the common clean string skips the non-inlined
+		// ReadStringOrNull call — only the SIMD scan itself remains
+		// (indexCloseOrEscape inlines here). The any path always copies, so
+		// string(rest[:k]) builds the same value; an escaped or truncated
+		// string falls back to ReadStringOrNull, whose error identities and
+		// positions are unchanged (it re-checks data[i] == '"' and takes its
+		// existing escaped/truncated paths).
+		rest := data[i+1:]
+		if k := indexCloseOrEscape(rest); k < len(rest) && rest[k] == '"' {
+			return string(rest[:k]), i + k + 2, nil
+		}
 		s, end, err := ReadStringOrNull(data, i)
 		return s, end, err
 	case '{':
@@ -87,9 +100,30 @@ func decodeAnyObject(data []byte, i int, compact bool, depth int) (any, int, err
 			}
 			return nil, i, ErrInvalidJSON
 		}
-		key, ni, err := ReadKey(data, i)
-		if err != nil {
-			return nil, ni, err
+		// Inline no-escape key fast path (the readKey inline trick, applied by
+		// hand): decodeAnyObject is recursive and never inlines, so the added
+		// body is free, while the common clean key skips the non-inlined
+		// ReadKey call. The map insert needs a copied key either way (ReadKey's
+		// clean result aliases data), so the fast path copies with
+		// string(rest[:k]) up front and the insert below drops the defensive
+		// string([]byte(key)) re-copy; an escaped key, truncated input, or a
+		// non-string falls back to ReadKey, whose error identities and
+		// positions are unchanged.
+		var key string
+		ni := -1
+		if data[i] == '"' {
+			rest := data[i+1:]
+			if k := indexCloseOrEscape(rest); k < len(rest) && rest[k] == '"' {
+				key = string(rest[:k])
+				ni = i + k + 2
+			}
+		}
+		if ni < 0 {
+			akey, aend, err := ReadKey(data, i)
+			if err != nil {
+				return nil, aend, err
+			}
+			key, ni = string([]byte(akey)), aend
 		}
 		i = SkipWSCompact(data, ni, compact)
 		if i >= len(data) || data[i] != ':' {
@@ -100,7 +134,7 @@ func decodeAnyObject(data []byte, i int, compact bool, depth int) (any, int, err
 		if err != nil {
 			return nil, end, err
 		}
-		m[string([]byte(key))] = val
+		m[key] = val
 		i = SkipWSCompact(data, end, compact)
 		if i >= len(data) {
 			return nil, i, ErrTruncated

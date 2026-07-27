@@ -42,12 +42,12 @@ func SkipValue(data []byte, i int) (int, error) {
 		}
 		return skipArray(data, i)
 	case 't':
-		if i+4 <= len(data) && data[i+1] == 'r' && data[i+2] == 'u' && data[i+3] == 'e' {
+		if i+4 <= len(data) && string(data[i:i+4]) == "true" {
 			return i + 4, nil
 		}
 		return i, ErrInvalidJSON
 	case 'f':
-		if i+5 <= len(data) && data[i+1] == 'a' && data[i+2] == 'l' && data[i+3] == 's' && data[i+4] == 'e' {
+		if i+5 <= len(data) && string(data[i:i+5]) == "false" {
 			return i + 5, nil
 		}
 		return i, ErrInvalidJSON
