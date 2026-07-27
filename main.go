@@ -519,7 +519,7 @@ func (g *gen) genUnmarshal(name string) string {
 	switch {
 	case g.sliceTypes[name] != nil:
 		at := g.sliceTypes[name]
-		fn := g.sliceDecoder(at.Elt, name, nocopy, false)
+		fn := g.sliceDecoder(at.Elt, name, nocopy, false, true)
 		call = fmt.Sprintf("%s((*[]%s)(v), data, i%s%s)", fn, g.typeStr(at.Elt), g.depthArgFor(fn), rootArenaArg)
 	case g.mapTypes[name] != nil:
 		mt := g.mapTypes[name]
@@ -1069,7 +1069,7 @@ func (g *gen) field(dest string, expr ast.Expr, hint string, nocopy, lax bool) s
 			}
 			return g.callDecoder(dest, g.arrayDecoder(t, hint, nocopy, lax))
 		}
-		return g.callDecoder(dest, g.sliceDecoder(t.Elt, hint, nocopy, lax))
+		return g.callDecoder(dest, g.sliceDecoder(t.Elt, hint, nocopy, lax, false))
 
 	case *ast.MapType:
 		fn := g.mapDecoder(t.Key, t.Value, hint, nocopy, lax)
@@ -1146,7 +1146,7 @@ func (g *gen) valueDecoder(expr ast.Expr, hint string, nocopy, lax bool) string 
 		return g.anonStruct(t, hint)
 	case *ast.ArrayType:
 		if t.Len == nil {
-			return g.sliceDecoder(t.Elt, hint, nocopy, lax)
+			return g.sliceDecoder(t.Elt, hint, nocopy, lax, false)
 		}
 		return g.arrayDecoder(t, hint, nocopy, lax)
 	case *ast.MapType:
@@ -1499,7 +1499,7 @@ func batchArrayFn(elt ast.Expr) string {
 // it must be doubled — an unescaped one is silently emitted into every generated
 // file as "%!(MISSING)", which is why the measurement note above is here and not
 // in the generated comment.
-func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax bool) string {
+func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax, root bool) string {
 	if fn := batchSliceFn(elt); fn != "" {
 		if g.arena {
 			// The ...Arena twin carves the presized backing from the decode's
@@ -1517,6 +1517,14 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax bool) string {
 		suffix += "Lax"
 	}
 	key := g.prefix + g.cmark() + "slice:" + suffix + ":" + g.typeStr(elt)
+	if root {
+		// A named slice root's decoder grows by progress extrapolation (see the
+		// presize == "" branch below), which is only sound where the array is
+		// known to span the rest of the document — the root position. Keep it
+		// memo-distinct from any field decoder for the same element type, which
+		// must keep the flat-2x growth.
+		key = "root:" + key
+	}
 	if fn, ok := g.memo[key]; ok {
 		return fn
 	}
@@ -1550,15 +1558,35 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax bool) string {
 		// array, a too-small one regrows exactly as before. Empty arrays never
 		// reach the first append, so `[]` still yields a nil slice, and decoding
 		// into a reused non-nil slice keeps appending unchanged.
+		growCall := "unstable.GrowSlice(*out)"
+		if root {
+			// A slice ROOT's growth extrapolates the final element count from
+			// decode progress instead of blind doubling: at the grow point the
+			// loop knows the array's '[' index (captured in lightningArrStart
+			// below — the only extra code, no extra scanning), the current
+			// position and the document end, so GrowSliceEst sizes the new
+			// backing by len * (end-start) / (i-start), padded and clamped (see
+			// its doc). The premise — the array spans the rest of the document,
+			// making progress a faithful density sample — is structurally true
+			// exactly at the root, so a root array of large records reaches its
+			// final capacity in one or two grows instead of log2(n) doublings
+			// of dead backing + memmove (github_events-shaped documents).
+			// Nested slices keep the measured flat-2x GrowSlice: for them the
+			// document tail says nothing about the array's own length, the
+			// estimate always saturates its clamp, and 4x-and-up growth was
+			// measured and rejected for exactly those shapes (see GrowSlice).
+			presize = "	lightningArrStart := i\n"
+			growCall = "unstable.GrowSliceEst(*out, lightningArrStart, i, len(data))"
+		}
 		grow = fmt.Sprintf(`var zero %[1]s
 		if *out == nil {
 			*out = make([]%[1]s, 1, max(4, 256/max(1, int(unsafe.Sizeof(zero)))))
 		} else {
 			if len(*out) == cap(*out) {
-				*out = unstable.GrowSlice(*out)
+				*out = %[2]s
 			}
 			*out = append(*out, zero)
-		}`, eltStr)
+		}`, eltStr, growCall)
 	}
 	// Trailing commas ([1,]) are rejected by the first-iteration flag, as in
 	// genStructBody (see there — a rotated loop regressed cloudflare +11%).
