@@ -201,6 +201,51 @@ byte-identical when adding cold paths; push new logic out-of-line.
   plain/compact forms via `g.cmark`/`g.csuf` (`Destructive` suffix). Covered by
   conformance `TestDestructiveDirective` and the `destructive` arm of pkg/unstable's
   `TestReadStringOrNull`.
+- **`//lightning:arena` — chunked backings for small scalar slices**
+  (`unstable.Arena` + `arenaCarve` in `pkg/unstable/arena.go`, the
+  `Decode*SliceArena` reader twins in `batch.go`, `g.arena`/`arenaParam`/
+  `arenaArg` threading in `main.go`). Documents shaped like marine_ik hold tens
+  of thousands of 3–4-element `[]float64` fields; each decoded into its own
+  exact-fit `make` backing, `DecodeFloat64Slice` was **95% of allocated
+  objects**. Under the directive, each `UnmarshalJSON` declares a local
+  `unstable.Arena` and threads `a *unstable.Arena` through every decoder of the
+  variant (uniformly — unlike depth's cycle gating, the directive itself is the
+  gate; the batch slice readers are rerouted to `...Arena` twins that carve the
+  presized backing from 4 KiB chunks instead of one `make` per slice). Safety
+  is by construction: `arenaCarve` is constrained to **noscan element kinds**
+  (chunks are `[]byte`, which the GC doesn't scan — pointerful types must never
+  live there); the cursor bumps past the **full capacity**, so carves are
+  exclusive and a caller's later `append` can never clobber a neighbour (exact
+  scalar counts leave `len == cap`, so such an append reallocates to the heap
+  anyway); carve offsets stay 8-aligned; chunks are make-zeroed and regions
+  never reused, so `s[len:cap]` reads zeros exactly like a `make` backing; and
+  backings over `arenaMaxCarve` (512 B) fall back to a direct `make`, keeping
+  both chunk waste and the pinning trade-off bounded to small slices. The
+  trade-off — a surviving small slice pins its ~4 KiB chunk — is why it is a
+  directive and not the default. Measured (interleaved A/B, n=24, pinned Zen 4):
+  **marine_ik allocs/op −94.9% (29 356 → 1 504) and time −2.80% (p=0.001);
+  mesh allocs/op −99.2% (3 618 → 30) and time −3.30% (p=0.000)**; B/op +0.2–0.4%
+  (chunk-tail waste); numbers exactly flat (its one big array bypasses the
+  threshold by design). Non-arena schemas are **byte-identical** (dual-generator
+  diff over all 60 bench inputs) and the shared-body restructure of the batch
+  readers costs nothing (`Decode*Slice` became inlinable wrappers over a private
+  body with a nil-arena parameter — regression A/B over marine_ik/mesh/numbers/
+  float-array/canada/cloudflare/citm all flat, n=8). **Calibration lesson worth
+  keeping:** the old "~18% target" here was sized from mallocgc's cumulative
+  profile share; the isolated micro (`BenchmarkDecodeSmallSlices`, −20.7%/slice)
+  over-predicted the same way. Most of that profile share is bytes-proportional
+  work the arena deliberately keeps (chunk zeroing costs the same bytes as the
+  makes it replaced, and GC assist paces on bytes) — the removable part is only
+  the per-object malloc fast path, ~12 ns on Zen 4. What the wall-clock number
+  understates is the whole-program effect: a service decoding at rate carries
+  29k → 1.5k objects/decode into every GC mark, which the benchmark loop's
+  short windows underweight. Locked by `TestArenaSliceParity`/`Exclusive`/
+  `AlignmentAndKinds`/`ThresholdBypass`/`ReuseKeepsBacking`/`RandomizedParity`
+  (pkg/unstable), conformance `TestArenaDirective` (stdlib parity, sibling
+  safety after append, reuse, and the arena×recursive combo `ArenaTree`, whose
+  decoders thread depth *and* arena), and the standing micro
+  `BenchmarkDecodeSmallSlices`. The bench harness generates a `data_arena.go`
+  twin per case (like destructive) and a `BenchmarkLightningArena` row.
 - **`CountArrayElements`** (slice presize) skips each element with `SkipValue`
   (vectorized via `indexStructural`), not a byte-by-byte depth walk — but **gives
   up the per-element walk after `countSampleCap` (64) elements** and extrapolates
@@ -875,19 +920,16 @@ no regressions.)
   the fast path measured *equal*, not slower, on exactly the short arrays it was
   built for, so there is no cap at which it starts winning.
   **The real lever on marine_ik is allocation, not counting** — see the next entry.
-- **Un-landed opportunity: a slab for small `[]float64` backings.** The same
-  marine_ik profile shows `DecodeFloat64Slice` is **93% of all allocated objects**
-  (29 356 allocs/op — one tiny `make([]float64, 0, n)` per `Pos`/`Rot`/`Scl`), with
-  `mallocgc` at **14%** of CPU and `memclrNoHeapPointers` another **4.5%** (the
-  presized backing is zeroed, then immediately overwritten — unavoidable for a heap
-  slice in Go). Unlike the *string* arena rejected below (whose target was only
-  ~1.4–2.4%), this is an ~18% target on marine_ik/mesh-shaped documents, because
-  the allocations are numerous *and* tiny. Carving these backings from a chunked
-  slab would be safe (set `cap == len` so a caller's later `append` reallocates
-  rather than clobbering a neighbour), but it needs an arena threaded through
-  `DecodeFloat64Slice`'s signature and therefore through generated code, and it
-  changes retention semantics (one surviving 3-float slice pins its whole chunk).
-  Not attempted — it is a design decision, not a local optimization.
+- **Formerly "un-landed": the slab for small `[]float64` backings is now live as
+  `//lightning:arena`** (see that entry in the performance architecture above).
+  The original sizing note stands: marine_ik's `DecodeFloat64Slice` was **95% of
+  all allocated objects** (29 356 allocs/op — one tiny `make([]float64, 0, n)`
+  per `Pos`/`Rot`/`Scl`), `mallocgc` ~20% of CPU. What made it a "design
+  decision, not a local optimization" — the retention-semantics change (one
+  surviving 3-float slice pins its whole chunk) and the arena threading through
+  generated code — is resolved the same way `destructive` was: an opt-in
+  directive, so the default semantics never change and non-arena schemas
+  generate byte-identical code.
 
 - **`switch len(key)` field dispatch, so no key comparison calls
   `runtime.memequal`** (`keyDispatch`/`chunkedKeyEq` in `main.go`). `cmd/compile`

@@ -124,6 +124,22 @@ for dir in */; do
 		continue
 	fi
 
+	# And an arena variant for BenchmarkLightningArena, by the same duplication:
+	# //lightning:arena batches the presized backings of small numeric slices into
+	# per-decode arena chunks (unstable.Arena), so slice-dense documents (marine_ik's
+	# 29k Pos/Rot/Scl triples) pay a few hundred chunk allocations instead of one
+	# make per slice. Cases without such slices generate an equivalent decoder (the
+	# arena is threaded but never carved from) and read ~flat.
+	asrc="${dir}data_arena.go"
+	cp "${dir}data.go" "$asrc"
+	for n in $names; do gofmt -r "${n} -> ${n}Arena" -w "$asrc"; done
+	sed -i '0,/^type /s//\/\/lightning:arena\ntype /' "$asrc"
+	if ! (cd "$ROOT" && go run . "bench/${asrc}"); then
+		echo "  lightning arena generator failed" >&2
+		status=1
+		continue
+	fi
+
 	# 2. Generate the easyjson deserializer in an ej/ sub-package. The struct is
 	#    copied verbatim (only the package clause changes), so the json tags --
 	#    including ",nocopy", which easyjson also understands -- carry over.
@@ -181,6 +197,21 @@ func BenchmarkLightning(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		var v Benchmark
+		if err := v.UnmarshalJSON(benchInput); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkLightningArena measures the //lightning:arena variant
+// (*BenchmarkArena).UnmarshalJSON, which carves the presized backings of small
+// numeric slices from per-decode arena chunks instead of one make() per slice.
+// The input is not mutated, so this is a plain decode loop like BenchmarkLightning.
+func BenchmarkLightningArena(b *testing.B) {
+	b.SetBytes(int64(len(benchInput)))
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		var v BenchmarkArena
 		if err := v.UnmarshalJSON(benchInput); err != nil {
 			b.Fatal(err)
 		}

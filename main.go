@@ -32,9 +32,11 @@
 // Per-type behavior is selected by `//lightning:` doc-comment directives on the
 // type: `//lightning:compact` (assume whitespace-free input), `//lightning:nocopy`
 // (alias string/[]byte leaves into the input instead of copying — the caller must
-// then keep the input alive and unchanged), and `//lightning:destructive`
-// (unescape strings in place, mutating and destroying the input buffer; implies
-// nocopy). See README.md for the full directive and struct-tag reference.
+// then keep the input alive and unchanged), `//lightning:destructive` (unescape
+// strings in place, mutating and destroying the input buffer; implies nocopy),
+// and `//lightning:arena` (batch small numeric-slice backings into per-decode
+// arena chunks — a retained slice pins its chunk, so it is for decode-and-discard
+// use). See README.md for the full directive and struct-tag reference.
 //
 // Non-goals. lightning is decode-only: it generates UnmarshalJSON, not
 // MarshalJSON. It operates on a complete []byte, not an io.Reader — the zero-copy
@@ -93,6 +95,7 @@ func generate(inPath string) error {
 		compactTypes:     map[string]bool{},
 		nocopyTypes:      map[string]bool{},
 		destructiveTypes: map[string]bool{},
+		arenaTypes:       map[string]bool{},
 		depthFns:         map[string]bool{},
 	}
 
@@ -110,7 +113,8 @@ func generate(inPath string) error {
 	}
 
 	// Collect every top-level struct type, in source order, recording the
-	// //lightning:compact / :nocopy / :destructive directives each carries.
+	// //lightning:compact / :nocopy / :destructive / :arena directives each
+	// carries.
 	for _, d := range file.Decls {
 		gd, ok := d.(*ast.GenDecl)
 		if !ok || gd.Tok != token.TYPE {
@@ -149,6 +153,9 @@ func generate(inPath string) error {
 			}
 			if hasDirective("lightning:destructive", gd.Doc, ts.Doc) {
 				g.destructiveTypes[ts.Name.Name] = true
+			}
+			if hasDirective("lightning:arena", gd.Doc, ts.Doc) {
+				g.arenaTypes[ts.Name.Name] = true
 			}
 		}
 	}
@@ -194,6 +201,7 @@ func generate(inPath string) error {
 		// A destructive root aliases the very buffer it decodes into, so it is nocopy
 		// too; a plain //lightning:nocopy root (slice/map) aliases its keys/elements.
 		g.nocopy = g.destructive || g.nocopyTypes[name]
+		g.arena = g.arenaTypes[name]
 		g.prefix = "lightning" + g.pathFrag + name
 		methods = append(methods, g.genUnmarshal(name))
 	}
@@ -237,15 +245,19 @@ type gen struct {
 	//   //lightning:nocopy       -> nocopyTypes       (slice/map root aliases keys/elements)
 	//   //lightning:destructive  -> destructiveTypes  (unescape strings into the input
 	//                                                   buffer, destroying it; implies nocopy)
+	//   //lightning:arena        -> arenaTypes        (batch small scalar-slice backings
+	//                                                   into per-decode arena chunks)
 	compactTypes     map[string]bool
 	nocopyTypes      map[string]bool
 	destructiveTypes map[string]bool
+	arenaTypes       map[string]bool
 
 	// Working flags for the root type currently being generated, derived from the
 	// directive sets above.
 	compact     bool
 	destructive bool   // //lightning:destructive: unescape strings in place
 	nocopy      bool   // //lightning:nocopy root, or a destructive root (which aliases what it decodes)
+	arena       bool   // //lightning:arena: thread a per-decode unstable.Arena through the decoders
 	pathFrag    string // import path sanitized into an identifier fragment
 	prefix      string // current per-type prefix for generated function names
 
@@ -430,10 +442,10 @@ func (g *gen) readKey() string {
 	}`
 }
 
-// cmark and csuf distinguish a decoder's compact and destructive variants from their
-// plain counterparts in, respectively, memo keys and generated function names, so
-// the same type reached from roots with different directive combinations yields a
-// distinct decoder per combination.
+// cmark and csuf distinguish a decoder's compact, destructive and arena variants
+// from their plain counterparts in, respectively, memo keys and generated function
+// names, so the same type reached from roots with different directive combinations
+// yields a distinct decoder per combination.
 func (g *gen) cmark() string {
 	var m string
 	if g.compact {
@@ -441,6 +453,9 @@ func (g *gen) cmark() string {
 	}
 	if g.destructive {
 		m += "destructive:"
+	}
+	if g.arena {
+		m += "arena:"
 	}
 	return m
 }
@@ -453,7 +468,32 @@ func (g *gen) csuf() string {
 	if g.destructive {
 		s += "Destructive"
 	}
+	if g.arena {
+		s += "Arena"
+	}
 	return s
+}
+
+// arenaParam and arenaArg thread the per-decode arena through an
+// //lightning:arena root's decoders, the way depthParam/depthArgFor thread the
+// recursion depth — except unconditionally within the variant: every decoder
+// generated for an arena root takes the parameter, so call sites need no
+// per-function bookkeeping, and a root without the directive (arenaParam == "")
+// generates byte-identical code. The batched scalar-slice readers are the only
+// consumers (see batchSliceFn's Arena rerouting in sliceDecoder); decoders the
+// arena merely passes through carry it unused.
+func (g *gen) arenaParam() string {
+	if g.arena {
+		return ", a *unstable.Arena"
+	}
+	return ""
+}
+
+func (g *gen) arenaArg() string {
+	if g.arena {
+		return ", a"
+	}
+	return ""
 }
 
 // genUnmarshal emits the UnmarshalJSON method for a named root type and makes sure
@@ -467,20 +507,27 @@ func (g *gen) genUnmarshal(name string) string {
 	var call string
 	nocopy := g.nocopy // //lightning:nocopy or :destructive root: alias the slice/map root's keys/elements
 	// The root call seeds the recursion depth at 0 (g.depthArg's zero value outside
-	// any body), and contributes nothing when the schema has no cycle.
+	// any body), and contributes nothing when the schema has no cycle. An arena root
+	// likewise seeds the decode's arena: the method declares it (arenaDecl) and every
+	// decoder threads the pointer down.
 	g.depthArg = "0"
+	var arenaDecl, rootArenaArg string
+	if g.arena {
+		arenaDecl = "var a unstable.Arena\n\t"
+		rootArenaArg = ", &a"
+	}
 	switch {
 	case g.sliceTypes[name] != nil:
 		at := g.sliceTypes[name]
 		fn := g.sliceDecoder(at.Elt, name, nocopy, false)
-		call = fmt.Sprintf("%s((*[]%s)(v), data, i%s)", fn, g.typeStr(at.Elt), g.depthArgFor(fn))
+		call = fmt.Sprintf("%s((*[]%s)(v), data, i%s%s)", fn, g.typeStr(at.Elt), g.depthArgFor(fn), rootArenaArg)
 	case g.mapTypes[name] != nil:
 		mt := g.mapTypes[name]
 		fn := g.mapDecoder(mt.Key, mt.Value, name, nocopy, false)
-		call = fmt.Sprintf("%s((*map[string]%s)(v), data, i%s)", fn, g.typeStr(mt.Value), g.depthArgFor(fn))
+		call = fmt.Sprintf("%s((*map[string]%s)(v), data, i%s%s)", fn, g.typeStr(mt.Value), g.depthArgFor(fn), rootArenaArg)
 	default:
 		fn := g.namedStruct(name)
-		call = fmt.Sprintf("%s(v, data, i%s)", fn, g.depthArgFor(fn))
+		call = fmt.Sprintf("%s(v, data, i%s%s)", fn, g.depthArgFor(fn), rootArenaArg)
 	}
 	var doc string
 	if g.destructive {
@@ -493,9 +540,16 @@ func (g *gen) genUnmarshal(name string) string {
 // "nocopy" option alias the input data instead of copying it; if any are
 // present, the caller must keep data unchanged while the result is in use.`, name)
 	}
+	if g.arena {
+		doc += `
+// Small numeric-slice backings are carved from shared per-call arena chunks
+// (//lightning:arena): retaining such a slice keeps its whole chunk reachable,
+// so decode, process, and discard the result together rather than holding on
+// to a few small slices from it.`
+	}
 	return fmt.Sprintf(`%[2]s
 func (v *%[1]s) UnmarshalJSON(data []byte) error {
-	i := unstable.SkipWS(data, 0)
+	%[4]si := unstable.SkipWS(data, 0)
 	if i >= len(data) {
 		return unstable.ErrTruncated
 	}
@@ -517,7 +571,7 @@ func (v *%[1]s) UnmarshalJSON(data []byte) error {
 		return unstable.ErrInvalidJSON
 	}
 	return nil
-}`, name, doc, call)
+}`, name, doc, call, arenaDecl)
 }
 
 // namedStruct returns (generating on first use) the decoder for a named struct.
@@ -937,7 +991,7 @@ func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
 		}
 		i++
 	}
-}`, fn, paramType, dispatch, g.skipWS("i", "i"), g.skipWS("i", "ni"), g.skipWS("i", "i+1"), g.skipWS("i", "i"), g.readKey(), g.depthParam(fn), g.depthGuard(fn))
+}`, fn, paramType, dispatch, g.skipWS("i", "i"), g.skipWS("i", "ni"), g.skipWS("i", "i+1"), g.skipWS("i", "i"), g.readKey(), g.depthParam(fn)+g.arenaParam(), g.depthGuard(fn))
 	g.decoders = append(g.decoders, body)
 }
 
@@ -1033,13 +1087,14 @@ func (g *gen) field(dest string, expr ast.Expr, hint string, nocopy, lax bool) s
 }
 
 // callDecoder invokes a (struct/slice/map) decoder function on &dest, passing the
-// recursion depth on when fn is one of the decoders that thread it.
+// recursion depth on when fn is one of the decoders that thread it, and the arena
+// when generating an //lightning:arena variant (whose decoders all take it).
 func (g *gen) callDecoder(dest, fn string) string {
-	return fmt.Sprintf(`end, err := %s(&%s, data, i%s)
+	return fmt.Sprintf(`end, err := %s(&%s, data, i%s%s)
 if err != nil {
 	return end, err
 }
-i = end`, fn, dest, g.depthArgFor(fn))
+i = end`, fn, dest, g.depthArgFor(fn), g.arenaArg())
 }
 
 // unsupportedf records a generation error for a type the generator cannot decode
@@ -1064,7 +1119,7 @@ func (g *gen) laxField(dest string, expr ast.Expr, hint string, nocopy bool) str
 		return g.skipEmit()
 	}
 	return fmt.Sprintf(`var lax %[1]s
-end, err := %[2]s(&lax, data, i%[4]s)
+end, err := %[2]s(&lax, data, i%[4]s%[5]s)
 if err != nil {
 	end, err = unstable.SkipValue(data, i)
 	if err != nil {
@@ -1073,7 +1128,7 @@ if err != nil {
 } else {
 	%[3]s = lax
 }
-i = end`, g.typeStr(expr), fn, dest, g.depthArgFor(fn))
+i = end`, g.typeStr(expr), fn, dest, g.depthArgFor(fn), g.arenaArg())
 }
 
 // valueDecoder returns the name of a function decoding the JSON value at data[i]
@@ -1105,6 +1160,13 @@ func (g *gen) valueDecoder(expr ast.Expr, hint string, nocopy, lax bool) string 
 		suffix += "Lax"
 	}
 	key := "value:" + suffix + ":" + g.typeStr(expr)
+	if g.arena {
+		// An arena root's value decoders take the arena parameter, so they must
+		// not share a memo entry (or a signature) with a non-arena root's. Scoped
+		// to arena rather than folding the whole cmark into the key, so existing
+		// schemas keep byte-identical output.
+		key = "arena:" + key
+	}
 	if fn, ok := g.memo[key]; ok {
 		return fn
 	}
@@ -1123,7 +1185,7 @@ func (g *gen) valueDecoder(expr ast.Expr, hint string, nocopy, lax bool) string 
 	body := fmt.Sprintf(`func %[1]s(v *%[2]s, data []byte, i int%[4]s) (int, error) {
 	%[3]s
 	return i, nil
-}`, fn, g.typeStr(expr), inner, g.depthParam(fn))
+}`, fn, g.typeStr(expr), inner, g.depthParam(fn)+g.arenaParam())
 	g.decoders = append(g.decoders, body)
 	return fn
 }
@@ -1373,7 +1435,7 @@ func (g *gen) arrayDecoder(t *ast.ArrayType, hint string, nocopy, lax bool) stri
 		}
 		i++
 	}
-}`, fn, arrType, g.skipWS("i", "i"), elem, g.depthParam(fn))
+}`, fn, arrType, g.skipWS("i", "i"), elem, g.depthParam(fn)+g.arenaParam())
 	g.decoders = append(g.decoders, body)
 	return fn
 }
@@ -1439,6 +1501,12 @@ func batchArrayFn(elt ast.Expr) string {
 // in the generated comment.
 func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax bool) string {
 	if fn := batchSliceFn(elt); fn != "" {
+		if g.arena {
+			// The ...Arena twin carves the presized backing from the decode's
+			// arena; callDecoder appends the `a` argument for every call under
+			// an arena root, which matches this reader's extra parameter.
+			return fn + "Arena"
+		}
 		return fn
 	}
 	suffix := ""
@@ -1546,7 +1614,7 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax bool) string {
 		}
 		i++
 	}
-}`, fn, eltStr, inner, presize, g.skipWS("i", "i"), grow, g.depthParam(fn))
+}`, fn, eltStr, inner, presize, g.skipWS("i", "i"), grow, g.depthParam(fn)+g.arenaParam())
 	g.decoders = append(g.decoders, body)
 	return fn
 }
@@ -1756,7 +1824,7 @@ func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy, lax boo
 		}
 		i++
 	}
-}`, fn, valStr, inner, g.skipWS("i", "i"), g.skipWS("i", "ni"), g.skipWS("i", "i+1"), g.readKey(), keyAssign, g.depthParam(fn))
+}`, fn, valStr, inner, g.skipWS("i", "i"), g.skipWS("i", "ni"), g.skipWS("i", "i+1"), g.readKey(), keyAssign, g.depthParam(fn)+g.arenaParam())
 	g.decoders = append(g.decoders, body)
 	return fn
 }

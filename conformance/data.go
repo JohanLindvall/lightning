@@ -136,6 +136,41 @@ type DestructiveDoc struct {
 	Tags []string `json:"tags,nocopy"`
 }
 
+// ArenaDoc carries //lightning:arena: the presized backings of its small numeric
+// slice fields are carved from per-decode arena chunks by the Decode*SliceArena
+// readers instead of allocated one make() per slice. Its shape covers every carve
+// path: several small slices per element (adjacent carves in one chunk), int and
+// uint element kinds narrower than 8 bytes (carve-size rounding), a slice big
+// enough to exceed the carve threshold (direct make fallback), plus null/empty
+// arrays and non-slice fields riding along. ArenaKey is a *named* element struct
+// so a decoder under the arena variant threads the arena through an intermediate
+// slice-of-named-struct decoder. Exercised by TestArenaDirective.
+//
+//lightning:arena
+type ArenaDoc struct {
+	Keys []ArenaKey `json:"keys"`
+	Name string     `json:"name"`
+}
+
+type ArenaKey struct {
+	Pos  []float64 `json:"pos"`
+	Rot  []int32   `json:"rot"`
+	Cnt  []uint16  `json:"cnt"`
+	Big  []float64 `json:"big"`
+	Time float64   `json:"time"`
+}
+
+// ArenaTree combines //lightning:arena with a recursive schema, so its decoders
+// thread *both* the depth counter and the arena pointer — the two extra
+// parameters must agree in order between every signature and call site, which
+// only a type needing both exercises. Decoded in TestArenaDirective.
+//
+//lightning:arena
+type ArenaTree struct {
+	Vals []float64    `json:"vals"`
+	Kids []*ArenaTree `json:"kids"`
+}
+
 // Tree is a self-referential type: its decoder and the decoder for its []*Tree
 // field call each other, so decoding recurses once per level of the document.
 // Because the generator detects the cycle, both carry a depth counter and refuse

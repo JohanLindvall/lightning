@@ -16,6 +16,10 @@ bench/*/bench_test.go
 # //lightning:destructive directive) written by bench/run_bench.sh for BenchmarkLightningDestructive
 bench/*/data_destructive.go
 
+# Arena variant source, the same duplication with //lightning:arena for
+# BenchmarkLightningArena
+bench/*/data_arena.go
+
 # easyjson sub-packages: the copied struct and the easyjson output are both generated
 bench/*/ej/
 

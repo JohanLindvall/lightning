@@ -322,7 +322,39 @@ documents with many keys this is a real saving: tagging the GeoSciences `gsoc_20
 corpus's root map cut its allocations ~21%. (Only slice and map roots take the
 directive; a struct root uses per-field `nocopy` tags.)
 
-## Recursive schemas
+### `//lightning:arena`
+
+Documents shaped like a skeletal animation or a mesh hold *many thousands of
+tiny numeric arrays* — 3-element `pos`/`rot`/`scl` triples, small index lists.
+Each decodes into its own exactly-sized `[]float64`/`[]int` backing, and those
+tens of thousands of small `make` calls become the decode's dominant cost (on
+the `marine_ik` benchmark they are 95% of allocated objects and ~20% of CPU).
+Mark the root `//lightning:arena` to batch them: each `UnmarshalJSON` call
+carves small numeric-slice backings out of shared 4 KiB arena chunks, turning
+tens of thousands of allocations into a few hundred, with no change to what is
+decoded:
+
+```go
+//lightning:arena
+type Animation struct {
+    Keys []Key `json:"keys"`
+}
+type Key struct {
+    Pos []float64 `json:"pos"` // backing carved from the decode's arena
+    Rot []float64 `json:"rot"`
+}
+```
+
+The trade-off is retention granularity: a carved slice keeps its whole chunk
+reachable, so holding on to one 3-element slice pins ~4 KiB. Use the directive
+when you decode, process, and discard the result together (the natural shape
+for these documents); don't use it if you retain a few small slices from a
+large decode. Everything else is unchanged: results are ordinary slices,
+appending to one reallocates it onto the heap without disturbing its
+neighbours, backings over 512 bytes are allocated individually as before, and
+reusing a target value still reuses its existing backings. Only slices of bare
+`float64`/int/uint kinds participate; other field types decode exactly as
+without the directive.
 
 A schema may refer back to itself — a tree node, a comment thread, a FHIR
 extension — either directly or through a chain of types:
@@ -823,6 +855,9 @@ Worth knowing before pointing this at input you don't control:
   [Checking validity](#checking-validity) for what that accepts.
 - `nocopy` results alias the input buffer and `//lightning:destructive` **overwrites
   it**; neither is safe for a buffer you don't own or intend to reuse.
+- `//lightning:arena` batches small numeric-slice backings into shared chunks: a
+  retained slice **pins its ~4 KiB chunk**, so opt in only for decode-and-discard
+  use.
 
 ## License
 

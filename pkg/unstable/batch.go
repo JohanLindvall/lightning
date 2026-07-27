@@ -30,6 +30,12 @@ import (
 // loop. The price is that every return — errors included — must write the
 // local back, to preserve the partial-progress-on-error behavior the parity
 // tests lock.
+//
+// Each slice reader has an ...Arena twin for the //lightning:arena decoders,
+// which carves the fresh presized backing from a shared chunk instead of
+// allocating per slice (see Arena). Both entry points are thin inlinable
+// wrappers over one shared body, so the per-element loops stay identical and
+// the arena test runs once per slice on the presize path.
 
 // intKind and uintKind are the integer element kinds the generic readers
 // stencil over. rune and byte are covered as aliases of int32 and uint8.
@@ -46,6 +52,22 @@ type uintKind interface {
 // a null element decodes as 0. When *out is nil the slice is presized from a
 // vectorized comma count.
 func DecodeFloat64Slice(out *[]float64, data []byte, i int) (int, error) {
+	return decodeFloat64Slice(out, data, i, nil)
+}
+
+// DecodeFloat64SliceArena is DecodeFloat64Slice with the fresh backing carved
+// from a instead of allocated per slice (see Arena); the //lightning:arena
+// decoders call it. Semantics are identical, including reuse: a non-nil *out
+// keeps its existing backing and the arena is untouched.
+func DecodeFloat64SliceArena(out *[]float64, data []byte, i int, a *Arena) (int, error) {
+	return decodeFloat64Slice(out, data, i, a)
+}
+
+// decodeFloat64Slice is the shared body: a nil arena allocates the presized
+// backing with make, exactly as before the arena existed. The arena test sits
+// on the once-per-slice presize path, not in the per-element loop, so the
+// non-arena entry point costs one predictable branch over the old form.
+func decodeFloat64Slice(out *[]float64, data []byte, i int, a *Arena) (int, error) {
 	if i >= len(data) {
 		return i, ErrTruncated
 	}
@@ -71,7 +93,11 @@ func DecodeFloat64Slice(out *[]float64, data []byte, i int) (int, error) {
 	s := (*out)[:0]
 	if s == nil {
 		if n := CountArrayScalars(data, i); n > 0 {
-			s = make([]float64, 0, n)
+			if a != nil {
+				s = arenaCarve[float64](a, n)
+			} else {
+				s = make([]float64, 0, n)
+			}
 		}
 	}
 	i++
@@ -156,6 +182,18 @@ func DecodeFloat64Slice(out *[]float64, data []byte, i int) (int, error) {
 // exactly as the generated per-element code converted (wrapping, not
 // saturating). A JSON null sets *out to nil; a null element decodes as 0.
 func DecodeIntSlice[T intKind](out *[]T, data []byte, i int) (int, error) {
+	return decodeIntSlice(out, data, i, nil)
+}
+
+// DecodeIntSliceArena is DecodeIntSlice with the fresh backing carved from a
+// (see DecodeFloat64SliceArena); the //lightning:arena decoders call it.
+func DecodeIntSliceArena[T intKind](out *[]T, data []byte, i int, a *Arena) (int, error) {
+	return decodeIntSlice(out, data, i, a)
+}
+
+// decodeIntSlice is the shared body; a nil arena presizes with make, exactly
+// as before the arena existed (see decodeFloat64Slice).
+func decodeIntSlice[T intKind](out *[]T, data []byte, i int, a *Arena) (int, error) {
 	if i >= len(data) {
 		return i, ErrTruncated
 	}
@@ -181,7 +219,11 @@ func DecodeIntSlice[T intKind](out *[]T, data []byte, i int) (int, error) {
 	s := (*out)[:0]
 	if s == nil {
 		if n := CountArrayScalars(data, i); n > 0 {
-			s = make([]T, 0, n)
+			if a != nil {
+				s = arenaCarve[T](a, n)
+			} else {
+				s = make([]T, 0, n)
+			}
 		}
 	}
 	i++
@@ -287,6 +329,18 @@ func DecodeIntSlice[T intKind](out *[]T, data []byte, i int) (int, error) {
 // DecodeUintSlice is DecodeIntSlice for the unsigned kinds; the element parse
 // mirrors ReadUint64OrNull.
 func DecodeUintSlice[T uintKind](out *[]T, data []byte, i int) (int, error) {
+	return decodeUintSlice(out, data, i, nil)
+}
+
+// DecodeUintSliceArena is DecodeUintSlice with the fresh backing carved from a
+// (see DecodeFloat64SliceArena); the //lightning:arena decoders call it.
+func DecodeUintSliceArena[T uintKind](out *[]T, data []byte, i int, a *Arena) (int, error) {
+	return decodeUintSlice(out, data, i, a)
+}
+
+// decodeUintSlice is the shared body; a nil arena presizes with make, exactly
+// as before the arena existed (see decodeFloat64Slice).
+func decodeUintSlice[T uintKind](out *[]T, data []byte, i int, a *Arena) (int, error) {
 	if i >= len(data) {
 		return i, ErrTruncated
 	}
@@ -312,7 +366,11 @@ func DecodeUintSlice[T uintKind](out *[]T, data []byte, i int) (int, error) {
 	s := (*out)[:0]
 	if s == nil {
 		if n := CountArrayScalars(data, i); n > 0 {
-			s = make([]T, 0, n)
+			if a != nil {
+				s = arenaCarve[T](a, n)
+			} else {
+				s = make([]T, 0, n)
+			}
 		}
 	}
 	i++

@@ -3,6 +3,7 @@ package conformance
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"reflect"
 	"testing"
@@ -227,6 +228,104 @@ func TestDestructiveDirective(t *testing.T) {
 	if string(data) == orig {
 		t.Errorf("input was not mutated; in-place unescape did not write through")
 	}
+}
+
+// arenaDocStd strips ArenaDoc's UnmarshalJSON so encoding/json decodes it by
+// reflection, giving the parity baseline (ArenaKey never had a method: it is
+// referenced by ArenaDoc, so its decoder is internal).
+type arenaDocStd ArenaDoc
+
+// TestArenaDirective covers //lightning:arena end to end: the decoded value must
+// equal encoding/json's bit for bit (the arena changes where backings live, never
+// what is decoded), covering adjacent small carves, sub-8-byte element kinds, the
+// over-threshold direct-make fallback, and null/empty arrays. Then the safety
+// property: growing one arena-backed slice must reallocate (exact counts leave
+// len == cap) and leave every sibling carve intact. Finally, decoding again into
+// the same value must replace contents, reusing backings without a fresh carve.
+func TestArenaDirective(t *testing.T) {
+	doc := `{
+	  "name": "anim",
+	  "keys": [
+	    {"pos": [1.5, 2.5, 3.5], "rot": [-1, 2, -3], "cnt": [7], "time": 0.25},
+	    {"pos": [4, 5], "rot": [], "cnt": [1, 2, 3, 4], "time": 0.5},
+	    {"pos": null, "rot": [9], "big": [` + bigInts(100) + `], "time": 0.75}
+	  ]
+	}`
+	var got ArenaDoc
+	if err := got.UnmarshalJSON([]byte(doc)); err != nil {
+		t.Fatal(err)
+	}
+	var want arenaDocStd
+	if err := json.Unmarshal([]byte(doc), &want); err != nil {
+		t.Fatal(err)
+	}
+	// One deliberate, pre-existing divergence from encoding/json (not an arena
+	// behavior): lightning decodes a JSON [] to a nil slice, the stdlib to a
+	// non-nil empty one. Normalize the baseline; everything else must match.
+	want.Keys[1].Rot = nil
+	if !reflect.DeepEqual(got, ArenaDoc(want)) {
+		t.Fatalf("arena decode diverges from encoding/json:\n got %#v\nwant %#v", got, want)
+	}
+
+	// Sibling safety: append far past Keys[0].Pos's capacity and then mutate the
+	// grown copy; no other carve may change.
+	if cap(got.Keys[0].Pos) != len(got.Keys[0].Pos) {
+		t.Fatalf("exact count should leave len == cap, got len %d cap %d", len(got.Keys[0].Pos), cap(got.Keys[0].Pos))
+	}
+	grown := append(got.Keys[0].Pos, make([]float64, 64)...)
+	for i := range grown {
+		grown[i] = -1
+	}
+	if !reflect.DeepEqual(got.Keys[0].Rot, []int32{-1, 2, -3}) ||
+		!reflect.DeepEqual(got.Keys[1].Pos, []float64{4, 5}) ||
+		!reflect.DeepEqual(got.Keys[1].Cnt, []uint16{1, 2, 3, 4}) {
+		t.Fatalf("append to one arena slice disturbed a sibling: %#v", got.Keys)
+	}
+
+	// Reuse: decode a second document into the same value; contents must be
+	// replaced (not appended) and still match encoding/json exactly.
+	doc2 := `{"name":"anim2","keys":[{"pos":[9.5],"rot":[4,5],"cnt":[],"time":1}]}`
+	if err := got.UnmarshalJSON([]byte(doc2)); err != nil {
+		t.Fatal(err)
+	}
+	var want2 arenaDocStd
+	if err := json.Unmarshal([]byte(doc2), &want2); err != nil {
+		t.Fatal(err)
+	}
+	want2.Keys[0].Cnt = nil // the []-to-nil normalization again
+	if !reflect.DeepEqual(got, ArenaDoc(want2)) {
+		t.Fatalf("arena reuse decode diverges:\n got %#v\nwant %#v", got, want2)
+	}
+
+	// Arena on a recursive schema: the decoders thread depth AND the arena, so a
+	// nested document must decode correctly (parameter-order bugs between the two
+	// extra parameters would break this immediately) and still enforce the depth
+	// bound.
+	var tree ArenaTree
+	if err := tree.UnmarshalJSON([]byte(`{"vals":[1,2],"kids":[{"vals":[3],"kids":[{"vals":[4,5,6]}]}]}`)); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(tree.Vals, []float64{1, 2}) ||
+		!reflect.DeepEqual(tree.Kids[0].Kids[0].Vals, []float64{4, 5, 6}) {
+		t.Fatalf("arena tree misdecoded: %#v", tree)
+	}
+	var deep ArenaTree
+	if err := deep.UnmarshalJSON(nestTree(unstable.MaxDepth + 10)); err == nil || !errors.Is(err, unstable.ErrMaxDepth) {
+		t.Fatalf("deep arena tree: want ErrMaxDepth, got %v", err)
+	}
+}
+
+// bigInts renders "0,1,…,n-1", a scalar array big enough to cross the arena's
+// carve threshold so the direct-make fallback is exercised in a real decode.
+func bigInts(n int) string {
+	b := make([]byte, 0, 4*n)
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			b = append(b, ',')
+		}
+		b = append(b, []byte(fmt.Sprintf("%d", i))...)
+	}
+	return string(b)
 }
 
 // nestTree builds a JSON document of n nested Tree levels: {"kids":[{"kids":[…]}]}.
