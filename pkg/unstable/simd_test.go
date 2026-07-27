@@ -55,8 +55,13 @@ func TestIndexStructuralScalar(t *testing.T) {
 // indexCloseOrEscape / indexStructural dispatch to SIMD on long inputs; verify
 // they agree with the scalar reference across a range of lengths and positions.
 func TestIndexFunctionsMatchScalar(t *testing.T) {
-	base := strings.Repeat("abcdefgh", 16) // 128 bytes, no special chars
-	for _, n := range []int{0, 1, 15, 16, 31, 32, 33, 64, 100, 128} {
+	// 320 bytes: long enough that the scanners' widest tail loop (the AVX-512
+	// 64-byte kmask loop on amd64) runs several full iterations after the 32-byte
+	// SSE2 head, with lengths straddling every block boundary (96 = head + one
+	// 64-byte block exactly; 97/160/193 leave 1..32-byte leftovers for the
+	// narrower loops; 256/320 are multi-block).
+	base := strings.Repeat("abcdefgh", 40)
+	for _, n := range []int{0, 1, 15, 16, 31, 32, 33, 64, 96, 97, 100, 128, 160, 192, 193, 256, 320} {
 		s := base[:n]
 		if got, want := indexCloseOrEscape([]byte(s)), indexCloseOrEscapeScalar([]byte(s)); got != want {
 			t.Errorf("indexCloseOrEscape(len=%d) = %d, want %d", n, got, want)
@@ -68,8 +73,10 @@ func TestIndexFunctionsMatchScalar(t *testing.T) {
 			t.Errorf("indexEscape(len=%d) = %d, want %d", n, got, want)
 		}
 		// Insert a target byte at each position and confirm both paths find it.
-		// The control bytes (0x00, '\n', 0x1f) exercise indexEscape's < 0x20 test.
-		for _, c := range []byte{'"', '\\', '{', '}', '[', ']', 0x00, '\n', 0x1f} {
+		// The control bytes (0x00, '\n', 0x1f) exercise indexEscape's < 0x20 test;
+		// 0x20 (space) sits just past that boundary and must NOT match, pinning
+		// the exact <-vs-<= edge in every vector variant.
+		for _, c := range []byte{'"', '\\', '{', '}', '[', ']', 0x00, '\n', 0x1f, ' '} {
 			for pos := 0; pos < n; pos++ {
 				b := []byte(s)
 				b[pos] = c

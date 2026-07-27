@@ -768,8 +768,96 @@ byte-identical when adding cold paths; push new logic out-of-line.
   the batched array readers. And `decodeAnyArray` gets the generated decoders'
   static first-append capacity hint (`cap(a)==0` → `make([]any, 0, 16)`, ~256
   bytes) instead of append growing 1→2→4→…; `[]` still returns the non-nil empty
-  slice. The dynamic path remains ~2.8× the typed path (map+boxing, intrinsic —
-  see the rejected key-interning entry); these only shave the removable overhead.
+  slice. The string case and `decodeAnyObject`'s key read carry the readKey
+  inline trick by hand: both host functions are recursive and never inline, so
+  the no-escape fast path (`indexCloseOrEscape` + one `string(rest[:k])` copy)
+  is free body-size-wise and skips the non-inlined `ReadStringOrNull`/`ReadKey`
+  call per clean string — the key path also drops the old alias-then-recopy
+  `string([]byte(key))` at the map insert (one copy, not two). Escaped/truncated
+  fall back to the old calls with identical error identities. Measured (with the
+  word-compare literal rewrite below, interleaved n=10): **DecodeAny citm −4.15%,
+  twitterescaped −3.45%**. The dynamic path remains ~2.8× the typed path
+  (map+boxing, intrinsic — see the rejected key-interning entry); these only
+  shave the removable overhead.
+- **Literal matching is constant-string compares** (`ExpectNull`,
+  `ReadBoolOrNull`, `SkipValue`'s true/false arms): `string(data[i:i+4]) ==
+  "null"` compiles to one word load + compare against an immediate (no
+  allocation, no memequal for constants ≤16 bytes) instead of 3–4 byte compares.
+  Bounds handling and error positions are byte-identical (a partial "nul" at EOF
+  fails the length test and returns i as before). `ExpectNull`'s inline cost
+  drops 45 → **25** — headroom for the many decoders that inline it — and
+  nothing that inlined before stopped inlining. Sub-noise alone; landed as a
+  rider on the any-path work above.
+- **Escaped-string decode, second pass** (on top of the four-part entry above;
+  both changes in `string.go`, twitterescaped **−8.4%** and gsoc_2018 **−2.3%**
+  interleaved). **(1)** `decodeEscaped`'s `\uXXXX` branch hand-encodes BMP runes
+  (1/2/3-byte UTF-8 appends) instead of calling `utf8.AppendRune`, whose
+  non-ASCII side is the non-inlinable `appendRuneNonASCII` — a call per rune
+  that profiled 5.9% flat on `\uXXXX`-dense text; `AppendRune` remains only for
+  supplementary-plane runes from valid surrogate pairs. Correctness subtlety: the
+  pairing logic passed *unpaired* surrogates through raw and relied on
+  AppendRune to rewrite them to U+FFFD, so the inline arm needs the explicit
+  `utf16.IsSurrogate(r) → RuneError` normalization to stay byte-identical
+  (locked by a differential test vs encoding/json over surrogate corners during
+  development; the conformance suite covers the encode arms). **(2)** the
+  close-quote cap hint's escaped-`\"` fallback no longer rescans via
+  `SkipString` from the string start — profiling gsoc/twitterescaped showed that
+  "rare" branch at ~2.5% flat (HTML/tweet text is full of `\"`), contradicting
+  the original entry's rarity claim. It now *resumes* the `bytes.IndexByte`
+  scan past each escaped quote, deciding by backslash-run parity (odd run =
+  escaped; the run cannot extend past the first escape, which bounds the
+  backward count), so each `\"` costs one vectorized sweep instead of a
+  per-backslash rescan. Only truncated input still calls `SkipString`, keeping
+  malformed-input sizing identical; the hint never changes acceptance. Also:
+  `Unwrap` probes the string body through an `unsafeBytes` alias and copies
+  only in the arms that return the body itself, so the base64 arm no longer
+  pays a dead copy of the whole embedded document.
+- **`Set` walkers, second pass** (`pkg/json/set.go`, on top of the four-part
+  zero-alloc entry). **(1)** The three walkers read keys with the readKey
+  inline trick (the get.go port CLAUDE.md left open pending amd64 evidence —
+  measured here: `Set/overwrite_nonobject` **−8.8%**, `append_empty` **−6.5%**,
+  rest flat, n=10 Zen 4). **(2)** `SetMany` counts found keys and, when all are
+  found, splices the rest of the input verbatim (`append(out, in[prev:]...)`) —
+  sound because all-found ⇔ no member remains to append at the close, and
+  duplicates pass through either way (first occurrence wins). `setObject` has
+  the same exit at the **root frame only** (`depth == 0 && nmatched ==
+  len(active)`; a nested frame would still need its `}` offset for the parent,
+  which costs the very scan the exit skips). The committed SetMany/SetPaths
+  benches append members and so measure flat by design;
+  `BenchmarkSetManyEarlyExit`/`BenchmarkSetPathsEarlyExit` (edit 2–3 early keys
+  of a 45-member record) pin the shape the exit serves: the walk drops from
+  O(doc) to O(prefix), 65/86 ns, zero allocs. One deliberate change rode along:
+  on a *duplicate-key* document with every path matched, SetPaths used to
+  re-edit later duplicates; the exit makes it first-occurrence-wins — which is
+  what Set and SetMany already did, so this is a consistency fix, verified by a
+  200k-random-document differential (unique-keyed docs byte-identical old vs
+  new).
+- **Root-slice growth extrapolates from decode progress**
+  (`unstable.GrowSliceEst` in `grow.go`; emitted by `sliceDecoder` for **named
+  slice roots only**, gated by a `root` flag whose memo marker keeps root and
+  field decoders for the same element type distinct). A github_events-shaped
+  document — a root array of large pointer-dense records — grew by pure flat-2×
+  doubling: ~40% of its allocated bytes were dead doubled backings + memmove.
+  At the grow point the decoder knows the array's `[` index (captured as
+  `lightningArrStart`, the only extra emitted code — **no extra scanning**, the
+  mechanism that distinguishes this from the rejected counting presizes), the
+  cursor, and `len(data)`, so the new capacity is `len * (end−start)/(i−start)`,
+  **padded by est/8+1** and clamped to [2×, 8×] of the current cap. The pad is
+  load-bearing: the raw estimate landed at 29 of the true 30 on github_events
+  and the mandatory 2× floor then doubled 29→58 — B/op measured **+42% worse**
+  than flat-2× before the pad, −37% after; a near-exact estimate plus a growth
+  floor overshoots, so make the estimate genuinely upper-ish. **Root-gating is
+  the safety design**: the premise (array spans the rest of the document, so
+  progress is a faithful density sample) is structurally true only at the root —
+  for a nested slice the estimate always saturates its clamp, and ≥4× growth was
+  measured and rejected for exactly those shapes in the flat-2× entry. Gated,
+  the dual-generator diff shows **only github_events' decoders change** among
+  all bench outputs; every nested slice keeps the tuned flat-2× byte-identically,
+  so no guard measurements were even needed. Interleaved A/B (n=8):
+  **github_events −27.6% time, −37.3% B/op, 1.31 GB/s** (was 0.95). Locked by
+  `TestGrowSliceEst` (clamps, pad, degenerate inputs, no aliasing). A possible
+  future extension — the estimate for *fields* that dominate the document tail
+  (large-json's `features`) — needs a way to bound nested-slice waste first.
 - **Trailing commas are rejected (first-iteration flag), matching
   encoding/json.** Every container loop — generated object/slice/fixed-array/map
   (`genStructBody`/`sliceDecoder`/`arrayDecoder`/`mapDecoder` in `main.go`), the
@@ -1021,7 +1109,11 @@ no regressions.)
   OoO window hides the frame, the same outcome as the unknown-field-skip inline
   above. The identical trick won 6–7% in generated code on amd64, so one
   interleaved A/B on an amd64 box could still justify it — don't land it on
-  arm64 evidence.
+  arm64 evidence. **Resolution: landed** (the get.go blocks are in-tree), and
+  the amd64 evidence arrived via the set.go port of the same block, which
+  measured `Set/overwrite_nonobject` −8.8% / `append_empty` −6.5% on Zen 4 —
+  the trick pays on amd64 walkers where the M2 hid it. The Get-family micros
+  themselves still measure flat on Zen 4 (their shapes are skip-dominated).
 - **SWAR / uint64 key matching in the generated field switch.** The thought was to
   load a key's bytes as a `uint64` and compare against precomputed constants instead
   of `memcmp`. Already done — by the Go compiler: `key == "8bytechars"` against a
@@ -1029,6 +1121,47 @@ no regressions.)
   so field dispatch is only ~3.5% even on cloudflare's 45-field struct (`memequal`
   2.0% + `memeqbody` 1.5%, the >8-byte names). No codegen change can beat what the
   compiler already emits.
+- **AVX-512BW kmask tails for the string scanners** (`indexQuoteOrBackslashSSE2`
+  / `indexEscapeSSE2`: a 64-byte `VPCMPEQB→k` loop replacing the AVX2 32-byte
+  tail, GP-broadcast splats, entered where the AVX2 loop was). Implemented,
+  byte-parity-verified under every dispatch variant at every offset — and
+  **reverted on measurement**: string_unicode (the long-string case the tail
+  serves) **+1.55% (p=0.040, n=16)**, gsoc flat. The skipBlocksAVX512 analogy
+  does not transfer: that win came from collapsing a 7-instruction classify to
+  2 per class, while this loop is already just load+compare+or+movemask and is
+  **load-port-bound** — Zen 4 double-pumps zmm on a 256-bit datapath (64 B/iter
+  costs the same load work as 2×32 B), so the wide form removes ~1 instruction
+  per 64 bytes while its added code shifts alignment. Same lesson as the
+  `VPCMPGTB` entry below: don't churn fuzz-verified SIMD asm for arithmetic
+  that only removes ops hiding under a port bottleneck. The strengthened tests
+  outlived the revert: `TestIndexFunctionsMatchScalar` now covers multi-block
+  lengths to 320 and the 0x20 boundary byte, and `TestIndexVariantsFlip`
+  differentially tests the pure-SSE2 and AVX2 arms under flag control (the
+  live-dispatch test alone never exercises the narrower paths on a wide
+  machine).
+- **Eliminating the SWAR wide-load bounds checks** (SkipWSRun,
+  ReadInt64/Uint64OrNull, scanFloat's fraction fold, the batch digit loops) —
+  verified negative by direct codegen audit: the ~66 `panicBounds` sites
+  visible in every objdump are *cold* branch targets of perfectly-predicted
+  compares that issue in parallel with the loads they guard; restructuring to
+  remove them (uint casts, explicit re-slicing) changes no hot-path schedule.
+  The same "predicted branches are free; attributed profile beats cycle
+  arithmetic" lesson as the memclr and unknown-field-skip entries — recorded so
+  the panic sites stop looking like removable waste in disassembly sessions.
+  Related watch-list from the same audit: `DecodeValue` (inline cost 77) and
+  `skipNumber` (74) sit just under the 80 budget — re-check `-gcflags=-m` after
+  any edit to either, as the SkipWSRun entry already mandates for itself.
+- **Whitespace run-length memoization (`wsGuess`)** — the tempting fix for
+  SkipWSRun's ~24% flat share on citm-shaped indentation: remember the last
+  run's length g per call site and verify a repeat with two compares
+  (`data[i+g-1] <= ' ' && data[i+g] > ' '`). **Unsound**: on a shorter actual
+  run the byte at `i+g-1` can be a ≤0x20 byte *inside the next string token*
+  (a space in `"hello world"`), so the check can skip over real token bytes
+  and misdecode valid documents. The sound form must verify all g bytes —
+  which is SkipWSRun's existing word loop minus only its final classify, so
+  the ceiling is roughly half the naive estimate, against generator threading
+  of per-site state and inline-budget risk. Not attempted; don't retry without
+  an O(1) sound verification.
 - **amd64 `indexStructuralAVX2` — `VPCMPGTB` to drop the trailing `NOTL`.** The
   shuffle-AND marker bytes are always `0x01`/`0x02` (positive), so
   `VPCMPGTB Yzero, Y6` yields `0xFF` where structural *directly* — no
@@ -1043,6 +1176,14 @@ no regressions.)
   destructive-compare copy `MOVOU X2,X3` is move-eliminated to ~0 latency on
   current uarchs, so there is nothing to shave.)
 
+- **No-corpus determinations (quantified, don't build without a workload):**
+  `[]float32`/`[]bool` batch readers — zero bench-corpus fields of those types
+  (if a real workload appears, the `DecodeFloat64Slice` pattern ports
+  mechanically and `arenaScalar` already includes `~float32`); a comma-count
+  presize hint for flat-valued maps (`map[string]string`) — mechanism sound and
+  unclaimed, but its entire measurable corpus is ~106 citm members, ≤0.3%
+  there; and the update_center struct-valued-map presize re-check *with* the
+  AVX-512 skip machinery — still a wash (~5% saved vs ~5–8% extent-scan cost).
 - **Routing Clinger's negative-exponent case through Eisel-Lemire** (replace the
   `f /= pow10exact[-exp]` division with EL's 128-bit multiply, which is also
   correctly-rounded so it's a legal swap): measured *worse* everywhere —
@@ -1267,7 +1408,11 @@ no regressions.)
   benchmark restores a pristine copy of the input into a reused buffer each iteration
   (the destructive decode mutates it) and decodes through
   `(*BenchmarkDestructive).UnmarshalJSON` — so the gap vs `BenchmarkLightning`
-  *understates* the real win (a true owner wouldn't pay the restore-copy). Cases with
+  *understates* the real win (a true owner wouldn't pay the restore-copy). The
+  restore also perturbs cache state, which cuts the other way on byte-bound
+  cases: skip-heavy's apparent Destructive "+38%" in the committed amd64 table
+  is this rotating-buffer cache effect on a >10 GB/s case, not a regression —
+  read Destructive rows on such cases accordingly. Cases with
   no `nocopy` string fields generate an identical decoder (destructive is a no-op
   there) and read ~flat. Implemented as a per-case source duplicate, **not** a
   generator twin (a `-inplace-twin` flag emitting a second `UnmarshalJSONInPlace`
