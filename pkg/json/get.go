@@ -450,6 +450,83 @@ func objectEach(data []byte, fn func(key string, value []byte) error, compact bo
 	}
 }
 
+// ArrayEach calls fn once for every element of the JSON array reached by the
+// object-key path keys in data — the array counterpart of ObjectEach. fn
+// receives the element's raw bytes, aliasing data (so the caller must keep
+// data unchanged while they are in use), following the same conventions as
+// Get — quotes kept for strings, the full span for objects and arrays, the
+// literal token for scalars.
+//
+// With no keys ArrayEach iterates the document's root array; otherwise each
+// key descends one level and the value at the end of the path must itself be
+// an array (ErrExpectArray if not, ErrKeyNotFound if a key is missing). If fn
+// returns a non-nil error, iteration stops and that error is returned.
+// Non-target members along the path are skipped without allocating.
+func ArrayEach(data []byte, fn func(value []byte) error, keys ...string) error {
+	return arrayEach(data, fn, false, keys...)
+}
+
+// ArrayEachCompact is ArrayEach for compact JSON — input with no whitespace
+// between tokens, as compact serializers emit — skipping the inter-token
+// whitespace scans ArrayEach makes (leading whitespace at the document start
+// is still tolerated). On such input it behaves identically to ArrayEach but
+// faster; given input that does contain inter-token whitespace it may report
+// an error.
+func ArrayEachCompact(data []byte, fn func(value []byte) error, keys ...string) error {
+	return arrayEach(data, fn, true, keys...)
+}
+
+func arrayEach(data []byte, fn func(value []byte) error, compact bool, keys ...string) error {
+	i := unstable.SkipWS(data, 0)
+	for _, key := range keys {
+		var err error
+		i, err = objectField(data, i, key, compact)
+		if err != nil {
+			return err
+		}
+	}
+	i = unstable.SkipWSCompact(data, i, compact)
+	if i >= len(data) {
+		return unstable.ErrTruncated
+	}
+	if data[i] != '[' {
+		return unstable.ErrExpectArray
+	}
+	i++
+	i = unstable.SkipWSCompact(data, i, compact)
+	if i >= len(data) {
+		return unstable.ErrTruncated
+	}
+	if data[i] == ']' {
+		return nil
+	}
+	for {
+		start := i
+		end, err := unstable.SkipValue(data, i)
+		if err != nil {
+			return err
+		}
+		if err := fn(data[start:end]); err != nil {
+			return err
+		}
+		i = unstable.SkipWSCompact(data, end, compact)
+		if i >= len(data) {
+			return unstable.ErrTruncated
+		}
+		switch data[i] {
+		case ']':
+			return nil
+		case ',':
+			i = unstable.SkipWSCompact(data, i+1, compact)
+			if i >= len(data) {
+				return unstable.ErrTruncated
+			}
+		default:
+			return unstable.ErrInvalidJSON
+		}
+	}
+}
+
 // objectField scans the JSON object at data[i] (after any leading whitespace)
 // for the member named key and returns the index of its value, with the value's
 // own leading whitespace already skipped. It returns ErrExpectObject if data[i]
