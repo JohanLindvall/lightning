@@ -5,13 +5,15 @@
 // generated decoder when the whole document maps onto a known struct, and this
 // package to read, edit, or reshape arbitrary JSON when it does not.
 //
-// The toolkit falls into three groups:
+// The toolkit falls into four groups:
 //
 //   - Read — extract raw values by key or path without decoding the rest of the
-//     document: [Get]/[GetCompact], [GetMany]/[GetManyCompact] (several top-level
-//     keys in one pass), [GetPaths]/[GetPathsCompact] (several nested paths in one
-//     prefix-sharing pass), and [ObjectEach]/[ObjectEachCompact] (iterate an
-//     object's members). Returned values alias the input, so the caller must keep
+//     document: [Get]/[GetCompact], [Lookup]/[LookupCompact] (Get with a
+//     found/not-found answer instead of an error), [GetMany]/[GetManyCompact]
+//     (several top-level keys in one pass), [GetPaths]/[GetPathsCompact] (several
+//     nested paths in one prefix-sharing pass), and [ObjectEach]/[ObjectEachCompact]
+//     and [ArrayEach]/[ArrayEachCompact] (iterate an object's members or an
+//     array's elements). Returned values alias the input, so the caller must keep
 //     it unchanged while they are in use.
 //   - Edit — splice raw values into a document, creating any missing path:
 //     [Set], [SetMany], [SetPaths]. These write into a caller-provided buffer and
@@ -51,8 +53,9 @@ import "github.com/JohanLindvall/lightning/pkg/unstable"
 // unstable package. Any of these may accompany a malformed, truncated, or
 // mistyped document; the individual functions document which they can return.
 var (
-	// ErrKeyNotFound is returned by Get when the requested key path does not
-	// exist in the document (or descends through a value that is not an object).
+	// ErrKeyNotFound is returned by Get when a requested key does not exist in
+	// the object it was looked up in. Descending through a value that is not an
+	// object reports ErrExpectObject instead.
 	ErrKeyNotFound = unstable.ErrKeyNotFound
 	// ErrInvalidJSON reports syntactically invalid JSON (e.g. a missing separator
 	// or an unexpected byte where a value was expected).
@@ -68,16 +71,30 @@ var (
 	ErrExpectColon = unstable.ErrExpectColon
 	// ErrMaxDepth reports input nested deeper than MaxDepth.
 	ErrMaxDepth = unstable.ErrMaxDepth
+	// ErrBadNumber reports a malformed or unrepresentable JSON number (returned
+	// by ParseFloat, DecodeAny, Valid and generated decoders; 1e309 is
+	// unrepresentable in a float64 and so rejected).
+	ErrBadNumber = unstable.ErrBadNumber
+	// ErrBadEscape reports an invalid backslash escape in a JSON string.
+	ErrBadEscape = unstable.ErrBadEscape
+	// ErrBadUnicode reports a malformed \uXXXX escape in a JSON string.
+	ErrBadUnicode = unstable.ErrBadUnicode
+	// ErrBadTime reports a time value a generated time.Time field could not
+	// parse (neither RFC 3339 nor a Unix timestamp).
+	ErrBadTime = unstable.ErrBadTime
 )
 
-// MaxDepth is how deeply nested a document may be before DecodeAny, Valid and the
-// generated decoders for recursive schemas give up with ErrMaxDepth. It matches
-// encoding/json's limit.
+// MaxDepth is how deeply nested a document may be before DecodeAny, Valid,
+// StripDefaults and the generated decoders for recursive schemas give up
+// (with ErrMaxDepth; StripDefaults, having no error return, stops stripping
+// and copies the remainder through verbatim). It matches encoding/json's limit.
 //
 // The bound exists because these walks recurse once per nesting level, and a Go
 // stack overflow is a fatal error that recover cannot catch: without it, deeply
-// nested input would end the process rather than return an error. Get, Lookup,
-// GetMany, GetPaths and Set walk iteratively and are not subject to it.
+// nested input would end the process rather than return an error. Get, Lookup
+// and GetMany walk iteratively; GetPaths and Set recurse only per requested
+// path segment, so their depth is bounded by the caller's path length rather
+// than by the document. None of those five need the bound.
 const MaxDepth = unstable.MaxDepth
 
 // UnescapeString decodes the body of a JSON string (the bytes that sit between
@@ -106,8 +123,9 @@ func UnescapeStringInto(in, out []byte) (string, error) {
 }
 
 // ParseFloat parses the JSON number in b as a float64. It takes the scanner's
-// Clinger fast path — an exact mantissa with a small decimal exponent becomes a
-// single multiply or divide — and falls back to strconv.ParseFloat for the rest.
+// fast paths — Clinger (an exact mantissa with a small decimal exponent becomes
+// a single multiply or divide), then Eisel-Lemire for longer mantissas and
+// larger exponents — and falls back to strconv.ParseFloat for the rest.
 // b must be exactly one number with no surrounding whitespace; trailing bytes or
 // an empty input yield an error.
 func ParseFloat(b []byte) (float64, error) {

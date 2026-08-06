@@ -2,9 +2,10 @@ package unstable
 
 import "math/bits"
 
-// Prototype: SIMD in-string-mask container skip (the sonic-rs skip_container
-// technique). skipObject/skipArray today land on each structural byte with
-// indexStructural and call SkipString per string; this instead streams 64-byte
+// SIMD in-string-mask container skip (the sonic-rs skip_container technique),
+// the production fast path SkipValue dispatches container skips to.
+// skipObject/skipArray land on each structural byte with indexStructural and
+// call SkipString per string; this instead streams 64-byte
 // blocks, computes an in-string mask (prefix-XOR of the real quote positions,
 // simdjson's find_escaped + carry handling), masks the bracket bitmaps to bytes
 // *outside* strings, and balances the container. Strings are absorbed into the

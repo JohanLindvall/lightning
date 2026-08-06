@@ -37,6 +37,20 @@ var ErrValueCount = errors.New("json: fewer raw values than keys")
 //
 // Use Set directly when in is a document you produced or have already validated —
 // this variant is for input you do not trust.
+// allValid reports whether in and every value in rawVal are well-formed JSON —
+// the shared argument gate of the checked edit wrappers.
+func allValid(in []byte, rawVal [][]byte) bool {
+	if !Valid(in) {
+		return false
+	}
+	for _, v := range rawVal {
+		if !Valid(v) {
+			return false
+		}
+	}
+	return true
+}
+
 func SetChecked(in, out, rawVal []byte, keys []string) ([]byte, error) {
 	if !Valid(in) || !Valid(rawVal) {
 		return nil, ErrInvalidJSON
@@ -57,13 +71,8 @@ func SetManyChecked(in, out []byte, rawVal [][]byte, keys []string) ([]byte, err
 	if len(rawVal) < len(keys) {
 		return nil, ErrValueCount
 	}
-	if !Valid(in) {
+	if !allValid(in, rawVal) {
 		return nil, ErrInvalidJSON
-	}
-	for _, v := range rawVal {
-		if !Valid(v) {
-			return nil, ErrInvalidJSON
-		}
 	}
 	res := SetMany(in, out, rawVal, keys)
 	if !Valid(res) {
@@ -83,13 +92,8 @@ func SetPathsChecked(in, out []byte, rawVal [][]byte, paths [][]string) ([]byte,
 	if len(rawVal) < len(paths) {
 		return nil, ErrValueCount
 	}
-	if !Valid(in) {
+	if !allValid(in, rawVal) {
 		return nil, ErrInvalidJSON
-	}
-	for _, v := range rawVal {
-		if !Valid(v) {
-			return nil, ErrInvalidJSON
-		}
 	}
 	res := SetPaths(in, out, rawVal, paths)
 	if !Valid(res) {

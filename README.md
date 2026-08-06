@@ -100,6 +100,11 @@ A fixed-size array follows `encoding/json`: the leading elements are filled, a
 shorter JSON array leaves the remaining elements zero, and a longer one's extras
 are discarded.
 
+A `[]byte` (`[]uint8`) field follows `encoding/json`: it accepts both the
+base64 string form the stdlib marshals (`"AQID"`) and a JSON array of numbers
+(`[1,2,3]`); `null` yields nil. A fixed-size `[N]byte` accepts only the numeric
+form, also like the stdlib.
+
 ### Reusing a decode target
 
 Decoding repeatedly into the same value is supported and is the cheapest way to
@@ -121,6 +126,10 @@ filled, so it holds only the current document's elements (the backing array is k
 which is what makes the reuse free). A map **keeps** its existing entries and the
 document's members are merged over them — so clear or replace a map field yourself
 if you need it to hold only the latest document. A fixed-size array is zeroed first.
+A non-nil pointer field is decoded **into the value it already points to**
+(allocating only when the pointer is nil), so pointer-dense schemas also reuse
+allocation-free; JSON `null` sets the pointer back to nil. As with the stdlib,
+a reused pointee keeps any field values the document omits.
 
 Note that fields absent from a later document keep their previous values, exactly as
 with `encoding/json`; zero the value first if you need absent-means-zero.
@@ -437,6 +446,10 @@ its surrounding quotes with escapes intact, an object or array spans the whole
   — calls `fn` for every member of the object reached by the path `keys` (the
   root object with no keys). If `fn` returns an error, iteration stops and
   returns it.
+- `ArrayEach(data []byte, fn func(value []byte) error, keys ...string) error`
+  — the array counterpart of `ObjectEach`: calls `fn` for every element of the
+  array reached by the path `keys` (the root array with no keys), same
+  error-stops-iteration contract.
 
 ```go
 // Pull a few fields out of a log record in one pass, reusing a scratch slice.
@@ -446,8 +459,8 @@ vals, err := json.GetMany(data, keys, scratch[:0])
 ```
 
 Each function has a **compact counterpart** — `GetCompact`, `LookupCompact`,
-`GetManyCompact`, `GetPathsCompact`, `ObjectEachCompact` — with the identical
-signature and result. Like the
+`GetManyCompact`, `GetPathsCompact`, `ObjectEachCompact`, `ArrayEachCompact` —
+with the identical signature and result. Like the
 [`//lightning:compact`](#lightningcompact) directive, they assume the input has
 no whitespace *between* tokens (the form `encoding/json`'s `Marshal` and most
 wire protocols emit) and skip the inter-token `SkipWS` scans, running about 10%
@@ -526,7 +539,8 @@ accept a trailing comma.)
 
 Errors returned by these helpers are the package's exported sentinels —
 `ErrKeyNotFound`, `ErrInvalidJSON`, `ErrTruncated`, `ErrExpectObject`,
-`ErrExpectArray`, `ErrExpectColon`, `ErrMaxDepth` — so callers can match them with
+`ErrExpectArray`, `ErrExpectColon`, `ErrMaxDepth`, `ErrBadNumber`,
+`ErrBadEscape`, `ErrBadUnicode`, `ErrBadTime` — so callers can match them with
 `errors.Is` without importing the internal `pkg/unstable` package.
 
 ## String escaping and unescaping
@@ -824,7 +838,7 @@ Representative numbers for a 1.8 KB Cloudflare log (Go 1.26, amd64):
 |---|---|
 | [`main.go`](main.go) | the generator (`package main`) |
 | [`pkg/unstable`](pkg/unstable) | the (unstable, do-not-import) runtime the generated decoders call into |
-| [`pkg/json`](pkg/json) | small public API over the scanner (`Get`/`Lookup`/`GetMany`/`GetPaths`/`ObjectEach`, `Valid`, `DecodeAny`, `Escape`/`UnescapeString`, `ParseFloat`, `StripDefaults`, `Set`/`SetMany`/`SetPaths` and their `…Checked` forms) |
+| [`pkg/json`](pkg/json) | small public API over the scanner (`Get`/`Lookup`/`GetMany`/`GetPaths`/`ObjectEach`/`ArrayEach`, `Valid`, `DecodeAny`, `Escape`/`UnescapeString`, `ParseFloat`, `StripDefaults`, `Set`/`SetMany`/`SetPaths` and their `…Checked` forms) |
 | [`bench/`](bench) | benchmark module: hand-written `data.go` + `input.json` per case, plus the generated decoders, harness, and results |
 
 Generated files (`*_unmarshal.go`, `bench/*/bench_test.go`, `bench/*/ej/`, and

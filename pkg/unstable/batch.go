@@ -1,6 +1,7 @@
 package unstable
 
 import (
+	"encoding/base64"
 	"encoding/binary"
 	"strconv"
 )
@@ -769,4 +770,55 @@ func DecodeUintArray[T uintKind](out []T, data []byte, i int) (int, error) {
 		}
 		i++
 	}
+}
+
+// DecodeByteSlice decodes the JSON value at data[i] into *out with
+// encoding/json's []byte semantics, which accept two shapes: a string value is
+// base64 (StdEncoding, decoded with the same base64.Decode call the stdlib
+// uses, so accepted inputs and error identities match), and an array is the
+// numeric element form (each element parsed like any uint kind, overflow wrap
+// included) shared with every other uint slice. null yields a nil slice. Like
+// the other slice readers it replaces *out's contents, reusing its backing when
+// the decoded bytes fit.
+func DecodeByteSlice(out *[]byte, data []byte, i int) (int, error) {
+	return decodeByteSlice(out, data, i, nil)
+}
+
+// DecodeByteSliceArena is DecodeByteSlice with the numeric-array form's backing
+// carved from a (see DecodeFloat64SliceArena); the //lightning:arena decoders
+// call it. The base64 form keeps a plain make: its length comes from the string
+// body, not a presize count, and Decode fills every byte, so there is no
+// zeroing to save.
+func DecodeByteSliceArena(out *[]byte, data []byte, i int, a *Arena) (int, error) {
+	return decodeByteSlice(out, data, i, a)
+}
+
+// decodeByteSlice is the shared body (see decodeFloat64Slice for the pattern).
+func decodeByteSlice(out *[]byte, data []byte, i int, a *Arena) (int, error) {
+	if i >= len(data) {
+		return i, ErrTruncated
+	}
+	if data[i] != '"' {
+		// null, '[', or an error — all exactly the shared uint-slice reader.
+		return decodeUintSlice(out, data, i, a)
+	}
+	s, end, err := ReadStringNoCopyOrNull(data, i)
+	if err != nil {
+		return end, err
+	}
+	// A nil *out always goes through make so an empty base64 string yields the
+	// non-nil empty slice encoding/json produces (null, not "", is what maps to
+	// a nil slice).
+	b := *out
+	if need := base64.StdEncoding.DecodedLen(len(s)); b == nil || cap(b) < need {
+		b = make([]byte, need)
+	} else {
+		b = b[:need]
+	}
+	n, derr := base64.StdEncoding.Decode(b, unsafeBytes(s))
+	if derr != nil {
+		return end, derr
+	}
+	*out = b[:n]
+	return end, nil
 }

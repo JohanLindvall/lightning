@@ -503,3 +503,21 @@ func TestReadTimeLaxOrNull(t *testing.T) {
 		})
 	}
 }
+
+// TestReadTimeErrorRetainsNoAlias locks the error-path copy in ReadTimeOrNull:
+// the *time.ParseError it returns must not alias the input buffer, so a caller
+// holding the error while the buffer is reused sees a stable message.
+func TestReadTimeErrorRetainsNoAlias(t *testing.T) {
+	data := []byte(`"2023-13-45T99:99:99Z"`)
+	_, _, err := ReadTimeOrNull(data, 0)
+	if err == nil {
+		t.Fatal("want error for invalid time")
+	}
+	before := err.Error()
+	for i := range data {
+		data[i] = 'X'
+	}
+	if after := err.Error(); after != before {
+		t.Errorf("error changed when buffer was overwritten:\n before %q\n after  %q", before, after)
+	}
+}

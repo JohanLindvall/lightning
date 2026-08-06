@@ -20,6 +20,17 @@ func escSwarHasByte(v uint64, b byte) uint64 {
 	return (x - escSwarLo) & ^x & escSwarHi
 }
 
+// SwarNeedsEscape reports (nonzero, high bit per matching lane) which of the
+// eight packed bytes in v JSON string encoding must escape — a control byte
+// < 0x20, '"' or '\\'. It is the one shared spelling of that predicate:
+// indexEscapeScalar's clean-run scan and pkg/json's EscapeStringInto per-run
+// probe both use it, so the escape byte set lives in one place. Pure bit math
+// with no calls, so it inlines into both (EscapeStringInto's gate depends on
+// that — re-check -gcflags=-m if this grows).
+func SwarNeedsEscape(v uint64) uint64 {
+	return escSwarHasLess(v, 0x20) | escSwarHasByte(v, '"') | escSwarHasByte(v, '\\')
+}
+
 // indexEscapeScalar is the portable fallback for indexEscape: it returns the index
 // of the first byte that JSON string encoding must escape — a control byte < 0x20,
 // '"' or '\\' — or len(b) if none, scanning eight bytes at a time via SWAR.
@@ -27,7 +38,7 @@ func indexEscapeScalar(b []byte) int {
 	i := 0
 	for ; i+8 <= len(b); i += 8 {
 		v := binary.LittleEndian.Uint64(b[i:])
-		if escSwarHasLess(v, 0x20)|escSwarHasByte(v, '"')|escSwarHasByte(v, '\\') != 0 {
+		if SwarNeedsEscape(v) != 0 {
 			break
 		}
 	}

@@ -962,6 +962,26 @@ no regressions.)
 
 ## Tried and rejected (don't re-attempt without a new idea)
 
+- **skipWS inline trick in the pkg/json walkers — split verdict, measured 2026-08.**
+  The two-compare + `SkipWSRun` block (the generated decoders' whitespace shape)
+  was ported to every `SkipWSCompact` site in both `strip_defaults.go` and
+  `get.go`, with new pretty-input benches (`get_pretty_bench_test.go` — no
+  committed bench covered non-compact pkg/json input before). Interleaved A/B
+  (final n=10, pinned Zen 4, idle machine): **strip_defaults.go kept** —
+  StripDefaultsPretty −11.7% and StripDefaultsCompact −5.1% (both p=0.000;
+  the compact win comes from the `for !compact` loop-entry test becoming a
+  single predictable `if`), everything else flat — but **get.go reverted**:
+  the first A/B (n=8) measured GetPretty +4.1%, ObjectEachPretty +5.7% (both
+  p≤0.005) on exactly the pretty shapes it targeted, with the WithSkip micros
+  flat; after the revert the Get family measures exactly flat again. The Get walkers are skip-dominated
+  (`SkipValue` absorbs member values, whitespace and all, in the maskBlock bulk
+  scan; only the short `": "`/newline-indent gaps between key tokens remain), so
+  the 22 expanded SkipWSRun inline blocks bought nothing and cost i-cache/layout.
+  `stripper.handle` visits every member of every object it keeps, so its 8 sites
+  amortize. Don't re-port get.go without a new idea; set.go was never ported
+  (its walkers are also skip-dominated — same economics as get.go).
+
+
 - **Dropping the up-front `clear(out)` in the batched fixed-size-array readers**
   (`DecodeFloat64Array`/`DecodeIntArray`/`DecodeUintArray`) in favour of zeroing only
   the unfilled tail. The setup looks compelling: `out`'s length is dynamic to the
@@ -1426,3 +1446,44 @@ no regressions.)
   suite, rendered to `bench/results_<arch>.md` by `bench/results_md.py`). Both write
   a raw `*results.txt` (gitignored) and commit the per-arch `.md`. `pkg_bench.sh`
   takes an optional benchmark-name filter as `$1` and honours `BENCHTIME`/`BENCHCOUNT`.
+
+## Session 2026-08 fixes worth knowing (correctness/API)
+
+- **`valueDecoder` memo keys now carry `g.prefix + g.cmark()`** like every other
+  emitter (and names go through `g.decFn`/`g.csuf`). Before, roots with
+  different directives sharing a lax field type shared one decoder — a plain
+  root could inherit a destructive sibling's in-place unescape (caller-buffer
+  mutation) or a compact sibling's whitespace rejection, and two files with the
+  same lax field type generated colliding names. Locked by
+  `TestLaxDecoderIsolation` (conformance).
+- **StripDefaults keep-key + emptied container value**: the rewind now backs up
+  to just past the separator comma (`postComma`), not to `localStartWrite` —
+  rewinding past the comma emitted `{"a":1"b":{...}}`, invalid JSON. Locked by
+  `TestStripDefaultsKeepKeyContainer`.
+- **Generated unwrap closures guard an all-whitespace body** (`i >= len(data)`
+  after the SkipWS): a pointer field's null probe reads `data[i]` unguarded and
+  panicked on `{"p":" "}`. Locked by `TestUnwrapWhitespaceBody`.
+- **Pointer fields reuse a non-nil pointee** (`if dest == nil { dest = new(T) }`),
+  matching encoding/json's documented pointer semantics and making reuse
+  allocation-free on pointer-dense schemas; null still nils. Locked by
+  `TestPointerFieldReuse` (with a stdlib premise check).
+- **`[]byte` follows encoding/json**: base64 string or numeric array both decode
+  (`unstable.DecodeByteSlice` + `...Arena`; `batchSliceFn` routes byte/uint8
+  there); `[N]byte` stays numeric-only like the stdlib. Locked by
+  `TestByteSliceStdlibParity`, `TestDecodeByteSlice`.
+- **Directives are validated**: unknown `//lightning:*` names are errors; a known
+  directive on a non-root/referenced type or bare `nocopy` on a struct root
+  warns on stderr (it silently did nothing before).
+- **pkg/json re-exports all eleven sentinels** (added ErrBadNumber/ErrBadEscape/
+  ErrBadUnicode/ErrBadTime); `TestSentinelsMatchable` locks the contract. Get's
+  non-object descent is documented as ErrExpectObject (was misdocumented as
+  ErrKeyNotFound).
+- **`time.Parse` does NOT retain its input in errors on modern Go** (the stdlib
+  copies into ParseError) — a plausible unsafe-alias finding refuted by test;
+  `TestReadTimeErrorRetainsNoAlias` guards the property against toolchain drift.
+- **`SwarNeedsEscape`** (pkg/unstable) is now the one spelling of the JSON
+  escape-byte predicate, shared by `indexEscapeScalar` and `EscapeStringInto`'s
+  probe — the dedup was verified byte-identical in `EscapeStringInto`'s asm.
+- The generator's dead `need*` import flags were deleted (`assemble` scans the
+  generated text); lax `[N]scalar` fields route through the batched array
+  readers via a thin generated wrapper (`TestLaxFixedArrays`).

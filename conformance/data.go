@@ -228,3 +228,79 @@ type LongKeys struct {
 	ThirtyThreePlus  string `json:"aKeyOfThirtyThreeBytesExactly_333"`
 	Alt              int    `json:"shortAlt|aVeryMuchLongerAlternateName"`
 }
+
+// LaxSharedDestructive and LaxSharedPlain share the exact same ",nocopy,lax"
+// string field type, with the destructive root declared FIRST: before the
+// valueDecoder memo key carried the per-root prefix and directive marker, both
+// roots shared whichever lax value decoder was generated first, so the plain
+// root inherited the destructive in-place unescape and silently mutated the
+// caller's buffer. Exercised by TestLaxDecoderIsolation.
+//
+//lightning:destructive
+type LaxSharedDestructive struct {
+	S string `json:"s,nocopy,lax"`
+}
+
+type LaxSharedPlain struct {
+	S string `json:"s,nocopy,lax"`
+}
+
+// LaxSharedCompact and LaxSharedAnyPlain cover the same leak for the compact
+// directive: pre-fix the shared lax `any` decoder called DecodeValueCompact, so
+// the plain root decoding whitespaced input had lax swallow the error and left
+// V nil. Exercised by TestLaxDecoderIsolation.
+//
+//lightning:compact
+type LaxSharedCompact struct {
+	V any `json:"v,lax"`
+}
+
+type LaxSharedAnyPlain struct {
+	V any `json:"v,lax"`
+}
+
+// UnwrapPtr covers the unwrap tag on a *pointer* field: the pointer null probe
+// in the generated inner decoder reads data[i] unguarded (safe everywhere else
+// because the enclosing loop guarantees a value byte), so the unwrap closure
+// must bail out before it on a body that is entirely whitespace. Exercised by
+// TestUnwrapWhitespaceBody.
+type UnwrapPtr struct {
+	P *Nested `json:"p,unwrap"`
+	S *string `json:"s,unwrap"`
+}
+
+// PtrReuse exercises decoding into a reused target with non-nil pointer
+// fields: the generated allocation is guarded (if p == nil { p = new(T) }), so
+// a non-nil pointee is decoded into rather than replaced — encoding/json's
+// documented pointer semantics, and zero allocations on reuse. Exercised by
+// TestPointerFieldReuse.
+type PtrReuse struct {
+	P *Nested `json:"p"`
+	N *int    `json:"n"`
+}
+
+// ByteSliceDoc covers []byte fields, which follow encoding/json: a base64
+// string (the form the stdlib marshals) or a numeric array both decode, null
+// is nil, and a fixed-size [N]byte stays numeric-only. Exercised by
+// TestByteSliceStdlibParity.
+type ByteSliceDoc struct {
+	B     []byte   `json:"b"`
+	Fixed [3]byte  `json:"fixed"`
+	Many  [][]byte `json:"many"`
+}
+
+// ByteBlob is a named byte-slice root type; base64 applies to it exactly as to
+// []byte (encoding/json keys on the underlying type). A named slice type is
+// only decodable as a root, so it is tested as one.
+type ByteBlob []byte
+
+// LaxArrays covers fixed-size scalar arrays behind the lax tag option: the
+// value decoder routes them through the batched pkg/unstable array readers
+// (the same ones field-level [N]T uses), and lax semantics still apply — a
+// mistyped value is skipped, leaving the zero array. Exercised by
+// TestLaxFixedArrays.
+type LaxArrays struct {
+	F [3]float64 `json:"f,lax"`
+	I [2]int32   `json:"i,lax"`
+	U [4]uint16  `json:"u,lax"`
+}

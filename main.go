@@ -14,13 +14,16 @@
 //	//go:generate lightning $GOFILE
 //
 // For each input file FOO.go it writes FOO_unmarshal.go next to it, containing
-// an UnmarshalJSON method for every top-level struct type. The generated code
-// calls the shared scanner helpers in pkg/unstable.
+// an UnmarshalJSON method for every top-level struct, slice, or map type (a
+// type nested inside another gets an internal decode function instead). The
+// generated code calls the shared scanner helpers in pkg/unstable.
 //
 // Supported field types: string, bool, all sized int/uint kinds, float32,
 // float64, json.Number, time.Time, json.RawMessage, nested (named or anonymous)
-// structs, slices, maps with string keys, pointers, and interface{}/any (decoded
-// into the usual Go representation of an arbitrary JSON value).
+// structs, slices, fixed-size arrays ([N]T), maps with string keys, pointers,
+// and interface{}/any (decoded into the usual Go representation of an arbitrary
+// JSON value). A []byte field follows encoding/json: both the stdlib's base64
+// string form and a JSON array of numbers decode into it.
 //
 // Field mapping follows the `json:"..."` struct tag: a tag renames the key,
 // `json:"-"` omits the field, and a `Name|Alias` tag maps several JSON keys onto
@@ -57,7 +60,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode"
@@ -65,7 +68,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: go run . <file.go> [more.go ...]")
+		fmt.Fprintf(os.Stderr, "usage: %s <file.go> [more.go ...]\n", filepath.Base(os.Args[0]))
 		os.Exit(2)
 	}
 	for _, in := range os.Args[1:] {
@@ -96,6 +99,7 @@ func generate(inPath string) error {
 		nocopyTypes:      map[string]bool{},
 		destructiveTypes: map[string]bool{},
 		arenaTypes:       map[string]bool{},
+		typeDirectives:   map[string][]string{},
 		depthFns:         map[string]bool{},
 	}
 
@@ -114,27 +118,48 @@ func generate(inPath string) error {
 
 	// Collect every top-level struct type, in source order, recording the
 	// //lightning:compact / :nocopy / :destructive / :arena directives each
-	// carries.
+	// carries. Directive use is validated as it is collected: a typo'd
+	// directive silently generating a decoder without the requested behavior
+	// (copying where the user believes nocopy, accepting whitespace where the
+	// user believes compact) is worse than failing, so an unknown
+	// //lightning:* name is an error; a known directive somewhere it cannot
+	// take effect only warns, since the generated code is still correct.
 	for _, d := range file.Decls {
 		gd, ok := d.(*ast.GenDecl)
 		if !ok || gd.Tok != token.TYPE {
 			continue
+		}
+		// A directive on the type(...) block applies to every spec inside, so
+		// unknown names in the block doc are diagnosed once, here.
+		for _, dir := range lightningDirectives(gd.Doc) {
+			if !knownDirectives[dir] {
+				g.errs = append(g.errs, fmt.Errorf("unknown directive //lightning:%s", dir))
+			}
 		}
 		for _, s := range gd.Specs {
 			ts, ok := s.(*ast.TypeSpec)
 			if !ok {
 				continue
 			}
+			for _, dir := range lightningDirectives(ts.Doc) {
+				if !knownDirectives[dir] {
+					g.errs = append(g.errs, fmt.Errorf("unknown directive //lightning:%s on type %s", dir, ts.Name.Name))
+				}
+			}
+			dirs := lightningDirectives(gd.Doc, ts.Doc)
+			isStruct := false
 			switch t := ts.Type.(type) {
 			case *ast.StructType:
 				g.structTypes[ts.Name.Name] = t
 				g.order = append(g.order, ts.Name.Name)
+				isStruct = true
 			case *ast.ArrayType:
 				// A named slice root type (type Foo []T) for array-root documents.
 				if t.Len == nil {
 					g.sliceTypes[ts.Name.Name] = t
 					g.order = append(g.order, ts.Name.Name)
 				} else {
+					g.warnDirectives(dirs, ts.Name.Name, "a fixed-size array type gets no UnmarshalJSON")
 					continue
 				}
 			case *ast.MapType:
@@ -143,7 +168,11 @@ func generate(inPath string) error {
 				g.mapTypes[ts.Name.Name] = t
 				g.order = append(g.order, ts.Name.Name)
 			default:
+				g.warnDirectives(dirs, ts.Name.Name, "not a struct, slice or map type")
 				continue
+			}
+			if len(dirs) > 0 {
+				g.typeDirectives[ts.Name.Name] = dirs
 			}
 			if hasDirective("lightning:compact", gd.Doc, ts.Doc) {
 				g.compactTypes[ts.Name.Name] = true
@@ -157,10 +186,16 @@ func generate(inPath string) error {
 			if hasDirective("lightning:arena", gd.Doc, ts.Doc) {
 				g.arenaTypes[ts.Name.Name] = true
 			}
+			// nocopy is consumed only by slice/map roots (a struct's aliasing is
+			// governed per field by the ,nocopy tag), so on a struct root the
+			// bare directive silently did nothing.
+			if isStruct && g.nocopyTypes[ts.Name.Name] && !g.destructiveTypes[ts.Name.Name] {
+				g.warnf("//lightning:nocopy on struct type %s has no effect; use the ,nocopy tag on its string/raw fields", ts.Name.Name)
+			}
 		}
 	}
 	if len(g.order) == 0 {
-		return fmt.Errorf("no top-level struct or slice types found")
+		return errors.New("no top-level struct, slice or map types found")
 	}
 
 	// A top-level type that is nested inside another (referenced by one of its
@@ -186,6 +221,16 @@ func generate(inPath string) error {
 		}
 	}
 	allReferenced := len(referenced) == len(g.order) // degenerate (fully cyclic); emit all
+
+	// A referenced type's decoder is emitted by the root that reaches it, under
+	// that root's directives — its own directives are never read, so tell the
+	// user rather than silently generating the plain variant.
+	for _, name := range g.order {
+		if referenced[name] && !allReferenced {
+			g.warnDirectives(g.typeDirectives[name], name,
+				"the type is nested inside another type; its decoder follows the enclosing root's directives")
+		}
+	}
 
 	// Decide, before any code is emitted, which decoders must thread a recursion
 	// depth: only those belonging to a type graph that loops back on itself.
@@ -251,6 +296,7 @@ type gen struct {
 	nocopyTypes      map[string]bool
 	destructiveTypes map[string]bool
 	arenaTypes       map[string]bool
+	typeDirectives   map[string][]string // every directive a type carries, for misplacement warnings
 
 	// Working flags for the root type currently being generated, derived from the
 	// directive sets above.
@@ -277,7 +323,6 @@ type gen struct {
 	decoders []string // generated decoder functions, in creation order
 	errs     []error  // generation errors; reported together after the walk
 
-	needBool, needUint, needFloat, needAny, needJSON, needNoCopyStr, needTime bool
 }
 
 func (g *gen) typeStr(e ast.Expr) string {
@@ -305,6 +350,50 @@ func (g *gen) uniq(base string) string {
 // "//lightning:compact", "// lightning:compact " and "// lightning: compact" are
 // equivalent. strings.Fields splits on any run of whitespace and joining the
 // pieces with "" collapses it all away before the comparison.
+// knownDirectives is the set of //lightning:* directive names the generator
+// understands; anything else in the lightning: namespace is a typo and an error.
+var knownDirectives = map[string]bool{
+	"compact":     true,
+	"nocopy":      true,
+	"destructive": true,
+	"arena":       true,
+}
+
+// lightningDirectives returns the name of every //lightning:* directive in the
+// given comment groups (the part after the colon), normalized the same way
+// hasDirective matches them.
+func lightningDirectives(groups ...*ast.CommentGroup) []string {
+	var out []string
+	for _, cg := range groups {
+		if cg == nil {
+			continue
+		}
+		for _, c := range cg.List {
+			text := strings.Join(strings.Fields(strings.TrimPrefix(c.Text, "//")), "")
+			if rest, ok := strings.CutPrefix(text, "lightning:"); ok {
+				out = append(out, rest)
+			}
+		}
+	}
+	return out
+}
+
+// warnf reports a non-fatal diagnostic on stderr: the generated code is
+// correct, but not what the source's directives appear to ask for.
+func (g *gen) warnf(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "warning: "+format+"\n", args...)
+}
+
+// warnDirectives warns that every directive in dirs is ineffective on the named
+// type, with the reason it cannot take effect there.
+func (g *gen) warnDirectives(dirs []string, typeName, reason string) {
+	for _, dir := range dirs {
+		if knownDirectives[dir] {
+			g.warnf("//lightning:%s on type %s has no effect: %s", dir, typeName, reason)
+		}
+	}
+}
+
 func hasDirective(name string, groups ...*ast.CommentGroup) bool {
 	for _, cg := range groups {
 		if cg == nil {
@@ -748,8 +837,8 @@ const skipUnknown = `end, err := unstable.SkipValue(data, i)
 // majority of schemas.
 //
 // A name longer than maxInlineCmp is the case worth restructuring, because `switch
-// key` compiles it to a runtime.memequal call — cloudflare's 45-field decoder made 20
-// such calls, and memeqbody plus memequal were ~5% of its profile. Then the dispatch
+// key` compiles it to a runtime.memequal call — cloudflare's 45-field decoder made 10
+// such calls, and memeqbody plus memequal were ~3.5% of its profile. Then the dispatch
 // becomes `switch len(key)`, and inside each length bucket the names are compared in
 // <=maxInlineCmp-byte chunks, so no comparison ever calls memequal. Buckets whose
 // names all fit keep a nested `switch key` so short keys are dispatched exactly as
@@ -797,7 +886,7 @@ func (g *gen) keyDispatch(arms []fieldArm) string {
 			byLen[l] = append(byLen[l], fieldArm{keys: ks, code: a.code})
 		}
 	}
-	sort.Ints(lens)
+	slices.Sort(lens)
 
 	var b strings.Builder
 	b.WriteString("switch len(key) {\n")
@@ -1007,14 +1096,12 @@ func (g *gen) field(dest string, expr ast.Expr, hint string, nocopy, lax bool) s
 		return g.field(dest, t.X, hint, nocopy, lax)
 
 	case *ast.StarExpr:
-		// new(T) spells the pointee type, so its package must be imported.
-		if isTime(t.X) {
-			g.needTime = true
-		}
-		if isRaw(t.X) {
-			g.needJSON = true
-		}
 		inner := g.field("(*"+dest+")", t.X, hint, nocopy, lax)
+		// The allocation is guarded so a reused non-nil target decodes into the
+		// existing pointee, matching encoding/json ("Unmarshal unmarshals the
+		// JSON into the value pointed at by the pointer") and sparing pointer-
+		// dense schemas one allocation per field per decode on reuse. Like the
+		// stdlib, a reused pointee keeps field values the document omits.
 		return fmt.Sprintf(`if data[i] == 'n' {
 	end, err := unstable.ExpectNull(data, i)
 	if err != nil {
@@ -1023,7 +1110,9 @@ func (g *gen) field(dest string, expr ast.Expr, hint string, nocopy, lax bool) s
 	%[1]s = nil
 	i = end
 } else {
-	%[1]s = new(%[2]s)
+	if %[1]s == nil {
+		%[1]s = new(%[2]s)
+	}
 	%[3]s
 }`, dest, g.typeStr(t.X), inner)
 
@@ -1159,26 +1248,20 @@ func (g *gen) valueDecoder(expr ast.Expr, hint string, nocopy, lax bool) string 
 	if lax {
 		suffix += "Lax"
 	}
-	key := "value:" + suffix + ":" + g.typeStr(expr)
-	if g.arena {
-		// An arena root's value decoders take the arena parameter, so they must
-		// not share a memo entry (or a signature) with a non-arena root's. Scoped
-		// to arena rather than folding the whole cmark into the key, so existing
-		// schemas keep byte-identical output.
-		key = "arena:" + key
-	}
+	// The memo key and function name carry the per-root prefix and the
+	// compact/destructive/arena marker exactly like every other emitter
+	// (named/anon/array/slice/map): without them, roots with different
+	// directives sharing a lax field type shared one decoder — a plain root
+	// could pick up a destructive sibling's in-place unescape (mutating the
+	// caller's buffer) or a compact sibling's whitespace rejection, and two
+	// files with the same lax field type generated colliding top-level names.
+	key := g.prefix + g.cmark() + "value:" + suffix + ":" + g.typeStr(expr)
 	if fn, ok := g.memo[key]; ok {
 		return fn
 	}
-	fn := g.uniq("decode" + g.baseName(expr) + suffix + "Value")
+	fn := g.uniq(g.decFn("decode" + g.baseName(expr) + suffix + "Value" + g.csuf()))
 	g.memo[key] = fn
 	g.markDepthFn(fn, g.exprThreadsDepth(expr))
-	if isRaw(expr) {
-		g.needJSON = true
-	}
-	if isTime(expr) {
-		g.needTime = true
-	}
 	prevDepth := g.enterBody(fn, false)
 	inner := g.field("(*v)", expr, hint, nocopy, lax)
 	g.depthArg = prevDepth
@@ -1196,7 +1279,6 @@ func (g *gen) scalar(dest, name string, nocopy bool) string {
 		reader := "unstable.ReadStringOrNull"
 		if nocopy {
 			reader = "unstable.ReadStringNoCopyOrNull"
-			g.needNoCopyStr = true
 			if g.destructive {
 				// //lightning:destructive — unescape escaped strings into the input
 				// buffer instead of allocating, aliasing the result (destroys the input).
@@ -1211,7 +1293,6 @@ if err != nil {
 i = end`, reader, dest)
 
 	case name == "bool":
-		g.needBool = true
 		return fmt.Sprintf(`b, end, err := unstable.ReadBoolOrNull(data, i)
 if err != nil {
 	return end, err
@@ -1220,7 +1301,6 @@ if err != nil {
 i = end`, dest)
 
 	case name == "float32" || name == "float64":
-		g.needFloat = true
 		val := "f"
 		if name == "float32" {
 			val = "float32(f)"
@@ -1245,7 +1325,6 @@ if err != nil {
 i = end`, dest, val)
 
 	case uintKinds[name]:
-		g.needUint = true
 		val := "n"
 		if name != "uint64" {
 			val = name + "(n)"
@@ -1257,7 +1336,10 @@ if err != nil {
 %s = %s
 i = end`, dest, val)
 	}
-	panic("unreachable scalar: " + name)
+	// Defensive: every caller gates on isScalar, so this fires only if isScalar
+	// and the switch above drift apart. Routed through the error accumulator so
+	// the user gets the uniform "unsupported type" diagnostic, not a stack trace.
+	return g.unsupportedf("internal: scalar kind %q not handled for %s", name, dest)
 }
 
 func (g *gen) rawMessage(dest string, nocopy bool) string {
@@ -1309,9 +1391,6 @@ i = end`, reader, dest)
 }
 
 func (g *gen) anyValue(dest string) string {
-	g.needAny = true
-	g.needBool = true
-	g.needFloat = true
 	decode := "unstable.DecodeValue"
 	if g.compact {
 		decode = "unstable.DecodeValueCompact"
@@ -1347,6 +1426,12 @@ if berr != nil {
 if len(body) > 0 {
 	if _, ierr := func(data []byte, i int) (int, error) {
 		i = unstable.SkipWS(data, i)
+		if i >= len(data) {
+			// All-whitespace body: like an empty string, leave the zero value.
+			// inner assumes a value byte at data[i] (a pointer field's null
+			// probe reads it unguarded), so it must not run here.
+			return i, nil
+		}
 %s
 		return i, nil
 	}(body, 0); ierr != nil {
@@ -1378,11 +1463,17 @@ func (g *gen) arrayDecoder(t *ast.ArrayType, hint string, nocopy, lax bool) stri
 	fn := g.uniq(g.decFn("decode" + cap1(hint) + suffix + "Array" + g.csuf()))
 	g.memo[key] = fn
 	g.markDepthFn(fn, g.exprThreadsDepth(t.Elt))
-	if isRaw(t.Elt) {
-		g.needJSON = true
-	}
-	if isTime(t.Elt) {
-		g.needTime = true
+	// A bare float64/int/uint element routes to the batched pkg/unstable reader
+	// even when the array is reached through a decoder function (a lax field's
+	// scratch decode) rather than field's inline emission — one call per array
+	// instead of a non-inlinable reader call per element, matching what field
+	// emits for the same [N]T. The wrapper only adapts the signature.
+	if bfn := batchArrayFn(t.Elt); bfn != "" {
+		body := fmt.Sprintf(`func %[1]s(out *%[2]s, data []byte, i int%[4]s) (int, error) {
+	return %[3]s((*out)[:], data, i)
+}`, fn, arrType, bfn, g.depthParam(fn)+g.arenaParam())
+		g.decoders = append(g.decoders, body)
+		return fn
 	}
 	prevDepth := g.enterBody(fn, false)
 	elem := g.field("(*out)[idx]", t.Elt, hint, nocopy, lax)
@@ -1458,6 +1549,11 @@ func batchSliceFn(elt ast.Expr) string {
 		return "unstable.DecodeFloat64Slice"
 	case intKinds[id.Name]:
 		return "unstable.DecodeIntSlice"
+	case id.Name == "byte" || id.Name == "uint8":
+		// []byte follows encoding/json: a base64 string or a numeric array.
+		// Fixed-size [N]byte stays numeric-only (batchArrayFn), also like the
+		// stdlib.
+		return "unstable.DecodeByteSlice"
 	case uintKinds[id.Name]:
 		return "unstable.DecodeUintSlice"
 	}
@@ -1536,12 +1632,6 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax, root bool) st
 	}
 	g.memo[key] = fn
 	g.markDepthFn(fn, g.exprThreadsDepth(elt))
-	if isRaw(elt) {
-		g.needJSON = true
-	}
-	if isTime(elt) {
-		g.needTime = true
-	}
 	eltStr := g.typeStr(elt)
 	prevDepth := g.enterBody(fn, false)
 	inner := g.field("(*out)[len(*out)-1]", elt, singular(hint)+"Entry", nocopy, lax)
@@ -1777,12 +1867,6 @@ func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy, lax boo
 	fn := g.uniq(g.decFn("decode" + cap1(hint) + suffix + "Map" + g.csuf()))
 	g.memo[key] = fn
 	g.markDepthFn(fn, g.exprThreadsDepth(valExpr))
-	if isRaw(valExpr) {
-		g.needJSON = true
-	}
-	if isTime(valExpr) {
-		g.needTime = true
-	}
 	valStr := g.typeStr(valExpr)
 	prevDepth := g.enterBody(fn, false)
 	inner := g.field("val", valExpr, hint+"Value", nocopy, lax)
@@ -2302,13 +2386,6 @@ func isScalar(name string) bool {
 	return intKinds[name] || uintKinds[name]
 }
 
-// isBracketFreeStruct reports whether every field of t is a plain number/bool
-// scalar, so the struct's JSON contains no string, '[' or ']' and no nested '{'.
-// An array of such structs can be counted by CountArrayObjects (find ']', count
-// '{'). Any string, pointer, array, map, embedded/named struct, or selector field
-// (time.Time, json.Number, json.RawMessage) disqualifies it — its JSON could hold
-// a bracket. Pipe-renamed or "-"/option-tagged fields are fine; only the field
-// *type* matters. A struct with no fields is excluded (nothing to size against).
 // isFlatScalarStringStruct reports whether every field is a plain number, bool or
 // string identifier — no nested struct/array/map/pointer. Such a struct's JSON
 // contains no '[', ']' or nested '{' of its own (only its single object braces and

@@ -11,10 +11,7 @@ package unstable
 // stay under 256 elements are unaffected either way, so this only changes the
 // large-array regime.
 func GrowSlice[T any](s []T) []T {
-	n := 2 * cap(s)
-	if n < 4 {
-		n = 4
-	}
+	n := max(2*cap(s), 4)
 	t := make([]T, len(s), n)
 	copy(t, s)
 	return t
@@ -76,17 +73,12 @@ func GrowSlice[T any](s []T) []T {
 // slice so large that 8*cap(s) exceeds int is already beyond what make/append
 // could have built, matching GrowSlice's own 2*cap(s) exposure.
 func GrowSliceEst[T any](s []T, start, i, end int) []T {
-	lo := 2 * cap(s)
-	if lo < 4 {
-		lo = 4
-	}
+	lo := max(2*cap(s), 4)
 	n := lo
 	if len(s) > 0 && i > start && end > start {
 		est := uint64(len(s)) * uint64(end-start) / uint64(i-start)
 		est += est/8 + 1 // upper-ish: don't land one short (see above)
-		if hi := uint64(lo) * 4; est > hi {
-			est = hi
-		}
+		est = min(est, uint64(lo)*4)
 		if est > uint64(n) {
 			n = int(est)
 		}

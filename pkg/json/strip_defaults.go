@@ -191,7 +191,12 @@ func (s *stripper) handle(read, write, depth int) (int, int) {
 	compact := s.ws == AssumeCompact
 	preserve := s.ws == PreserveWhitespace
 	dataLen := len(in)
-	read = unstable.SkipWSCompact(in, read, compact)
+	if !compact && read < len(in) && in[read] <= ' ' {
+		read++
+		if read < len(in) && in[read] <= ' ' {
+			read = unstable.SkipWSRun(in, read+1)
+		}
+	}
 	if read == dataLen {
 		return read, write
 	}
@@ -220,8 +225,20 @@ func (s *stripper) handle(read, write, depth int) (int, int) {
 				out[write] = ','
 				write++
 			}
+			// Where the member's own bytes begin — just past the separator
+			// comma. The container value branch below rewinds an emptied value
+			// here, not to localStartWrite: the keepKey path may still emit the
+			// member, and the comma belongs with it (rewinding past the comma
+			// produced {"a":1"b":{...}} — invalid JSON). Dropping the member
+			// entirely still rewinds to localStartWrite, comma included.
+			postComma := write
 			wsStart := read
-			read = unstable.SkipWSCompact(in, read, compact)
+			if !compact && read < len(in) && in[read] <= ' ' {
+				read++
+				if read < len(in) && in[read] <= ' ' {
+					read = unstable.SkipWSRun(in, read+1)
+				}
+			}
 			if read >= dataLen || in[read] != '"' {
 				return eject()
 			}
@@ -238,7 +255,13 @@ func (s *stripper) handle(read, write, depth int) (int, int) {
 					return eject()
 				}
 			}
-			read = unstable.SkipWSCompact(in, keyEnd, compact)
+			read = keyEnd
+			if !compact && read < len(in) && in[read] <= ' ' {
+				read++
+				if read < len(in) && in[read] <= ' ' {
+					read = unstable.SkipWSRun(in, read+1)
+				}
+			}
 			colonPos := read
 			if read == dataLen || in[read] != ':' {
 				// Missing ':' — copy the key, then eject.
@@ -248,7 +271,12 @@ func (s *stripper) handle(read, write, depth int) (int, int) {
 			read++
 			tmpRead := read
 
-			read = unstable.SkipWSCompact(in, read, compact)
+			if !compact && read < len(in) && in[read] <= ' ' {
+				read++
+				if read < len(in) && in[read] <= ' ' {
+					read = unstable.SkipWSRun(in, read+1)
+				}
+			}
 			valueEmpty := true
 			if read < dataLen {
 				switch in[read] {
@@ -274,7 +302,14 @@ func (s *stripper) handle(read, write, depth int) (int, int) {
 					if in[read] == '[' {
 						closeBrace = ']'
 					}
-					if peek := unstable.SkipWSCompact(in, read+1, compact); peek < dataLen && in[peek] == closeBrace {
+					peek := read + 1
+					if !compact && peek < dataLen && in[peek] <= ' ' {
+						peek++
+						if peek < dataLen && in[peek] <= ' ' {
+							peek = unstable.SkipWSRun(in, peek+1)
+						}
+					}
+					if peek < dataLen && in[peek] == closeBrace {
 						read = peek + 1 // empty nested container — drop the member
 						break
 					}
@@ -292,7 +327,7 @@ func (s *stripper) handle(read, write, depth int) (int, int) {
 					if tmpWrite != write {
 						valueEmpty = false
 					} else {
-						write = localStartWrite
+						write = postComma // rewind the key+colon; keepKey may still emit
 					}
 				default:
 					end := findDelimiter(in, read)
@@ -314,7 +349,12 @@ func (s *stripper) handle(read, write, depth int) (int, int) {
 				written = true
 			}
 			wsBeforeDelim := read
-			read = unstable.SkipWSCompact(in, read, compact)
+			if !compact && read < len(in) && in[read] <= ' ' {
+				read++
+				if read < len(in) && in[read] <= ' ' {
+					read = unstable.SkipWSRun(in, read+1)
+				}
+			}
 			if read == dataLen {
 				return eject()
 			}
@@ -351,7 +391,12 @@ func (s *stripper) handle(read, write, depth int) (int, int) {
 				write++
 			}
 			wsStart := read
-			read = unstable.SkipWSCompact(in, read, compact)
+			if !compact && read < len(in) && in[read] <= ' ' {
+				read++
+				if read < len(in) && in[read] <= ' ' {
+					read = unstable.SkipWSRun(in, read+1)
+				}
+			}
 			if preserve {
 				write += copy(out[write:], in[wsStart:read]) // element's leading whitespace
 			}
@@ -363,7 +408,12 @@ func (s *stripper) handle(read, write, depth int) (int, int) {
 				written = true
 			}
 			wsBeforeDelim := read
-			read = unstable.SkipWSCompact(in, read, compact)
+			if !compact && read < len(in) && in[read] <= ' ' {
+				read++
+				if read < len(in) && in[read] <= ' ' {
+					read = unstable.SkipWSRun(in, read+1)
+				}
+			}
 			if read == dataLen {
 				return eject()
 			}

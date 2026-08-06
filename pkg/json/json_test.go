@@ -2,6 +2,7 @@ package json
 
 import (
 	stdjson "encoding/json"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -222,5 +223,30 @@ func TestValid(t *testing.T) {
 		if Valid([]byte(s)) {
 			t.Errorf("Valid(%q) = true, want false", s)
 		}
+	}
+}
+
+// TestSentinelsMatchable locks the package's error contract: every sentinel a
+// pkg/json function can return must be matchable with errors.Is against this
+// package's re-exports, without importing pkg/unstable.
+func TestSentinelsMatchable(t *testing.T) {
+	if _, err := ParseFloat([]byte("abc")); !errors.Is(err, ErrBadNumber) {
+		t.Errorf("ParseFloat bad number: got %v, want ErrBadNumber", err)
+	}
+	if _, err := DecodeAny([]byte("1e999")); !errors.Is(err, ErrBadNumber) {
+		t.Errorf("DecodeAny overflow: got %v, want ErrBadNumber", err)
+	}
+	if _, err := UnescapeString([]byte(`a\q`)); !errors.Is(err, ErrBadEscape) {
+		t.Errorf("UnescapeString bad escape: got %v, want ErrBadEscape", err)
+	}
+	if _, err := UnescapeString([]byte(`a\uZZZZ`)); !errors.Is(err, ErrBadUnicode) {
+		t.Errorf("UnescapeString bad unicode: got %v, want ErrBadUnicode", err)
+	}
+	// Get: a missing key vs descent through a non-object are distinct errors.
+	if _, _, err := Get([]byte(`{"a":5}`), "b"); !errors.Is(err, ErrKeyNotFound) {
+		t.Errorf("Get missing key: got %v, want ErrKeyNotFound", err)
+	}
+	if _, _, err := Get([]byte(`{"a":5}`), "a", "b"); !errors.Is(err, ErrExpectObject) {
+		t.Errorf("Get non-object descent: got %v, want ErrExpectObject", err)
 	}
 }

@@ -2,6 +2,12 @@ package unstable
 
 import "bytes"
 
+// countSampleCap bounds CountArrayElements' per-element walk: a huge array
+// (apache_builds' 875 job objects) need not be skipped in full just to size a
+// slice. After this many elements the total is extrapolated from the bytes the
+// sample spans, turning an O(array) skip into O(countSampleCap).
+const countSampleCap = 64
+
 // CountArrayElements returns the number of top-level elements in the JSON array
 // beginning at data[i] (data[i] must be '['), so a destination slice can be
 // allocated once instead of grown by repeated append. It returns 0 for an empty
@@ -16,12 +22,6 @@ import "bytes"
 // coordinate array of many numbers, say — is jumped over in vectorized strides
 // instead of one byte at a time. This is what makes presizing slices of arrays,
 // objects, or strings cheap.
-// countSampleCap bounds the per-element walk: a huge array (apache_builds' 875
-// job objects) need not be skipped in full just to size a slice. After this many
-// elements the total is extrapolated from the bytes the sample spans, turning an
-// O(array) skip into O(countSampleCap).
-const countSampleCap = 64
-
 func CountArrayElements(data []byte, i int) int {
 	if i >= len(data) || data[i] != '[' {
 		return 0

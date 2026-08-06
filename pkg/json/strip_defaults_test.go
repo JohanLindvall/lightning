@@ -167,3 +167,36 @@ func TestStripDefaultsWhitespaceOnly(t *testing.T) {
 		}
 	}
 }
+
+// TestStripDefaultsKeepKeyContainer locks the rewind fix in handle's object
+// branch: a keep-listed member whose container value strips to empty must be
+// re-emitted WITH its separator comma. The empty-container rewind used to back
+// up past the comma written at the loop top, producing {"a":1"b":{...}} —
+// invalid JSON.
+func TestStripDefaultsKeepKeyContainer(t *testing.T) {
+	defaults := [][]byte{[]byte("0")}
+	keep := [][]byte{[]byte("b")}
+	cases := []struct {
+		in, want string
+		ws       WhitespaceMode
+	}{
+		// keep-key member after a kept member: comma must survive.
+		{`{"a":1,"b":{"x":0}}`, `{"a":1,"b":{"x":0}}`, RemoveWhitespace},
+		// keep-key member first: no leading comma.
+		{`{"b":{"x":0},"a":1}`, `{"b":{"x":0},"a":1}`, RemoveWhitespace},
+		// array value stripping empty behaves the same.
+		{`{"a":1,"b":[0]}`, `{"a":1,"b":[0]}`, RemoveWhitespace},
+		// non-kept sibling dropped around the kept container.
+		{`{"a":1,"c":0,"b":{"x":0}}`, `{"a":1,"b":{"x":0}}`, RemoveWhitespace},
+		{`{"a": 1, "b": {"x": 0}}`, `{"a": 1, "b": {"x": 0}}`, PreserveWhitespace},
+	}
+	for _, c := range cases {
+		got := string(StripDefaults([]byte(c.in), nil, defaults, keep, c.ws))
+		if got != c.want {
+			t.Errorf("StripDefaults(%q) = %q, want %q", c.in, got, c.want)
+		}
+		if got != "" && !json.Valid([]byte(got)) {
+			t.Errorf("StripDefaults(%q) = %q is not valid JSON", c.in, got)
+		}
+	}
+}

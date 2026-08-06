@@ -123,7 +123,11 @@ func decodeAnyObject(data []byte, i int, compact bool, depth int) (any, int, err
 			if err != nil {
 				return nil, aend, err
 			}
-			key, ni = string([]byte(akey)), aend
+			// Reached only for an escaped key (the inline scan above catches
+			// every clean one, and a truncated key errors), and ReadKey's
+			// escaped path returns a fresh never-reused buffer — safe to own
+			// without another copy.
+			key, ni = akey, aend
 		}
 		i = SkipWSCompact(data, ni, compact)
 		if i >= len(data) || data[i] != ':' {

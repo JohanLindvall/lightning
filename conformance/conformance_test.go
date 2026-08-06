@@ -624,3 +624,199 @@ func TestLongKeyDispatch(t *testing.T) {
 		}
 	}
 }
+
+// TestLaxDecoderIsolation locks the valueDecoder memo-key fix: lax value
+// decoders must be per-root (prefix + directive marker) like every other
+// generated decoder, so a plain root never inherits a destructive or compact
+// sibling's semantics through a shared lax field type.
+func TestLaxDecoderIsolation(t *testing.T) {
+	// Plain root: decoding must not mutate the input even though a destructive
+	// root with the identical lax field type was generated first.
+	orig := `{"s":"a\nb"}`
+	data := []byte(orig)
+	var p LaxSharedPlain
+	if err := p.UnmarshalJSON(data); err != nil {
+		t.Fatal(err)
+	}
+	if p.S != "a\nb" {
+		t.Fatalf("plain root decoded %q, want %q", p.S, "a\nb")
+	}
+	if string(data) != orig {
+		t.Fatalf("plain root mutated its input: %q", data)
+	}
+
+	// The destructive root itself must still unescape in place.
+	ddata := []byte(orig)
+	var d LaxSharedDestructive
+	if err := d.UnmarshalJSON(ddata); err != nil {
+		t.Fatal(err)
+	}
+	if d.S != "a\nb" {
+		t.Fatalf("destructive root decoded %q, want %q", d.S, "a\nb")
+	}
+	if string(ddata) == orig {
+		t.Fatal("destructive root did not mutate its input (in-place unescape lost)")
+	}
+
+	// Plain root with a lax any field: whitespaced input must decode even
+	// though a compact root with the identical lax field type exists.
+	var ap LaxSharedAnyPlain
+	if err := ap.UnmarshalJSON([]byte(`{"v": { "a" : 1 }}`)); err != nil {
+		t.Fatal(err)
+	}
+	if ap.V == nil {
+		t.Fatal("plain root left V nil: lax decoder leaked compact semantics")
+	}
+}
+
+// TestUnwrapWhitespaceBody locks the bounds guard in the generated unwrap
+// closure: a wrapped body that is empty or all whitespace leaves the field at
+// its zero value — it must not panic (the pointer field's null probe used to
+// index one past the end) and must not consume the field's zero state.
+func TestUnwrapWhitespaceBody(t *testing.T) {
+	cases := []string{
+		`{"p":" "}`,          // single space — the original panic input
+		`{"p":"   \t\n  "}`,  // longer mixed whitespace
+		`{"p":""}`,           // empty body (previously safe; must stay so)
+		`{"s":" "}`,          // *string field, same guard
+		`{"p":" ","s":"\t"}`, // both fields
+	}
+	for _, in := range cases {
+		var u UnwrapPtr
+		if err := u.UnmarshalJSON([]byte(in)); err != nil {
+			t.Errorf("UnmarshalJSON(%q): %v", in, err)
+			continue
+		}
+		if u.P != nil || u.S != nil {
+			t.Errorf("UnmarshalJSON(%q): fields not zero: %#v", in, u)
+		}
+	}
+	// A non-empty wrapped body still decodes.
+	var u UnwrapPtr
+	if err := u.UnmarshalJSON([]byte(`{"p":" {\"count\": 7} ","s":"\"hi\""}`)); err != nil {
+		t.Fatal(err)
+	}
+	if u.P == nil || u.P.Count != 7 || u.S == nil || *u.S != "hi" {
+		t.Fatalf("got %#v", u)
+	}
+}
+
+// ptrReuseStd strips PtrReuse's generated UnmarshalJSON so encoding/json
+// decodes it by reflection, giving the stdlib-parity baseline.
+type ptrReuseStd PtrReuse
+
+// TestPointerFieldReuse locks the guarded pointer allocation: decoding into a
+// target whose pointer fields are non-nil must reuse the pointees (stdlib
+// semantics — pointer identity kept, omitted pointee fields left as they were)
+// instead of allocating fresh ones, and null must still nil the pointer.
+func TestPointerFieldReuse(t *testing.T) {
+	doc := []byte(`{"p":{"name":"x"}}`)
+
+	// Premise: this is what encoding/json does with a reused non-nil pointer.
+	sp := &Nested{Name: "old", Count: 5}
+	sn := 3
+	std := ptrReuseStd{P: (*Nested)(sp), N: &sn}
+	if err := json.Unmarshal(doc, &std); err != nil {
+		t.Fatal(err)
+	}
+	if std.P != sp || std.P.Name != "x" || std.P.Count != 5 || std.N != &sn || *std.N != 3 {
+		t.Fatalf("stdlib premise changed: %#v (pointee reuse no longer stdlib semantics?)", std)
+	}
+
+	// Lightning must match: same pointer identity, same surviving pointee state.
+	lp := &Nested{Name: "old", Count: 5}
+	ln := 3
+	l := PtrReuse{P: lp, N: &ln}
+	if err := l.UnmarshalJSON(doc); err != nil {
+		t.Fatal(err)
+	}
+	if l.P != lp {
+		t.Error("pointer field was reallocated; want pointee reuse")
+	}
+	if l.P.Name != "x" || l.P.Count != 5 {
+		t.Errorf("pointee = %#v, want Name=x Count=5", *l.P)
+	}
+	if l.N != &ln || *l.N != 3 {
+		t.Error("untouched pointer field must keep its pointee")
+	}
+
+	// null still nils the pointer, and a nil pointer still allocates.
+	if err := l.UnmarshalJSON([]byte(`{"p":null,"n":9}`)); err != nil {
+		t.Fatal(err)
+	}
+	if l.P != nil || l.N == nil || *l.N != 9 {
+		t.Fatalf("got %#v", l)
+	}
+}
+
+// byteSliceDocStd strips the generated method for the reflection baseline.
+type byteSliceDocStd ByteSliceDoc
+
+// TestByteSliceStdlibParity locks []byte decoding to encoding/json: base64
+// strings and numeric arrays are both accepted (bit-identical results), null
+// is nil, invalid base64 errors, and [N]byte accepts only the numeric form.
+func TestByteSliceStdlibParity(t *testing.T) {
+	cases := []string{
+		`{"b":"AQID"}`,                      // base64 string (stdlib Marshal form)
+		`{"b":[1,2,3]}`,                     // numeric array form
+		`{"b":null}`,                        // null -> nil
+		`{"b":""}`,                          // empty base64 -> empty slice
+		`{"fixed":[7,8,9]}`,                 // [N]byte numeric
+		`{"many":["AQ==","Ag==",[3],null]}`, // elements of [][]byte are []byte too
+	}
+	for _, in := range cases {
+		var std byteSliceDocStd
+		stdErr := json.Unmarshal([]byte(in), &std)
+		var l ByteSliceDoc
+		lErr := l.UnmarshalJSON([]byte(in))
+		if (stdErr == nil) != (lErr == nil) {
+			t.Errorf("%s: error disagreement: stdlib %v, lightning %v", in, stdErr, lErr)
+			continue
+		}
+		if stdErr == nil && !reflect.DeepEqual(ByteSliceDoc(std), l) {
+			t.Errorf("%s:\n stdlib    %#v\n lightning %#v", in, std, l)
+		}
+	}
+	// A named byte-slice root gets base64 exactly like []byte.
+	var blob ByteBlob
+	if err := blob.UnmarshalJSON([]byte(`"aGVsbG8="`)); err != nil || string(blob) != "hello" {
+		t.Errorf("ByteBlob base64 root: %q, %v", blob, err)
+	}
+	if err := blob.UnmarshalJSON([]byte(`[104,105]`)); err != nil || string(blob) != "hi" {
+		t.Errorf("ByteBlob numeric root: %q, %v", blob, err)
+	}
+
+	// Both reject what the other rejects.
+	for _, in := range []string{`{"b":"!!!not base64!!!"}`, `{"fixed":"AQID"}`} {
+		var std byteSliceDocStd
+		if json.Unmarshal([]byte(in), &std) == nil {
+			t.Fatalf("stdlib accepted %s — premise wrong", in)
+		}
+		var l ByteSliceDoc
+		if l.UnmarshalJSON([]byte(in)) == nil {
+			t.Errorf("lightning accepted %s, stdlib rejects it", in)
+		}
+	}
+}
+
+// TestLaxFixedArrays locks the batched routing for lax [N]scalar fields: valid
+// arrays decode exactly as non-lax ones (leading fill, short leaves zeros,
+// surplus skipped), and a mistyped value is skipped leaving the zero array.
+func TestLaxFixedArrays(t *testing.T) {
+	var l LaxArrays
+	if err := l.UnmarshalJSON([]byte(`{"f":[1.5,2.5],"i":[-3,4,99],"u":[7]}`)); err != nil {
+		t.Fatal(err)
+	}
+	if l.F != [3]float64{1.5, 2.5, 0} || l.I != [2]int32{-3, 4} || l.U != [4]uint16{7, 0, 0, 0} {
+		t.Fatalf("got %#v", l)
+	}
+	// lax: a mistyped value is skipped, and previously decoded content is
+	// replaced by zeros only where the document writes.
+	var m LaxArrays
+	if err := m.UnmarshalJSON([]byte(`{"f":"nope","i":{"x":1},"u":[9]}`)); err != nil {
+		t.Fatal(err)
+	}
+	if m.F != [3]float64{} || m.I != [2]int32{} || m.U != [4]uint16{9} {
+		t.Fatalf("got %#v", m)
+	}
+}

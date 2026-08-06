@@ -37,9 +37,13 @@ func GetManyCompact(data []byte, keys []string, out [][]byte) ([][]byte, error) 
 }
 
 func getMany(data []byte, keys []string, out [][]byte, compact bool) ([][]byte, error) {
-	out = out[:0]
-	for range keys {
-		out = append(out, nil)
+	// One sized allocation (or a cleared reuse) instead of growing a nil out
+	// by repeated append.
+	if cap(out) < len(keys) {
+		out = make([][]byte, len(keys))
+	} else {
+		out = out[:len(keys)]
+		clear(out)
 	}
 	i := unstable.SkipWS(data, 0)
 	if i >= len(data) {
@@ -145,9 +149,13 @@ func GetPathsCompact(data []byte, paths [][]string, out [][]byte) ([][]byte, err
 }
 
 func getPaths(data []byte, paths [][]string, out [][]byte, compact bool) ([][]byte, error) {
-	out = out[:0]
-	for range paths {
-		out = append(out, nil)
+	// One sized allocation (or a cleared reuse) instead of growing a nil out
+	// by repeated append.
+	if cap(out) < len(paths) {
+		out = make([][]byte, len(paths))
+	} else {
+		out = out[:len(paths)]
+		clear(out)
 	}
 	i := unstable.SkipWS(data, 0)
 	if i >= len(data) {
@@ -303,8 +311,9 @@ func walkPaths(data []byte, i, depth int, active, free []int, paths [][]string, 
 // '{'..'}' or '['..']', and for a scalar it is the literal token.
 //
 // Each key descends one level: at every step the current value must be a JSON
-// object that contains the key, or Get returns ErrKeyNotFound (and, for a
-// non-object where descent was attempted, the index is left at that value).
+// object that contains the key. A missing key returns ErrKeyNotFound; attempting
+// to descend through a value that is not an object returns ErrExpectObject (with
+// the index left at that value).
 // With no keys Get returns the whole value at the document root. The second
 // return value is the offset in data at which the returned value begins, and
 // leading whitespace is tolerated at every level.
@@ -358,10 +367,11 @@ func get(data []byte, compact bool, keys ...string) ([]byte, int, error) {
 
 // ObjectEach calls fn once for every member of the JSON object reached by the
 // object-key path keys in data, without reporting a value type. fn receives the
-// member's decoded key and the raw bytes of its value; both alias data (so the caller
-// must keep data unchanged while they are in use), and the value follows the
-// same conventions as Get — quotes kept for strings, the full span for objects
-// and arrays, the literal token for scalars.
+// member's decoded key and the raw bytes of its value. The value always aliases
+// data, and so does the key when it contains no escapes (an escaped key is
+// decoded into a fresh string); the caller must keep data unchanged while they
+// are in use. The value follows the same conventions as Get — quotes kept for
+// strings, the full span for objects and arrays, the literal token for scalars.
 //
 // With no keys ObjectEach iterates the document's root object; otherwise each
 // key descends one level and the value at the end of the path must itself be an

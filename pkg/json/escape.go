@@ -10,21 +10,6 @@ import (
 
 const hexAlphabet = "0123456789abcdef"
 
-// SWAR (SIMD-within-a-register) helpers operating on eight packed bytes at once,
-// used by EscapeStringInto's first-run probe. swarHasLess reports (high bit per
-// lane) whether any byte lane of v is < n (1 <= n <= 128); swarHasByte reports
-// whether any lane equals b.
-const (
-	swarLo = 0x0101010101010101 // 1 in every byte lane
-	swarHi = 0x8080808080808080 // high bit of every byte lane
-)
-
-func swarHasLess(v, n uint64) uint64 { return (v - swarLo*n) & ^v & swarHi }
-func swarHasByte(v uint64, b byte) uint64 {
-	x := v ^ (swarLo * uint64(b))
-	return (x - swarLo) & ^x & swarHi
-}
-
 // EscapeString writes the JSON-escaped form of s to out — the string body only,
 // without the surrounding quotes. The bytes JSON requires escaped (control bytes
 // below 0x20, '"' and '\\') are replaced by their escape sequences: the short
@@ -76,7 +61,7 @@ func EscapeStringInto(s []byte, out []byte) []byte {
 		const minVectorRun = 48
 		if n-i >= minVectorRun {
 			v := binary.LittleEndian.Uint64(s[i:])
-			if m := swarHasLess(v, 0x20) | swarHasByte(v, '"') | swarHasByte(v, '\\'); m != 0 {
+			if m := unstable.SwarNeedsEscape(v); m != 0 {
 				i += bits.TrailingZeros64(m) >> 3
 			} else {
 				i += 8 + unstable.IndexEscape(s[i+8:])
@@ -84,7 +69,7 @@ func EscapeStringInto(s []byte, out []byte) []byte {
 		} else {
 			for i+8 <= n {
 				v := binary.LittleEndian.Uint64(s[i:])
-				if m := swarHasLess(v, 0x20) | swarHasByte(v, '"') | swarHasByte(v, '\\'); m != 0 {
+				if m := unstable.SwarNeedsEscape(v); m != 0 {
 					i += bits.TrailingZeros64(m) >> 3
 					break
 				}

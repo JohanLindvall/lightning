@@ -314,8 +314,9 @@ func ReadBoolOrNull(data []byte, i int) (bool, int, error) {
 
 // ReadTimeOrNull reads an RFC 3339 JSON string (or null) at data[i] as a
 // time.Time, matching how encoding/json decodes time.Time. The intermediate
-// string aliases data (time.Parse does not retain it), so this allocates only
-// the time.Time itself.
+// string aliases data — safe because time.Parse retains it in neither its
+// result nor its error (the stdlib copies into ParseError; locked by
+// TestReadTimeErrorRetainsNoAlias) — so this allocates only the time.Time.
 func ReadTimeOrNull(data []byte, i int) (time.Time, int, error) {
 	if i >= len(data) {
 		return time.Time{}, i, ErrTruncated

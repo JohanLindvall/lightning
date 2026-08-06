@@ -429,3 +429,123 @@ func unescapeNL(s string) string {
 	}
 	return string(out)
 }
+
+// TestDecodeIntArrayMatchesReader locks the fixed-size array reader's inlined
+// element parse to ReadInt64OrNull element by element, mirroring what
+// TestDecodeIntSliceMatchesReader locks for the slice reader: overflow wrap,
+// tolerated fraction/exponent truncation, null elements, whitespace, and the
+// fixed-array-specific semantics (zero first, ignore surplus JSON elements,
+// leave a short JSON array's tail zero).
+func TestDecodeIntArrayMatchesReader(t *testing.T) {
+	inputs := []string{
+		`[0,1,-1,42]`,
+		`[12345678901234567,-9223372036854775808,7,8]`,
+		`[9223372036854775808]`, // overflow: wraps exactly as ReadInt64OrNull
+		`[1.9,-2.5,3e2,4E-1]`,   // tolerated fraction/exponent, truncated toward zero
+		`[null, 7 ,null]`,
+		`[ 10 , 200 , 3000 ]`,
+		`[1,2,3,4,5,6]`, // more elements than the array: surplus skipped
+		`[]`,
+	}
+	for _, in := range inputs {
+		data := []byte(in)
+		got := [4]int64{-77, -77, -77, -77} // pre-dirtied: reader must zero it
+		end, err := DecodeIntArray(got[:], data, 0)
+		if err != nil {
+			t.Fatalf("DecodeIntArray(%q): %v", in, err)
+		}
+		if end != len(data) {
+			t.Errorf("DecodeIntArray(%q): end = %d, want %d", in, end, len(data))
+		}
+		var want [4]int64
+		for i, n := range readInt64ArrayReference(t, data) {
+			if i == len(want) {
+				break
+			}
+			want[i] = n
+		}
+		if got != want {
+			t.Errorf("DecodeIntArray(%q) = %v, want %v", in, got, want)
+		}
+	}
+}
+
+// TestDecodeUintArrayMatchesReader is the ReadUint64OrNull twin of
+// TestDecodeIntArrayMatchesReader.
+func TestDecodeUintArrayMatchesReader(t *testing.T) {
+	inputs := []string{
+		`[0,1,42,4294967297]`,
+		`[18446744073709551615,7,8,9]`,
+		`[18446744073709551616]`, // overflow: wraps exactly as ReadUint64OrNull
+		`[1.9,2.5,3e2,4E-1]`,     // tolerated fraction/exponent
+		`[null, 7 ,null]`,
+		`[1,2,3,4,5,6]`,
+		`[]`,
+	}
+	for _, in := range inputs {
+		data := []byte(in)
+		got := [4]uint64{77, 77, 77, 77}
+		end, err := DecodeUintArray(got[:], data, 0)
+		if err != nil {
+			t.Fatalf("DecodeUintArray(%q): %v", in, err)
+		}
+		if end != len(data) {
+			t.Errorf("DecodeUintArray(%q): end = %d, want %d", in, end, len(data))
+		}
+		var want [4]uint64
+		i := SkipWS(data, 0)
+		i++ // '['
+		idx := 0
+		for {
+			i = SkipWS(data, i)
+			if data[i] == ']' {
+				break
+			}
+			n, end, err := ReadUint64OrNull(data, i)
+			if err != nil {
+				t.Fatalf("reference ReadUint64OrNull at %d: %v", i, err)
+			}
+			if idx < len(want) {
+				want[idx] = n
+			}
+			idx++
+			i = SkipWS(data, end)
+			if data[i] == ']' {
+				break
+			}
+			i++ // ','
+		}
+		if got != want {
+			t.Errorf("DecodeUintArray(%q) = %v, want %v", in, got, want)
+		}
+	}
+}
+
+// TestDecodeByteSlice covers the []byte reader's base64 arm directly: reuse
+// replaces, backing is reused when it fits, and the numeric/null arms delegate
+// to the shared uint reader.
+func TestDecodeByteSlice(t *testing.T) {
+	var b []byte
+	if _, err := DecodeByteSlice(&b, []byte(`"aGVsbG8="`), 0); err != nil || string(b) != "hello" {
+		t.Fatalf("base64: %q, %v", b, err)
+	}
+	backing := &b[0]
+	if _, err := DecodeByteSlice(&b, []byte(`"aGk="`), 0); err != nil || string(b) != "hi" {
+		t.Fatalf("reuse: %q, %v", b, err)
+	}
+	if &b[0] != backing {
+		t.Error("smaller decode did not reuse the backing")
+	}
+	if _, err := DecodeByteSlice(&b, []byte(`[104,105,33]`), 0); err != nil || string(b) != "hi!" {
+		t.Fatalf("numeric: %q, %v", b, err)
+	}
+	if _, err := DecodeByteSlice(&b, []byte(`null`), 0); err != nil || b != nil {
+		t.Fatalf("null: %v, %v", b, err)
+	}
+	if _, err := DecodeByteSlice(&b, []byte(`""`), 0); err != nil || b == nil || len(b) != 0 {
+		t.Fatalf("empty base64: %#v, %v", b, err)
+	}
+	if _, err := DecodeByteSlice(&b, []byte(`"???"`), 0); err == nil {
+		t.Fatal("invalid base64 accepted")
+	}
+}
