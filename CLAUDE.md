@@ -1447,6 +1447,49 @@ no regressions.)
   a raw `*results.txt` (gitignored) and commit the per-arch `.md`. `pkg_bench.sh`
   takes an optional benchmark-name filter as `$1` and honours `BENCHTIME`/`BENCHCOUNT`.
 
+## Apple M2 re-validation of the Zen-4-measured stack (2026-08-08)
+
+Every perf commit landed since the NEON whole-loop port was interleaved-A/B'd
+(n=10, benchstat, parent-vs-commit builds from worktrees) on Apple M2, since all
+of them had been measured only on the pinned Zen 4 box. Everything transfers in
+direction; four entries diverge enough in magnitude to matter when reading the
+per-entry numbers above (M2 vs Zen 4):
+
+- **Transfers cleanly**: escape second pass (twitterescaped −7.1% vs −8.4%, gsoc
+  −4.6% vs −2.3%; the UnescapeString micro isolates it — unicode_escaped_dense
+  −9.3%/−10.8%, every other case exactly flat), any-path inlines (DecodeAny citm
+  −3.5% vs −4.15%, twitterescaped −1.9% vs −3.45%), len(key) dispatch
+  (cloudflare −2.05% vs −2.16%), SetMany/SetPaths all-found early exits (−92% on
+  the early-exit shapes, 1005→82 ns / 1086→89 ns), and the arena directive,
+  which is *better* on M2: marine_ik **−6.6%** time (Zen 4 −2.8%), mesh −3.0%,
+  allocs/op identical to Zen 4 (−94.9%/−99.2%).
+- **GrowSliceEst**: github_events B/op −37.3% — *exactly* the Zen 4 number, as
+  allocation mechanics must be — but time −10.8% vs Zen 4's −27.6% (M2's
+  faster allocator/memmove shrinks the doubling share it removes).
+- **Smaller on M2**: strip_defaults skipWS port — StripDefaultsPretty −4.0% (vs
+  −11.7%), StripDefaults −1.0%, but StripDefaultsCompact **+2.7%** (vs −5.1%);
+  net ≈ wash on M2, clearly positive on Zen 4. All-spaces SkipWSRun fast path —
+  citm −0.9% (vs −4.1%): the M-class OoO core hides the classify ALU ops the
+  fast path skips, even though SkipWSRun is still ~22% of citm's decode tree on
+  M2. Same lesson as the unknown-field-skip rejection: M2 hides short
+  ALU/call-frame savings that Zen 4 exposes.
+- **Set-walker readKey inline**: the early exits dominate the commit, but the
+  inline-key-read half is mildly *negative* on M2 — overwrite_nonobject +5.4%
+  (~2 ns), append +2.5%, replace/SetMany/SetPaths +1.6–1.9%, create_nested
+  −3.7% — where Zen 4 measured −8.8%/−6.5%. Third confirmation (after the
+  get.go flats and the unknown-field-skip revert) that this trick pays on Zen 4
+  and is ~neutral-to-slightly-negative on M2. Keep: the Zen 4 win is real and
+  the M2 cost is ~2 ns on ns-scale micros.
+
+M2 profiling note: macOS CPU profiles are dominated by `runtime.kevent` +
+`runtime.madvise` samples from background threads (81%+18% flat on a citm run —
+they swamp the denominator). Read decode shares with `pprof
+-ignore='kevent|madvise|pthread'` or as fractions of the decode tree, not of
+total samples. The filtered M2 profiles match the documented cost structure:
+citm SkipWSRun ~22% of decode, cloudflare scanner ~30% + unknown-field skips
+~33%, gsoc scanner+decodeEscaped — all already-attacked or documented-intrinsic;
+no new addressable hot spot surfaced.
+
 ## Session 2026-08 fixes worth knowing (correctness/API)
 
 - **`valueDecoder` memo keys now carry `g.prefix + g.cmark()`** like every other
