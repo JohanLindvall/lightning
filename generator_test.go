@@ -278,6 +278,140 @@ type Root struct {
 		wantNoWarn: []string{"omitempty", "field B", "field D", "field E"},
 	},
 	{
+		// A2. A json tag name encoding/json's isValidTag rejects (it allows
+		// letters, digits and one punctuation set; a quote, backslash or control
+		// byte is out) makes the stdlib discard the WHOLE tag and key the field by
+		// its Go field name. lightning has no such rule, so the two disagree in
+		// both directions with no error on either side: lightning answers to a key
+		// the stdlib never looks for, and not to the field name it falls back to.
+		// Warned rather than rejected (that would fail a schema decoding correctly
+		// today) and rather than adopting the fallback (that would silently change
+		// which key an existing decoder answers to) — the ",string" precedent.
+		//
+		// The probe is the divergence itself, both directions, through the
+		// methodless twin. '|' is deliberately in the schema as a NON-case: it is
+		// in the stdlib's allowed set, so lightning's alternate names draw no
+		// warning even though the stdlib reads them as one long key.
+		name: "invalid_json_tag_names",
+		schema: `package main
+
+type Root struct {
+	Q    int "json:\"a\\\"b\""
+	BS   int "json:\"a\\\\b\""
+	NL   int "json:\"a\\nb\""
+	OK   int "json:\"ok.name-1/2\""
+	Alt  int "json:\"alt|other\""
+	Sp   int "json:\"with space\""
+}
+
+type rootStd Root
+`,
+		probe: `package main
+
+import (
+	"encoding/json"
+	"fmt"
+)
+
+const (
+	tagKeys   = "{\"a\\\"b\":1,\"a\\\\b\":2,\"a\\nb\":3}"
+	fieldKeys = "{\"Q\":1,\"BS\":2,\"NL\":3}"
+)
+
+func main() {
+	var v Root
+	if err := v.UnmarshalJSON([]byte(tagKeys)); err != nil {
+		panic(err)
+	}
+	var s rootStd
+	if err := json.Unmarshal([]byte(tagKeys), &s); err != nil {
+		panic(err)
+	}
+	fmt.Printf("tag keys:   lightning=%d,%d,%d stdlib=%d,%d,%d\n", v.Q, v.BS, v.NL, s.Q, s.BS, s.NL)
+
+	var v2 Root
+	if err := v2.UnmarshalJSON([]byte(fieldKeys)); err != nil {
+		panic(err)
+	}
+	var s2 rootStd
+	if err := json.Unmarshal([]byte(fieldKeys), &s2); err != nil {
+		panic(err)
+	}
+	fmt.Printf("field keys: lightning=%d,%d,%d stdlib=%d,%d,%d\n", v2.Q, v2.BS, v2.NL, s2.Q, s2.BS, s2.NL)
+}
+`,
+		want: `tag keys:   lightning=1,2,3 stdlib=0,0,0
+field keys: lightning=0,0,0 stdlib=1,2,3
+`,
+		wantWarn:   []string{"field Q", "field BS", "field NL", "encoding/json"},
+		wantNoWarn: []string{"field OK", "field Alt", "field Sp"},
+	},
+	{
+		// The README used to say that embedding a type from another package "is
+		// decoded as a single named field instead of being flattened". It is not:
+		// only the three selector types the generator knows decode at all, and
+		// anything else fails the run — which is the right failure mode (silently
+		// decoding an opaque foreign type would be worse) but was documented as
+		// the opposite. Pinned here so the doc and the behavior cannot drift apart
+		// again; the known-selector half is pinned by the sibling case below.
+		name: "foreign_embedded_type_is_an_error",
+		schema: `package main
+
+import "strings"
+
+type Root struct {
+	strings.Builder
+	A int "json:\"a\""
+}
+`,
+		wantErr: "unsupported type strings.Builder",
+	},
+	{
+		// The exception the README sentence was reaching for: the three selector
+		// types the generator does know decode as named fields when embedded,
+		// keyed by the type name (encoding/json keys them the same way, and for
+		// time.Time and json.RawMessage then hands the whole document to the
+		// promoted UnmarshalJSON — see conformance's
+		// TestEmbeddedUnmarshalerDivergesFromStdlib).
+		name: "known_selector_embeds_decode_as_named_fields",
+		schema: `package main
+
+import (
+	"encoding/json"
+	"time"
+)
+
+type Root struct {
+	time.Time
+	json.Number
+	A int "json:\"a\""
+}
+
+type Raw struct {
+	json.RawMessage
+	B int "json:\"b\""
+}
+`,
+		probe: `package main
+
+import "fmt"
+
+func main() {
+	var v Root
+	if err := v.UnmarshalJSON([]byte("{\"Time\":\"2021-01-02T03:04:05Z\",\"Number\":12,\"a\":7}")); err != nil {
+		panic(err)
+	}
+	fmt.Printf("%s %s %d\n", v.Time.Format("2006-01-02"), v.Number, v.A)
+	var r Raw
+	if err := r.UnmarshalJSON([]byte("{\"RawMessage\":{\"z\":1},\"b\":8}")); err != nil {
+		panic(err)
+	}
+	fmt.Printf("%s %d\n", r.RawMessage, r.B)
+}
+`,
+		want: "2021-01-02 12 7\n{\"z\":1} 8\n",
+	},
+	{
 		// D1. Directive validation only looked at comments the parser had
 		// attached to a type declaration, so a blank line between the directive
 		// and its type — or a directive stranded above the package clause —

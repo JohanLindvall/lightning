@@ -1310,3 +1310,169 @@ func TestLaxSwallowsTypeMismatches(t *testing.T) {
 		})
 	}
 }
+
+// The methodless twins for the embedded-Unmarshaler comparison. Stripping the
+// GENERATED UnmarshalJSON is what makes encoding/json decode these by reflection
+// instead of delegating to lightning (the trap CLAUDE.md records); the embedded
+// field's own method still promotes to the twin, which is the stdlib behavior
+// under test.
+type (
+	embedTimeStd   EmbedTime
+	embedRawStd    EmbedRaw
+	embedNumberStd EmbedNumber
+)
+
+// TestEmbeddedUnmarshalerDivergesFromStdlib pins a deliberate departure from the
+// promotion parity the README otherwise claims: when the embedded type carries
+// its own UnmarshalJSON, Go promotes that METHOD to the outer struct, so
+// encoding/json treats the whole struct as a json.Unmarshaler and hands it the
+// entire document — the sibling fields are never decoded. lightning promotes
+// fields only: the embed becomes a named field keyed by its type name and the
+// siblings decode normally.
+//
+// Written in the spirit of TestValidDivergesFromStdlib: neither side is asserted
+// to be right, both are asserted to keep doing what they do, so the disagreement
+// cannot rot into an undocumented one.
+func TestEmbeddedUnmarshalerDivergesFromStdlib(t *testing.T) {
+	// time.Time: its UnmarshalJSON demands a JSON string, so the stdlib fails the
+	// whole document — a loud divergence.
+	doc := []byte(`{"Time":"2021-01-02T03:04:05Z","a":7}`)
+	var std embedTimeStd
+	if err := json.Unmarshal(doc, &std); err == nil {
+		t.Fatalf("stdlib premise changed: %#v decoded without error; the promoted "+
+			"(*time.Time).UnmarshalJSON no longer hijacks the struct?", std)
+	}
+	var v EmbedTime
+	if err := v.UnmarshalJSON(doc); err != nil {
+		t.Fatalf("lightning: %v", err)
+	}
+	// v.Equal is the embedded time.Time's promoted method — the same promotion
+	// that makes encoding/json treat the whole struct as a json.Unmarshaler.
+	if v.A != 7 || !v.Equal(time.Date(2021, 1, 2, 3, 4, 5, 0, time.UTC)) {
+		t.Errorf("got %+v, want the embed decoded as a named field and A=7", v)
+	}
+
+	// json.RawMessage: its UnmarshalJSON accepts anything, so the stdlib silently
+	// swallows the whole document into the embedded field and leaves B zero — the
+	// same divergence without an error to notice it by.
+	rdoc := []byte(`{"RawMessage":{"z":1},"b":8}`)
+	var rstd embedRawStd
+	if err := json.Unmarshal(rdoc, &rstd); err != nil {
+		t.Fatalf("stdlib: %v", err)
+	}
+	if string(rstd.RawMessage) != string(rdoc) || rstd.B != 0 {
+		t.Fatalf("stdlib premise changed: got %+v, want the whole document in the embed", rstd)
+	}
+	var r EmbedRaw
+	if err := r.UnmarshalJSON(rdoc); err != nil {
+		t.Fatalf("lightning: %v", err)
+	}
+	if string(r.RawMessage) != `{"z":1}` || r.B != 8 {
+		t.Errorf("got %+v, want RawMessage={\"z\":1} B=8", r)
+	}
+
+	// Control: json.Number has no UnmarshalJSON, so nothing is promoted and the
+	// two agree — the divergence is the promoted method, not the foreign embed.
+	ndoc := []byte(`{"Number":12,"c":9}`)
+	var nstd embedNumberStd
+	if err := json.Unmarshal(ndoc, &nstd); err != nil {
+		t.Fatalf("stdlib: %v", err)
+	}
+	var n EmbedNumber
+	if err := n.UnmarshalJSON(ndoc); err != nil {
+		t.Fatalf("lightning: %v", err)
+	}
+	if n != EmbedNumber(nstd) {
+		t.Errorf("lightning %+v, stdlib %+v: embedding a type without UnmarshalJSON must agree", n, nstd)
+	}
+}
+
+// TestUnwrapRejectsTrailingContent locks the unwrap option's "parsed as a fresh
+// input" contract at the end of the body as well as the start: content after the
+// wrapped document's top-level value is ErrInvalidJSON, exactly as it is for the
+// same bytes decoded as a root. Before the check the wrapped decode stopped at
+// the first value and ignored the rest, so `"{\"count\":7} garbage"` decoded
+// happily while the identical root document did not.
+func TestUnwrapRejectsTrailingContent(t *testing.T) {
+	bad := []string{
+		`{"count":7} trailing garbage`,
+		`{"count":7}{"count":8}`,
+		`{"count":7} null`,
+		`{"count":7},`,
+		`{"count":7} }`,
+	}
+	for _, body := range bad {
+		// The root decode of the same bytes is the reference behavior.
+		var root UnwrapRoot
+		rootErr := root.UnmarshalJSON([]byte(body))
+		if !errors.Is(rootErr, unstable.ErrInvalidJSON) {
+			t.Fatalf("root decode of %q: err = %v, want ErrInvalidJSON (reference behavior changed)", body, rootErr)
+		}
+		var u UnwrapTrailing
+		err := u.UnmarshalJSON([]byte(wrap(body)))
+		if !errors.Is(err, unstable.ErrInvalidJSON) {
+			t.Errorf("unwrap of %q: err = %v, want ErrInvalidJSON like the root decode", body, err)
+		}
+	}
+
+	// Trailing (and leading) whitespace is not trailing content — the root
+	// accepts it, so the wrapped body must too, and the whole document decodes.
+	for _, body := range []string{`{"count":7}`, "  {\"count\":7}\t\n ", "\n{\"count\":7}"} {
+		var root UnwrapRoot
+		if err := root.UnmarshalJSON([]byte(body)); err != nil {
+			t.Fatalf("root decode of %q: %v (reference behavior changed)", body, err)
+		}
+		var u UnwrapTrailing
+		if err := u.UnmarshalJSON([]byte(wrap(body))); err != nil {
+			t.Errorf("unwrap of %q: %v", body, err)
+			continue
+		}
+		if u.W.Count != 7 || u.X != 9 {
+			t.Errorf("unwrap of %q: got %+v, want W.Count=7 X=9", body, u)
+		}
+	}
+
+	// The empty and all-whitespace bodies keep their own rule — no value, no
+	// error, field left zero (TestUnwrapWhitespaceBody covers the pointer form).
+	for _, body := range []string{``, `   `, "\t\n"} {
+		var u UnwrapTrailing
+		if err := u.UnmarshalJSON([]byte(wrap(body))); err != nil {
+			t.Errorf("unwrap of empty body %q: %v", body, err)
+			continue
+		}
+		if u.W != (Nested{}) || u.X != 9 {
+			t.Errorf("unwrap of empty body %q: got %+v, want the zero field and X=9", body, u)
+		}
+	}
+
+	// unwrap + lax: the check must not turn lax into strict. A wrapped value of
+	// the wrong type is still swallowed (field unset, rest of the object
+	// decoded); trailing content is malformed JSON, which lax has never
+	// tolerated, so it still fails.
+	var lax UnwrapTrailing
+	if err := lax.UnmarshalJSON([]byte(wrapKey("l", `[1,2]`))); err != nil {
+		t.Errorf("lax unwrap of a mistyped value: %v, want it swallowed", err)
+	} else if lax.L != (Nested{}) || lax.X != 9 {
+		t.Errorf("lax unwrap of a mistyped value: got %+v, want the zero field and X=9", lax)
+	}
+	for _, body := range []string{`[1,2] trailing`, `{"count":7} trailing`} {
+		var u UnwrapTrailing
+		if err := u.UnmarshalJSON([]byte(wrapKey("l", body))); !errors.Is(err, unstable.ErrInvalidJSON) {
+			t.Errorf("lax unwrap of %q: err = %v, want ErrInvalidJSON (lax tolerates mismatches, not malformed JSON)", body, err)
+		}
+	}
+}
+
+// wrap builds the outer document whose "w" member is body carried as a JSON
+// string, the shape the unwrap option reads.
+func wrap(body string) string { return wrapKey("w", body) }
+
+// wrapKey is wrap for a chosen member, so the same bodies can be aimed at the
+// plain unwrap field and at the lax one.
+func wrapKey(key, body string) string {
+	q, err := json.Marshal(body)
+	if err != nil {
+		panic(err)
+	}
+	return `{"` + key + `":` + string(q) + `,"x":9}`
+}

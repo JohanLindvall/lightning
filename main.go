@@ -1014,6 +1014,9 @@ func (g *gen) collectFields(st *ast.StructType, prefix string, depth int, allocs
 		if len(tag.unknown) > 0 {
 			g.warnTagOptions(tag.unknown, fieldLabel(f))
 		}
+		if len(tag.names) > 0 {
+			g.warnTagNames(tag.names, fieldLabel(f))
+		}
 		if tag.skip {
 			continue
 		}
@@ -1877,6 +1880,15 @@ i = end`
 // inner's own (int, error) returns stay scoped to the embedded document while the
 // outer cursor advances past the original string. A null or empty string leaves
 // the field at its zero value.
+//
+// The body is a whole document, not a value spliced into the outer one, so the
+// closure ends with the same trailing-content check genUnmarshal emits at the
+// root, and with the same ErrInvalidJSON: `"{\"n\":1} trailing garbage"` must not
+// decode here when the identical bytes are rejected as a root. Without it the
+// wrapped decode stopped at the end of the first value and silently ignored
+// everything after it — the one place the option's "parsed as a fresh input"
+// contract did not hold. Trailing WHITESPACE is still fine (it is on the root
+// path too), which is why the check skips whitespace before comparing.
 func unwrapField(inner string) string {
 	return fmt.Sprintf(`body, bend, berr := unstable.Unwrap(data, i)
 if berr != nil {
@@ -1892,6 +1904,11 @@ if len(body) > 0 {
 			return i, nil
 		}
 %s
+		if unstable.SkipWS(data, i) != len(data) {
+			// Content after the wrapped document's value, rejected exactly as
+			// a root UnmarshalJSON rejects it.
+			return i, unstable.ErrInvalidJSON
+		}
 		return i, nil
 	}(body, 0); ierr != nil {
 		return bend, ierr
@@ -2632,6 +2649,47 @@ func (g *gen) warnTagOptions(opts []string, field string) {
 			continue
 		}
 		g.warnf("unrecognized json tag option %q on %s; it is ignored (this generator understands nocopy, lax and unwrap)", o, field)
+	}
+}
+
+// invalidTagRune returns the first rune of a json tag name that encoding/json's
+// isValidTag rejects. That function allows letters, digits and the punctuation
+// set below; a name containing anything else (a quote, a backslash, a control
+// byte) makes encoding/json discard the WHOLE tag and key the field by its Go
+// field name instead. The set is copied from encoding/json's encode.go — note it
+// includes '|', so lightning's pipe-separated alternate names are valid there
+// too, which is what lets each name be checked on its own.
+func invalidTagRune(name string) (rune, bool) {
+	for _, c := range name {
+		switch {
+		case strings.ContainsRune("!#$%&()*+-./:;<=>?@[]^_{|}~ ", c):
+			// Reserved characters aside, punctuation is allowed in a tag name.
+		case !unicode.IsLetter(c) && !unicode.IsDigit(c):
+			return c, true
+		}
+	}
+	return 0, false
+}
+
+// warnTagNames reports json tag names encoding/json would refuse to use as keys.
+//
+// The two decoders disagree in BOTH directions on such a name: lightning matches
+// the tag as written, so it answers to a key encoding/json never looks for, and
+// it does not answer to the Go field name encoding/json falls back to. Neither
+// side errors, so a schema migrating in either direction silently decodes to zero
+// values.
+//
+// It warns rather than rejecting or adopting the fallback, for the same reason
+// warnTagOptions does: rejecting would fail a schema that decodes correctly here
+// today, and silently re-keying the field to its Go name would change which JSON
+// key an existing decoder answers to. Naming the field and the offending
+// character leaves the choice — rename the key, or keep it knowingly — to the
+// author.
+func (g *gen) warnTagNames(names []string, field string) {
+	for _, n := range names {
+		if c, bad := invalidTagRune(n); bad {
+			g.warnf("json tag name %q on %s contains %q, which encoding/json's tag validation rejects: this generator matches the name as written, while encoding/json ignores the whole tag and matches the Go field name instead", n, field, c)
+		}
 	}
 }
 

@@ -92,6 +92,21 @@ you get a `func (v *Log) UnmarshalJSON(data []byte) error` that parses the JSON
 with an index-based scanner, no reflection, and no allocation on the common
 paths (unescaped strings, integers, object keys).
 
+The `json:"..."` struct tag names the key, as with `encoding/json`, and the
+[alternate-name](#alternate-field-names), [`nocopy`](#the-nocopy-tag-option),
+[`lax`](#the-lax-tag-option) and [`unwrap`](#the-unwrap-tag-option) options
+extend it. One naming rule is *not* shared: `encoding/json` validates the tag
+name and throws the whole tag away when it holds a character outside its allowed
+set — letters, digits, `!#$%&()*+-./:;<=>?@[]^_{|}~` and space — keying the
+field by its **Go field name** instead. A tag holding a quote, a backslash or a
+control byte (`json:"a\"b"`) is therefore one `encoding/json` ignores, while
+lightning has no such rule and matches the name as written: the two then answer
+to different keys in both directions, with no error on either side. `|` is in
+the allowed set, so alternate names are unaffected. The generator prints a
+warning naming the field; it does not reject the tag (that would fail a schema
+decoding correctly today) and does not adopt the field-name fallback (that would
+silently change which key an existing decoder answers to).
+
 ## Supported types
 
 `string`, `bool`, every sized `int`/`uint` kind, `float32`/`float64`,
@@ -199,9 +214,30 @@ exported fields decode as if they were the outer struct's own (an embedded
 pointer is allocated on demand), a name present on both the outer struct and an
 embed is resolved by Go's shallower-wins rule, an equal-depth clash is dropped
 unless a single field is tagged, and an embedded field with its own JSON tag name
-is a plain named field rather than promoted. Embedding a type from another
-package, whose fields aren't visible to the generator, is the one gap — it is
-decoded as a single named field instead of being flattened.
+is a plain named field rather than promoted.
+
+Two limits on that:
+
+- **A struct type from another package cannot be embedded.** Its fields aren't
+  visible to the generator, so there is nothing to promote, and generation
+  *fails* — `type Root struct { strings.Builder; … }` reports `unsupported type
+  strings.Builder`. Only the three foreign types the generator knows —
+  `time.Time`, `json.RawMessage` and `json.Number` — decode when embedded, and
+  they decode as a single named field keyed by the type name (`"Time"`,
+  `"RawMessage"`, `"Number"`), not flattened.
+- **An embedded type that has its own `UnmarshalJSON` is decoded as that named
+  field, where `encoding/json` lets the promoted method take over the whole
+  struct.** Go promotes the *method* as well as the fields, so the outer struct
+  itself satisfies `json.Unmarshaler` and the stdlib hands it the entire
+  document; lightning promotes fields only. Given `struct { time.Time; A int }`
+  and `{"Time":"2021-01-02T03:04:05Z","A":7}`, lightning fills both fields,
+  while `encoding/json` fails the whole decode (`Time.UnmarshalJSON: input is
+  not a JSON string`) — and with an embedded `json.RawMessage` it fails
+  *silently*, capturing the entire document into the embed and leaving the
+  sibling fields zero. lightning's answer is usually the wanted one, but it is a
+  real divergence: don't embed such a type in a schema that has to decode the
+  same way under both. An embedded `json.Number` is unaffected — it carries no
+  `UnmarshalJSON`, so nothing is promoted and the two agree.
 
 ## Differences from `encoding/json`
 
@@ -483,6 +519,12 @@ type (struct, slice, map, scalar…) and with `nocopy` — a `nocopy` string ins
 the embedded document aliases the decoded buffer, which is retained for as long
 as the result is in use. The embedded document is parsed as a fresh input, so
 its own whitespace, escaping, and structure are independent of the outer JSON.
+
+"A fresh input" holds at both ends: the body must be one JSON value and nothing
+more, so content after it fails with `ErrInvalidJSON` exactly as it would at the
+root — `"{\"id\":7} trailing garbage"` is an error, not an `{"id":7}` with the
+rest ignored. Whitespace around the value is fine, and a body that is empty or
+all whitespace still leaves the field at its zero value without an error.
 
 ## Comment directives
 
