@@ -2082,3 +2082,45 @@ against the tree before and after, and the normalized whole-binary disassembly
 pclntab and DWARF line numbers shift when you insert comments — so a naive binary
 comparison would have looked like a code change and a naive `diff` of the source
 proves nothing about codegen. Disassemble and normalize.
+
+### Generator front end: two silent stdlib disagreements, one real bug, one wrong doc
+
+Same area as the entry above, same proof obligation — parent-vs-tree generators
+over conformance plus all 30 bench schemas: **30 of 31 byte-identical**, the one
+that differs adding only the unwrap check below (+25/−0, five identical sites), and
+identical diagnostic streams (no committed schema has a tag name the new check
+flags, so CI stderr does not change).
+
+- **`,unwrap` tolerated trailing garbage in the wrapped body.** The generated
+  closure decoded one value and stopped, so `"{\"n\":1} trailing garbage"` decoded
+  happily while the identical bytes decoded as a *root* are `ErrInvalidJSON`. The
+  body is a whole document, so `unwrapField` now ends with `genUnmarshal`'s own
+  `unstable.SkipWS(data, i) != len(data)` check and the same sentinel. Two
+  neighbours it must not disturb, both covered: the whitespace-only-body guard
+  returns *before* `inner` (so `TestUnwrapWhitespaceBody` is untouched), and
+  `unwrapField` wraps the **lax** code too — a wrapped value of the wrong *type* is
+  still swallowed, while trailing content is malformed JSON, which lax has never
+  tolerated. Locked by `TestUnwrapRejectsTrailingContent`, which decodes every body
+  as a root as well, so the wrapped path is pinned to the root's answer rather than
+  to a hardcoded expectation.
+- **Tag names encoding/json rejects are honored here — warned, not "fixed".**
+  `isValidTag` discards a whole tag holding a character outside its allowed set and
+  keys the field by the **Go field name**; lightning matched the name as written, so
+  the two answered to different keys *in both directions* with no error either side.
+  Both candidate fixes are worse than the warning: rejecting fails a schema that
+  decodes correctly today, and adopting the field-name fallback silently moves which
+  key an existing decoder answers to. `invalidTagRune` copies the stdlib set
+  verbatim — note it contains `|`, which is exactly what makes checking each
+  pipe-separated name separately equivalent to checking the joined tag.
+- **Field promotion is not method promotion.** An embedded `time.Time` or
+  `json.RawMessage` decodes here as a named field keyed by the type name, while Go
+  promotes the embedded `UnmarshalJSON` to the outer struct, so `encoding/json`
+  hands it the entire document: loud for `time.Time`, **silent** for
+  `json.RawMessage` (whole document into the embed, siblings zero). An embedded
+  `json.Number` is the control — no method, no divergence — which is what makes the
+  cause attributable to the promoted method rather than to foreign embedding. Note
+  the methodless twin `type FooStd Foo` still inherits the *embedded* type's
+  methods, which is precisely why it is the right baseline here.
+- **The README's "embedding a foreign type is decoded as a single named field" was
+  false**: generation *fails* (`unsupported type strings.Builder`). The failure mode
+  is right; the doc was wrong, and only the three known selector types embed at all.

@@ -302,6 +302,22 @@ are *silent*.
 - **Numbers are validated by arithmetic, not by grammar**, so `01`, `+1`, `.5` and
   `5.` are accepted while `1e309` is rejected (it has no `float64`). The table
   under [Checking validity](#checking-validity) spells this out.
+- **A json tag name `encoding/json` considers invalid is honored here.** The stdlib
+  validates the tag name and, when it holds a character outside its allowed set
+  (letters, digits, `!#$%&()*+-./:;<=>?@[]^_{|}~` and space), throws the whole tag
+  away and keys the field by its **Go field name**. lightning matches the name as
+  written, so `json:"a\"b"` is filled by the key `a"b` here and by the key `Q` (the
+  Go field name) there — a disagreement in both directions, silent on both sides.
+  The generator warns when it sees such a tag; see [How it works](#how-it-works).
+- **An embedded type with its own `UnmarshalJSON` does not take over the struct.**
+  Go promotes the embedded *method* along with the fields, so `struct { time.Time;
+  … }` itself satisfies `json.Unmarshaler` and `encoding/json` hands the whole
+  document to `time.Time.UnmarshalJSON`, never reaching the sibling fields.
+  lightning promotes fields only: the embed decodes as a named field keyed by its
+  type name and the siblings decode normally. The stdlib fails loudly for
+  `time.Time` and *silently* for an embedded `json.RawMessage`, which captures the
+  entire document and leaves the siblings zero. See
+  [Supported types](#supported-types).
 - **Errors are sentinel values, not typed errors.** Every failure is one of the
   package [sentinels](#errors), matched with `errors.Is`; there is no
   `*json.UnmarshalTypeError` or `*json.SyntaxError` carrying the offending field,
