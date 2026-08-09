@@ -122,7 +122,8 @@ for _, doc := range docs {
 ```
 
 Reuse here is *storage* reuse, not *value* reuse, and that is the one place where it
-parts company with `encoding/json`. Two rules cover it:
+parts company with `encoding/json`. Three rules cover it, and only the last is a
+divergence:
 
 - **Struct fields are decoded in place.** A field the document omits keeps the value
   it had, exactly as with `encoding/json` — that applies to the fields of a nested
@@ -130,6 +131,18 @@ parts company with `encoding/json`. Two rules cover it:
   already points to* (a nil pointer allocates; JSON `null` sets it back to nil), so
   pointer-dense schemas reuse allocation-free. Zero the target yourself if you need
   absent-means-zero.
+- **An explicit `null` follows `encoding/json`'s rule, which splits by kind.**
+  "Unmarshaling a JSON null into any other Go type has no effect on the value and
+  produces no error", so `{"n":null}` leaves a `string`, `bool`, integer, float,
+  `json.Number`, `time.Time`, nested struct or `[N]T` field **exactly as it was** —
+  the same as an omitted key. The kinds a null *does* reach are set: a slice, map,
+  pointer or `any` field becomes nil, and a `json.RawMessage` field takes the four
+  bytes `null` (its `UnmarshalJSON` is called with them, as in the stdlib). The rule
+  is the same for a field tagged `lax`. Like the pointer rule above, this is only
+  observable when the target is not already zero — a struct seeded with defaults, or
+  one reused across documents — which is exactly the pattern this section is about.
+  At the **root**, the same split applies to the receiver: `UnmarshalJSON("null")` on
+  a named slice or map type sets it to nil, and on a struct type does nothing.
 - **Container elements are reset before they are filled.** Every slice element,
   fixed-array element and map value starts from its zero value, so nothing carries
   over from the previous document into an element. The *storage* is still reused:
@@ -232,9 +245,12 @@ Two things that are *not* differences, though they are commonly assumed to be:
 
 - **Trailing commas are rejected**, exactly as `encoding/json` rejects them:
   `{"a":1,}` and `[1,]` both fail with `ErrInvalidJSON`, in generated decoders,
-  `DecodeAny` and [`Valid`](#checking-validity) alike. (The lenient bracket
-  balancer used to *skip* unwanted values would accept them, which is precisely
-  why `Valid` does not use it.)
+  `DecodeAny` and [`Valid`](#checking-validity) alike — and in the value of a
+  [`lax`](#the-lax-tag-option) field, whose skip is that same grammar walk. (The
+  lenient bracket balancer used to *skip* unwanted values would accept them,
+  which is precisely why neither `Valid` nor `lax` uses it. It remains what an
+  *unknown* field's value is skipped with, where nothing downstream depends on
+  those bytes.)
 - **Unknown object keys are skipped**, as with `encoding/json`'s default; there is
   no `DisallowUnknownFields` equivalent.
 
@@ -334,10 +350,19 @@ type Log struct {
 
 Only type mismatches are tolerated; genuinely malformed JSON (a syntax error in
 the value) still fails, since a well-formed value of the wrong type can be
-skipped but a broken one cannot. `lax` works for every field type, including
-nested structs, slices, and maps, where a decode error anywhere in the value
-leaves the whole field unset. It combines with the other options and with
-alternate names — `json:"Name|Title,nocopy,lax"`.
+skipped but a broken one cannot. That is enforced rather than assumed: after a
+failed decode the value is skipped with a walk that *parses* the grammar (the
+same one [`Valid`](#checking-validity) uses) instead of a bracket balancer, so
+`{"l":[1,]}`, `{"l":[1 2 3]}` and `{"l":[1,,2]}` into a `[]int` field tagged
+`lax` fail with `ErrInvalidJSON` exactly as they do without the tag. The
+tolerance covers a mismatch nested anywhere inside an otherwise well-formed
+value, which is the point of the option: `["a"]` into `[]int`, or `{"name":5}`
+into a struct, is still swallowed.
+
+`lax` works for every field type, including nested structs, slices, and maps,
+where a decode error anywhere in the value leaves the whole field unset. It
+combines with the other options and with alternate names —
+`json:"Name|Title,nocopy,lax"`.
 
 On a `time.Time` field, `lax` additionally widens what counts as a valid
 timestamp. Besides strict RFC 3339, it accepts a space in place of the `T`
@@ -621,6 +646,11 @@ worth being precise about, since it is what makes `Valid` useful as a gate:
   and stop, so `{"n":1.2.3}` decodes `n` as `1` with no error while `Valid`
   rejects the document. Read `Valid` as "this is well-formed JSON as lightning
   defines it", not as "every generated decoder will accept this".
+- A [`lax`](#the-lax-tag-option) field is the one place a generated decoder runs
+  *this exact walk*: when the typed decode of such a field fails, the value is
+  skipped by the same grammar check rather than by the bracket balancer, which is
+  what makes "lax tolerates type mismatches, not syntax errors" true. So the
+  "unknown field" leniency above stops at a `lax` field's value.
 
 The divergences from `encoding/json.Valid` are these:
 

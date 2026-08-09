@@ -364,6 +364,103 @@ type ByteSliceDoc struct {
 // only decodable as a root, so it is tested as one.
 type ByteBlob []byte
 
+// NullDoc pins encoding/json's rule for an explicit JSON null: "unmarshaling a
+// JSON null into any other Go type has no effect on the value and produces no
+// error". The rule is only observable on a target that is not already zero — the
+// seeded or reused decode target this library encourages — which is why
+// TestNullFieldsMatchStdlib decodes into a pre-filled value rather than a fresh
+// one. The emitted code got it wrong because the *OrNull readers signal a null
+// by returning the ZERO value with a nil error, and the assignment was
+// unconditional, so every scalar field was wiped instead of kept.
+//
+// One field of every kind is present, because the rule splits by kind: a scalar,
+// json.Number, time.Time, a struct and a fixed-size array are left ALONE, while a
+// slice, map, pointer and any become nil and a json.RawMessage takes the four
+// bytes "null". The nocopy spellings ride along because they use different
+// readers.
+type NullDoc struct {
+	Str    string          `json:"str"`
+	StrNC  string          `json:"strNC,nocopy"`
+	Bool   bool            `json:"bool"`
+	I      int             `json:"i"`
+	I8     int8            `json:"i8"`
+	I64    int64           `json:"i64"`
+	U      uint            `json:"u"`
+	U16    uint16          `json:"u16"`
+	F32    float32         `json:"f32"`
+	F64    float64         `json:"f64"`
+	Num    json.Number     `json:"num"`
+	NumNC  json.Number     `json:"numNC,nocopy"`
+	Time   time.Time       `json:"time"`
+	Nested Nested          `json:"nested"`
+	Arr    [3]int          `json:"arr"`
+	Sl     []int           `json:"sl"`
+	Strs   []string        `json:"strs"`
+	M      map[string]int  `json:"m"`
+	P      *int            `json:"p"`
+	A      any             `json:"a"`
+	R      json.RawMessage `json:"r"`
+}
+
+// NullLaxDoc is NullDoc's ",lax" twin. A lax field decodes into a fresh scratch
+// value and then commits it, so the null rule has to be applied a second time at
+// that commit — and per kind, since committing is right for the kinds a null
+// assigns (slice, map, pointer, any, RawMessage) and wrong for the kinds it
+// leaves alone. Without that, json:"i" and json:"i,lax" disagreed with each
+// other on {"i":null}: the plain field kept its value and the lax one was
+// zeroed. Exercised by TestNullFieldsMatchStdlib.
+type NullLaxDoc struct {
+	Str    string          `json:"str,lax"`
+	I      int             `json:"i,lax"`
+	F64    float64         `json:"f64,lax"`
+	Num    json.Number     `json:"num,lax"`
+	Time   time.Time       `json:"time,lax"`
+	Nested Nested          `json:"nested,lax"`
+	Arr    [3]int          `json:"arr,lax"`
+	Sl     []int           `json:"sl,lax"`
+	M      map[string]int  `json:"m,lax"`
+	P      *int            `json:"p,lax"`
+	A      any             `json:"a,lax"`
+	R      json.RawMessage `json:"r,lax"`
+}
+
+// LaxKinds and StrictKinds are the same shape with and without ",lax" on every
+// field, so one input can be run through both. That pairing is what makes the
+// lax contract testable in both directions: a *type mismatch* must be swallowed
+// by lax and rejected by strict, while a *syntax error* must be rejected by
+// both.
+//
+// The second half was false until the lax skip became unstable.SkipValueStrict.
+// It used to be unstable.SkipValue, a bracket balancer, so any balanced but
+// invalid value — [1,] and [1 2 3] and [1,,2] — was silently dropped and the whole
+// decode returned nil, punching a hole through the trailing-comma rejection the
+// rest of the decoder enforces (and giving a host-dependent answer on some
+// shapes, since SkipValue picks a SIMD or scalar balancer by CPU feature). The
+// field kinds are chosen to cover every branch of the lax value decoder: a
+// slice, a named struct, a map, a time.Time (whose lax reader is a different
+// reader, not just a different error path), a fixed-size array routed through
+// the batched reader, and a bare scalar. X follows the lax field in every test
+// document so a test can tell "swallowed and kept decoding" from "failed".
+type LaxKinds struct {
+	Sl  []int          `json:"sl,lax"`
+	St  Nested         `json:"st,lax"`
+	M   map[string]int `json:"m,lax"`
+	T   time.Time      `json:"t,lax"`
+	Arr [2]int         `json:"arr,lax"`
+	N   int            `json:"n,lax"`
+	X   int            `json:"x"`
+}
+
+type StrictKinds struct {
+	Sl  []int          `json:"sl"`
+	St  Nested         `json:"st"`
+	M   map[string]int `json:"m"`
+	T   time.Time      `json:"t"`
+	Arr [2]int         `json:"arr"`
+	N   int            `json:"n"`
+	X   int            `json:"x"`
+}
+
 // LaxArrays covers fixed-size scalar arrays behind the lax tag option: the
 // value decoder routes them through the batched pkg/unstable array readers
 // (the same ones field-level [N]T uses), and lax semantics still apply — a
