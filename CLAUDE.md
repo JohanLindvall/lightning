@@ -2124,3 +2124,67 @@ flags, so CI stderr does not change).
 - **The README's "embedding a foreign type is decoded as a single named field" was
   false**: generation *fails* (`unsupported type strings.Builder`). The failure mode
   is right; the doc was wrong, and only the three known selector types embed at all.
+
+### Toolkit consistency pass: the same span, read twice
+
+Five low-severity findings in `pkg/json`, four sharing a shape worth naming: **a
+value the walker emits without having decided every byte of it**.
+
+- **`StripDefaults`' keep path re-emitted a member's original input span**, so
+  `RemoveWhitespace` handed back whitespace it promised to remove
+  (`{"b":{ "x" : 0 }}` → `{"b":{ "x" : 0 }}`). The repo's own oracle
+  (`compact(preserve) == remove`) could not see it because no shipped test
+  generated a keep-listed container that empties *with interior whitespace*. **An
+  oracle only tests the inputs you generate; when one exists, ask what shapes it
+  never reaches.** Fixed with `emitKeptCompact` + `compactValue`, both off the hot
+  path — and `handle` came out ~155 instructions *smaller*, because the keep path's
+  inlined `emitField` copy became a call. Outlining a cold branch is a real win
+  here, not a wash.
+- **`SetMany` was the odd one of the family in two ways**: its non-object-root
+  branch replaced the whole *input* instead of the root *value* (dropping leading
+  whitespace and trailing bytes `Set`/`SetPaths` keep), and a key listed twice
+  appended a second member, producing a **duplicate-key document** no later `Valid`
+  would flag. `TestSetManyMatchesSet` locked byte equality on object roots only —
+  the branch it did not cover was the divergent one. Both fixed toward SetPaths'
+  answer (first request wins); `SetMany` is ~60 instructions smaller than before.
+- **`GetPaths` — adding a request changed another request's outcome.** Descending
+  for a deeper path is stricter than skipping a value (`Get(doc,"a")` reads
+  `{"b" 1}`; `Get(doc,"a","x")` reports `ErrExpectColon`), so co-requesting `{a}`
+  and `{a,x}` returned `[nil nil]` plus an error. Capture-before-descend fixes only
+  the same-key case — a path at a *later member* still lost its value. `walkPaths`
+  now returns `(end, err, fatal)`: a failed descent is re-skipped with the same
+  lenient `SkipValue` a solo lookup uses, the walk continues, and the failure is
+  held as the frame's first error and still returned. Nothing is swallowed; each
+  path gets what it would have got alone. Locked by a randomized solo-vs-combined
+  differential — **20 354 mismatches over 300k documents before, 0 after** — which
+  is the kind of check worth writing precisely because the property ("each path
+  behaves as if requested alone") is otherwise only assertable one hand-picked
+  shape at a time.
+
+**Integration note, and the reason it needed care.** The compaction fix and the
+in-place snapshot fix were written on separate branches from the same parent, and
+they touch the same three lines: one re-emits the kept member's original bytes, the
+other changes *where those bytes live*. Composed naively, the compaction would read
+`in` while the snapshot existed precisely because `in` had been overwritten.
+`emitKeptCompact` therefore takes `(src, base)` and compacts out of whichever buffer
+holds the original — snapshot in place, input otherwise. The proof that they compose
+is that the three cases the compaction work had to exclude from its in-place
+assertions now pass with the exclusion removed; that flag is the artifact to look
+for when merging two fixes to one path.
+
+Composing them also cost the zero-alloc contract, since a kept container member
+always snapshotted. **The snapshot exists only because writing the output over the
+input destroys bytes a kept member still needs**, so it is now taken only when the
+output actually aliases the input (`unstable.SameBuffer`, which answers "same
+backing array" and is conservative in the safe direction — anything it cannot prove
+separate still snapshots). With an output buffer of its own the input is only ever
+read, so the copy had no reader. All twelve StripDefaults/Set benchmark rows are
+back to 0 allocs/op.
+
+Method note that paid off twice in this pass: **before claiming a divergence is
+yours, re-run the same input against the parent commit.** The compaction agent
+correctly identified its in-place divergences as pre-existing rather than
+self-inflicted, which is what made the merge a composition problem instead of a bug
+hunt. Note also that agent worktrees branch from *origin/main*, not local `main`, so
+parallel fixes see none of the merges that happened while they ran — check the
+branch parent before assuming a report's baseline matches the tree.
