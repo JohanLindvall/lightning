@@ -69,11 +69,22 @@ jobs:
       # pattern that matches no test. Its committed parity tests therefore ran
       # nowhere and could rot into a compile failure unnoticed; this compiles and
       # runs the self-contained ones. Only the tests — the benchmarks stay out of
-      # CI (they download an ~8 MB input and measure for seconds a case). The Go
-      # toolchain may fetch a newer release here if bench/go.mod's `go` directive
-      # is ahead of the main module's; that is the same switch a contributor sees.
+      # CI (they download an ~8 MB input and measure for seconds a case).
       - name: Bench module tests
         if: matrix.arch == 'amd64'
+        env:
+          # bench/go.mod's `go` directive runs ahead of the main module's, and has
+          # to: it requires go-json-experiment/json, which declares go 1.26, and
+          # MVS floors a module's own directive at the maximum of its dependencies'.
+          # The main module deliberately stays at 1.25.0 — that directive is the
+          # minimum Go a library consumer must have, so it is not a knob to turn for
+          # a benchmark-only module. setup-go installs from the main go.mod and pins
+          # GOTOOLCHAIN=local, which turns that gap into a hard error ("go.mod
+          # requires go >= 1.26 ... GOTOOLCHAIN=local") instead of the toolchain
+          # switch a contributor sees; `auto` restores it, fetching the newer
+          # toolchain for this module alone. The download lands in GOMODCACHE, which
+          # the setup-go cache above already covers.
+          GOTOOLCHAIN: auto
         run: make bench-test
 
   # On a green main build, bump the patch of the latest vX.Y.Z tag (the Go module
