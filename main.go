@@ -318,7 +318,10 @@ func generateTo(inPath string, warn io.Writer) error {
 		// above so it can be inspected).
 		return fmt.Errorf("generated code did not parse, wrote unformatted %s: %w", outPath, ferr)
 	}
-	fmt.Fprintf(warn, "wrote %s\n", outPath)
+	// Best effort: a generated file is not worth failing over an unwritable
+	// diagnostic stream. Discarded explicitly because warn is an io.Writer, so
+	// errcheck's built-in os.Stderr exclusion does not apply here.
+	_, _ = fmt.Fprintf(warn, "wrote %s\n", outPath)
 	return nil
 }
 
@@ -530,7 +533,7 @@ func (g *gen) warnf(format string, args ...any) {
 		g.warned = map[string]bool{}
 	}
 	g.warned[msg] = true
-	fmt.Fprint(g.warn, msg)
+	_, _ = fmt.Fprint(g.warn, msg) // best effort; see the write at the end of generateTo
 }
 
 // warnDirectives warns that every directive in dirs is ineffective on the named

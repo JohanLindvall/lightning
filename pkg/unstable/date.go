@@ -49,7 +49,12 @@ func parseRFC3339(s string, allowSpace bool) (time.Time, bool) {
 	// Cost on the common path is one table load and one not-taken compare (the
 	// bounds check on daysInMonth is proved away by the month test above); the
 	// leap-year divisions run only for a 29 February.
-	if day > int(daysInMonth[month]) && !(month == 2 && day == 29 && isLeapYear(year)) {
+	// The second clause is "and this is not the 29 February exception", De Morgan'd
+	// (staticcheck QF1001 rejects the negated conjunction): daysInMonth holds the
+	// non-leap lengths, so a leap 29 February is the only date the table alone
+	// rejects wrongly. Short-circuiting is unchanged by the rewrite — the year
+	// divisions are still reached only when month == 2 && day == 29.
+	if day > int(daysInMonth[month]) && (month != 2 || day != 29 || !isLeapYear(year)) {
 		return time.Time{}, false
 	}
 
