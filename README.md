@@ -117,6 +117,15 @@ base64 string form the stdlib marshals (`"AQID"`) and a JSON array of numbers
 (`[1,2,3]`); `null` yields nil. A fixed-size `[N]byte` accepts only the numeric
 form, also like the stdlib.
 
+One divergence comes out of the reuse above: a `[]byte` field decodes base64
+straight into the backing array it already has, so a *failed* decode cannot leave
+the previous value intact — the bytes that did decode have overwritten it. The
+field is therefore set to the prefix that decoded, which is what the other
+readers do on error too, rather than left reporting its old length over rewritten
+bytes. `encoding/json` decodes into a fresh buffer and so leaves its target
+untouched; a caller that needs the old value across a failed decode has to keep
+its own copy.
+
 ### Reusing a decode target
 
 Decoding repeatedly into the same value is supported and is the cheapest way to

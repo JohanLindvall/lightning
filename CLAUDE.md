@@ -1693,3 +1693,240 @@ checked by nothing. This is exactly the class of the recorded `maskBlock`
 result-offset bug (confirmed by experiment: that edit is reported by
 `GOARCH=arm64 go vet` and invisible to amd64). New `vet` and `fmt-check` targets;
 `bench-test` compiles the otherwise-unreachable `bench/get`.
+
+## Session 2026-08-09 (second pass): nine fixes from a four-domain review
+
+A second correctness review — generator, pure-Go runtime, SIMD/skip, `pkg/json`,
+one reviewer each — reported 21 findings; the nine load-bearing ones (3 high, 6
+medium) were fixed here. The SIMD and float/escape machinery came back **clean**
+under a guard-page OOB harness, a 6.4M-exec fast-vs-scalar differential, and an
+exact-arithmetic re-derivation of the Eisel-Lemire table, so nothing below touches
+it. As with the first audit, the entries worth carrying are the *reasoning*.
+
+### Generator front-end: four more "exits 0, does not compile" shapes, and one silent no-op
+
+`generator_test.go`'s generate-then-compile table closed the *class*; these are the
+instances it then found in the front end (type collection and root selection). All
+are output-neutral — generators built from the parent commit and from the fix emit
+**byte-identical decoders for conformance and all 30 bench schemas**, which is the
+proof any change in this area owes.
+
+- **Generic and alias declarations were collected as roots.** The collect loop
+  switched on `ts.Type` and never read `ts.TypeParams` or `ts.Assign`, so
+  `type Root[T any] struct{…}` got a method ("cannot use generic type without
+  instantiation") and `type Root = struct{…}` got one too ("invalid receiver type
+  *Root"). Both now **warn and skip**, following the fixed-size-array precedent in
+  the same loop: a schema file may legitimately hold a generic helper or a compat
+  alias, and failing the whole run over an incidental declaration is worse than
+  naming it. If that empties the file, the existing "no top-level struct, slice or
+  map types found" error fires. **One subtlety worth keeping:** an alias to a
+  *struct literal* is still registered in `g.structTypes` (but not `g.order`) — it
+  cannot take a method, but a decoder taking a `*Legacy` is legal Go and that is how
+  such an alias already decoded as a **field** type. Skipping it outright was a real
+  regression, caught only by generating the shape under both generators.
+- **Every `*ast.InterfaceType` routed to the `any` decoder**, so a field typed
+  `interface{ Foo() }` was assigned an `any`. `isAnyInterface` now accepts only the
+  empty interface and its spellings (`interface{ any }`, `interface{ interface{} }`
+  — the same type); a method, an embedded name, or a type set is reported as the
+  unsupported type it is. Note `ast.InterfaceType`'s element list is `Methods`,
+  which holds embedded elements and type-set terms too.
+- **A schema type named like a generated identifier was captured by it.**
+  `type data` met the `[]byte` parameter ("data (parameter) is not a type"),
+  `type unstable` collided with the scanner import, `type max` shadowed the builtin
+  the un-presized slice's capacity hint calls. Now a hard error naming the type
+  (`reservedIdents`/`checkReservedNames`); renaming the generated locals instead was
+  rejected as churn across every committed generated file. **The set is derived, not
+  guessed** — decoder parameters/locals, the generated file's imports, and the
+  predeclared identifiers the generated code names *of its own accord* — and the
+  first two groups were cross-checked by parsing the decoders generated for
+  conformance plus all 30 bench schemas, which declare exactly that list.
+  Predeclared names that reach the output only as an echo of the schema's own type
+  text (`bool`, `uint16`, `any` — `typeStr` prints what the field declares) are
+  deliberately excluded, which leaves one adjacent class unaddressed:
+  `type uint16 struct{…}` used as a field still gets predeclared meaning from
+  `isScalar`. Scope check when editing: adding a local to an emitted template means
+  adding its name to `reservedIdents`. The rule is deliberately a property of the
+  *name* rather than of how far a given schema gets, so the generator now rejects a
+  few schemas that happened to compile — a lone `type data` root is one (a
+  parameter's scope is the function body, so `*data` in the signature still resolves
+  to the type; it breaks only once a *body* says `var zero data`).
+- **A mutually recursive pair beside any other type got NO method and no decoder**,
+  silently. `referenced` marks both members, so both were skipped as "nested", and
+  the `allReferenced` rescue only fired when the cycle was the *entire* file — one
+  unrelated type alongside brought the hole back, and the user's code then failed on
+  a missing `UnmarshalJSON`. The special case is now the general rule
+  (`entryTypes`): start from the types nothing references, mark what they reach,
+  promote a cycle nothing emitted enters, recompute until stable.
+
+  **Two decisions inside that promotion are load-bearing, and both exist to make the
+  result independent of declaration order** — "reorder two `type` lines and a
+  different type becomes decodable" is not a property anyone can reason about.
+
+  *How much to promote: the candidate's whole strongly-connected component.*
+  Promoting one member leaves the rest merely reachable from it, so the decodable
+  member of `MutA ↔ MutB` would be whichever came first — and the fully-cyclic file,
+  which `allReferenced` gave a method per member, would silently lose one on
+  upgrade. The SCC is exactly "the cycle", so the general rule is a strict superset
+  of the special case it replaced.
+
+  *Which candidate: one whose component is a SOURCE of the still-uncovered
+  subgraph* (no other uncovered type outside it reaches it). Taking the first
+  uncovered type in source order is **not** enough, and the gap opens only when the
+  file has no entry type at all — every type referenced by something, so nothing is
+  covered on the first round. Then a record that merely hangs off a cycle is
+  uncovered like everything else, and *declared before* that cycle it gets picked
+  and handed a method, where declaring it after leaves it covered and correctly
+  nested. That is a measured witness, not a hypothetical: the same three
+  declarations in two orders produced `{MutA, MutB}` and `{MutA, MutB, Other}`.
+  Requiring a source makes the first round behave exactly like a file that does have
+  an entry type, which is what keeps a hanger-on nested and its
+  `type recordStd Record` reflection baseline reaching `encoding/json` rather than
+  the generated decoder. A source always exists while anything is uncovered (only
+  uncovered-internal edges can matter — anything referenced by an emitted or covered
+  type would itself be covered — so the condensation of the induced subgraph is a
+  finite non-empty DAG); among sources the first in source order is taken, and that
+  choice is immaterial since distinct sources are mutually unreachable and all of
+  them are promoted before the fixpoint ends.
+
+  **The table test cannot see this class** — each case fixes one declaration order,
+  so an order-sensitive rule passes all of them, and the first fix's per-shape checks
+  did pass while still being order-dependent. `TestEntryTypesOrderIndependent` is the
+  guard that can: it generates every permutation of a schema's top-level
+  declarations (6 and 120 orders over two shapes) and asserts the set of types
+  receiving `UnmarshalJSON` never moves. It runs the generator only, no
+  per-permutation `go build`, which is what makes exhausting 5! orders cheap. Point
+  it at any future change to `entryTypes`.
+
+### `,lax` swallowed syntax errors, and the fix deduplicated a grammar
+
+`laxField` skipped a failed field's value with `unstable.SkipValue` — a bracket
+balancer — so every *balanced but invalid* value was dropped silently and the whole
+decode returned nil: `{"l":[1,]}`, `{"l":[1 2 3]}`, `{"l":[1,,2]}` into a `[]int`
+field tagged `lax` all gave `err=nil, L=[], X=9`, where the same field without the
+tag fails. That contradicted the option's own doc comment and README, punched a hole
+through the trailing-comma rejection the rest of the decoder enforces, and was
+**host-dependent** on some shapes (SkipValue picks a SIMD or scalar balancer by CPU
+feature, and the two differ off the well-formed set — the divergence classes
+`TestSkipPathsDivergeOnMalformed` already pins).
+
+The fix needed a *validating* skip and one already existed: `pkg/json`'s
+`validValue` is exactly a strict single-value parse. It moved to
+**`unstable.SkipValueStrict`** (`pkg/unstable/valid.go`) returning
+`(end int, err error)`; `pkg/json.Valid` is now a six-line wrapper and `laxField`
+calls it in place of `SkipValue`. **One grammar, two callers** is the load-bearing
+part: `Valid`'s contract is "accepts exactly what `DecodeAny` accepts", and a lax
+field now inherits that by construction instead of a parallel implementation
+drifting alongside. Acceptance unchanged: `FuzzValidMatchesDecodeAny` **14.07M
+execs, zero divergence**; `TestValidDivergesFromStdlib` untouched. One deliberate
+change is an *error identity* — a `]`/`}` where a value must start is
+`ErrInvalidJSON` rather than the number reader's `ErrBadNumber`, so lax reports the
+same sentinel a non-lax container loop reports for `[1,]`. The strict walk is a
+scalar parse and slower per byte than the SIMD balancer, but runs only after a
+decode has already failed; `SkipValue` remains what an *unknown* field's value is
+skipped with, where nothing downstream depends on those bytes.
+
+New test worth knowing: `SkipValueStrict`'s **end offset** is pinned against
+`SkipValue` on well-formed input (`pkg/unstable/valid_test.go`). `Valid` only reads
+the error, so a walk that returned the wrong end would pass every Valid test —
+including the 14M-exec fuzz — while making a lax field resume in the middle of the
+value it just skipped.
+
+### An explicit JSON null zeroed scalar fields
+
+Every `*OrNull` reader signals a null by returning the **zero value with a nil
+error**, and the emitted code assigned it unconditionally — so `{"s":null}` wiped a
+string/bool/int/uint/float/`json.Number`/`time.Time` field where encoding/json
+documents "unmarshaling a JSON null into any other Go type has no effect on the
+value". Invisible on a fresh target (the zero was already there) and wrong on
+exactly the targets this library promotes: a struct seeded with defaults, and one
+reused across documents.
+
+The guard is on the **assignment**, not the read: `if data[i] != 'n' { dest = v }`.
+Two invariants make it exact and in bounds at every emission site, both worth
+keeping: `i` still holds the value's start (the templates assign `i = end` only
+after the guard, and no `*OrNull` reader skips leading whitespace of its own), and
+**`data[i]` is in range *because the reader returned nil*** — every one of them
+returns `ErrTruncated` when `i >= len(data)`, so the bound does not depend on the
+caller. Guarding the assignment leaves the readers byte-identical.
+
+The rule splits by kind and **`laxField` has to repeat the split** (`nullAssigns`):
+a lax value decodes into a fresh zero scratch and commits it, so for the kinds whose
+null arm leaves the destination alone (scalar, `time.Time`, `json.Number`, struct,
+`[N]T`) the commit needed the same guard — otherwise `json:"i"` and `json:"i,lax"`
+disagreed with each other on `{"i":null}` — while the kinds whose null arm *assigns*
+(nil for slice/map/pointer/`any`, the literal `null` for `json.RawMessage`) keep the
+unconditional commit.
+
+### A null at the ROOT left a named slice or map alone
+
+`genUnmarshal` intercepts a null document and returns before calling the root
+decoder — whose own null arm is the thing that nils a slice or map. So
+`List{1,2}.UnmarshalJSON("null")` left `[1 2]` where the stdlib gives nil, while the
+same named type used as a *field* was nil'd by the very arm the intercept skipped.
+Fixed with a per-kind `nullReset` (`*v = nil` for slice and map roots, nothing for
+struct roots, which the stdlib also no-ops). Conformance had a null-root test that
+passed either way because it decoded into an *already nil* root — the same "a
+differential over inputs that lack the feature under test proves nothing" lesson as
+the SetPaths duplicate-key finding.
+
+### A failed base64 decode left `[]byte` reporting a stale length over rewritten bytes
+
+`decodeByteSlice` reuses `*out`'s backing when the decoded bytes fit, and
+`base64.Decode` fills that backing quantum by quantum before it reports a bad one.
+Returning the error without touching `*out` therefore never preserved the caller's
+previous value — the bytes are already gone — it only left the old **length**
+describing rewritten bytes, so a caller that handles the error and keeps using the
+value saw a silent splice of two documents: `"QUJD####"` into a retained
+`"0123456789abcdef"` left `"ABC\x00456789abcdef"`. It now publishes `b[:n]` on every
+return, the partial-progress convention every other reader in `batch.go` already
+follows (`*out = s` on all paths, errors included), so `len(*out)` says exactly what
+decoded and the semantics no longer depend on whether the target had spare capacity.
+encoding/json leaves its target untouched because it always decodes into a fresh
+buffer; that divergence is documented on `DecodeByteSlice`.
+
+### Measuring the null guard: interleaving two *binaries* does not control for layout
+
+The null guard is the only change here that adds hot-path work (~5 instructions per
+matched scalar field), so it was measured — on a **contended laptop** (i7-1360P,
+load 15–22 from concurrent agents, powersave governor), where per-rep paired deltas
+span −14%…+29%. Four harnesses, benchstat verdict `~` in all six comparisons:
+
+- cross-binary interleaved n=14: cloudflare −0.8% (p=0.659)
+- cross-binary interleaved n=30: cloudflare **+4.0%** (p=0.060), citm +0.5%
+- cross-binary **ABBA** n=30: cloudflare +3.3% (p=0.408), citm +0.8% (p=0.633);
+  robust paired estimators read +2.5…+3.5% on cloudflare
+- **both decoders in ONE binary**, n=30: cloudflare **−1.2%** (p=0.756),
+  citm **−0.6%** (p=0.686)
+
+**The lesson: interleaving two binaries does not control for link layout.** Put both
+variants in one binary (rename the schema's top-level types, as `run_bench.sh`
+already does for its destructive/arena twins) and the apparent +3% disappears —
+the same "adding code shifts a micro-benchmark a few % with no change to executed
+instructions" effect the float-array entry records, showing up as a *between-binary*
+rather than a within-binary artifact. Second methodology note: a fixed
+base-then-opt arm order *within* each rep biases every rep the same way; alternate
+it (ABBA). Interleaving alone is not enough — position within a rep has to alternate
+too.
+
+Static confirmation, which is load-independent and agreed with the same-binary
+result: cloudflare's decoder grows 1611 → 1928 instructions, but **+25 of those are
+`runtime.panicBounds` sites and objdump puts them in the cold function tail**; the
+call structure is otherwise byte-identical (`indexQuoteOrBackslashSSE2` still
+inlines at the readKey site, no `memequal`, no new `SkipWSRun` frame — the guard did
+*not* push the wide decoder past the inliner's big-caller threshold, the documented
+failure mode for adding code to `string_unicode`-sized decoders). citm's root
+decoder is byte-identical (766 instructions both ways; its scalars live in nested
+decoders). A hoisted variant (probe `data[i]` *before* the reader call) does **not**
+let the compiler prove the index (still 53 panicBounds) and saves only 57
+instructions, so it was not adopted. The escape hatch, if a pinned box ever
+disagrees, is one line: make `nullGuard` return `dest = val`.
+
+### Testing note that generalized
+
+`time.Time` implements `json.Unmarshaler`, so `TestStdlibTwinsAreReflectionOnly`'s
+guard (it fails on any Unmarshaler in a twin's reflect graph) rejects any twin
+containing a `time.Time` field. The exception list is now `{json.RawMessage,
+time.Time}` — both standard-library-owned, i.e. the behaviour the differentials
+measure lightning *against* rather than a way for the comparison to short-circuit
+back into lightning's own decoder. Any future twin holding a stdlib type with its
+own `UnmarshalJSON` needs the same treatment.
