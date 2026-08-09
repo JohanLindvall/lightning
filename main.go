@@ -15,14 +15,19 @@
 //
 // For each input file FOO.go it writes FOO_unmarshal.go next to it, containing
 // an UnmarshalJSON method for every top-level struct, slice, or map type (a
-// type nested inside another gets an internal decode function instead). The
-// generated code calls the shared scanner helpers in pkg/unstable.
+// type nested inside another gets an internal decode function instead, emitted
+// by the type that reaches it; where a group of types reference each other in a
+// cycle no other type enters, every member of that cycle gets the method).
+// Generic types and type aliases get neither — no method can be
+// declared on them — and are skipped with a warning. The generated code calls
+// the shared scanner helpers in pkg/unstable.
 //
 // Supported field types: string, bool, all sized int/uint kinds, float32,
 // float64, json.Number, time.Time, json.RawMessage, nested (named or anonymous)
 // structs, slices, fixed-size arrays ([N]T), maps with string keys, pointers,
-// and interface{}/any (decoded into the usual Go representation of an arbitrary
-// JSON value). A []byte field follows encoding/json: both the stdlib's base64
+// and the empty interface any/interface{} (decoded into the usual Go
+// representation of an arbitrary JSON value; an interface with methods is not
+// supported). A []byte field follows encoding/json: both the stdlib's base64
 // string form and a JSON array of numbers decode into it.
 //
 // Numbers are converted to the field's declared type without a range check,
@@ -168,6 +173,38 @@ func generateTo(inPath string, warn io.Writer) error {
 					g.errs = append(g.errs, fmt.Errorf("unknown directive //lightning:%s on type %s", dir, ts.Name.Name))
 				}
 			}
+			// Two declaration forms carry a struct/slice/map type that no method
+			// can be attached to, and both reach the type switch below as an
+			// ordinary TypeSpec — the switch reads ts.Type and never looks at
+			// how the type was declared. Without these tests the generator
+			// collected them like any other root and exited 0 having written a
+			// package that does not compile ("cannot use generic type
+			// Root[T any] without instantiation"; "invalid receiver type
+			// *Root"). Skipped with a warning rather than failed, following the
+			// fixed-size-array case just below: a schema file may legitimately
+			// hold a generic helper or a compatibility alias that was never
+			// meant as a root, and failing the whole run over an incidental
+			// declaration is worse than naming it and moving on. If that leaves
+			// nothing at all, the "no top-level struct, slice or map types
+			// found" error below still fires.
+			if ts.TypeParams != nil {
+				g.warnf("generic type %s gets no UnmarshalJSON: a decoder cannot be generated for a type with type parameters", ts.Name.Name)
+				continue
+			}
+			if ts.Assign.IsValid() {
+				// An alias to a struct literal stays resolvable as a FIELD
+				// type: `type Legacy = struct{...}` is not a defined type, so
+				// no method can be attached, but a generated decoder taking a
+				// *Legacy is perfectly legal and that is how such an alias
+				// already decoded. Registering it without adding it to g.order
+				// keeps that working while denying it the method it cannot
+				// have.
+				if st, isStruct := ts.Type.(*ast.StructType); isStruct {
+					g.structTypes[ts.Name.Name] = st
+				}
+				g.warnf("type alias %s gets no UnmarshalJSON: a method can only be declared on a defined type (drop the '=' to define one)", ts.Name.Name)
+				continue
+			}
 			dirs := lightningDirectives(gd.Doc, ts.Doc)
 			isStruct := false
 			switch t := ts.Type.(type) {
@@ -246,6 +283,7 @@ func generateTo(inPath string, warn io.Writer) error {
 	if len(g.order) == 0 {
 		return errors.New("no top-level struct, slice or map types found")
 	}
+	g.checkReservedNames()
 
 	// A top-level type that is nested inside another (referenced by one of its
 	// fields, directly or through slices/maps/pointers/anonymous structs) gets
@@ -257,25 +295,31 @@ func generateTo(inPath string, warn io.Writer) error {
 	// types are needed for recursive or shared schemas (e.g. a tree node, a FHIR
 	// code) that an anonymous struct cannot express. With one top-level type — the
 	// common case — nothing is referenced, so every type still gets its method.
+	refs := make(map[string]map[string]bool, len(g.order))
 	referenced := map[string]bool{}
 	for _, name := range g.order {
+		r := map[string]bool{}
 		if st, ok := g.structTypes[name]; ok {
 			for _, f := range st.Fields.List {
-				g.markReferenced(f.Type, name, referenced)
+				g.markReferenced(f.Type, name, r)
 			}
 		} else if at, ok := g.sliceTypes[name]; ok {
-			g.markReferenced(at.Elt, name, referenced)
+			g.markReferenced(at.Elt, name, r)
 		} else if mt, ok := g.mapTypes[name]; ok {
-			g.markReferenced(mt.Value, name, referenced)
+			g.markReferenced(mt.Value, name, r)
+		}
+		refs[name] = r
+		for u := range r {
+			referenced[u] = true
 		}
 	}
-	allReferenced := len(referenced) == len(g.order) // degenerate (fully cyclic); emit all
+	emitted := g.entryTypes(refs, referenced)
 
 	// A referenced type's decoder is emitted by the root that reaches it, under
 	// that root's directives — its own directives are never read, so tell the
 	// user rather than silently generating the plain variant.
 	for _, name := range g.order {
-		if referenced[name] && !allReferenced {
+		if !emitted[name] {
 			g.warnDirectives(g.typeDirectives[name], name,
 				"the type is nested inside another type; its decoder follows the enclosing root's directives")
 		}
@@ -287,7 +331,7 @@ func generateTo(inPath string, warn io.Writer) error {
 
 	var methods []string
 	for _, name := range g.order {
-		if referenced[name] && !allReferenced {
+		if !emitted[name] {
 			continue // nested in another type; its decoder is emitted there
 		}
 		g.compact = g.compactTypes[name]
@@ -458,6 +502,77 @@ func (g *gen) noteQualifiers(e ast.Expr) {
 		}
 		return true
 	})
+}
+
+// reservedIdents are the identifiers the generated code puts in scope around the
+// schema's own type names. A schema type sharing one of these names is captured
+// by the generated declaration and stops being a type where the decoders name it
+// — `var zero zero` makes the following `make([]zero, ...)` illegal, a decoder
+// body that says `new(data)` or `var zero data` resolves data to the []byte
+// parameter, and a package-level `unstable` collides outright with the scanner
+// import. Every one of those is the generator's characteristic failure: it exits
+// 0 having written a package that does not compile, so the collision is reported
+// as an error at generate time instead (see checkReservedNames).
+//
+// The set is derived by reading the format strings in this file — the only place
+// generated text is written — in three groups:
+//
+//  1. Parameters and locals every emitted decoder declares: the signatures of
+//     genUnmarshal / genStructBody / valueDecoder / arrayDecoder / sliceDecoder /
+//     mapDecoder, and the locals in readKey, skipUnknown, scalar, rawMessage,
+//     numberRead, timeRead, anyValue, skipEmit, laxField, unwrapField,
+//     callDecoder and the pointer arm of field. Names this generator prefixes
+//     with "lightning" (lightningArrStart, the dispatch labels) are excluded —
+//     the prefix exists precisely so they cannot collide.
+//  2. The packages the generated file imports: an import name and a
+//     package-level declaration may not share an identifier. The schema's own
+//     encoding/json and time qualifiers are checked separately in
+//     checkReservedNames, since they are whatever the input file imports them as.
+//  3. The predeclared identifiers the generated code names of its own accord. A
+//     package-level declaration shadows the universe block, so `type max
+//     struct{...}` breaks the capacity hint's max(4, ...) and `type nil
+//     struct{...}` breaks every `return end, nil`. Predeclared names that reach
+//     the output only as an echo of the schema's own type text (bool, float64,
+//     uint16, any — typeStr prints what the field declares) are deliberately
+//     not here: nothing in the generated code puts them in scope.
+//
+// Groups 1 and 2 were cross-checked against reality rather than only read off
+// the templates — parsing the decoders generated for the conformance suite and
+// all 30 benchmark schemas yields exactly this list of declared parameters,
+// locals and imports (plus the blank identifier and lightningArrStart).
+//
+// Keep it in step with the templates: adding a local to an emitted body means
+// adding its name here.
+var reservedIdents = map[string]bool{
+	// 1. decoder parameters and locals
+	"a": true, "b": true, "bend": true, "berr": true, "body": true, "data": true,
+	"depth": true, "end": true, "err": true, "f": true, "first": true, "i": true,
+	"idx": true, "ierr": true, "k": true, "key": true, "ks": true, "lax": true,
+	"m": true, "n": true, "ni": true, "out": true, "s": true, "start": true,
+	"t": true, "v": true, "val": true, "zero": true,
+	// 2. imports of the generated file
+	"unstable": true, "unsafe": true,
+	// 3. predeclared identifiers the generated code uses
+	"append": true, "byte": true, "cap": true, "error": true, "false": true,
+	"int": true, "len": true, "make": true, "max": true, "new": true,
+	"nil": true, "string": true, "true": true,
+}
+
+// checkReservedNames reports every collected type whose name the generated code
+// would capture (see reservedIdents). It is an error, not a warning: unlike a
+// misplaced directive the result does not compile, and the fix — rename the type
+// — is the user's to make. Renaming the generated locals instead was considered
+// and rejected: it would rewrite every committed generated file to buy nothing.
+func (g *gen) checkReservedNames() {
+	for _, name := range g.order {
+		// jsonQual/timeQual are the identifiers the *input* file imports
+		// encoding/json and time under, and the generated file re-imports them
+		// under the same name; "" means the schema does not import that package,
+		// and no type name is empty.
+		if reservedIdents[name] || name == g.jsonQual || name == g.timeQual {
+			g.errs = append(g.errs, fmt.Errorf("type name %q collides with an identifier used by the generated code; rename it", name))
+		}
+	}
 }
 
 func (g *gen) uniq(base string) string {
@@ -1332,6 +1447,14 @@ func (g *gen) field(dest string, expr ast.Expr, hint string, nocopy, lax bool) s
 		return g.callDecoder(dest, fn)
 
 	case *ast.InterfaceType:
+		// Only the empty interface holds an arbitrary JSON value: DecodeValue
+		// returns an `any`, which assigns to `any` and to nothing else. Every
+		// *ast.InterfaceType used to route here, so a field declared
+		// `interface{ Foo() }` generated `v.E = val` with val an any — the
+		// generator exiting 0 on a package that does not compile.
+		if !isAnyInterface(t) {
+			return g.unsupportedf("unsupported type %s for %s: only the empty interface (any) can hold an arbitrary JSON value", g.typeStr(t), dest)
+		}
 		return g.anyValue(dest)
 
 	default:
@@ -2628,6 +2751,148 @@ func (g *gen) markReferenced(expr ast.Expr, self string, ref map[string]bool) {
 	}
 }
 
+// entryTypes decides which collected types get an UnmarshalJSON method: a type
+// is skipped — its decoder emitted by the type that reaches it — only when it is
+// reachable from a type that actually gets one. refs is the reference graph
+// (name -> the top-level types its own definition names, self excluded, as
+// markReferenced builds it) and referenced its union.
+//
+// The obvious rule, "skip everything some other type references", loses a cycle:
+// each member of a mutually recursive pair references the other, so both are
+// referenced, both are skipped, and the pair gets no method AND no decoder — the
+// user's code then fails to compile on the missing UnmarshalJSON, with the
+// generator having exited 0 in silence. That was papered over by a special case
+// for the file where *every* type is referenced (emit all of them), which only
+// fired when the cycle was the whole file: declaring one unrelated type
+// alongside the pair brought the hole back.
+//
+// The fixpoint generalizes that special case instead of guarding it. Start from
+// the types nothing references, mark everything reachable from them, and note
+// that a type which is neither emitted nor reachable can only be sitting on a
+// cycle no emitted type enters; promote one such cycle and recompute, until
+// every type is emitted or covered.
+//
+// Which cycle, and how much of it, is the whole design — both answers exist to
+// make the result independent of DECLARATION ORDER, since "reorder two type
+// declarations and a different type becomes decodable" is not a property anyone
+// can reason about.
+//
+//   - Promote the candidate's whole strongly-connected component, not the
+//     candidate alone. Promoting one member would leave the rest merely
+//     reachable from it, so `MutA ↔ MutB` would give a method to whichever came
+//     first in the file — and would downgrade the fully-cyclic file, which the
+//     old special case gave a method per member, so a cycle-only schema would
+//     silently lose an UnmarshalJSON. Every member of a cycle is mutually
+//     reachable with every other, so the SCC is exactly "the cycle".
+//
+//   - Take the candidate from a SOURCE component of what is still uncovered:
+//     one that no other uncovered type outside it reaches. Scanning for the
+//     first uncovered type in source order is not enough, and the gap only
+//     opens when the file has NO entry type at all (every type referenced by
+//     something, so the first round starts with nothing covered). Then a record
+//     that merely hangs off a cycle — reachable FROM it, never reaching back —
+//     is uncovered like everything else, and if it happens to be declared first
+//     it is picked and handed a method, where declaring it after the cycle
+//     leaves it covered and correctly nested. Requiring a source makes the
+//     first round behave exactly as a file that does have an entry type: the
+//     hanger-on is never a candidate, so it stays nested and its
+//     `type recordStd Record` reflection baseline keeps reaching encoding/json.
+//
+// Among source components the first in source order is taken, and that choice
+// is immaterial: distinct source components are mutually unreachable, so none
+// of them can cover another and every one is promoted before the fixpoint ends.
+//
+// A source always exists while anything is uncovered. Only uncovered-internal
+// edges can matter — if an emitted-or-covered type referenced an uncovered one,
+// that one would be covered by definition — so the condensation of the induced
+// subgraph is a finite non-empty DAG, and a finite non-empty DAG has a source.
+func (g *gen) entryTypes(refs map[string]map[string]bool, referenced map[string]bool) map[string]bool {
+	emitted := make(map[string]bool, len(g.order))
+	for _, n := range g.order {
+		if !referenced[n] {
+			emitted[n] = true
+		}
+	}
+	for {
+		reach := make(map[string]map[string]bool, len(g.order))
+		for _, n := range g.order {
+			reach[n] = reachableFrom(refs, n)
+		}
+		covered := map[string]bool{}
+		for _, n := range g.order {
+			if emitted[n] {
+				for u := range reach[n] {
+					covered[u] = true
+				}
+			}
+		}
+		// The first uncovered type sitting in a source component. reach[u][n]
+		// with !reach[n][u] is "u is strictly upstream of n": u reaches n and n
+		// cannot reach back, so n's component is not a source. Mutual
+		// reachability is the same component and does not disqualify it.
+		promote, first := "", ""
+		for _, n := range g.order {
+			if emitted[n] || covered[n] {
+				continue
+			}
+			if first == "" {
+				first = n
+			}
+			source := true
+			for _, u := range g.order {
+				if u == n || emitted[u] || covered[u] {
+					continue
+				}
+				if reach[u][n] && !reach[n][u] {
+					source = false
+					break
+				}
+			}
+			if source {
+				promote = n
+				break
+			}
+		}
+		if promote == "" {
+			// Unreachable per the DAG argument above. Falling back to the first
+			// uncovered type keeps the walk terminating and every type reachable
+			// from something emitted, which is the property callers depend on —
+			// a silent "no method and no decoder" is the bug this function
+			// exists to prevent, so never let a missing source stop the loop.
+			promote = first
+		}
+		if promote == "" {
+			return emitted
+		}
+		// promote and everything mutually reachable with it: the cycle it sits
+		// on, and any other cycle that shares a member with it.
+		emitted[promote] = true
+		for _, n := range g.order {
+			if reach[promote][n] && reach[n][promote] {
+				emitted[n] = true
+			}
+		}
+	}
+}
+
+// reachableFrom returns every type reachable from start by following refs. start
+// itself is in the result exactly when it lies on a cycle, which is what makes
+// the mutual-reachability test in entryTypes a strongly-connected-component test.
+func reachableFrom(refs map[string]map[string]bool, start string) map[string]bool {
+	seen := map[string]bool{}
+	var walk func(string)
+	walk = func(cur string) {
+		for u := range refs[cur] {
+			if !seen[u] {
+				seen[u] = true
+				walk(u)
+			}
+		}
+	}
+	walk(start)
+	return seen
+}
+
 // unparen strips any enclosing parentheses from a type expression.
 func unparen(expr ast.Expr) ast.Expr {
 	for {
@@ -2669,6 +2934,38 @@ func (g *gen) isRaw(expr ast.Expr) bool {
 func (g *gen) isNumber(expr ast.Expr) bool { return qualified(expr, g.jsonQual, "Number") }
 
 func (g *gen) isTime(expr ast.Expr) bool { return qualified(expr, g.timeQual, "Time") }
+
+// isAnyInterface reports whether an interface type is `any` under another
+// spelling — the only interface a decoded value can be assigned to. That is the
+// empty interface itself, and one whose elements are all embedded empty
+// interfaces (`interface{ any }`, `interface{ interface{} }`), which are the
+// same type. A method (a field with a name), an embedded named interface, or a
+// type-set element makes it something else, and the field is unsupported.
+func isAnyInterface(t *ast.InterfaceType) bool {
+	// Methods is the whole element list, embedded elements and type-set terms
+	// included, not just the methods its name suggests.
+	if t.Methods == nil {
+		return true
+	}
+	for _, f := range t.Methods.List {
+		if len(f.Names) != 0 { // a method
+			return false
+		}
+		switch e := unparen(f.Type).(type) {
+		case *ast.Ident:
+			if e.Name != "any" {
+				return false
+			}
+		case *ast.InterfaceType:
+			if !isAnyInterface(e) {
+				return false
+			}
+		default: // a union, ~T, or a qualified interface name
+			return false
+		}
+	}
+	return true
+}
 
 func isScalar(name string) bool {
 	switch name {

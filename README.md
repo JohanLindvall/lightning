@@ -67,8 +67,14 @@ go run . path/to/data.go
 
 For each input file `FOO.go` it writes `FOO_unmarshal.go` next to it, containing
 an `UnmarshalJSON` method for every top-level type (a struct, or a named slice or
-map root — see [Root types](#root-types)). The generated code imports
-`github.com/JohanLindvall/lightning/pkg/unstable` for the shared scanner.
+map root — see [Root types](#root-types)). A type that another type in the file
+*uses* as a field gets an internal decode function instead of a method, emitted
+by the type that reaches it — so a shared record type stays a plain struct, and a
+`type recordStd Record` reflection baseline still measures `encoding/json`. Where
+a group of types reference each other in a cycle that nothing else enters, every
+member of that cycle gets the method, so which of them you decode into is not
+decided by declaration order. The generated code imports `github.com/JohanLindvall/lightning/pkg/unstable` for the
+shared scanner.
 
 Given:
 
@@ -92,9 +98,15 @@ paths (unescaped strings, integers, object keys).
 `json.RawMessage` (and `RawValue`), `time.Time` (RFC 3339, like `encoding/json`;
 the [`lax`](#the-lax-tag-option) option also accepts a space separator and Unix
 timestamps), nested named and anonymous structs, slices, fixed-size arrays
-(`[N]T`), maps with string keys, pointers, and `interface{}`/`any` (decoded into
-the usual Go representation of an arbitrary JSON value). Unknown object keys are
-skipped.
+(`[N]T`), maps with string keys, pointers, and the *empty* interface —
+`any`, `interface{}`, or a spelling of the same type like `interface{ any }` —
+decoded into the usual Go representation of an arbitrary JSON value. Unknown
+object keys are skipped.
+
+An interface with any content of its own (a method, an embedded named interface,
+a type set) is **not** supported: a decoded value is an `any` and assigns to
+nothing narrower, so the generator reports the field as an unsupported type
+rather than emitting a decoder that does not compile.
 
 A fixed-size array follows `encoding/json`: the leading elements are filled, a
 shorter JSON array leaves the remaining elements zero, and a longer one's extras
@@ -257,6 +269,34 @@ root types (struct, slice, map, in any mix) can live in one input file. For a
 root that is a *bare* `any`/`interface{}` — whose schema you don't know at all —
 there is no method to generate (Go forbids methods on interface types); decode it
 dynamically with [`json.DecodeAny`](#decoding-into-any) instead.
+
+### Declarations that get no method
+
+A schema file usually holds more than roots, so a declaration no method can be
+attached to is **skipped** rather than failing the run — a generic helper or a
+compatibility alias sitting next to the real root should not break the build:
+
+```go
+type Pair[T any] struct{ A T }  // generic: skipped, with a warning (a method needs an instantiated type)
+type Legacy = Record            // alias:   skipped, with a warning (a method needs a defined type)
+type Triple [3]int              // fixed-size array root: skipped
+type ID string                  // not a struct, slice or map: skipped
+```
+
+The two forms that *look* like roots — the generic type and the alias — say so on
+stderr, since silently dropping something spelled like a root is the surprising
+case. Skipping costs an alias nothing else: `type Legacy = struct{…}` still
+decodes wherever another type uses it as a field, it just gets no method of its
+own. The remaining types generate as usual; if *nothing* is left, the run fails
+with `no top-level struct, slice or map types found`.
+
+One thing here is a hard error rather than a warning: a top-level type whose
+**name is one the generated code already uses** for a parameter, a local, an
+import, or a predeclared identifier — `data`, `i`, `err`, `key`, `zero`, `out`,
+`val`, `unstable`, `max`, `nil`, … The generated bodies would capture it (`var
+zero zero`, or `new(data)` where `data` is the `[]byte` parameter), so the
+generator reports `type name "data" collides with an identifier used by the
+generated code; rename it` instead of writing a package that does not compile.
 
 ## The `nocopy` tag option
 
