@@ -287,9 +287,12 @@ byte-identical when adding cold paths; push new logic out-of-line.
   `,nocopy` on the plugins map *field* does land though: aliasing the 654 plugin-name
   keys is −21% allocs / −2.5% time.)
 - **`slicePresize`** skips presize in two cases. **(1)** When a struct element
-  transitively holds a *multi-dimensional* slice (`hasMultiDimSlice`, e.g. GeoJSON
-  `[][][]float64`): counting it would deep-scan every element's bulk for only
-  ~log2(n) reallocs saved. **(2)** When the slice's element is itself a *fixed-size
+  transitively holds a *multi-dimensional* slice (e.g. GeoJSON `[][][]float64`):
+  counting it would deep-scan every element's bulk for only ~log2(n) reallocs
+  saved. (The test is `structSkipIsCheap`, which walks the element's fields
+  transitively with a `seen` map for cycle safety and answers the more general
+  question "is skipping one of these cheap"; an earlier `hasMultiDimSlice` helper
+  named here until 2026-08-09 no longer exists.) **(2)** When the slice's element is itself a *fixed-size
   array* `[N]T` (the `ArrayType` case is gated on `t.Len == nil`, so a `[3]float64`
   coordinate point in large-json's `[][3]float64` rings disqualifies the ring):
   presizing such a ring runs `CountArrayElements`, which descends through every
@@ -374,7 +377,18 @@ byte-identical when adding cold paths; push new logic out-of-line.
   result offsets — a 32-byte `uint32`-return build silently miscounted because Go
   8-aligns the result block *after the `isArray bool` arg*, so the first return sits
   at +32, not +28. Verify `maskBlock`'s masks with a direct dump if you touch the
-  signature; the live 64-byte form returns `uint64`s, which are 8-aligned anyway.)
+  signature; the live 64-byte form returns `uint64`s, which are 8-aligned anyway.
+  **The reason, re-confirmed by experiment 2026-08-09 — do not "correct" this
+  entry**: the four result stores go through the `CLASS(s, off)` macro, whose body
+  ends `MOVQ AX, off(FP)`. asmdecl scans the assembly *source*, so in the macro
+  definition it sees the token `off(FP)`, never the expanded `quote+32(FP)`, and
+  has nothing to check. Sabotaging `CLASS(Y10, quote+32)` to `quote+28`, and
+  replacing a named reference with a bare `40`, are both accepted in silence —
+  while the *control*, shifting the non-macro `b_base+0(FP)` to `+8`, is reported
+  at once (`invalid offset b_base+8(FP); expected b_base+0(FP)`). So asmdecl is
+  running and is not the problem; macro-hidden FP references are. A probe on a
+  hand-written maskBlock-shaped function *is* flagged and will mislead you into
+  thinking the gotcha is stale — it is the macro, not the toolchain.)
   `findEscaped64` (simdjson's branchless odd-run detection)
   + `prefixXor64` (the carryless-multiply-by-ones done in six shift/XORs — **no
   PCLMULQDQ**, so the bit math is plain Go) build the *inside-string* mask; the
