@@ -40,7 +40,14 @@ func EscapeString(s []byte, out *strings.Builder) {
 // allocation (escaping can lengthen the input, so out still grows when its
 // capacity is exceeded). It escapes the same bytes as EscapeString — control
 // bytes below 0x20, '"' and '\\' — and writes the string body only, without the
-// surrounding quotes, mirroring the in/out convention of UnescapeStringInto.
+// surrounding quotes.
+//
+// out must not overlap s. There is no in-place form of escaping and there cannot
+// be one: every escape writes more bytes than it consumes, so an out aliasing s
+// would overrun the input the scan has not read yet and then rescan the output it
+// had just written. That is the one point where this differs from
+// UnescapeStringInto, whose out == in[:0] is safe precisely because unescaping
+// only ever shrinks.
 func EscapeStringInto(s []byte, out []byte) []byte {
 	n := len(s)
 	p := 0 // start of the current run of bytes that need no escaping

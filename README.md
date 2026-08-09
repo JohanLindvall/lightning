@@ -789,7 +789,11 @@ the result is in use.
 - `EscapeStringInto(s, out []byte) []byte` — appends the escaped form of `s` to
   `out` and returns the extended slice, allocating nothing when `out` has room
   (escaping can grow a string up to 6× for control bytes). Pass `out[:0]` to
-  reuse a buffer across calls.
+  reuse a buffer across calls. `out` must not overlap `s`: escaping has no
+  in-place form, because every escape writes more bytes than it consumes and the
+  appends would run over input the scan hasn't read yet. (That is the one place
+  the two directions differ — `UnescapeStringInto` takes `out == in[:0]` precisely
+  because unescaping only shrinks.)
 
 Clean runs are skipped with a vectorized scan (`indexEscapeSSE2`/`indexEscapeNEON`,
 which classify `"`, `\` and control bytes in one pass), so a string needing little
@@ -837,8 +841,10 @@ forwarding them:
 `output` is filled from the front and the populated prefix is returned; `input`
 is never modified. StripDefaults never lengthens the document, so `output` is grown
 (allocated) only when `cap(output) < len(input)` — pass `input[:0]` to strip in
-place, or a reused buffer to run allocation-free. It is best effort and copies
-malformed input through unchanged.
+place, or a reused buffer to run allocation-free. Stripping in place gives exactly
+the bytes a separate output buffer would: the walk never writes past its own read
+cursor, so it only ever overwrites input it has already consumed. It is best effort
+and copies malformed input through unchanged.
 
 `ws` chooses how inter-token whitespace is handled:
 - `RemoveWhitespace` (the zero value) — tolerate any whitespace; output is compact.
@@ -955,7 +961,10 @@ promise you make: `AssumeCompact` is not verified, as nowhere else in this packa
 verifies a `Compact` claim. And stripping a document down to **nothing** is a
 documented outcome rather than an error — when every member of the root is a
 default, the empty containers cascade up and `StripDefaults` returns zero bytes,
-so test `len()` before forwarding the result.
+so test `len()` before forwarding the result. `PreserveWhitespace` reaches that
+outcome holding the document's outer whitespace, so its raw result is those bytes
+rather than none; `StripDefaultsChecked` reports it the same way in every mode —
+an empty slice and a `nil` error — so `len()` stays the one test.
 
 The cost is the extra `Valid` passes, which allocate nothing; the unchecked
 functions are untouched, so code that doesn't call these pays nothing for them.
