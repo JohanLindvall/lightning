@@ -228,6 +228,35 @@ func TestDestructiveDirective(t *testing.T) {
 	if string(data) == orig {
 		t.Errorf("input was not mutated; in-place unescape did not write through")
 	}
+
+	// The null rule has to survive the mutation. The guard that implements it
+	// re-reads data[i] AFTER the reader has run, and this is the one reader that
+	// writes into data while running — so the byte it re-reads had better still
+	// be the value's first byte. It is: the in-place unescape starts at the
+	// string BODY (i+1) and its write cursor only ever trails its own read
+	// cursor, so the opening quote at data[i] is never overwritten, and a
+	// preceding field's unescape never reaches past its own closing quote.
+	seeded := DestructiveDoc{Name: "keep", Tags: []string{"t"}}
+	nulls := []byte(`{"name":null,"tags":null}`)
+	if err := seeded.UnmarshalJSON(nulls); err != nil {
+		t.Fatal(err)
+	}
+	if seeded.Name != "keep" {
+		t.Errorf("null cleared a destructive nocopy string: %q, want %q", seeded.Name, "keep")
+	}
+	if seeded.Tags != nil {
+		t.Errorf("null left a slice field at %v, want nil", seeded.Tags)
+	}
+	// And with a *mutating* read of the same field earlier in the same document,
+	// so the guard runs on a buffer the decoder has already written into.
+	mixed := []byte(`{"tags":["a\tb","c\nd"],"name":null}`)
+	seeded2 := DestructiveDoc{Name: "keep2"}
+	if err := seeded2.UnmarshalJSON(mixed); err != nil {
+		t.Fatal(err)
+	}
+	if seeded2.Name != "keep2" || len(seeded2.Tags) != 2 || seeded2.Tags[0] != "a\tb" {
+		t.Errorf("got %#v", seeded2)
+	}
 }
 
 // arenaDocStd strips ArenaDoc's UnmarshalJSON so encoding/json decodes it by
@@ -818,5 +847,413 @@ func TestLaxFixedArrays(t *testing.T) {
 	}
 	if m.F != [3]float64{} || m.I != [2]int32{} || m.U != [4]uint16{9} {
 		t.Fatalf("got %#v", m)
+	}
+}
+
+// nullDocStd and nullLaxDocStd strip the generated UnmarshalJSON so encoding/json
+// decodes these by reflection. Without the twin, json.Unmarshal would delegate
+// straight back to lightning and the differential would compare the decoder
+// against itself — see TestStdlibTwinsAreReflectionOnly.
+type nullDocStd NullDoc
+
+type nullLaxDocStd NullLaxDoc
+
+// seedNullDoc returns a NullDoc with every field set to something distinguishable
+// from its zero value, so a null that wrongly overwrites a field is visible.
+func seedNullDoc() NullDoc {
+	p := 42
+	return NullDoc{
+		Str: "keep", StrNC: "keepNC", Bool: true,
+		I: 1, I8: 2, I64: 3, U: 4, U16: 5, F32: 6.5, F64: 7.5,
+		Num: json.Number("8.5"), NumNC: json.Number("9.5"),
+		Time:   time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC),
+		Nested: Nested{Name: "n", Count: 11},
+		Arr:    [3]int{1, 2, 3},
+		Sl:     []int{1, 2}, Strs: []string{"a"},
+		M: map[string]int{"a": 1}, P: &p, A: "any",
+		R: json.RawMessage(`{"old":1}`),
+	}
+}
+
+// TestNullFieldsMatchStdlib pins encoding/json's null rule field by field, on a
+// SEEDED target — the only place the rule is observable, since into a fresh
+// target "leave the value alone" and "store the zero value" are the same thing.
+// That is exactly why the divergence survived: every benchmark, and most of this
+// suite, decodes into a freshly declared value.
+//
+// The expectation is not spelled out here but taken from a methodless twin, so
+// the test states "lightning agrees with encoding/json" rather than "lightning
+// does what I believe encoding/json does". Against the unfixed generator every
+// scalar row fails (Str "" vs "keep", I 0 vs 1, a zero Time, a zeroed Nested)
+// while the slice/map/pointer/any/raw rows pass, which is the split the fix is
+// built around.
+func TestNullFieldsMatchStdlib(t *testing.T) {
+	allNull := []byte(`{"str":null,"strNC":null,"bool":null,"i":null,"i8":null,` +
+		`"i64":null,"u":null,"u16":null,"f32":null,"f64":null,"num":null,` +
+		`"numNC":null,"time":null,"nested":null,"arr":null,"sl":null,"strs":null,` +
+		`"m":null,"p":null,"a":null,"r":null}`)
+
+	t.Run("seeded", func(t *testing.T) {
+		std := nullDocStd(seedNullDoc())
+		if err := json.Unmarshal(allNull, &std); err != nil {
+			t.Fatalf("stdlib: %v", err)
+		}
+		// Premise check: the stdlib really does keep the scalars. If this fails,
+		// the rule changed and the rest of the test means nothing.
+		if std.Str != "keep" || std.I != 1 || std.Time.IsZero() || std.Nested.Count != 11 || std.Arr != [3]int{1, 2, 3} {
+			t.Fatalf("stdlib premise changed: %+v", std)
+		}
+		l := seedNullDoc()
+		if err := l.UnmarshalJSON(allNull); err != nil {
+			t.Fatalf("lightning: %v", err)
+		}
+		if !reflect.DeepEqual(NullDoc(std), l) {
+			t.Errorf("null into a seeded target diverges:\n stdlib    %+v\n lightning %+v", std, l)
+		}
+	})
+
+	t.Run("fresh", func(t *testing.T) {
+		// The already-correct case, kept as a regression guard: a null into a
+		// fresh target must still produce the zero value, and nil rather than
+		// empty for the reference kinds.
+		var std nullDocStd
+		if err := json.Unmarshal(allNull, &std); err != nil {
+			t.Fatalf("stdlib: %v", err)
+		}
+		var l NullDoc
+		if err := l.UnmarshalJSON(allNull); err != nil {
+			t.Fatalf("lightning: %v", err)
+		}
+		if !reflect.DeepEqual(NullDoc(std), l) {
+			t.Errorf("null into a fresh target diverges:\n stdlib    %+v\n lightning %+v", std, l)
+		}
+	})
+
+	t.Run("reuse", func(t *testing.T) {
+		// The shape a real caller hits: decode a full document, then one whose
+		// fields are null. The second decode must leave the first document's
+		// scalars in place and nil the reference kinds.
+		full := []byte(`{"str":"one","strNC":"oneNC","bool":true,"i":10,"i8":11,` +
+			`"i64":12,"u":13,"u16":14,"f32":1.5,"f64":2.5,"num":3.5,"numNC":4.5,` +
+			`"time":"2021-03-04T05:06:07Z","nested":{"name":"x","count":9},` +
+			`"arr":[7,8,9],"sl":[1],"strs":["s"],"m":{"k":1},"p":5,"a":"aa","r":{"z":1}}`)
+		var std nullDocStd
+		if err := json.Unmarshal(full, &std); err != nil {
+			t.Fatalf("stdlib: %v", err)
+		}
+		if err := json.Unmarshal(allNull, &std); err != nil {
+			t.Fatalf("stdlib: %v", err)
+		}
+		var l NullDoc
+		if err := l.UnmarshalJSON(full); err != nil {
+			t.Fatalf("lightning: %v", err)
+		}
+		if err := l.UnmarshalJSON(allNull); err != nil {
+			t.Fatalf("lightning: %v", err)
+		}
+		if l.Str != "one" || l.I != 10 {
+			t.Errorf("a reused target lost the previous document's scalars: %+v", l)
+		}
+		if !reflect.DeepEqual(NullDoc(std), l) {
+			t.Errorf("null over a reused target diverges:\n stdlib    %+v\n lightning %+v", std, l)
+		}
+	})
+
+	t.Run("lax", func(t *testing.T) {
+		// The same rule reached through ",lax", which decodes into a scratch
+		// value and commits it. That commit has to repeat the per-kind decision,
+		// or json:"i" and json:"i,lax" disagree with each other on {"i":null}.
+		laxNull := []byte(`{"str":null,"i":null,"f64":null,"num":null,"time":null,` +
+			`"nested":null,"arr":null,"sl":null,"m":null,"p":null,"a":null,"r":null}`)
+		p := 42
+		seed := NullLaxDoc{
+			Str: "keep", I: 1, F64: 2.5, Num: json.Number("3.5"),
+			Time:   time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC),
+			Nested: Nested{Name: "n", Count: 11}, Arr: [3]int{1, 2, 3},
+			Sl: []int{1}, M: map[string]int{"a": 1}, P: &p, A: "any",
+			R: json.RawMessage(`{"old":1}`),
+		}
+		std := nullLaxDocStd(seed)
+		if err := json.Unmarshal(laxNull, &std); err != nil {
+			t.Fatalf("stdlib: %v", err)
+		}
+		l := seed
+		if err := l.UnmarshalJSON(laxNull); err != nil {
+			t.Fatalf("lightning: %v", err)
+		}
+		if !reflect.DeepEqual(NullLaxDoc(std), l) {
+			t.Errorf("null into a seeded lax target diverges:\n stdlib    %+v\n lightning %+v", std, l)
+		}
+	})
+
+	t.Run("elements", func(t *testing.T) {
+		// A null *element* of a slice or map decodes into a freshly zeroed slot,
+		// so it must stay zero-filled and nothing about it changes. Included
+		// because it is the property a careless "just skip the assignment" fix
+		// breaks: it would leave a stale element behind on a reused backing.
+		in := []byte(`{"sl":[1,null,3],"strs":["a",null],"m":{"a":1,"b":null},"nested":{"name":null,"count":null}}`)
+		var std nullDocStd
+		if err := json.Unmarshal(in, &std); err != nil {
+			t.Fatalf("stdlib: %v", err)
+		}
+		var l NullDoc
+		if err := l.UnmarshalJSON(in); err != nil {
+			t.Fatalf("lightning: %v", err)
+		}
+		if !reflect.DeepEqual(NullDoc(std), l) {
+			t.Errorf("null elements diverge:\n stdlib    %+v\n lightning %+v", std, l)
+		}
+		if !reflect.DeepEqual(l.Sl, []int{1, 0, 3}) || !reflect.DeepEqual(l.Strs, []string{"a", ""}) {
+			t.Errorf("null elements are not zero-filled: %v %v", l.Sl, l.Strs)
+		}
+		if l.M["b"] != 0 {
+			t.Errorf("null map value is not zero: %v", l.M)
+		}
+
+		// The same document over a SEEDED target is deliberately NOT compared
+		// against the stdlib: encoding/json decodes an array element into
+		// whatever the backing array already holds, so its second element keeps
+		// the old 2, while lightning resets each element first. That is the
+		// pre-existing, documented divergence under "Slice, array and map
+		// elements are reset before being decoded" — asserted here so the null
+		// guard cannot quietly change which of the two rules applies.
+		s := seedNullDoc()
+		if err := s.UnmarshalJSON(in); err != nil {
+			t.Fatalf("lightning: %v", err)
+		}
+		if !reflect.DeepEqual(s.Sl, []int{1, 0, 3}) {
+			t.Errorf("a null element over a seeded slice must reset, got %v", s.Sl)
+		}
+		// The nested struct's own fields ARE reached by the document, so their
+		// nulls follow the field rule: over a seeded Nested they keep the seed.
+		if s.Nested.Name != "n" || s.Nested.Count != 11 {
+			t.Errorf("null inside a seeded nested struct overwrote it: %+v", s.Nested)
+		}
+	})
+}
+
+// pointListStd, scoreMapStd, noCopyListStd and byteBlobStd are the methodless
+// twins for the root types TestNullRootMatchesStdlib compares.
+type pointListStd PointList
+
+type scoreMapStd ScoreMap
+
+type noCopyListStd NoCopyList
+
+type byteBlobStd ByteBlob
+
+// TestNullRootMatchesStdlib pins the *root* half of the same rule, which the
+// generated UnmarshalJSON decides for itself: it intercepts a null document
+// before calling the root decoder, so the decoder's own null arm — the one that
+// nils a slice or map — never ran. A slice or map root therefore kept its
+// previous contents (PointList{…}.UnmarshalJSON("null") left the element in
+// place) while a *field* of that same named type was nil'd by the very arm the
+// intercept skipped. A struct root is correctly a no-op and must stay one.
+//
+// The pre-existing conformance coverage only decoded null into an already-nil
+// root, which passes either way; the seeded receiver below is what makes the bug
+// visible, and the whole test fails against the unfixed generator except for the
+// struct-root subtest.
+func TestNullRootMatchesStdlib(t *testing.T) {
+	null := []byte("null")
+
+	t.Run("slice_root", func(t *testing.T) {
+		l := PointList{{X: 1, Y: 2, Tag: "a"}}
+		std := pointListStd(l)
+		if err := json.Unmarshal(null, &std); err != nil {
+			t.Fatalf("stdlib: %v", err)
+		}
+		if std != nil {
+			t.Fatalf("stdlib premise changed: %v", std)
+		}
+		if err := l.UnmarshalJSON(null); err != nil {
+			t.Fatalf("lightning: %v", err)
+		}
+		if l != nil {
+			t.Errorf("null left a seeded slice root at %v, want nil as the stdlib gives", l)
+		}
+	})
+
+	t.Run("map_root", func(t *testing.T) {
+		m := ScoreMap{"a": 1}
+		std := scoreMapStd(m)
+		if err := json.Unmarshal(null, &std); err != nil {
+			t.Fatalf("stdlib: %v", err)
+		}
+		if std != nil {
+			t.Fatalf("stdlib premise changed: %v", std)
+		}
+		if err := m.UnmarshalJSON(null); err != nil {
+			t.Fatalf("lightning: %v", err)
+		}
+		if m != nil {
+			t.Errorf("null left a seeded map root at %v, want nil", m)
+		}
+	})
+
+	t.Run("directive_and_byte_roots", func(t *testing.T) {
+		// The //lightning:nocopy roots and the []byte root take the same path, so
+		// they get the same reset.
+		nl := NoCopyList{"a", "b"}
+		nlStd := noCopyListStd(nl)
+		if err := json.Unmarshal(null, &nlStd); err != nil {
+			t.Fatalf("stdlib: %v", err)
+		}
+		if err := nl.UnmarshalJSON(null); err != nil {
+			t.Fatalf("lightning: %v", err)
+		}
+		if nl != nil || nlStd != nil {
+			t.Errorf("NoCopyList: lightning %v, stdlib %v; want both nil", nl, nlStd)
+		}
+		nm := NoCopyMap{"a": "b"}
+		if err := nm.UnmarshalJSON(null); err != nil {
+			t.Fatalf("lightning: %v", err)
+		}
+		if nm != nil {
+			t.Errorf("NoCopyMap: %v, want nil", nm)
+		}
+		bb := ByteBlob{1, 2, 3}
+		bbStd := byteBlobStd(bb)
+		if err := json.Unmarshal(null, &bbStd); err != nil {
+			t.Fatalf("stdlib: %v", err)
+		}
+		if err := bb.UnmarshalJSON(null); err != nil {
+			t.Fatalf("lightning: %v", err)
+		}
+		if bb != nil || bbStd != nil {
+			t.Errorf("ByteBlob: lightning %v, stdlib %v; want both nil", bb, bbStd)
+		}
+	})
+
+	t.Run("struct_root_is_a_no_op", func(t *testing.T) {
+		// The other half of the rule, and the reason the reset is not
+		// unconditional: a null document leaves a struct root untouched.
+		n := 7
+		seed := PtrReuse{P: &Nested{Name: "keep", Count: 3}, N: &n}
+		std := ptrReuseStd(seed)
+		if err := json.Unmarshal(null, &std); err != nil {
+			t.Fatalf("stdlib: %v", err)
+		}
+		if std.P == nil || std.P.Name != "keep" || std.N == nil {
+			t.Fatalf("stdlib premise changed: %+v", std)
+		}
+		l := seed
+		if err := l.UnmarshalJSON(null); err != nil {
+			t.Fatalf("lightning: %v", err)
+		}
+		if l.P == nil || l.P.Name != "keep" || l.N == nil || *l.N != 7 {
+			t.Errorf("null zeroed a struct root: %+v", l)
+		}
+	})
+}
+
+// TestLaxRejectsSyntaxErrors is the H3 regression. ",lax" documents that "only
+// type mismatches are tolerated; genuinely malformed JSON (a syntax error in the
+// value) still fails", and it did not: the skip after a failed decode was
+// unstable.SkipValue, a bracket balancer, so every balanced-but-invalid value
+// was dropped silently and the whole decode returned nil — which also punched a
+// hole through the trailing-comma rejection the rest of the decoder enforces,
+// and gave a host-dependent answer on some shapes, since SkipValue picks a SIMD
+// or scalar balancer by CPU feature.
+//
+// Every case is run through StrictKinds too, which pins the premise that the
+// input really is malformed rather than merely mistyped: both must fail. Against
+// the unfixed generator all the balanced rows fail with "lax accepted"; the
+// truncated ones passed even before, since SkipValue could not balance them
+// either.
+func TestLaxRejectsSyntaxErrors(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+	}{
+		{"slice_trailing_comma", `{"sl":[1,],"x":9}`},
+		{"slice_missing_commas", `{"sl":[1 2 3],"x":9}`},
+		{"slice_double_comma", `{"sl":[1,,2],"x":9}`},
+		{"slice_truncated", `{"sl":[1,2`},
+		{"slice_unbalanced", `{"sl":[1,2},"x":9}`},
+		{"slice_bad_keyword", `{"sl":[tru],"x":9}`},
+		// The interesting interaction: a type mismatch is what triggers the
+		// skip, and the skip then has to notice the value is also malformed.
+		{"slice_mismatch_then_garbage", `{"sl":["a"e],"x":9}`},
+		{"slice_mismatch_trailing_comma", `{"sl":["a",],"x":9}`},
+		{"struct_trailing_comma", `{"st":{"name":"a",},"x":9}`},
+		{"struct_missing_colon", `{"st":{"name" "a"},"x":9}`},
+		{"struct_unquoted_key", `{"st":{name:"a"},"x":9}`},
+		{"struct_truncated", `{"st":{"name":"a"`},
+		{"struct_bad_escape", `{"st":{"name":"a\q"},"x":9}`},
+		{"struct_unterminated_string", `{"st":{"name":"a},"x":9}`},
+		{"map_trailing_comma", `{"m":{"a":1,},"x":9}`},
+		{"map_missing_value", `{"m":{"a":},"x":9}`},
+		{"map_truncated", `{"m":{"a":1`},
+		{"array_trailing_comma", `{"arr":[1,],"x":9}`},
+		{"array_missing_commas", `{"arr":[1 2],"x":9}`},
+		{"time_bad_escape", `{"t":"2020-01-02T03:04:05Z\q","x":9}`},
+		{"time_mismatch_trailing_comma", `{"t":["a",],"x":9}`},
+		{"scalar_bad_unicode_escape", `{"n":"\uZZZZ","x":9}`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var s StrictKinds
+			if err := s.UnmarshalJSON([]byte(c.in)); err == nil {
+				t.Fatalf("premise: the non-lax decoder ACCEPTED %s, so it is not a syntax error", c.in)
+			}
+			var l LaxKinds
+			if err := l.UnmarshalJSON([]byte(c.in)); err == nil {
+				t.Errorf("lax accepted malformed JSON %s (decoded %+v); lax must swallow "+
+					"type mismatches only", c.in, l)
+			}
+		})
+	}
+}
+
+// TestLaxSwallowsTypeMismatches is the other half of the contract, and the
+// reason the H3 fix could not simply propagate every error: a well-formed value
+// of the wrong type — including one whose mismatch is buried inside an otherwise
+// well-formed container, which is what makes lax worth having — must still be
+// skipped, leaving the field at its zero value and the rest of the object
+// decoding normally.
+func TestLaxSwallowsTypeMismatches(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+	}{
+		{"slice_is_string", `{"sl":"nope","x":9}`},
+		{"slice_is_object", `{"sl":{"a":1},"x":9}`},
+		{"slice_element_is_string", `{"sl":["a"],"x":9}`},
+		{"slice_element_is_array", `{"sl":[[1]],"x":9}`},
+		{"slice_element_is_object", `{"sl":[{"a":1},2],"x":9}`},
+		{"struct_is_number", `{"st":42,"x":9}`},
+		{"struct_is_array", `{"st":[1,2],"x":9}`},
+		{"struct_field_is_wrong_type", `{"st":{"name":5,"count":1},"x":9}`},
+		{"struct_field_is_container", `{"st":{"name":{"deep":[1,2]}},"x":9}`},
+		{"map_is_array", `{"m":[1,2],"x":9}`},
+		{"map_value_is_string", `{"m":{"a":"b"},"x":9}`},
+		{"map_value_is_object", `{"m":{"a":{"b":1}},"x":9}`},
+		{"time_is_not_a_date", `{"t":"not a date","x":9}`},
+		{"time_is_object", `{"t":{"a":1},"x":9}`},
+		{"time_is_bool", `{"t":true,"x":9}`},
+		{"array_is_string", `{"arr":"x","x":9}`},
+		{"array_element_is_string", `{"arr":["a","b"],"x":9}`},
+		{"scalar_is_string", `{"n":"7","x":9}`},
+		{"scalar_is_object", `{"n":{"a":1},"x":9}`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var s StrictKinds
+			if err := s.UnmarshalJSON([]byte(c.in)); err == nil {
+				t.Fatalf("premise: the non-lax decoder ACCEPTED %s, so it is not a mismatch", c.in)
+			}
+			var l LaxKinds
+			if err := l.UnmarshalJSON([]byte(c.in)); err != nil {
+				t.Fatalf("lax rejected a well-formed value of the wrong type %s: %v", c.in, err)
+			}
+			if l.X != 9 {
+				t.Errorf("%s: decoding did not continue past the lax field (X=%d, want 9)", c.in, l.X)
+			}
+			want := LaxKinds{X: 9}
+			if !reflect.DeepEqual(l, want) {
+				t.Errorf("%s: lax left the field set: %+v", c.in, l)
+			}
+		})
 	}
 }

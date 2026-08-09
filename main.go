@@ -861,6 +861,16 @@ func (g *gen) genUnmarshal(name string) string {
 	// *map[string]V, and the receiver *Name (whose underlying type matches) is
 	// converted to it.
 	var call string
+	// A JSON null at the root: encoding/json documents that "unmarshaling a JSON
+	// null into any other Go type has no effect on the value", but a slice and a
+	// map are among the types it *does* affect — literalStore zeroes them — so a
+	// null must nil a slice or map root while leaving a struct root untouched.
+	// The intercept below returns before reaching the root decoder, whose own
+	// null arm already does exactly this, so without nullReset a named slice or
+	// map root kept its previous contents: List{1,2}.UnmarshalJSON("null") left
+	// [1 2]. It was also internally inconsistent, since a *field* of that same
+	// named type is nil'd by the very arm the intercept skips.
+	var nullReset string
 	nocopy := g.nocopy // //lightning:nocopy or :destructive root: alias the slice/map root's keys/elements
 	// The root call seeds the recursion depth at 0 (g.depthArg's zero value outside
 	// any body), and contributes nothing when the schema has no cycle. An arena root
@@ -877,10 +887,12 @@ func (g *gen) genUnmarshal(name string) string {
 		at := g.sliceTypes[name]
 		fn := g.sliceDecoder(at.Elt, name, nocopy, false, true)
 		call = fmt.Sprintf("%s((*[]%s)(v), data, i%s%s)", fn, g.typeStr(at.Elt), g.depthArgFor(fn), rootArenaArg)
+		nullReset = "*v = nil\n\t\t"
 	case g.mapTypes[name] != nil:
 		mt := g.mapTypes[name]
 		fn := g.mapDecoder(mt.Key, mt.Value, name, nocopy, false)
 		call = fmt.Sprintf("%s((*map[string]%s)(v), data, i%s%s)", fn, g.typeStr(mt.Value), g.depthArgFor(fn), rootArenaArg)
+		nullReset = "*v = nil\n\t\t"
 	default:
 		fn := g.namedStruct(name)
 		call = fmt.Sprintf("%s(v, data, i%s%s)", fn, g.depthArgFor(fn), rootArenaArg)
@@ -917,7 +929,7 @@ func (v *%[1]s) UnmarshalJSON(data []byte) error {
 		if unstable.SkipWS(data, end) != len(data) {
 			return unstable.ErrInvalidJSON
 		}
-		return nil
+		%[5]sreturn nil
 	}
 	end, err := %[3]s
 	if err != nil {
@@ -927,7 +939,7 @@ func (v *%[1]s) UnmarshalJSON(data []byte) error {
 		return unstable.ErrInvalidJSON
 	}
 	return nil
-}`, name, doc, call, arenaDecl)
+}`, name, doc, call, arenaDecl, nullReset)
 }
 
 // namedStruct returns (generating on first use) the decoder for a named struct.
@@ -1485,26 +1497,85 @@ func (g *gen) unsupportedf(format string, args ...any) string {
 
 // laxField emits the decode for a field carrying the "lax" tag option. The value
 // is decoded into a scratch variable; on success it is committed to dest, and on
-// any error the input value is skipped and dest left unset. Because a well-formed
-// JSON value of the wrong type is skippable while genuinely malformed JSON is
-// not, only type mismatches are swallowed: a syntax error still propagates.
+// a decode error the input value is skipped and dest left unset — but only if the
+// value is well-formed JSON. That distinction is the option's documented contract
+// ("only type mismatches are tolerated; a syntax error still fails"), and the
+// skip is what enforces it, so it must be the *validating* walk
+// unstable.SkipValueStrict rather than unstable.SkipValue.
+//
+// SkipValue is a bracket balancer, which is right for an unknown field (nothing
+// downstream depends on those bytes) and wrong here: every balanced-but-invalid
+// value — {"l":[1,]}, {"l":[1 2 3]}, {"l":[1,,2]} — was silently dropped and the
+// whole decode returned nil, so ",lax" quietly punched a hole through the
+// trailing-comma rejection the rest of the decoder enforces, and the verdict on
+// some shapes was even host-dependent (SkipValue picks a SIMD or scalar balancer
+// by CPU feature, and the two differ off the well-formed set). The strict walk
+// still accepts every well-formed value of any shape, so a type mismatch — a
+// nested one included, such as []int receiving ["a"] — is swallowed exactly as
+// before; only genuine syntax errors now propagate. The strict walk is a scalar
+// parse and so is slower per byte than the SIMD balancer, but it runs only after
+// a decode has already failed — the path that was about to re-scan the value
+// anyway — and never on a field that decodes, so no successful decode pays for
+// it. Correctness outranks the skip rate of a mistyped value in any case.
+//
+// The commit carries nullGuard's rule as well, for the types that need it. A
+// lax value decodes into a fresh zero scratch, so on an explicit null a type
+// whose null arm leaves its destination alone (a scalar, time.Time,
+// json.Number, a struct, a fixed-size array) hands back that zero and the commit
+// wrote it over the field — reintroducing, through the lax path only, exactly
+// the divergence nullGuard closes for a plain field, and making json:"i" and
+// json:"i,lax" disagree with each other on {"i":null}. Types whose null arm
+// *assigns* (nil for slice/map/pointer/any, the literal "null" for
+// json.RawMessage) must keep the unconditional commit, since for them the
+// scratch holds the value encoding/json would store — which is why this is
+// nullAssigns and not a blanket guard.
 func (g *gen) laxField(dest string, expr ast.Expr, hint string, nocopy bool) string {
 	fn := g.valueDecoder(expr, hint, nocopy, true)
 	if fn == "" {
 		// Unsupported type: skipping already leaves the field unset.
 		return g.skipEmit()
 	}
+	commit := "} else {\n\t" + dest + " = lax\n}"
+	if !g.nullAssigns(expr) {
+		commit = "} else if data[i] != 'n' { // an explicit null leaves the field as it was\n\t" + dest + " = lax\n}"
+	}
 	return fmt.Sprintf(`var lax %[1]s
 end, err := %[2]s(&lax, data, i%[4]s%[5]s)
 if err != nil {
-	end, err = unstable.SkipValue(data, i)
+	// A "lax" mismatch is swallowed only for a well-formed value: the strict
+	// walk rejects malformed JSON that a bracket balancer would have skipped.
+	end, err = unstable.SkipValueStrict(data, i)
 	if err != nil {
 		return end, err
 	}
-} else {
-	%[3]s = lax
+%[6]s
+i = end`, g.typeStr(expr), fn, dest, g.depthArgFor(fn), g.arenaArg(), commit)
 }
-i = end`, g.typeStr(expr), fn, dest, g.depthArgFor(fn), g.arenaArg())
+
+// nullAssigns reports whether a JSON null decoded into a field of this type
+// *sets* the field rather than leaving it as it was — encoding/json's split,
+// which the generated decoders follow: a slice, map, pointer or any becomes nil
+// and a json.RawMessage takes the literal "null", while a scalar, json.Number,
+// time.Time, struct or fixed-size array is untouched ("unmarshaling a JSON null
+// into any other Go type has no effect on the value").
+//
+// Only laxField needs to ask: everywhere else the null arm lives inside the
+// decoder for the type itself, so the distinction is already made by whichever
+// emitter ran. A field's *ast.Ident is a scalar, a named struct or `any` — the
+// generator rejects a named slice/map as a field type — so the Ident arm only
+// has to separate `any` out.
+func (g *gen) nullAssigns(expr ast.Expr) bool {
+	switch t := unparen(expr).(type) {
+	case *ast.StarExpr, *ast.MapType, *ast.InterfaceType:
+		return true
+	case *ast.ArrayType:
+		return t.Len == nil // a slice is nil'd; a fixed-size array is untouched
+	case *ast.Ident:
+		return t.Name == "any"
+	case *ast.SelectorExpr:
+		return g.isRaw(t) // RawMessage stores "null"; Number and Time do not
+	}
+	return false
 }
 
 // valueDecoder returns the name of a function decoding the JSON value at data[i]
@@ -1560,6 +1631,43 @@ func (g *gen) valueDecoder(expr ast.Expr, hint string, nocopy, lax bool) string 
 	return fn
 }
 
+// nullGuard wraps the assignment of a leaf reader's result so an explicit JSON
+// null leaves dest untouched, which is what encoding/json documents:
+// "unmarshaling a JSON null into any other Go type has no effect on the value and
+// produces no error". Every *OrNull reader reports a null by returning the ZERO
+// value with a nil error, so assigning it unconditionally zeroed the field
+// instead. That is invisible on a fresh target — the zero was already there — and
+// wrong on exactly the targets this library tells callers to use: a struct seeded
+// with defaults before decoding, and a target reused across documents, where a
+// null silently wiped the previous value.
+//
+// The guard tests the value's first byte rather than the returned value, because
+// only the byte separates "the value was null" from "the value was an empty
+// string / 0 / false". It is exact — a JSON value starting with 'n' can only be
+// null, since anything else fails in the reader — and in bounds, for two reasons
+// that hold at every emission site by construction:
+//
+//   - i still holds the value's start. The templates below assign i = end only
+//     after the guard, no *OrNull reader skips leading whitespace of its own, and
+//     every enclosing loop skips whitespace and rejects truncation before the
+//     read, so data[i] is precisely the value's first byte.
+//   - data[i] is in range. Every *OrNull reader returns ErrTruncated when
+//     i >= len(data), so reaching the guard at all (err == nil) proves
+//     i < len(data) — the bound does not depend on the caller.
+//
+// Guarding the assignment rather than the read is what keeps this off the hot
+// path: the readers stay byte-identical and a non-null value pays one compare on
+// a byte already in cache. Composite kinds need no guard — slice, map, pointer
+// and any decoders have their own null arms, a fixed-size array is documented as
+// left untouched, and json.RawMessage deliberately stores the literal "null".
+// Inside a slice, array or map element the guard is a no-op either way, since
+// those decode into a freshly zeroed slot.
+func nullGuard(dest, val string) string {
+	return fmt.Sprintf(`if data[i] != 'n' { // an explicit null leaves the field as it was
+	%s = %s
+}`, dest, val)
+}
+
 // scalar emits the read for a leaf field of a builtin kind.
 //
 // Range behavior differs from encoding/json, deliberately and in the decoder's
@@ -1600,16 +1708,16 @@ func (g *gen) scalar(dest, name string, nocopy bool) string {
 if err != nil {
 	return end, err
 }
-%s = s
-i = end`, reader, dest)
+%s
+i = end`, reader, nullGuard(dest, "s"))
 
 	case name == "bool":
 		return fmt.Sprintf(`b, end, err := unstable.ReadBoolOrNull(data, i)
 if err != nil {
 	return end, err
 }
-%s = b
-i = end`, dest)
+%s
+i = end`, nullGuard(dest, "b"))
 
 	case name == "float32" || name == "float64":
 		val := "f"
@@ -1620,8 +1728,8 @@ i = end`, dest)
 if err != nil {
 	return end, err
 }
-%s = %s
-i = end`, dest, val)
+%s
+i = end`, nullGuard(dest, val))
 
 	case intKinds[name]:
 		val := "n"
@@ -1632,8 +1740,8 @@ i = end`, dest, val)
 if err != nil {
 	return end, err
 }
-%s = %s
-i = end`, dest, val)
+%s
+i = end`, nullGuard(dest, val))
 
 	case uintKinds[name]:
 		val := "n"
@@ -1644,8 +1752,8 @@ i = end`, dest, val)
 if err != nil {
 	return end, err
 }
-%s = %s
-i = end`, dest, val)
+%s
+i = end`, nullGuard(dest, val))
 	}
 	// Defensive: every caller gates on isScalar, so this fires only if isScalar
 	// and the switch above drift apart. Routed through the error accumulator so
@@ -1703,8 +1811,8 @@ func (g *gen) numberRead(dest string, nocopy bool) string {
 if err != nil {
 	return end, err
 }
-%s = %s.Number(s)
-i = end`, reader, dest, g.jsonQual)
+%s
+i = end`, reader, nullGuard(dest, g.jsonQual+".Number(s)"))
 }
 
 func (g *gen) timeRead(dest string, lax bool) string {
@@ -1717,8 +1825,8 @@ func (g *gen) timeRead(dest string, lax bool) string {
 if err != nil {
 	return end, err
 }
-%s = t
-i = end`, reader, dest)
+%s
+i = end`, reader, nullGuard(dest, "t"))
 }
 
 func (g *gen) anyValue(dest string) string {

@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -274,16 +275,25 @@ func TestRawMessageNull(t *testing.T) {
 // twins below would quietly start delegating again. So this walks each twin's
 // reflect graph and fails on any lightning-generated Unmarshaler found in it.
 //
-// json.RawMessage is the one deliberate exception: its UnmarshalJSON is
-// encoding/json's own, and it is precisely the behaviour rawNullDocStd exists to
-// measure lightning against.
+// json.RawMessage and time.Time are the deliberate exceptions: their
+// UnmarshalJSON methods belong to the standard library, not to lightning, so
+// they are the behaviour the differentials measure lightning *against* rather
+// than a way for the comparison to short-circuit into lightning's own decoder.
+// (time.Time.UnmarshalJSON is itself part of what nullDocStd pins: on the four
+// bytes "null" it returns nil without touching the receiver, which is exactly
+// the "no effect" rule under test.)
 func TestStdlibTwinsAreReflectionOnly(t *testing.T) {
 	twins := []any{
 		compactDocStd{}, compactPlainStd{}, rawNullDocStd{},
 		arenaDocStd{}, ptrReuseStd{}, byteSliceDocStd{},
+		nullDocStd{}, nullLaxDocStd{}, pointListStd{}, scoreMapStd{},
+		noCopyListStd{}, byteBlobStd{},
 	}
 	unmarshaler := reflect.TypeOf((*json.Unmarshaler)(nil)).Elem()
-	rawMessage := reflect.TypeOf(json.RawMessage(nil))
+	stdlibOwned := map[reflect.Type]bool{
+		reflect.TypeOf(json.RawMessage(nil)): true,
+		reflect.TypeOf(time.Time{}):          true,
+	}
 
 	seen := map[reflect.Type]bool{}
 	var walk func(t *testing.T, path string, ty reflect.Type)
@@ -292,8 +302,8 @@ func TestStdlibTwinsAreReflectionOnly(t *testing.T) {
 			return
 		}
 		seen[ty] = true
-		if ty == rawMessage {
-			return // encoding/json's own Unmarshaler, deliberately in play
+		if stdlibOwned[ty] {
+			return // the standard library's own Unmarshaler, deliberately in play
 		}
 		if ty.Implements(unmarshaler) || reflect.PointerTo(ty).Implements(unmarshaler) {
 			t.Errorf("%s has type %s, which implements json.Unmarshaler: "+
