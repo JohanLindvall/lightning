@@ -21,17 +21,32 @@ const (
 	AssumeCompact
 	// PreserveWhitespace keeps the input's inter-token whitespace around surviving
 	// content, so a pretty-printed document stays pretty-printed; only the dropped
-	// members (and their whitespace) are removed.
+	// members (and their whitespace) are removed. One kind of surviving whitespace
+	// is not kept: the run between a value and the ',' that follows it, which is
+	// dropped with the separator it precedes ({"a":1 , "b":2} becomes
+	// {"a":1, "b":2}). Whitespace before a closing '}' or ']' is preserved.
 	PreserveWhitespace
 )
 
-// StripDefaults copies the JSON document in input to output, dropping every object
-// member whose value is a "default" — byte-equal to one of defaults, compared
-// against the bare token: the unquoted contents for a string value, the literal
-// token for a number/keyword — and then dropping any object or array that this
-// leaves empty. Empty values are not special-cased: list an empty entry ("") in
-// defaults to drop them. A member is kept despite a default value when its
-// (unquoted) key is byte-equal to one of keep.
+// StripDefaults copies the JSON document in input to output, dropping every
+// "default" value — one byte-equal to an entry of defaults, compared against the
+// bare token: the unquoted contents for a string value, the literal token for a
+// number/keyword. An object member with a default value is dropped whole (key
+// included); an array element that is a default is dropped from the array, which
+// reindexes it ([0,1,0,2] with "0" listed becomes [1,2]). Any object or array left
+// empty by that pass is then dropped from its own parent, cascading upward until
+// the document itself can come out empty.
+//
+// A container that is *already* empty in the input is dropped the same way, and
+// that is the one rule that does not consult defaults: {"a":{}} strips to nothing
+// even for a nil defaults (keep still rescues such a member, as it does any
+// other). No other value is special-cased — in particular the empty string is
+// dropped only when an empty entry ("") is listed in defaults.
+//
+// A member is kept despite a default value when its (unquoted) key is byte-equal
+// to one of keep; a kept member keeps its original value — including the members
+// of a container value that stripped away to nothing — reformatted according to
+// ws. keep names object keys, so it has no effect on array elements.
 //
 // output is filled from the front and the populated prefix is returned; input is
 // not modified. StripDefaults never lengthens the document, so output needs room
@@ -172,6 +187,73 @@ func (s *stripper) emitField(write, wsStart, keyStart, keyEnd, colonPos, valStar
 	out[write] = ':'
 	write++
 	return write + copy(out[write:], in[valStart:valEnd])
+}
+
+// emitKept appends a member the keep list rescues: one whose value is a default,
+// or a container that stripped away to nothing. Its original value bytes are
+// re-emitted, so valStart..valEnd is a span of *input* the walk never re-examined
+// — and in RemoveWhitespace mode that span may still hold the inter-token
+// whitespace the mode promises to remove ({"b":{ "x" : 0 }} kept "b" verbatim,
+// interior spaces and all, which also broke the compact(preserve) == remove
+// oracle). Only this path can produce such a span: every other emitField caller
+// passes a single scalar or string token. So the whitespace is taken out here,
+// off the hot path — the leading run after the ':' by advancing valStart, and a
+// container value's interior by copying it through compactValue.
+//
+// PreserveWhitespace re-emits verbatim by definition, and AssumeCompact asserts
+// there is no whitespace to remove (scanning for it would contradict the mode),
+// so both fall through to emitField unchanged.
+//
+// This reads the member's original bytes out of s.in, the same buffer emitField
+// re-reads: if that source ever changes (an in-place run overwrites the span
+// before this path re-reads it, so a snapshot would have to be read instead),
+// it has to change in both.
+func (s *stripper) emitKept(write, wsStart, keyStart, keyEnd, colonPos, valStart, valEnd int) int {
+	if s.ws == RemoveWhitespace {
+		in := s.in
+		for valStart < valEnd && in[valStart] <= ' ' {
+			valStart++
+		}
+		if valStart < valEnd && (in[valStart] == '{' || in[valStart] == '[') {
+			out := s.out
+			write += copy(out[write:], in[keyStart:keyEnd])
+			out[write] = ':'
+			write++
+			return write + compactValue(out[write:], in[valStart:valEnd])
+		}
+	}
+	return s.emitField(write, wsStart, keyStart, keyEnd, colonPos, valStart, valEnd)
+}
+
+// compactValue copies the JSON value src into dst with its inter-token whitespace
+// removed, returning the number of bytes written. Whitespace is the same
+// deliberately lenient "<= ' '" the rest of this walker uses, and a string token
+// is copied whole so bytes inside it are never touched. Output can only be
+// shorter than src, so dst — the tail of an output buffer sized to the whole
+// input — always has room.
+//
+// A malformed string (unterminated) ends the scan: the rest of src is copied
+// through verbatim, the same best-effort response handle's eject gives.
+func compactValue(dst, src []byte) int {
+	n := 0
+	for i := 0; i < len(src); {
+		switch c := src[i]; {
+		case c <= ' ':
+			i++
+		case c == '"':
+			end, err := unstable.SkipString(src, i)
+			if err != nil {
+				return n + copy(dst[n:], src[i:])
+			}
+			n += copy(dst[n:], src[i:end])
+			i = end
+		default:
+			dst[n] = c
+			n++
+			i++
+		}
+	}
+	return n
 }
 
 // handle strips the value beginning at in[read], appending the kept bytes at
@@ -360,7 +442,7 @@ func (s *stripper) handle(read, write, depth int) (int, int) {
 				if !s.keepKey(in[keyStart:keyEnd]) {
 					write = localStartWrite // rewind: drop the member (and its whitespace/comma)
 				} else {
-					write = s.emitField(write, wsStart, keyStart, keyEnd, colonPos, tmpRead, read)
+					write = s.emitKept(write, wsStart, keyStart, keyEnd, colonPos, tmpRead, read)
 					written = true
 				}
 			} else {

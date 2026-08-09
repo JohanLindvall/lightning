@@ -114,34 +114,48 @@ func BenchmarkStripDefaultsCompact(b *testing.B) { benchmarkStripDefaults(b, Ass
 // stripping the same fields. The oracle: PreserveWhitespace output must be valid
 // JSON, must still contain whitespace, and must compact to exactly the
 // RemoveWhitespace result (same data, same fields dropped).
+//
+// The keep_container document is the shape the oracle used to fail on: a
+// keep-listed member whose container value strips to empty is re-emitted from its
+// original span, so before the emitKept fix RemoveWhitespace handed back that
+// span's interior whitespace and the two outputs disagreed.
 func TestStripDefaultsWhitespaceModes(t *testing.T) {
-	pretty := []byte("{\n  \"a\": 1,\n  \"b\": 0,\n  \"c\": {\n    \"d\": 0,\n    \"e\": 5\n  },\n  \"f\": [ 0, 7, 0 ]\n}")
+	docs := []struct {
+		name   string
+		pretty []byte
+	}{
+		{"plain", []byte("{\n  \"a\": 1,\n  \"b\": 0,\n  \"c\": {\n    \"d\": 0,\n    \"e\": 5\n  },\n  \"f\": [ 0, 7, 0 ]\n}")},
+		{"keep_container", []byte("{\n  \"a\": 1,\n  \"WallTimeMs\": {\n    \"d\": 0,\n    \"e\": \"none\"\n  },\n  \"CPUTimeMs\": [ 0, 0 ],\n  \"WorkerCPUTime\": 0,\n  \"z\": { }\n}")},
+	}
+	for _, d := range docs {
+		t.Run(d.name, func(t *testing.T) {
+			rw := string(StripDefaults(d.pretty, nil, origDefaults, origKeep, RemoveWhitespace))
+			if !json.Valid([]byte(rw)) {
+				t.Fatalf("RemoveWhitespace output invalid: %s", rw)
+			}
+			if strings.ContainsAny(rw, " \n\t") {
+				t.Errorf("RemoveWhitespace output still has whitespace: %q", rw)
+			}
 
-	rw := string(StripDefaults(pretty, nil, origDefaults, origKeep, RemoveWhitespace))
-	if !json.Valid([]byte(rw)) {
-		t.Fatalf("RemoveWhitespace output invalid: %s", rw)
+			pw := StripDefaults(d.pretty, nil, origDefaults, origKeep, PreserveWhitespace)
+			if !json.Valid(pw) {
+				t.Fatalf("PreserveWhitespace output invalid: %s", pw)
+			}
+			if !bytes.ContainsAny(pw, "\n") {
+				t.Errorf("PreserveWhitespace output lost its formatting: %q", pw)
+			}
+			// Oracle: compacting the preserved output must equal the compact strip.
+			var compacted bytes.Buffer
+			if err := json.Compact(&compacted, pw); err != nil {
+				t.Fatalf("preserved output not compactable: %v", err)
+			}
+			if compacted.String() != rw {
+				t.Errorf("preserve vs remove differ in data:\n  preserve(compacted)=%q\n  remove           =%q", compacted.String(), rw)
+			}
+			t.Logf("RemoveWhitespace:   %s", rw)
+			t.Logf("PreserveWhitespace: %q", pw)
+		})
 	}
-	if strings.ContainsAny(rw, " \n\t") {
-		t.Errorf("RemoveWhitespace output still has whitespace: %q", rw)
-	}
-
-	pw := StripDefaults(pretty, nil, origDefaults, origKeep, PreserveWhitespace)
-	if !json.Valid(pw) {
-		t.Fatalf("PreserveWhitespace output invalid: %s", pw)
-	}
-	if !bytes.ContainsAny(pw, "\n") {
-		t.Errorf("PreserveWhitespace output lost its formatting: %q", pw)
-	}
-	// Oracle: compacting the preserved output must equal the compact strip.
-	var compacted bytes.Buffer
-	if err := json.Compact(&compacted, pw); err != nil {
-		t.Fatalf("preserved output not compactable: %v", err)
-	}
-	if compacted.String() != rw {
-		t.Errorf("preserve vs remove differ in data:\n  preserve(compacted)=%q\n  remove           =%q", compacted.String(), rw)
-	}
-	t.Logf("RemoveWhitespace:   %s", rw)
-	t.Logf("PreserveWhitespace: %q", pw)
 }
 
 // TestStripDefaultsWhitespaceOnly verifies that with empty defaults/keep nothing

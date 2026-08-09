@@ -138,6 +138,15 @@ func getMany(data []byte, keys []string, out [][]byte, compact bool) ([][]byte, 
 // filled), and first-occurrence-wins governs the descent as well as the capture: a
 // duplicate key in the document is not descended a second time, so GetPaths reports
 // what Get reports for the same path. out is filled from out[:0] and returned.
+//
+// What each path resolves to does not depend on what else was requested, malformed
+// input included. Descending for a deeper path is stricter than skipping a value —
+// Get(doc, "a") on {"a":{"b" 1}} returns the value while Get(doc, "a", "x") reports
+// ErrExpectColon — so a subtree only a co-requested path enters may fail to be
+// walked; that failure is reported as the call's error but never retracts another
+// path's value, which is the one Get would have given it alone. The error is the
+// first such failure in document order, and out is returned filled as far as the
+// walk got.
 func GetPaths(data []byte, paths [][]string, out [][]byte) ([][]byte, error) {
 	return getPaths(data, paths, out, false)
 }
@@ -217,7 +226,7 @@ func getPaths(data []byte, paths [][]string, out [][]byte, compact bool) ([][]by
 		return out, unstable.ErrExpectObject
 	}
 	free := scratch[len(active):cap(scratch)]
-	_, err := walkPaths(data, i, 0, active, free, paths, out, compact)
+	_, err, _ := walkPaths(data, i, 0, active, free, paths, out, compact)
 	return out, err
 }
 
@@ -227,21 +236,29 @@ func getPaths(data []byte, paths [][]string, out [][]byte, compact bool) ([][]by
 // there) or is recursed into (path continues and the value is an object); members
 // off every active path are skipped. free is the unused tail of the shared scratch,
 // where a child's active set is built (never reallocated — see getPaths).
-func walkPaths(data []byte, i, depth int, active, free []int, paths [][]string, out [][]byte, compact bool) (int, error) {
-	i++ // step over '{'
+//
+// The three results are (end, err, fatal). fatal distinguishes the two ways a walk
+// can report an error, which the caller must treat differently: fatal means this
+// frame could not be walked and end is only the offset it gave up at, while a
+// non-fatal error means the frame completed — end is past its '}' — and err is
+// merely the first failure met *inside* it, recovered from so the rest of the
+// document could still be served (see the recovery at the descent below).
+func walkPaths(data []byte, i, depth int, active, free []int, paths [][]string, out [][]byte, compact bool) (int, error, bool) {
+	var firstErr error // first recovered failure; reported once the frame completes
+	i++                // step over '{'
 	for {
 		i = unstable.SkipWSCompact(data, i, compact)
 		if i >= len(data) {
-			return i, unstable.ErrTruncated
+			return i, unstable.ErrTruncated, true
 		}
 		if data[i] == '}' {
-			return i + 1, nil
+			return i + 1, firstErr, false
 		}
 		// Key read with the no-escape fast path inline; see getMany.
 		var key string
 		var ni int
 		if i >= len(data) || data[i] != '"' {
-			return i, unstable.ErrInvalidJSON
+			return i, unstable.ErrInvalidJSON, true
 		}
 		ks := i + 1
 		if k := unstable.IndexCloseOrEscape(data[ks:]); ks+k < len(data) && data[ks+k] == '"' {
@@ -249,12 +266,12 @@ func walkPaths(data []byte, i, depth int, active, free []int, paths [][]string, 
 		} else {
 			var err error
 			if key, ni, err = unstable.ReadKey(data, i); err != nil {
-				return ni, err
+				return ni, err, true
 			}
 		}
 		i = unstable.SkipWSCompact(data, ni, compact)
 		if i >= len(data) || data[i] != ':' {
-			return i, unstable.ErrExpectColon
+			return i, unstable.ErrExpectColon, true
 		}
 		i = unstable.SkipWSCompact(data, i+1, compact)
 		start := i
@@ -277,16 +294,33 @@ func walkPaths(data []byte, i, depth int, active, free []int, paths [][]string, 
 		}
 
 		var end int
-		var err error
 		if len(recurse) > 0 && start < len(data) && data[start] == '{' {
-			end, err = walkPaths(data, start, depth+1, recurse, free[len(recurse):], paths, out, compact)
+			werr, fatal := error(nil), false
+			end, werr, fatal = walkPaths(data, start, depth+1, recurse, free[len(recurse):], paths, out, compact)
+			if werr != nil {
+				// A descent is stricter than a skip — it reads keys and colons
+				// where SkipValue only balances brackets — so a member only a
+				// deeper path enters can fail where a solo lookup of a shorter
+				// path succeeds. recoverDescent re-skips the member with that same
+				// lenient SkipValue, so what this key's other paths get, and what
+				// the members after it get, is what they would have got had the
+				// deeper path not been requested. The failure is not swallowed: it
+				// is held in firstErr and returned once the frame completes.
+				var ok bool
+				if end, ok = recoverDescent(data, start, end, fatal); !ok {
+					return end, werr, true // not even skippable: give up here
+				}
+				if firstErr == nil {
+					firstErr = werr
+				}
+			}
 		} else {
 			// start may be past the end here (a truncated "key:" with no
 			// value); SkipValue bounds-checks and returns ErrTruncated.
-			end, err = unstable.SkipValue(data, start)
-		}
-		if err != nil {
-			return end, err
+			var err error
+			if end, err = unstable.SkipValue(data, start); err != nil {
+				return end, err, true
+			}
 		}
 		if ending || len(recurse) > 0 {
 			// This key consumed some paths: capture those that end here, and drop
@@ -321,17 +355,37 @@ func walkPaths(data []byte, i, depth int, active, free []int, paths [][]string, 
 
 		i = unstable.SkipWSCompact(data, end, compact)
 		if i >= len(data) {
-			return i, unstable.ErrTruncated
+			return i, unstable.ErrTruncated, true
 		}
 		switch data[i] {
 		case '}':
-			return i + 1, nil
+			return i + 1, firstErr, false
 		case ',':
 			i++
 		default:
-			return i, unstable.ErrInvalidJSON
+			return i, unstable.ErrInvalidJSON, true
 		}
 	}
+}
+
+// recoverDescent resolves a member whose descent reported an error. A non-fatal
+// error leaves the recursion's end usable as it is; a fatal one means the frame
+// gave up mid-object, so the member's extent is re-taken with the lenient
+// SkipValue a solo lookup of a shorter path would have used. ok is false only
+// when even that fails, i.e. the member cannot be stepped over at all and the
+// walk must stop.
+//
+// It is a separate function to keep walkPaths' loop free of a branch that only
+// malformed input reaches.
+func recoverDescent(data []byte, start, end int, fatal bool) (int, bool) {
+	if !fatal {
+		return end, true
+	}
+	e, err := unstable.SkipValue(data, start)
+	if err != nil {
+		return end, false
+	}
+	return e, true
 }
 
 // Get walks the object-key path keys into the JSON document data and returns
