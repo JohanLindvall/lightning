@@ -66,3 +66,12 @@ func unsafeStr(b []byte) string {
 	}
 	return unsafe.String(unsafe.SliceData(b), len(b))
 }
+
+// SameBuffer reports whether a and b are backed by the same array, which is how
+// the pkg/json rewriters recognize an in-place call (out passed as in[:0]) and
+// take the extra care that requires. It answers "same backing array", not
+// "overlapping": a slice into the middle of another reports false, so a caller
+// must treat false as "not proven separate" and stay on the safe path.
+func SameBuffer(a, b []byte) bool {
+	return cap(a) > 0 && cap(b) > 0 && &a[:1][0] == &b[:1][0]
+}

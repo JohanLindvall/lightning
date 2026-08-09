@@ -183,9 +183,16 @@ func skipValueOrEnd(data []byte, i int) int {
 // written as plain JSON strings without escaping, so they must come from the
 // program rather than from untrusted input (see Set — SetManyChecked rejects an
 // unsafe key with ErrUnsafeKey). A non-object root is replaced by a fresh object
-// holding all the given members. Inter-token whitespace outside the replaced
-// values and the insertion point is preserved. If rawVal is shorter than keys the
-// extra keys are ignored.
+// holding all the given members, in place of that root value: whitespace before it
+// and any bytes after it survive, as in Set and SetPaths. Inter-token whitespace
+// outside the replaced values and the insertion point is preserved. If rawVal is
+// shorter than keys the extra keys are ignored.
+//
+// A key occurring more than once in the document is edited at its first occurrence
+// only, as in Set and SetPaths. A key listed twice in keys is likewise set once,
+// from its first entry — the later entries are ignored rather than appending a
+// second member — so a degenerate request cannot make SetMany write a
+// duplicate-key document.
 func SetMany(in, out []byte, rawVal [][]byte, keys []string) []byte {
 	out = out[:0]
 	n := len(keys)
@@ -194,15 +201,7 @@ func SetMany(in, out []byte, rawVal [][]byte, keys []string) []byte {
 	}
 	j := unstable.SkipWS(in, 0)
 	if j >= len(in) || in[j] != '{' {
-		// Non-object root: replace the whole document with a flat object.
-		out = append(out, '{')
-		for m := 0; m < n; m++ {
-			if m > 0 {
-				out = append(out, ',')
-			}
-			out = appendMember(out, keys[m:m+1], rawVal[m])
-		}
-		return append(out, '}')
+		return setManyNonObject(in, out, rawVal, keys, n, j)
 	}
 	// The found flags live on the stack for the common small key set; only an
 	// oversized set falls back to a heap slice. The backing never escapes.
@@ -215,6 +214,20 @@ func SetMany(in, out []byte, rawVal [][]byte, keys []string) []byte {
 	}
 	prev := 0   // bytes of in already copied into out
 	nfound := 0 // requested keys found so far, for the all-found early exit
+	// A key requested more than once is served by its first entry alone: the
+	// later entries are marked found up front, so they neither edit a document
+	// duplicate of that key nor append a second member with it. Without this a
+	// degenerate request emitted a duplicate-key *document* — SetMany(`{"a":1}`,
+	// "a"=7, "a"=8) gave {"a":7,"a":8} where SetPaths gives {"a":7} (its
+	// matched[] consumes both entries at the first occurrence and appendMembers
+	// dedups by key). Entry 0 is never a duplicate, so nfound < n still holds
+	// for n > 0 and the all-found exit below keeps its meaning.
+	for m := 1; m < n; m++ {
+		if dupKey(keys, m) {
+			found[m] = true
+			nfound++
+		}
+	}
 	afterBrace := j + 1
 	p := unstable.SkipWS(in, afterBrace)
 	empty := p >= len(in) || in[p] == '}'
@@ -289,6 +302,44 @@ func SetMany(in, out []byte, rawVal [][]byte, keys []string) []byte {
 		needComma = true
 	}
 	return append(out, in[lastValEnd:]...)
+}
+
+// setManyNonObject is SetMany's non-object-root case: the root VALUE at in[j] is
+// replaced by a flat object of the requested members, keeping the whitespace
+// before it and whatever follows it — Set and SetPaths both copy in[:i] and
+// in[end:] around their replacement, and SetMany dropped both, so Set(" 5") gave
+// " {\"a\":7}" and SetMany gave "{\"a\":7}". It is a separate function because it
+// is the rare branch: written inline it grew SetMany's body (and the walk's
+// i-cache footprint) by ~100 instructions for a case that returns immediately.
+func setManyNonObject(in, out []byte, rawVal [][]byte, keys []string, n, j int) []byte {
+	out = append(out, in[:j]...)
+	out = append(out, '{')
+	lead := false
+	for m := 0; m < n; m++ {
+		if dupKey(keys, m) {
+			continue // a repeat of an earlier key: the first entry wins
+		}
+		if lead {
+			out = append(out, ',')
+		}
+		lead = true
+		out = appendMember(out, keys[m:m+1], rawVal[m])
+	}
+	out = append(out, '}')
+	return append(out, in[skipValueOrEnd(in, j):]...)
+}
+
+// dupKey reports whether keys[m] repeats an earlier entry — a second request for
+// a key already served, which SetMany ignores rather than acting on twice. Key
+// sets are small, so the pairwise scan beats building a set (appendMembers dedups
+// the same way, for the same reason).
+func dupKey(keys []string, m int) bool {
+	for _, k := range keys[:m] {
+		if k == keys[m] {
+			return true
+		}
+	}
+	return false
 }
 
 // SetPaths sets several object-key PATHS in a single pass — the multi-path form of

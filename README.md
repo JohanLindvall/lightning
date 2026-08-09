@@ -703,7 +703,12 @@ its surrounding quotes with escapes intact, an object or array spans the whole
   **once** and paths that share a prefix share that descent, so pulling several
   nested fields — especially under a common parent — costs one traversal rather than
   one `Get` per field (≈40–50% faster on a record with a handful of nested paths).
-  Same result conventions as `GetMany`; a `nil`/empty path selects the root.
+  Same result conventions as `GetMany`; a `nil`/empty path selects the root. What a
+  path resolves to never depends on what else was requested: descending for a
+  deeper path is stricter than skipping a value, so on malformed input a subtree
+  only a co-requested path enters can fail to be walked — that is reported as the
+  call's error, but the other paths still get the values `Get` would have given
+  them, and `out` comes back filled as far as the walk got.
 - `ObjectEach(data []byte, fn func(key string, value []byte) error, keys ...string) error`
   — calls `fn` for every member of the object reached by the path `keys` (the
   root object with no keys). If `fn` returns an error, iteration stops and
@@ -899,16 +904,22 @@ verbose, mostly-default records (Cloudflare HTTP logs, say) before storing or
 forwarding them:
 
 - `StripDefaults(input, output []byte, defaults, keep [][]byte, ws WhitespaceMode) []byte`
-  — copies `input` to `output`, dropping every object member whose value is a
-  default and then dropping any object or array that this leaves empty. A value
-  is a default when it is byte-equal to one of `defaults`, compared against the
-  bare token — the unquoted contents for a string, the literal token for a number
-  or keyword (e.g. `[]byte("none")`, `[]byte("false")`). Empty values are *not*
-  special-cased: to drop empty strings (and other empty tokens) include an empty
-  entry `[]byte("")` in `defaults`. A member is kept despite a default value when
-  its unquoted key is byte-equal to one of `keep` (e.g. `[]byte("WallTimeMs")`).
-  String values keep their surrounding quotes and escapes; scalars keep their
-  literal token. (Empty `{}`/`[]` are always dropped, independent of `defaults`.)
+  — copies `input` to `output`, dropping every default value and then dropping any
+  object or array that this leaves empty (which cascades: the document itself can
+  come out empty). A value is a default when it is byte-equal to one of
+  `defaults`, compared against the bare token — the unquoted contents for a
+  string, the literal token for a number or keyword (e.g. `[]byte("none")`,
+  `[]byte("false")`). An object member with a default value is dropped whole, key
+  included; an array *element* that is a default is dropped from the array, which
+  reindexes it (`[0,1,0,2]` with `"0"` listed becomes `[1,2]`). Empty values are
+  *not* special-cased: to drop empty strings (and other empty tokens) include an
+  empty entry `[]byte("")` in `defaults`. A member is kept despite a default value
+  when its unquoted key is byte-equal to one of `keep` (e.g.
+  `[]byte("WallTimeMs")`) — it then keeps its original value, reformatted per
+  `ws`; `keep` names object keys, so it has no effect on array elements. String
+  values keep their surrounding quotes and escapes; scalars keep their literal
+  token. (An already-empty `{}`/`[]` is dropped too, and that is the one rule that
+  ignores `defaults` — though `keep` still rescues the member holding it.)
 
 `output` is filled from the front and the populated prefix is returned; `input`
 is never modified. StripDefaults never lengthens the document, so `output` is grown
@@ -924,6 +935,9 @@ and copies malformed input through unchanged.
   `SkipWS` scans (faster, as [`GetCompact`](#key-lookups) does); misreads spaced input.
 - `PreserveWhitespace` — keep the input's whitespace around surviving content, so a
   pretty-printed document stays pretty-printed; only dropped members are removed.
+  One exception: the run between a value and the `,` after it goes with the
+  separator (`{"a":1 , "b":2}` → `{"a":1, "b":2}`); whitespace before a closing
+  `}`/`]` is kept.
 
 ```go
 // "" opts empty strings in; "0"/"none"/"false"/"unknown" are the non-empty defaults.
@@ -954,8 +968,11 @@ single pass, without a full unmarshal/edit/marshal round-trip:
   replacing it where the key exists and appending a member where it doesn't.
   `SetMany` is to `Set` what [`GetMany`](#key-lookups) is to `Get` — one walk over
   the object instead of rescanning and rewriting it once per key. A non-object
-  root is replaced by a fresh object of all the members; a `rawVal` shorter than
-  `keys` ignores the surplus keys.
+  root is replaced by a fresh object of all the members, in place of that root
+  *value* (whitespace before it and anything after it survive, as with `Set`); a
+  `rawVal` shorter than `keys` ignores the surplus keys. A key listed twice in
+  `keys` is set once, from its first entry, so a degenerate request can't make
+  `SetMany` write a duplicate-key document.
 - `SetPaths(in, out []byte, rawVal [][]byte, paths [][]string) []byte` — the
   multi-*path* form of `Set` (the write counterpart of `GetPaths`): each `paths[i]`
   is a nested key path set to `rawVal[i]`, replaced if present or created (with any

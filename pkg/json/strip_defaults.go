@@ -62,6 +62,15 @@ func StripDefaults(input, output []byte, defaults, keep [][]byte, ws WhitespaceM
 		defaultLens: lenSet(defaults),
 		keepLens:    lenSet(keep),
 		ws:          ws,
+		// The kept-member snapshot exists solely because writing the output over
+		// the input destroys bytes a kept member still needs (see snapshotMember).
+		// With an output buffer of its own the input is only ever read, so the
+		// snapshot would be a copy nobody reads — and the allocation for it is the
+		// one this package promises not to make. Taking it only in place keeps
+		// both properties. Conservative by construction: the comparison answers
+		// "same backing array", and anything it cannot prove separate still
+		// snapshots.
+		inPlace: unstable.SameBuffer(output, input),
 	}
 	// Whitespace at the document start is tolerated (and preserved when asked) for
 	// every mode; handle's own skips honor ws thereafter.
@@ -117,6 +126,7 @@ type stripper struct {
 	defaultLens uint64
 	keepLens    uint64
 	ws          WhitespaceMode
+	inPlace     bool   // out aliases in, so a kept member's bytes can be overwritten
 	scratch     []byte // last: the fields above keep the offsets the walk loads from
 }
 
@@ -205,6 +215,59 @@ func (s *stripper) emitFieldSnap(base, write, wsStart, keyStart, keyEnd, colonPo
 	return write + copy(out[write:], snap[valStart-base:valEnd-base])
 }
 
+// compactValue copies src to dst with inter-token whitespace dropped, and returns
+// the number of bytes written. String tokens are copied whole, so a space inside a
+// string survives; a truncated string (malformed input) falls back to copying the
+// rest verbatim, which is the same "pass through what you cannot interpret" answer
+// the rest of this file gives.
+func compactValue(dst, src []byte) int {
+	n := 0
+	for i := 0; i < len(src); {
+		switch c := src[i]; {
+		case c <= ' ':
+			i++
+		case c == '"':
+			end, err := unstable.SkipString(src, i)
+			if err != nil {
+				return n + copy(dst[n:], src[i:])
+			}
+			n += copy(dst[n:], src[i:end])
+			i = end
+		default:
+			dst[n] = c
+			n++
+			i++
+		}
+	}
+	return n
+}
+
+// emitKeptCompact emits a kept member as key:value with RemoveWhitespace's
+// guarantee applied, reading the member's bytes from src, where src[i-base] is
+// in[i] (base 0 reads the input directly; a snapshot passes its own base).
+//
+// The kept member is the one piece of output this walker emits without having
+// decided every byte of it — everywhere else the bytes are copied token by token,
+// here a whole original span is replayed — so it is also the one place the
+// promised output shape has to be re-imposed rather than inherited. Dropping the
+// post-colon run fixes the scalar case; a container value additionally goes
+// through compactValue, since its interior whitespace was never inspected.
+// PreserveWhitespace wants the span verbatim by definition and AssumeCompact by
+// assertion, so both keep taking emitField/emitFieldSnap instead.
+func (s *stripper) emitKeptCompact(src []byte, base, write, keyStart, keyEnd, valStart, valEnd int) int {
+	for valStart < valEnd && src[valStart-base] <= ' ' {
+		valStart++
+	}
+	out := s.out
+	write += copy(out[write:], src[keyStart-base:keyEnd-base])
+	out[write] = ':'
+	write++
+	if valStart < valEnd && (src[valStart-base] == '{' || src[valStart-base] == '[') {
+		return write + compactValue(out[write:], src[valStart-base:valEnd-base])
+	}
+	return write + copy(out[write:], src[valStart-base:valEnd-base])
+}
+
 // The two non-offset values of handle's per-member snapBase (see there): no early
 // keep decision was taken, and one was taken and came out negative.
 const (
@@ -231,6 +294,12 @@ func (s *stripper) snapshotMember(read, wsStart, keyStart, keyEnd int) int {
 	// end of the value — which SkipValue finds over the same bytes with the same
 	// string handling. Malformed input is the one place the two can disagree, and
 	// there the walk may run to the end of the document, so cover that far.
+	if !s.inPlace {
+		// Nothing will overwrite in, so finishEarly can re-emit straight from it.
+		// It reaches that arm on its own: the snapshot-length test below fails
+		// against an empty scratch, which is exactly the "no snapshot" state.
+		return wsStart
+	}
 	snapEnd, err := unstable.SkipValue(in, read)
 	if err != nil {
 		snapEnd = len(in)
@@ -252,12 +321,18 @@ func (s *stripper) finishEarly(snapBase, write, localStartWrite, wsStart, keySta
 		// The kept member, re-emitted from the snapshot: its own bytes in the
 		// input have been written over by the speculative write and the
 		// recursion whenever output aliases input.
+		if s.ws == RemoveWhitespace {
+			return s.emitKeptCompact(s.scratch, snapBase, write, keyStart, keyEnd, valStart, valEnd), true
+		}
 		return s.emitFieldSnap(snapBase, write, wsStart, keyStart, keyEnd, colonPos, valStart, valEnd), true
 	default:
 		// The walk ran past the end SkipValue found over the same bytes, so the
 		// snapshot stops short of the member. That takes malformed input — the
 		// two agree everywhere else — and leaves the input as the only source;
 		// it is the intact one whenever output is a buffer of its own.
+		if s.ws == RemoveWhitespace {
+			return s.emitKeptCompact(s.in, 0, write, keyStart, keyEnd, valStart, valEnd), true
+		}
 		return s.emitField(write, wsStart, keyStart, keyEnd, colonPos, valStart, valEnd), true
 	}
 }
@@ -500,7 +575,11 @@ func (s *stripper) handle(read, write, depth int) (int, int) {
 					write, emitted = s.finishEarly(snapBase, write, localStartWrite, wsStart, keyStart, keyEnd, colonPos, tmpRead, read)
 					written = written || emitted
 				case s.keepKey(in[keyStart:keyEnd]):
-					write = s.emitField(write, wsStart, keyStart, keyEnd, colonPos, tmpRead, read)
+					if s.ws == RemoveWhitespace {
+						write = s.emitKeptCompact(in, 0, write, keyStart, keyEnd, tmpRead, read)
+					} else {
+						write = s.emitField(write, wsStart, keyStart, keyEnd, colonPos, tmpRead, read)
+					}
 					written = true
 				default:
 					write = localStartWrite // rewind: drop the member (and its whitespace/comma)
