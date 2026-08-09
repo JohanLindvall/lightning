@@ -3,6 +3,7 @@ package json
 import (
 	"bytes"
 	"encoding/json"
+	"math/rand"
 	"strings"
 	"testing"
 )
@@ -197,6 +198,268 @@ func TestStripDefaultsKeepKeyContainer(t *testing.T) {
 		}
 		if got != "" && !json.Valid([]byte(got)) {
 			t.Errorf("StripDefaults(%q) = %q is not valid JSON", c.in, got)
+		}
+	}
+}
+
+// stripFresh and stripInPlace are the two ways StripDefaults' output buffer can
+// be supplied: a buffer of its own, and the input itself (output == input[:0],
+// the documented in-place mode). They must agree byte for byte on every input —
+// the walk only ever writes behind its own read cursor, so nothing it still needs
+// can have been overwritten — which is the property TestStripDefaultsInPlace*
+// below check, and the one a keep-listed member whose container value strips to
+// empty used to break: that member's key and original bytes are re-read after the
+// speculative write of the key, the colon and the recursion's own output.
+func stripFresh(in string, defaults, keep [][]byte, ws WhitespaceMode) string {
+	return string(StripDefaults([]byte(in), nil, defaults, keep, ws))
+}
+
+func stripInPlace(in string, defaults, keep [][]byte, ws WhitespaceMode) string {
+	buf := []byte(in)
+	return string(StripDefaults(buf, buf[:0], defaults, keep, ws))
+}
+
+var stripWSModes = []struct {
+	ws   WhitespaceMode
+	name string
+}{
+	{RemoveWhitespace, "RemoveWhitespace"},
+	{AssumeCompact, "AssumeCompact"},
+	{PreserveWhitespace, "PreserveWhitespace"},
+}
+
+// TestStripDefaultsInPlaceMatchesFresh pins the in-place result against the
+// fresh-buffer one on the shapes that reach the keep-listed-container path, and
+// pins the fresh result itself against a written-out expectation so the fix
+// cannot quietly redefine the semantics it was preserving. want is the compact
+// (RemoveWhitespace) output; the other two modes are checked against the fresh
+// run only, since AssumeCompact misreads spaced input by contract.
+//
+// Before the fix every non-AssumeCompact case whose input carries a left shift
+// (something dropped, or whitespace removed, ahead of the kept member) produced a
+// different in-place result — the member vanished, or came out garbled — while
+// the fresh result was already right.
+func TestStripDefaultsInPlaceMatchesFresh(t *testing.T) {
+	d0 := [][]byte{[]byte("0"), []byte("")}
+	kb := [][]byte{[]byte("b"), []byte("keepMe"), []byte(`esc\"key`)}
+
+	cases := []struct{ name, in, want string }{
+		// The reported shapes: a kept container after a member whose whitespace
+		// (or whole self) is dropped, so the write cursor lags the read cursor.
+		{"lag from removed whitespace", `{"q": 1,"b":{"x":0},"t":2}`, `{"q":1,"b":{"x":0},"t":2}`},
+		{"lag from leading whitespace", `{ "b":{"x":0}}`, `{"b":{"x":0}}`},
+		{"lag from dropped member", `{"":0,"b":{"x":{"y":0}}}`, `{"b":{"x":{"y":0}}}`},
+		{"large lag", `{"d1":0,"d2":0,"d3":0,"d4":0,"d5":0,"d6":0,"b":{"x":0,"y":0}}`, `{"b":{"x":0,"y":0}}`},
+
+		// No lag at all: the kept member is first and nothing ahead of it is
+		// dropped, so every write is a self-copy and in-place was already right.
+		{"zero lag, only member", `{"b":{"x":0}}`, `{"b":{"x":0}}`},
+		{"zero lag, kept first", `{"b":{"x":0},"a":1}`, `{"b":{"x":0},"a":1}`},
+		{"kept last", `{"a":1,"b":{"x":0}}`, `{"a":1,"b":{"x":0}}`},
+		{"kept array value", `{"a":0,"b":[0,0]}`, `{"b":[0,0]}`},
+
+		// A kept member whose value does NOT strip away keeps the stripped value,
+		// not the original — the semantics the snapshot must not disturb.
+		{"kept, value survives", `{"a":0,"b":{"x":0,"y":9}}`, `{"b":{"y":9}}`},
+		{"kept, value partly survives", `{"z":0,"b":[0,5,0]}`, `{"b":[5]}`},
+
+		// Nested kept containers, which is what makes one shared snapshot buffer
+		// enough: an inner kept member replaces the outer member's snapshot, but
+		// it is itself always emitted — verbatim in the first case, stripped in
+		// the second — which leaves every container above it non-empty, so the
+		// outer member never reaches back for the snapshot it lost.
+		{"nested kept containers", `{"a":0,"b":{"keepMe":{"x":0}}}`, `{"b":{"keepMe":{"x":0}}}`},
+		{"inner emits from its snapshot", `{"pad":0,"b":{"q":0,"keepMe":{"x":0}},"z":0}`, `{"b":{"keepMe":{"x":0}}}`},
+		{"inner emits a stripped value", `{"p":0,"b":{"keepMe":{"x":0,"y":1}}}`, `{"b":{"keepMe":{"y":1}}}`},
+		{"kept inside dropped-looking parent", `{"a":0,"b":{"q":0,"keepMe":[0]}}`, `{"b":{"keepMe":[0]}}`},
+		{"kept container in array element", `{"a":0,"z":[{"b":{"x":0}}]}`, `{"z":[{"b":{"x":0}}]}`},
+
+		// Escapes in keys and values, including a kept key that is itself escaped.
+		{"escaped key kept", `{"a":0,"esc\"key":{"x":0}}`, `{"esc\"key":{"x":0}}`},
+		{"escaped value in kept container", `{"a":0,"b":{"x":0,"e":"q\"\\z"}}`, `{"b":{"e":"q\"\\z"}}`},
+		{"escaped value strips to empty", `{"a":0,"b":{"e":""}}`, `{"b":{"e":""}}`},
+
+		// Several kept members in one object: the scratch is reused across them.
+		{"two kept members", `{"a":0,"b":{"x":0},"c":0,"keepMe":{"y":0}}`, `{"b":{"x":0},"keepMe":{"y":0}}`},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := stripFresh(c.in, d0, kb, RemoveWhitespace); got != c.want {
+				t.Errorf("fresh RemoveWhitespace = %q, want %q", got, c.want)
+			}
+			for _, m := range stripWSModes {
+				fresh := stripFresh(c.in, d0, kb, m.ws)
+				if got := stripInPlace(c.in, d0, kb, m.ws); got != fresh {
+					t.Errorf("%s: in-place = %q, fresh = %q", m.name, got, fresh)
+				}
+				if fresh != "" && m.ws != AssumeCompact && !json.Valid([]byte(fresh)) {
+					t.Errorf("%s: output %q is not valid JSON", m.name, fresh)
+				}
+			}
+		})
+	}
+}
+
+// stripFuzzKeys / stripFuzzScalars are the alphabets randomStripDoc draws from:
+// short so keys repeat and collide with the keep list, and carrying escapes (in
+// both keys and values) so the escape-aware scans are exercised. The key bodies
+// are written as they appear between the quotes, which is also how keep entries
+// are compared, so `esc\"key` here is the keep entry []byte(`esc\"key`).
+var stripFuzzKeys = []string{"a", "b", "", "keepMe", `esc\"key`, "x", "longer_key_name", `sl\/ash`}
+
+// (Every entry has to be valid to encoding/json as well as to this package, since
+// the fuzz uses json.Valid as its oracle for the output: `00`, which Valid here
+// accepts and encoding/json rejects, would fail that check on the input's own
+// bytes rather than on anything the stripper did.)
+var stripFuzzScalars = []string{
+	`0`, `1`, `-2.5e3`, `true`, `false`, `null`,
+	`""`, `"x"`, `"none"`, `"a\"b"`, `"é tail"`, `"0"`,
+}
+
+// randomStripDoc builds a random well-formed JSON document from those alphabets.
+// Duplicate keys and empty containers are deliberately possible: both are shapes
+// the stripper has its own handling for.
+func randomStripDoc(r *rand.Rand, depth int) string {
+	if depth <= 0 || r.Intn(3) == 0 {
+		return stripFuzzScalars[r.Intn(len(stripFuzzScalars))]
+	}
+	n := r.Intn(5)
+	parts := make([]string, n)
+	if r.Intn(2) == 0 {
+		for i := range parts {
+			parts[i] = `"` + stripFuzzKeys[r.Intn(len(stripFuzzKeys))] + `":` + randomStripDoc(r, depth-1)
+		}
+		return "{" + strings.Join(parts, ",") + "}"
+	}
+	for i := range parts {
+		parts[i] = randomStripDoc(r, depth-1)
+	}
+	return "[" + strings.Join(parts, ",") + "]"
+}
+
+// randomSubset returns a random non-empty-ish subset of items as byte slices.
+func randomSubset(r *rand.Rand, items []string) [][]byte {
+	var out [][]byte
+	for _, it := range items {
+		if r.Intn(3) == 0 {
+			out = append(out, []byte(it))
+		}
+	}
+	return out
+}
+
+// TestStripDefaultsInPlaceFuzz is the post-condition of the in-place fix as a
+// property: for every document, every defaults/keep pool and every whitespace
+// mode, stripping in place produces exactly the bytes stripping into a separate
+// buffer does. It also checks the fresh run leaves its input alone and that a
+// non-empty result is valid JSON whenever the mode's contract was honored — so a
+// fix that made the two agree by breaking both would still fail here.
+//
+// Against the unfixed code this fails within the first few dozen documents:
+// in-place loses or garbles a keep-listed member whose container value strips to
+// empty, in all three whitespace modes.
+func TestStripDefaultsInPlaceFuzz(t *testing.T) {
+	r := rand.New(rand.NewSource(20260809))
+	defaultPool := []string{"0", "", "false", "null", "x", "none", `a\"b`, "1", "00"}
+
+	const iterations = 20000
+	for n := 0; n < iterations; n++ {
+		compact := randomStripDoc(r, 1+r.Intn(4))
+		defaults := randomSubset(r, defaultPool)
+		keep := randomSubset(r, stripFuzzKeys)
+
+		// Both a compact and an indented spelling of the same document, so the
+		// whitespace-skipping and whitespace-preserving paths both see real runs.
+		docs := []struct {
+			in       string
+			isCompac bool
+		}{{compact, true}}
+		var pretty bytes.Buffer
+		if err := json.Indent(&pretty, []byte(compact), strings.Repeat(" ", r.Intn(3)), "\t"); err == nil {
+			docs = append(docs, struct {
+				in       string
+				isCompac bool
+			}{pretty.String(), false})
+		}
+
+		for _, d := range docs {
+			for _, m := range stripWSModes {
+				orig := d.in
+				fresh := stripFresh(d.in, defaults, keep, m.ws)
+				if d.in != orig {
+					t.Fatalf("fresh run mutated its input: %q -> %q", orig, d.in)
+				}
+				if got := stripInPlace(d.in, defaults, keep, m.ws); got != fresh {
+					t.Fatalf("in-place != fresh\n  doc      = %q\n  defaults = %q\n  keep     = %q\n  mode     = %s\n  in-place = %q\n  fresh    = %q",
+						d.in, defaults, keep, m.name, got, fresh)
+				}
+				// AssumeCompact is only answerable for compact input, by contract.
+				if (m.ws != AssumeCompact || d.isCompac) && fresh != "" && !json.Valid([]byte(fresh)) {
+					t.Fatalf("%s output is not valid JSON\n  doc      = %q\n  defaults = %q\n  keep     = %q\n  out      = %q",
+						m.name, d.in, defaults, keep, fresh)
+				}
+			}
+		}
+	}
+}
+
+// TestStripDefaultsSnapshotShortOfMember exercises finishEarly's last branch, the
+// one where the snapshot of a kept member stops short of where the walk ended.
+// The snapshot is sized by SkipValue over the same bytes, and the two agree on
+// every well-formed value; they part on a bare token holding a quote (`q"w`),
+// where SkipValue opens a string the walk does not and so ends up *outside* a
+// string where the walk is *inside* one — it then takes the `}` inside the key
+// "a}b" for the container's close and stops early.
+//
+// What is locked here is that the branch is a fallback, not a cliff: the walk
+// must not read past the snapshot, the fresh result is exactly what it was before
+// the snapshot existed (the member re-emitted from the input), and the in-place
+// run — the one case where the input is no longer intact to re-emit from — still
+// returns rather than panicking.
+func TestStripDefaultsSnapshotShortOfMember(t *testing.T) {
+	keep := [][]byte{[]byte("b")}
+	defaults := [][]byte{[]byte(`q"w`), []byte("0")}
+	cases := []struct{ in, want string }{
+		{`{"b":{"k":q"w,"a}b":0}}`, `{"b":{"k":q"w,"a}b":0}}`},
+		{`{"z":0,"b":{"k":q"w,"a}b":0}}`, `{"b":{"k":q"w,"a}b":0}}`},
+		{`{"b":{"k":q"w,"a}b":0},"t":1}`, `{"b":{"k":q"w,"a}b":0},"t":1}`},
+	}
+	for _, c := range cases {
+		if got := stripFresh(c.in, defaults, keep, RemoveWhitespace); got != c.want {
+			t.Errorf("fresh StripDefaults(%q) = %q, want %q", c.in, got, c.want)
+		}
+		stripInPlace(c.in, defaults, keep, RemoveWhitespace) // must not panic
+	}
+}
+
+// TestStripDefaultsInPlaceFuzzMalformed is the same property over deliberately
+// broken input, where StripDefaults is only promised to be best effort: the point
+// is that in-place stays as safe as the fresh path — no panic, no read past the
+// buffer — not that the two agree, since a truncated container can leave the walk
+// and the snapshot's own SkipValue disagreeing about where the value ended.
+func TestStripDefaultsInPlaceFuzzMalformed(t *testing.T) {
+	r := rand.New(rand.NewSource(4242))
+	defaults := [][]byte{[]byte("0"), []byte("")}
+	keep := [][]byte{[]byte("b"), []byte("keepMe"), []byte("a")}
+
+	for n := 0; n < 20000; n++ {
+		doc := randomStripDoc(r, 1+r.Intn(3))
+		b := []byte(doc)
+		switch r.Intn(3) {
+		case 0: // truncate
+			b = b[:r.Intn(len(b)+1)]
+		case 1: // corrupt one byte
+			if len(b) > 0 {
+				b[r.Intn(len(b))] = []byte(`{}[]",:\ `)[r.Intn(9)]
+			}
+		default: // splice in a stray byte
+			at := r.Intn(len(b) + 1)
+			b = append(b[:at:at], append([]byte{[]byte(`{}[]",:\`)[r.Intn(8)]}, b[at:]...)...)
+		}
+		for _, m := range stripWSModes {
+			_ = stripFresh(string(b), defaults, keep, m.ws)
+			_ = stripInPlace(string(b), defaults, keep, m.ws)
 		}
 	}
 }

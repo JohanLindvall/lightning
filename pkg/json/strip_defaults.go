@@ -37,7 +37,10 @@ const (
 // not modified. StripDefaults never lengthens the document, so output needs room
 // for at most len(input) bytes — it is grown (allocated) only when cap(output) is
 // smaller, mirroring UnescapeStringInto. Pass output == input[:0] to strip in
-// place. The returned slice aliases whichever buffer was written.
+// place: the walk never writes past its own read cursor, so it only ever
+// overwrites bytes it has already consumed, and the result is byte-identical to
+// the one a separate output buffer produces. The returned slice aliases
+// whichever buffer was written.
 //
 // StripDefaults is best effort and forgiving of malformed input: on the first
 // byte it cannot make sense of it copies the remainder of input through verbatim
@@ -102,7 +105,10 @@ func hasLen(m uint64, n int) bool {
 // stripper carries the read buffer (in), write buffer (out) and the caller's
 // default-value and keep-key lists through the recursive walk in handle.
 // defaultLens/keepLens summarize the candidate lengths (see lenSet) so a token
-// of non-matching length skips the scan.
+// of non-matching length skips the scan. scratch holds the one member shape that
+// has to be re-read after out has been written over it — see handle's container
+// case; it stays nil unless such a member appears, so the common walk allocates
+// nothing.
 type stripper struct {
 	in          []byte
 	out         []byte
@@ -111,6 +117,7 @@ type stripper struct {
 	defaultLens uint64
 	keepLens    uint64
 	ws          WhitespaceMode
+	scratch     []byte // last: the fields above keep the offsets the walk loads from
 }
 
 // isDefault reports whether a scalar value should be dropped: one byte-equal to a
@@ -172,6 +179,87 @@ func (s *stripper) emitField(write, wsStart, keyStart, keyEnd, colonPos, valStar
 	out[write] = ':'
 	write++
 	return write + copy(out[write:], in[valStart:valEnd])
+}
+
+// emitFieldSnap is emitField reading the member's bytes from the snapshot in
+// s.scratch instead of from in, where scratch[i-base] is in[i]. It re-emits a
+// member handle has already written over; nothing else needs it.
+//
+// It is a second function rather than a src/base pair threaded through emitField
+// because the parameterized single form costs 88 against the inliner's budget of
+// 80: emitField would stop inlining and every kept member's emit — the hot one —
+// would pay a call frame to serve this rare one. This copy is out of line (cost
+// 93) and belongs there. Same reasoning as the whitespace-skip blocks this file
+// expands by hand rather than factoring into a helper.
+func (s *stripper) emitFieldSnap(base, write, wsStart, keyStart, keyEnd, colonPos, valStart, valEnd int) int {
+	snap, out := s.scratch, s.out
+	if s.ws == PreserveWhitespace {
+		return write + copy(out[write:], snap[wsStart-base:valEnd-base])
+	}
+	if colonPos == keyEnd && valStart == keyEnd+1 {
+		return write + copy(out[write:], snap[keyStart-base:valEnd-base])
+	}
+	write += copy(out[write:], snap[keyStart-base:keyEnd-base])
+	out[write] = ':'
+	write++
+	return write + copy(out[write:], snap[valStart-base:valEnd-base])
+}
+
+// The two non-offset values of handle's per-member snapBase (see there): no early
+// keep decision was taken, and one was taken and came out negative.
+const (
+	snapNone    = -1
+	snapDropped = -2
+)
+
+// snapshotMember takes the early drop-or-keep decision for a member whose value
+// is the container at in[read], and, when the key is kept, the copy of the
+// member's original bytes that handle will need if that container strips to
+// nothing. It returns the snapBase handle carries: snapDropped, or the base
+// offset (wsStart) of the copy in s.scratch.
+//
+// It is deliberately out of line. The work is per container member and reached
+// through a cold branch, while handle is a large function whose object-member
+// loop is the hot one in this package's profile — expanding this into it grew the
+// loop's body and cost the pretty-printed benchmark a few percent for nothing.
+func (s *stripper) snapshotMember(read, wsStart, keyStart, keyEnd int) int {
+	in := s.in
+	if !s.keepKey(in[keyStart:keyEnd]) {
+		return snapDropped
+	}
+	// The copy has to reach as far as the walk will, and the walk stops at the
+	// end of the value — which SkipValue finds over the same bytes with the same
+	// string handling. Malformed input is the one place the two can disagree, and
+	// there the walk may run to the end of the document, so cover that far.
+	snapEnd, err := unstable.SkipValue(in, read)
+	if err != nil {
+		snapEnd = len(in)
+	}
+	s.scratch = append(s.scratch[:0], in[wsStart:snapEnd]...)
+	return wsStart
+}
+
+// finishEarly finishes a member whose value was a container that stripped to
+// nothing and whose keep decision was therefore taken early, in snapshotMember:
+// it drops the member, or re-emits it, and reports whether it emitted anything.
+// Out of line for the same reason snapshotMember is — both arms are cold, and
+// expanding them into handle's member loop only lengthens it.
+func (s *stripper) finishEarly(snapBase, write, localStartWrite, wsStart, keyStart, keyEnd, colonPos, valStart, valEnd int) (int, bool) {
+	switch {
+	case snapBase == snapDropped:
+		return localStartWrite, false // rewind: drop the member (and its whitespace/comma)
+	case valEnd-snapBase <= len(s.scratch):
+		// The kept member, re-emitted from the snapshot: its own bytes in the
+		// input have been written over by the speculative write and the
+		// recursion whenever output aliases input.
+		return s.emitFieldSnap(snapBase, write, wsStart, keyStart, keyEnd, colonPos, valStart, valEnd), true
+	default:
+		// The walk ran past the end SkipValue found over the same bytes, so the
+		// snapshot stops short of the member. That takes malformed input — the
+		// two agree everywhere else — and leaves the input as the only source;
+		// it is the intact one whenever output is a buffer of its own.
+		return s.emitField(write, wsStart, keyStart, keyEnd, colonPos, valStart, valEnd), true
+	}
 }
 
 // handle strips the value beginning at in[read], appending the kept bytes at
@@ -296,6 +384,16 @@ func (s *stripper) handle(read, write, depth int) (int, int) {
 				}
 			}
 			valueEmpty := true
+			// A container value is the one member shape whose bytes reach out
+			// before the member's fate is known, so that branch has to decide
+			// early and hand the answer down to the drop-or-keep block below;
+			// see the '{', '[' case. One int carries it, to keep this loop's
+			// live set where it was: snapNone (the ordinary path — nothing has
+			// been written for this member, so that block can still read the key
+			// and the value out of the input), snapDropped (decided early, not a
+			// kept key), or the base offset in s.scratch of the snapshot of the
+			// member's original bytes (decided early, kept).
+			snapBase := snapNone
 			if read < dataLen {
 				switch in[read] {
 				case '"':
@@ -331,6 +429,42 @@ func (s *stripper) handle(read, write, depth int) (int, int) {
 						read = peek + 1 // empty nested container — drop the member
 						break
 					}
+					// Everything below this point writes speculatively: the key
+					// and colon (or the preserved prefix), then whatever the
+					// recursion emits, all rewound if the value strips to
+					// nothing. out may alias in — StripDefaults documents
+					// output == input[:0] — so those writes land on this
+					// member's own bytes, and both things the drop-or-keep
+					// decision below needs would then be read back clobbered:
+					// the key (silently flipping the decision) and the original
+					// span a kept member is re-emitted from. Take them here,
+					// while the input is certainly intact. The keep test is a
+					// pure function of the key, so it can simply move; the bytes
+					// need a copy, taken only when the key is kept so that the
+					// ordinary member costs nothing and allocates nothing.
+					//
+					// One scratch serves every nesting level: a deeper frame
+					// overwrites it only by snapshotting a kept member of its
+					// own, and such a member is then always emitted (stripped or
+					// verbatim), which leaves every container enclosing it
+					// non-empty — so no outer frame ever reaches back for a
+					// snapshot a deeper one replaced.
+					//
+					// Only a kept key needs any of that, and only a key whose
+					// length matches a keep entry can be kept — keepKey's own
+					// length pre-filter, which is exact in the negative
+					// direction. Leading with it keeps the ordinary container
+					// member (empty keep list, or no candidate of that length)
+					// at one compare instead of a call; a container-dense
+					// document has as many of those as it has members, and a
+					// call each measured ~4% on the pretty benchmark. The key
+					// span is the quotes plus the name, and both key reads above
+					// land past a closing quote, so it is never below 2 and the
+					// subtraction never hands hasLen a negative shift.
+					snapBase = snapDropped
+					if hasLen(s.keepLens, keyEnd-keyStart-2) {
+						snapBase = s.snapshotMember(read, wsStart, keyStart, keyEnd)
+					}
 					// Non-empty nested value: write key + colon (or the verbatim
 					// "ws key : ws" prefix when preserving), then recurse.
 					if preserve {
@@ -357,11 +491,19 @@ func (s *stripper) handle(read, write, depth int) (int, int) {
 				}
 			}
 			if valueEmpty {
-				if !s.keepKey(in[keyStart:keyEnd]) {
-					write = localStartWrite // rewind: drop the member (and its whitespace/comma)
-				} else {
+				switch {
+				case snapBase != snapNone:
+					// Decided early because the value was a container: both
+					// outcomes live in finishEarly, out of line. written only
+					// ever goes true, so a dropped member must not clear it.
+					var emitted bool
+					write, emitted = s.finishEarly(snapBase, write, localStartWrite, wsStart, keyStart, keyEnd, colonPos, tmpRead, read)
+					written = written || emitted
+				case s.keepKey(in[keyStart:keyEnd]):
 					write = s.emitField(write, wsStart, keyStart, keyEnd, colonPos, tmpRead, read)
 					written = true
+				default:
+					write = localStartWrite // rewind: drop the member (and its whitespace/comma)
 				}
 			} else {
 				written = true

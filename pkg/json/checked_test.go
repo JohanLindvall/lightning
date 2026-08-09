@@ -82,6 +82,67 @@ func TestSetPathsChecked(t *testing.T) {
 	}
 }
 
+// TestStripDefaultsCheckedModes covers the wrapper's whole outcome space in every
+// whitespace mode: a document stripped away entirely (as an object and as a bare
+// scalar root, each with and without surrounding whitespace), one stripped in
+// part, one nothing is stripped from, and the two inputs that hold no document at
+// all. The rows are mode-independent on purpose — that is the contract, and it is
+// what PreserveWhitespace used to break: keeping the input's outer whitespace left
+// the consumed-document case with a whitespace-only result, which is not Valid, so
+// the wrapper reported ErrInvalidJSON on input it had just validated. Those two
+// rows (" {\"a\":0} " and " true\n" under PreserveWhitespace) fail against the
+// unfixed code.
+func TestStripDefaultsCheckedModes(t *testing.T) {
+	zero := [][]byte{[]byte("0")}
+	yes := [][]byte{[]byte("true")}
+
+	rows := []struct {
+		name     string
+		in       string
+		defaults [][]byte
+		want     string
+		wantErr  error
+	}{
+		{"fully stripped object", `{"a":0}`, zero, "", nil},
+		{"fully stripped object, padded", ` {"a":0} `, zero, "", nil},
+		{"fully stripped nested", `{"a":[{"b":0}]}`, zero, "", nil},
+		{"fully stripped scalar root", `true`, yes, "", nil},
+		{"fully stripped scalar root, padded", " true\n", yes, "", nil},
+		{"partially stripped", `{"a":0,"b":1}`, zero, `{"b":1}`, nil},
+		{"nothing stripped", `{"b":1}`, zero, `{"b":1}`, nil},
+		{"empty input", ``, zero, "", ErrInvalidJSON},
+		{"whitespace-only input", `  `, zero, "", ErrInvalidJSON},
+		{"malformed input", `{"a":`, zero, "", ErrInvalidJSON},
+	}
+
+	for _, m := range stripWSModes {
+		for _, row := range rows {
+			t.Run(m.name+"/"+row.name, func(t *testing.T) {
+				got, err := StripDefaultsChecked([]byte(row.in), nil, row.defaults, nil, m.ws)
+				if !errors.Is(err, row.wantErr) {
+					t.Fatalf("err = %v, want %v", err, row.wantErr)
+				}
+				if row.wantErr != nil {
+					if got != nil {
+						t.Errorf("got %q on error, want a nil slice", got)
+					}
+					return
+				}
+				if string(got) != row.want {
+					t.Errorf("got %q, want %q", got, row.want)
+				}
+			})
+		}
+	}
+
+	// The consumed-document result is empty in every mode, which is what makes
+	// len() the documented test — even where the unchecked function, keeping the
+	// document's outer whitespace, hands back bytes.
+	if raw := StripDefaults([]byte(` {"a":0} `), nil, zero, nil, PreserveWhitespace); string(raw) != "  " {
+		t.Errorf("premise: unchecked PreserveWhitespace = %q, want the two outer spaces", raw)
+	}
+}
+
 func TestStripDefaultsChecked(t *testing.T) {
 	defaults := [][]byte{[]byte("0"), []byte("")}
 

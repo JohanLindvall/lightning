@@ -174,14 +174,24 @@ func SetPathsChecked(in, out []byte, rawVal [][]byte, paths [][]string) ([]byte,
 // document. When every member of the root is a default — {"a":{"b":0}} with 0
 // among defaults — the empty containers this leaves cascade up and the result is
 // zero bytes, which is not valid JSON but is StripDefaults working as documented.
-// This variant returns that empty slice with a nil error, so a caller who forwards
-// the result should test len() before treating it as a document.
+// PreserveWhitespace reaches the same outcome with the document's outer whitespace
+// still in hand, so its result is whitespace rather than nothing; both are reported
+// the same way here, as an empty slice (the whitespace is dropped) and a nil error,
+// so len() stays the test in every mode for a caller who forwards the result.
 func StripDefaultsChecked(input, output []byte, defaults, keep [][]byte, ws WhitespaceMode) ([]byte, error) {
 	if !Valid(input) {
 		return nil, ErrInvalidJSON
 	}
 	res := StripDefaults(input, output, defaults, keep, ws)
-	if len(res) > 0 && !Valid(res) {
+	// A result holding no token at all is the consumed-document case above, not a
+	// malformed one — Valid rejects it either way, so it has to be recognized
+	// before the result check. The whitespace test is unstable.SkipWS, the same
+	// (deliberately lenient, <= 0x20) notion of whitespace the stripper copied
+	// those bytes through with and Valid skips them with.
+	if unstable.SkipWS(res, 0) == len(res) {
+		return res[:0], nil
+	}
+	if !Valid(res) {
 		return nil, ErrInvalidJSON
 	}
 	return res, nil

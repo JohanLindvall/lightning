@@ -71,6 +71,48 @@ func TestEscapeStringIntoReference(t *testing.T) {
 	}
 }
 
+// TestEscapeStringIntoOutBuffers locks the out contract EscapeStringInto
+// documents — out must not overlap s — by exercising the buffers that satisfy it:
+// a nil out, an out that already holds content (the escaped form is *appended*,
+// leaving what was there), and an out reused across calls with out[:0]. Each one
+// must yield exactly escapeReference's answer and leave s untouched.
+//
+// The aliased form the doc used to invite (out == s[:0], by analogy with
+// UnescapeStringInto) is deliberately not exercised: escaping lengthens, so the
+// appends overrun the bytes the scan has yet to read and the result is garbage.
+// There is nothing to lock about it beyond the sentence in the doc.
+func TestEscapeStringIntoOutBuffers(t *testing.T) {
+	const prefix = `{"k":"`
+	for _, bc := range escapeBenchCases {
+		t.Run(bc.name, func(t *testing.T) {
+			want := escapeReference(bc.in)
+			orig := string(bc.in)
+
+			if got := string(EscapeStringInto(bc.in, nil)); got != want {
+				t.Errorf("nil out: got %q, want %q", got, want)
+			}
+
+			// An out with content: EscapeStringInto appends, so the caller can
+			// build a whole JSON member in one buffer.
+			if got := string(EscapeStringInto(bc.in, []byte(prefix))); got != prefix+want {
+				t.Errorf("out with content: got %q, want %q", got, prefix+want)
+			}
+
+			// A reused buffer, both when it has room and when it must grow.
+			for _, capacity := range []int{0, 1, 6*len(bc.in) + 8} {
+				buf := make([]byte, 0, capacity)
+				if got := string(EscapeStringInto(bc.in, buf[:0])); got != want {
+					t.Errorf("reused out (cap %d): got %q, want %q", capacity, got, want)
+				}
+			}
+
+			if string(bc.in) != orig {
+				t.Errorf("input mutated: %q -> %q", orig, bc.in)
+			}
+		})
+	}
+}
+
 // altEscaping names the unescapeCases whose canonical JSON body (in) uses an
 // escape the escaper does not emit, so EscapeString's output differs from in:
 // the escaper leaves '/' unescaped and renders other control bytes as \u00XX
