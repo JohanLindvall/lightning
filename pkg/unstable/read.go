@@ -27,6 +27,20 @@ func ReadKey(data []byte, i int) (string, int, error) {
 
 // ReadStringOrNull reads a JSON string (or null) at data[i], copying the bytes
 // into a fresh string.
+//
+// String bytes are returned verbatim: this decodes escapes but never inspects
+// the UTF-8 of the literal runs between them, so raw invalid UTF-8 in the input
+// reaches the Go string unchanged ("a\xffb" stays "a\xffb"), where
+// encoding/json coerces the same input to "a\uFFFDb". Passing the bytes
+// through is the cheaper and the more faithful of the two — no re-encode, and a
+// caller that cares can run utf8.ValidString — but it does mean a decoded
+// string is not guaranteed to be well-formed UTF-8. Every string path here
+// shares the property because they share these scanners —
+// ReadStringNoCopyOrNull, ReadStringDestructiveOrNull, ReadKey, the dynamic
+// DecodeValue, and decodeEscaped's literal runs — and
+// TestStringsPassInvalidUTF8Through pins it across all of them. Only the
+// \uXXXX decoder normalizes: an unpaired surrogate escape becomes U+FFFD,
+// matching encoding/json, since there is no other way to encode it.
 func ReadStringOrNull(data []byte, i int) (string, int, error) {
 	if i >= len(data) {
 		return "", i, ErrTruncated
@@ -358,9 +372,25 @@ func ReadBoolOrNull(data []byte, i int) (bool, int, error) {
 }
 
 // ReadTimeOrNull reads an RFC 3339 JSON string (or null) at data[i] as a
-// time.Time, matching how encoding/json decodes time.Time. The intermediate
-// string aliases data — safe because time.Parse retains it in neither its
-// result nor its error (the stdlib copies into ParseError; locked by
+// time.Time. Its authority for the grammar is time.Parse(time.RFC3339, ...):
+// the fast path in date.go is only ever allowed to be more conservative, and
+// everything it declines is handed to time.Parse itself, which
+// TestReadTimeMatchesStdlibAcceptance locks over a generated date corpus. That
+// is also what encoding/json's time.Time reduces to today — its extra RFC 3339
+// strictness is compiled out pending go.dev/issue/54580 — so on an escape-free
+// timestamp the two accept the same set and produce the same instant.
+//
+// The parity stops at the JSON string layer, and only in the lenient direction:
+// this reads the string *value* (escapes decoded) and parses that, where
+// time.Time.UnmarshalJSON parses the raw bytes between the quotes without
+// unescaping them (a known stdlib quirk, go.dev/issue/47353). So a timestamp
+// written with any \uXXXX escape — legal JSON denoting a legal instant, such
+// as "2021-01-01T00:00:00\u005A" — decodes here and is rejected by the stdlib.
+// TestReadTimeAcceptsEscapedTimestamps pins both halves of that.
+// ReadTimeLaxOrNull inherits the same leniency by construction.
+//
+// The intermediate string aliases data — safe because time.Parse retains it in
+// neither its result nor its error (the stdlib copies into ParseError; locked by
 // TestReadTimeErrorRetainsNoAlias) — so this allocates only the time.Time.
 func ReadTimeOrNull(data []byte, i int) (time.Time, int, error) {
 	if i >= len(data) {

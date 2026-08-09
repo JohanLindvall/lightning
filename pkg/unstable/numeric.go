@@ -264,11 +264,21 @@ func eiselLemire64(man uint64, exp10 int, neg bool) (float64, bool) {
 	return math.Float64frombits(retBits), true
 }
 
-// ParseFloat parses the JSON number in b as a float64. It takes the same Clinger
+// ParseFloat parses the number in b as a float64. It takes the same Clinger
 // fast path as the scanner — an exact mantissa with a small decimal exponent is
 // converted with a single multiply or divide — and falls back to
 // strconv.ParseFloat for everything else. b must be exactly one number with no
 // surrounding whitespace; trailing bytes or an empty input yield ErrBadNumber.
+//
+// What it accepts is scanFloat's grammar, which is deliberately a superset of
+// RFC 8259's number: a leading '+' as well as '-' (ParseFloat("+5") is 5, nil),
+// leading zeros ("01"), an empty integer part (".5") and an empty fraction
+// ("1."). That is not laxness for its own sake — it is the accept set of every
+// number reader in this package, so ParseFloat, Valid and a generated decoder
+// agree on which documents are numbers; TestValidDivergesFromStdlib pins the
+// same list from Valid's side. In the other direction it is narrower than the
+// JSON grammar in one place: a magnitude no float64 can represent (1e309) is
+// ErrBadNumber, since there is no value to return.
 func ParseFloat(b []byte) (float64, error) {
 	f, end, fast, ok := scanFloat(b, 0)
 	if !ok || end != len(b) {
