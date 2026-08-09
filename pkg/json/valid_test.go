@@ -70,9 +70,17 @@ func mutateSeeds(per int, check func(string)) {
 }
 
 // TestValidMatchesDecodeAny is the contract Valid promises: it accepts exactly the
-// documents this library's decoders accept. DecodeAny is the reference because it
-// drives the same scanners a generated UnmarshalJSON does, so a divergence here
-// would be Valid lying about whether a decode will succeed.
+// documents DecodeAny accepts. DecodeAny is the reference because Valid is built on
+// the same readers, so the two can be held to a genuine equivalence.
+//
+// It is only that. Sharing the scanners with a generated UnmarshalJSON does not make
+// this test say anything about one: the schema adds strictness Valid has no view of,
+// and the generated decoder is looser both where it skips (unknown fields take
+// SkipValue's bracket balancing) and where it reads (the integer readers accept
+// "1.2.3" as 1, which Valid rejects). An audit found the earlier wording here —
+// that a divergence would mean "Valid lying about whether a decode will succeed" —
+// asserting an equivalence nothing tests; Valid's own doc comment now states both
+// directions.
 func TestValidMatchesDecodeAny(t *testing.T) {
 	mutateSeeds(400, func(s string) {
 		_, err := DecodeAny([]byte(s))

@@ -36,7 +36,20 @@ func parseRFC3339(s string, allowSpace bool) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	// Reject out-of-range fields so leap seconds and the like defer to time.Parse.
-	if month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || min > 59 || sec > 59 {
+	if month < 1 || month > 12 || day < 1 || hour > 23 || min > 59 || sec > 59 {
+		return time.Time{}, false
+	}
+	// The day must fit its month. A plain 1..31 check is not enough: daysFromCivil
+	// normalizes an overflowing day instead of rejecting it, so "2021-02-31" used to
+	// decode as 2021-03-03 and "2021-02-29" (a non-leap year — the shape a real
+	// producer is most likely to emit) as 2021-03-01, both with a nil error.
+	// Declining here routes the value down the fallback this function already has
+	// for out-of-range years, so time.Parse produces "day out of range" with
+	// encoding/json's exact error text and identity, for free.
+	// Cost on the common path is one table load and one not-taken compare (the
+	// bounds check on daysInMonth is proved away by the month test above); the
+	// leap-year divisions run only for a 29 February.
+	if day > int(daysInMonth[month]) && !(month == 2 && day == 29 && isLeapYear(year)) {
 		return time.Time{}, false
 	}
 
@@ -139,6 +152,19 @@ func daysFromCivil(y, m, d int) int64 {
 // non-leap year (January = index 0).
 var monthYearDay = [12]int32{0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334}
 
+// daysInMonth[m] is the length of month m in a non-leap year; February's leap day
+// is handled by the caller so that the leap test costs nothing on the other 340-odd
+// days of the year. Index 0 is unused, so the table is indexed by the 1-based month
+// directly (no m-1 subtraction on the date fast path).
+var daysInMonth = [13]int8{0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31}
+
+// isLeapYear reports whether y is a leap year in the proleptic Gregorian calendar.
+// It is the one spelling of the rule shared by parseRFC3339's day check and
+// daysFromCivilCached's leap-day bump, so the two cannot drift apart; the compiler
+// lowers the divisions to a mask and two magic multiplies and inlines the whole
+// thing.
+func isLeapYear(y int) bool { return y%4 == 0 && (y%100 != 0 || y%400 == 0) }
+
 // yearStartDays[i] is the number of days from 1970-01-01 to (1970+i)-01-01, built
 // once from daysFromCivil (so it cannot disagree with it). It spans 1970 through
 // 2261, the years that dominate real timestamps.
@@ -157,7 +183,7 @@ var yearStartDays = func() [292]int32 {
 func daysFromCivilCached(y, m, d int) int64 {
 	if uint(y-1970) < uint(len(yearStartDays)) {
 		days := int64(yearStartDays[y-1970]) + int64(monthYearDay[m-1]) + int64(d-1)
-		if m > 2 && y%4 == 0 && (y%100 != 0 || y%400 == 0) {
+		if m > 2 && isLeapYear(y) {
 			days++ // leap day of this year has already passed
 		}
 		return days

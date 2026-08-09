@@ -375,6 +375,23 @@ EOF
 		perl -0777 -i -pe 's{\n\tej "[^"]*"}{}; s{\n// BenchmarkEasyjson.*?\n\}\n}{}s' "${dir}bench_test.go"
 	fi
 
+	# 3b. Run the case's own tests — not its benchmarks. Most cases have none, but a
+	#     hand-written *_test.go beside data.go (bench/cloudflare-compact's
+	#     TestCompactDecode, guarding the //lightning:compact decoder, is the only
+	#     one today) can only be compiled once the steps above have written
+	#     data_unmarshal.go and bench_test.go, which makes this script the only
+	#     thing that can ever execute it. -bench='^$' keeps this pass to tests
+	#     alone; the measuring run below keeps -run='^$' so a failing test can
+	#     neither perturb nor be timed by the benchmark pass. Output goes to the
+	#     console rather than "$RESULTS", which results_md.py parses.
+	#     (bench/get has no data.go and so is never reached by this loop; `make
+	#     bench-test` in the parent module compiles and runs that one.)
+	if ! testout=$(go test -mod=mod -run=. -bench='^$' -count=1 "./${dir}" 2>&1); then
+		echo "  tests failed:" >&2
+		echo "$testout" >&2
+		status=1
+	fi
+
 	# 4. Run the benchmarks and record the output.
 	{
 		echo "================================================================"

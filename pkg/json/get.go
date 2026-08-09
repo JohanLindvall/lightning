@@ -135,7 +135,9 @@ func getMany(data []byte, keys []string, out [][]byte, compact bool) ([][]byte, 
 // least one requested path, and paths that share a prefix share that descent — so N
 // nested lookups, especially under a common parent, cost one traversal instead of
 // N. Results follow GetMany's rules (first occurrence wins; duplicate paths are all
-// filled). out is filled from out[:0] and returned.
+// filled), and first-occurrence-wins governs the descent as well as the capture: a
+// duplicate key in the document is not descended a second time, so GetPaths reports
+// what Get reports for the same path. out is filled from out[:0] and returned.
 func GetPaths(data []byte, paths [][]string, out [][]byte) ([][]byte, error) {
 	return getPaths(data, paths, out, false)
 }
@@ -186,7 +188,11 @@ func getPaths(data []byte, paths [][]string, out [][]byte, compact bool) ([][]by
 		scratch = make([]int, 0, need)
 	}
 	// An empty path selects the whole root value; everything else needs an object to
-	// descend and joins the depth-0 active set.
+	// descend and joins the depth-0 active set. The root span is scanned once and
+	// handed to *every* empty path — duplicate paths are all filled, as the doc
+	// says and as the object walk below does; the earlier flag guarded the
+	// assignment as well as the scan, so a second empty path came back nil.
+	var root []byte
 	rootCaptured := false
 	for n, p := range paths {
 		if len(p) == 0 {
@@ -196,8 +202,9 @@ func getPaths(data []byte, paths [][]string, out [][]byte, compact bool) ([][]by
 					return out, err
 				}
 				rootCaptured = true
-				out[n] = data[i:end]
+				root = data[i:end]
 			}
+			out[n] = root
 		} else {
 			scratch = append(scratch, n)
 		}
@@ -281,12 +288,35 @@ func walkPaths(data []byte, i, depth int, active, free []int, paths [][]string, 
 		if err != nil {
 			return end, err
 		}
-		if ending {
+		if ending || len(recurse) > 0 {
+			// This key consumed some paths: capture those that end here, and drop
+			// every path it matched from the active set so a later duplicate of the
+			// key is not descended a second time. Get stops at a key's first
+			// occurrence and GetPaths is documented as its multi-path form, but the
+			// descent had no such bookkeeping — on {"o":{"a":1},"o":{"b":2}} Get(o,b)
+			// reported ErrKeyNotFound while GetPaths(o,b) walked into the second "o"
+			// and returned 2. (The capture side was already first-occurrence-wins via
+			// the out[p] == nil guard, which also keeps duplicate *requested* paths
+			// all filled.) One pass does both, so a matched member costs no more
+			// scans of active than the capture loop alone did, and off-path members —
+			// the overwhelmingly common case — reach neither.
+			//
+			// Compacting active in place is safe: it is the parent frame's recurse
+			// slice, which the parent does not read after this call returns (it
+			// rebuilds it from free[:0] for the next member), and shrinking it never
+			// moves free, so the shared scratch's no-reallocation invariant holds.
+			w := 0
 			for _, p := range active {
-				if out[p] == nil && depth+1 == len(paths[p]) && paths[p][depth] == key {
+				if paths[p][depth] != key {
+					active[w] = p
+					w++
+					continue
+				}
+				if out[p] == nil && depth+1 == len(paths[p]) {
 					out[p] = data[start:end]
 				}
 			}
+			active = active[:w]
 		}
 
 		i = unstable.SkipWSCompact(data, end, compact)

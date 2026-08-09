@@ -121,18 +121,41 @@ for _, doc := range docs {
 }
 ```
 
-Reuse follows `encoding/json` exactly. A slice has its length **reset** and is then
-filled, so it holds only the current document's elements (the backing array is kept,
-which is what makes the reuse free). A map **keeps** its existing entries and the
-document's members are merged over them — so clear or replace a map field yourself
-if you need it to hold only the latest document. A fixed-size array is zeroed first.
-A non-nil pointer field is decoded **into the value it already points to**
-(allocating only when the pointer is nil), so pointer-dense schemas also reuse
-allocation-free; JSON `null` sets the pointer back to nil. As with the stdlib,
-a reused pointee keeps any field values the document omits.
+Reuse here is *storage* reuse, not *value* reuse, and that is the one place where it
+parts company with `encoding/json`. Two rules cover it:
 
-Note that fields absent from a later document keep their previous values, exactly as
-with `encoding/json`; zero the value first if you need absent-means-zero.
+- **Struct fields are decoded in place.** A field the document omits keeps the value
+  it had, exactly as with `encoding/json` — that applies to the fields of a nested
+  struct and to a non-nil **pointer** field, which is decoded *into the value it
+  already points to* (a nil pointer allocates; JSON `null` sets it back to nil), so
+  pointer-dense schemas reuse allocation-free. Zero the target yourself if you need
+  absent-means-zero.
+- **Container elements are reset before they are filled.** Every slice element,
+  fixed-array element and map value starts from its zero value, so nothing carries
+  over from the previous document into an element. The *storage* is still reused:
+  a slice keeps its **backing array** (its length is reset and it is refilled, which
+  is what makes the reuse free), a map keeps its existing **entries** and merges the
+  document's members over them — clear or replace a map field yourself if you need it
+  to hold only the latest document — and a fixed-size array is zeroed in full.
+
+`encoding/json` differs on the second rule: it decodes a slice or array element
+*into* whatever that element already holds, so a field absent from the later document
+survives from the earlier one. With `Items []Inner` where `Inner` is `{A int; B string}`:
+
+```go
+v.UnmarshalJSON([]byte(`{"items":[{"a":1,"b":"one"}]}`))
+v.UnmarshalJSON([]byte(`{"items":[{"a":2}]}`))
+// lightning:      v.Items == [{A:2, B:""}]     — the element was reset first
+// encoding/json:  v.Items == [{A:2, B:"one"}]  — "one" bled through from document 1
+```
+
+The same holds for `[]*Inner` (lightning gives the element a fresh pointee; the
+stdlib reuses the old one) and for `[N]Inner`; map values are reset by both. The
+divergence is deliberate — stale-field bleed through a reused slice is a classic
+`encoding/json` footgun, and resetting the element is the counterpart of the
+length reset that makes `[1,2]` decoded twice yield `[1,2]` and not `[1,2,1,2]`.
+Note that the difference is invisible unless you reuse a target *and* the documents
+disagree about which fields are present.
 
 Embedded struct fields are promoted like `encoding/json`: an embedded struct's
 exported fields decode as if they were the outer struct's own (an embedded
@@ -142,6 +165,78 @@ unless a single field is tagged, and an embedded field with its own JSON tag nam
 is a plain named field rather than promoted. Embedding a type from another
 package, whose fields aren't visible to the generator, is the one gap — it is
 decoded as a single named field instead of being flattened.
+
+## Differences from `encoding/json`
+
+Decoding is meant to be a drop-in swap: for every supported type a well-formed
+document yields the values the stdlib yields. The list below is the set of
+deliberate divergences — worth reading once before migrating, because most of them
+are *silent*.
+
+- **Key matching is exact and case-sensitive.** `encoding/json` tries an exact
+  match and then falls back to a case-insensitive one, so `{"ITEMS":[…]}` fills a
+  field tagged `json:"items"`. lightning has no fallback: a key that isn't
+  byte-equal to the tag (or to one of its
+  [alternate names](#alternate-field-names)) is simply an unknown key, and unknown
+  keys are skipped. That is faster — the field switch is a `switch len(key)` over
+  constant strings, with no case folding — and less surprising to read, but it
+  fails quietly: a mis-cased document decodes to zero values — or, into a
+  [reused target](#reusing-a-decode-target), to the *previous* document's values.
+  If a source has unstable capitalization, list the spellings explicitly:
+  `json:"items|Items|ITEMS"`.
+- **The `,string` tag option is not implemented.** `encoding/json` uses it to read
+  a number or bool that the producer wrapped in a JSON string — `{"n":"7"}` into an
+  `int` field tagged `json:"n,string"`. lightning ignores the option and decodes
+  the value with the field's declared Go type, so a quoted number fails with
+  `ErrBadNumber`; the generator prints a warning when it sees the option, rather
+  than emitting a decoder that silently does the wrong thing. Declare the field as
+  a `string` and convert, or — when the string holds a whole JSON *document* rather
+  than one scalar — use [`unwrap`](#the-unwrap-tag-option). `omitempty` is accepted
+  and ignored, since lightning only decodes.
+- **Slice, array and map elements are reset before being decoded**, where
+  `encoding/json` decodes a slice or array element into whatever it already holds.
+  Only observable when you reuse a decode target; see
+  [Reusing a decode target](#reusing-a-decode-target) for the full rule and an
+  example.
+- **Out-of-range numbers wrap or saturate instead of failing.** `encoding/json`
+  reports an `UnmarshalTypeError` for a number that doesn't fit the destination
+  and leaves the field alone. lightning parses into the widest type and converts,
+  so `300` into an `int8` stores `44`, a 20-digit integer into an `int64` wraps,
+  and `1e39` into a `float32` stores `+Inf` — the same for those types inside a
+  slice or array. (A *negative* number in an unsigned field is the one range error
+  that is reported, as `ErrBadNumber`.) The reason is the hot integer path: a SWAR
+  digit fold with no per-width range check. If out-of-range input must be
+  rejected, decode into `int64`/`float64`/`json.Number` and check the range
+  yourself.
+- **Numbers are validated by arithmetic, not by grammar**, so `01`, `+1`, `.5` and
+  `5.` are accepted while `1e309` is rejected (it has no `float64`). The table
+  under [Checking validity](#checking-validity) spells this out.
+- **Errors are sentinel values, not typed errors.** Every failure is one of the
+  package [sentinels](#errors), matched with `errors.Is`; there is no
+  `*json.UnmarshalTypeError` or `*json.SyntaxError` carrying the offending field,
+  Go type and byte offset. Tolerating a type mismatch on a particular field is
+  what the [`lax`](#the-lax-tag-option) option is for.
+- **Invalid UTF-8 is passed through** rather than replaced with U+FFFD — see
+  [Limits and untrusted input](#limits-and-untrusted-input).
+- **Duplicate keys: last wins when decoding, first wins in the toolkit.** A
+  generated `UnmarshalJSON` decodes every occurrence in document order, so the last
+  one survives — matching `encoding/json`. The [`pkg/json`](pkg/json) lookup and
+  edit helpers (`Get`, `Lookup`, `GetMany`, `GetPaths`, `Set`, `SetMany`,
+  `SetPaths`) take the **first** occurrence and leave any later one untouched,
+  because they return or rewrite a single span rather than reading the object to
+  its end. (`ObjectEach`/`ArrayEach` are the exception: iteration visits every
+  member, duplicates included.) Duplicate keys are rare and neither answer is
+  wrong, but the two halves of the library disagree, so don't build on it.
+
+Two things that are *not* differences, though they are commonly assumed to be:
+
+- **Trailing commas are rejected**, exactly as `encoding/json` rejects them:
+  `{"a":1,}` and `[1,]` both fail with `ErrInvalidJSON`, in generated decoders,
+  `DecodeAny` and [`Valid`](#checking-validity) alike. (The lenient bracket
+  balancer used to *skip* unwanted values would accept them, which is precisely
+  why `Valid` does not use it.)
+- **Unknown object keys are skipped**, as with `encoding/json`'s default; there is
+  no `DisallowUnknownFields` equivalent.
 
 ## Root types
 
@@ -491,8 +586,10 @@ A document nested deeper than 10 000 levels is rejected with `ErrMaxDepth` rathe
 than descended into — the same bound `encoding/json` applies, and for the same
 reason: `DecodeAny` recurses once per nesting level, and a Go stack overflow is a
 *fatal* error that `recover` cannot catch, so without the bound a hostile document
-would take the process down instead of returning an error. `Get`, `Set` and the
-`Skip` path are iterative and unaffected.
+would take the process down instead of returning an error. `Get`, `Set` and value
+skipping walk the document without recursing per level, so the bound does not
+constrain them (the one recursive skip fallback carries the same limit, so nothing
+here can be driven into a stack overflow either).
 
 ## Checking validity
 
@@ -500,13 +597,32 @@ would take the process down instead of returning an error. `Get`, `Set` and the
 (optionally whitespace-surrounded, no trailing content), checking the document in
 place — **no allocation, and no decoded value built**.
 
-`Valid` answers *"will lightning decode this?"*: it accepts exactly what
-[`DecodeAny`](#decoding-into-any) and a generated `UnmarshalJSON` accept, which is
-what makes it useful as a gate in front of them (a 20-million-execution
-differential fuzz against `DecodeAny` keeps the two in step). That is a
+`Valid` answers *"will lightning's own scanner accept this?"*, which is a
 deliberately different question from `encoding/json.Valid`'s *"does this match the
-JSON grammar?"*, and the two disagree in a few places because the decoder's
-scanners are tuned for input already known to be JSON:
+JSON grammar?"* — the decoder's scanners are tuned for input already known to be
+JSON, so the two disagree in a few places. What "lightning's own scanner" means is
+worth being precise about, since it is what makes `Valid` useful as a gate:
+
+- Against [`DecodeAny`](#decoding-into-any) the two are **held equal by test**: a
+  20-million-execution differential fuzz runs both over the same inputs and
+  requires them to agree, so `Valid` is exactly `DecodeAny`'s precondition. It
+  holds because `Valid` reuses the decoder's own readers instead of
+  reimplementing them.
+- Against a generated `UnmarshalJSON` it is a **guide, not an equivalence**, and
+  nothing tests it as one. A generated decoder shares these scanners — so every
+  divergence in the table below applies to it too — and then adds the schema,
+  which cuts both ways. It is *stricter* where the schema looks: a value `Valid`
+  accepts is rejected when its type doesn't fit the field it lands in. And it is
+  *looser* in two ways. Looser where the schema doesn't look: an unknown field's
+  value is jumped with the lenient bracket balancer rather than parsed, so
+  `{"zzz":[1,,2],"i8":5}` decodes fine into a struct with no `zzz` field even
+  though `Valid` rejects it. And — the surprising one — looser where it *does*
+  look, on integer fields: the integer readers consume a run of digit-ish bytes
+  and stop, so `{"n":1.2.3}` decodes `n` as `1` with no error while `Valid`
+  rejects the document. Read `Valid` as "this is well-formed JSON as lightning
+  defines it", not as "every generated decoder will accept this".
+
+The divergences from `encoding/json.Valid` are these:
 
 | Input | `Valid` | `encoding/json.Valid` | Why |
 |---|:--:|:--:|---|
@@ -684,11 +800,16 @@ out = json.SetPaths(doc, out[:0], [][]byte{[]byte("9"), []byte("8")},
 	[][]string{{"a", "b"}, {"a", "c"}})
 ```
 
-Each `rawVal` is inserted verbatim and must be one well-formed JSON value; any
-keys created along the way are written as plain JSON strings (no escaping, so
-avoid keys needing it). `out` is filled from `out[:0]` and returned — pass a
-reusable buffer to avoid allocation; `out` must not alias `in`, which is never
-modified. Inter-token whitespace in `in` is preserved outside the edited spans.
+Each `rawVal` is inserted verbatim and must be one well-formed JSON value; any key
+created along the way is written **raw between two quotes**, with no escaping pass
+— part of what keeps these functions allocation-free. So a key containing `"`, `\`
+or a control byte does not round-trip, and a key crafted to close its own string
+(`x":1,"role`) splices whole extra members into the result. Never build a path out
+of untrusted input: use the [checked forms](#checked-edits), which reject such a
+key with `ErrUnsafeKey` before the edit runs. `out` is filled from `out[:0]` and
+returned — pass a reusable buffer to avoid allocation; `out` must not alias `in`,
+which is never modified. Inter-token whitespace in `in` is preserved outside the
+edited spans.
 
 ## Checked edits
 
@@ -702,8 +823,9 @@ isn't a single JSON value, propagates silently into the result.
 
 For input you don't trust, each has a `…Checked` counterpart that returns an
 error. They validate their arguments with [`Valid`](#checking-validity) before the
-edit and validate the result afterwards, so a bad document, a bad inserted value,
-or a result that somehow came out malformed is reported instead of returned:
+edit, check every key they are asked to create, and validate the result
+afterwards, so a bad document, a bad inserted value, an unwritable key, or a
+result that somehow came out malformed is reported instead of returned:
 
 - `SetChecked(in, out, rawVal []byte, keys []string) ([]byte, error)`
 - `SetManyChecked(in, out []byte, rawVal [][]byte, keys []string) ([]byte, error)`
@@ -717,10 +839,16 @@ if err != nil { // ErrInvalidJSON: untrusted wasn't one well-formed value
 }
 ```
 
-They return `ErrInvalidJSON` for a malformed document, inserted value, or result,
-and `ErrValueCount` when `rawVal` has fewer entries than `keys`/`paths` — the case
-the unchecked forms handle by silently ignoring the surplus. On error the returned
-slice is `nil`, so there's no half-edited buffer to mistake for a result.
+They return `ErrInvalidJSON` for a malformed document, inserted value, or result;
+`ErrValueCount` when `rawVal` has fewer entries than `keys`/`paths` — the case the
+unchecked forms handle by silently ignoring the surplus; and `ErrUnsafeKey` when a
+key, or any element of a path (the intermediate objects are built from them too),
+holds a byte that would have to be escaped. That last one is a security check
+rather than a tidiness one: created keys are written raw, so `x":1,"role` closes
+its own string and injects a member — and since the forgery is itself well-formed
+JSON, validating the *result* would not catch it, which is why keys are checked
+before the edit. On error the returned slice is `nil`, so there's no half-edited
+buffer to mistake for a result.
 
 Two things they deliberately don't check. The compactness *assertion* is still a
 promise you make: `AssumeCompact` is not verified, as nowhere else in this package
@@ -818,9 +946,10 @@ Run them yourself with:
 ./bench/run_bench.sh
 ```
 
-which (re)generates each case's deserializers and writes `bench/results.txt`
-and an architecture-specific `bench/results_<goarch>.md` (so runs on different
-CPUs do not overwrite each other's committed results).
+which (re)generates each case's deserializers, runs any hand-written tests sitting
+beside its `data.go`, and writes `bench/results.txt` and an architecture-specific
+`bench/results_<goarch>.md` (so runs on different CPUs do not overwrite each
+other's committed results).
 
 Representative numbers for a 1.8 KB Cloudflare log (Go 1.26, amd64):
 
@@ -852,21 +981,44 @@ Worth knowing before pointing this at input you don't control:
 - **Nesting is bounded at 10 000 levels** (`unstable.MaxDepth`, matching
   `encoding/json`); past that the decode returns `ErrMaxDepth` instead of
   descending. `DecodeAny`, `Valid`, `StripDefaults` and generated decoders for
-  recursive schemas (below) all enforce it; `Get`/`Lookup`/`GetMany`/`GetPaths`/
-  `Set` walk iteratively and are unaffected.
+  recursive schemas (below) all enforce it. `Get`/`Lookup`/`GetMany`/`GetPaths`/
+  `Set` walk the document without recursing per level, so the bound does not limit
+  what they can read; the value skipping they rely on is bounded as well, so no
+  entry point here can be driven into a stack overflow.
 
   The bound exists because a Go stack overflow is a **fatal** error that `recover`
   cannot catch — so without it, deeply nested input would take the process down
   instead of returning an error. That was measurable: a 4-million-level document
   aimed at a recursive schema used to die with `fatal error: stack overflow`, and
   now reports `ErrMaxDepth`.
+- **A slice presize is a hint, and it is bounded by the document's own bytes.**
+  Before filling a slice the decoder cheaply estimates how many elements the JSON
+  array holds — by counting commas or braces, or by sampling the first few
+  elements — and sizes the backing array once instead of growing it repeatedly.
+  Those scans deliberately don't parse, so bytes inside a *string value* can
+  inflate the estimate: `[{"s":"{{{{…"}]` is one element that counts as thousands.
+  Each counter is therefore clamped to the most elements its byte span could
+  legally hold, which caps the effect at what an equally large honest document
+  would already cost — measured, a 2 MB crafted body allocates 98 MB where a 2 MB
+  genuinely dense array of the same type allocates 96 MB, so crafting buys about
+  1.02×. What remains is the ordinary JSON-to-Go expansion ratio (a `[{},{},…]`
+  array of a 144-byte struct really does need ~48× its own JSON in memory), which
+  is a capacity-planning fact rather than an attack, and applies equally to
+  `encoding/json`. Size your request-body limit against your widest element type,
+  not against the JSON.
 - **Invalid UTF-8 is passed through**, not replaced. `encoding/json` substitutes
   U+FFFD for malformed bytes; lightning returns them verbatim, so a decoded
   `string` is not guaranteed to be valid UTF-8. (Unpaired `\uXXXX` surrogates *are*
   replaced with U+FFFD, matching `encoding/json`.) This is lossless rather than
   lenient, but check with `utf8.Valid` if you need the guarantee.
 - **Numbers are validated by arithmetic, not by grammar** — see the table under
-  [Checking validity](#checking-validity) for what that accepts.
+  [Checking validity](#checking-validity) for what that accepts. A number that
+  overflows its destination **wraps** (sized ints) or **saturates to ±Inf**
+  (`float32`) instead of erroring, so a field whose range matters wants an explicit
+  check; see [Differences from `encoding/json`](#differences-from-encodingjson).
+- **Key matching is exact**, with no case-insensitive fallback, so a document that
+  varies the capitalization of a key decodes that field to its zero value (or, on a
+  reused target, to the previous document's value) with no error — same section.
 - `nocopy` results alias the input buffer and `//lightning:destructive` **overwrites
   it**; neither is safe for a buffer you don't own or intend to reuse.
 - `//lightning:arena` batches small numeric-slice backings into shared chunks: a

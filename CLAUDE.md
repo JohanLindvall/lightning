@@ -361,8 +361,9 @@ byte-identical when adding cold paths; push new logic out-of-line.
   instead streams **64-byte** blocks: `maskBlock` (AVX2 / NEON) returns four uint64
   bitmaps — `"`, `\`, and only the container's *own* open/close brackets (it is told
   which via an `isArray` arg and branches to the `{`/`}` or `[`/`]` splats, so a
-  stray bracket of the other type is never counted — matching `skipObject`/
-  `skipArray` so the SIMD and scalar paths never diverge). 64 bytes/call (vs an
+  stray bracket of the other type is never counted — which on *well-formed* input
+  matches `skipObject`/`skipArray`, and on malformed input does **not**; see the
+  divergence note below). 64 bytes/call (vs an
   earlier 32) halves the call/marshal/`VZEROUPPER` overhead and the
   `findEscaped`/`prefixXor` frequency; computing only 4 classes (not 6) cuts the
   per-block movemasks 12→8. A direct A/B (both builds 4-mask type-selected, only the
@@ -386,8 +387,20 @@ byte-identical when adding cold paths; push new logic out-of-line.
   where one `indexStructural` scan already reaches the close and the mask path would
   only add per-block work. The probe is a heuristic; a wrong guess (or a miss on
   malformed input) only costs speed, never correctness — both paths are bracket
-  balancers that agree on every value the other accepts (50k-doc differential fuzz +
-  truncation safety vs `skipObject`/`skipArray`). **This is not the rejected two-stage
+  balancers that return the identical end index on every **well-formed** value
+  (50k-doc differential fuzz + truncation safety vs `skipObject`/`skipArray`).
+  **They are not interchangeable off that set.** An earlier version of this entry
+  claimed they "agree on every value the other accepts"; a 2026-08 audit falsified
+  it, and `skipfast.go`'s header now enumerates three divergence classes — an
+  unbalanced bracket of the *other* type (fast ignores, scalar descends), nesting
+  past `MaxDepth` (fast is iterative and accepts, scalar now returns `ErrMaxDepth`),
+  and a stray backslash *outside* a string (`findEscaped64` is pure bit math and
+  cannot know it is not in a string, so the verdict flips on 64-byte-grid alignment
+  alone: `{`+N spaces+`\}` is accepted at N=62, rejected at 63, accepted at 64).
+  Because `SkipValue` picks the path by CPU feature, all three make its answer on
+  **malformed** input host-dependent. Pinned by `TestSkipPathsDivergeOnMalformed` /
+  `TestSkipBackslashAlignmentCliff` / `TestSkipDepthDivergence`, in the spirit of
+  `TestValidDivergesFromStdlib`. **This is not the rejected two-stage
   feed** (below): the skip path has no typed stage-2, so the index-like scan *is* the
   work and the economics that sank two-stage do not apply. Wins: **`Get` end-to-end
   +105%** (skip-heavy doc, skipping 500 nested-object siblings: 27.9→13.6 µs),
@@ -1102,6 +1115,28 @@ no regressions.)
   only mallocgc *count*: ~25 ns × count ≈ **1.4% on twitter_status, 2.4% on
   gsoc** for signature churn through every `Read*` and generated decoder. The
   destructive directive already owns the eliminate-the-bytes win. Don't build it.
+
+  **CORRECTION (2026-08-09) — that sizing model is wrong, and this verdict is
+  withdrawn for the escaped-string case.** The `~25 ns × alloc count` estimate
+  above predicts a win proportional to *allocation count*; measurement says the
+  cost is span acquisition inside `makeslice`, which is proportional to *chunk
+  count*. `pprof -peek` on gsoc_2018 attributes **10.4% of total** to
+  `runtime.makeslice` under `decodeStringEscaped` (0.49s of 4.73s), not 2.4%. A
+  measurement-only bump allocator replacing the `make` at `string.go:102`
+  (interleaved A/B, n=10, pinned) measures **−8.78% time (p=0.001), allocs/op
+  −56%, B/op −4.2%** — that is the *ceiling*, since a real arena also pays
+  threading and bookkeeping, and it is below the −11…−13% an isolated estimate
+  predicted (the usual over-prediction).
+  The decisive experiment is the chunk-size sweep, and it is what proves the
+  mechanism: at **4 KiB** chunks — the size `unstable.Arena` already uses — the
+  same probe is **statistically flat (p=0.065)** and B/op is **+13.4% worse**
+  (chunk-tail waste) while allocs/op still fall 37%. So a 37% reduction in
+  allocation count buys *nothing*, which falsifies the count model outright, and
+  **the existing `//lightning:arena` infrastructure cannot deliver this win** —
+  it needs large chunks (≥64 KiB), which changes the pinning trade-off that made
+  4 KiB the right choice there. Anyone picking this up should size it against the
+  8.78% ceiling, not the 2.4% figure, and should not assume the Arena type is
+  reusable as-is.
 - **Inline clean-string fast path in the unknown-field `default:` skip** (the
   readKey inline trick applied to the generated `SkipValue` branch: emit
   `IndexCloseOrEscape` + close-quote test inline, fall back to `SkipValue` for a
@@ -1530,3 +1565,131 @@ no new addressable hot spot surfaced.
 - The generator's dead `need*` import flags were deleted (`assemble` scans the
   generated text); lax `[N]scalar` fields route through the batched array
   readers via a thin generated wrapper (`TestLaxFixedArrays`).
+
+## Session 2026-08-09 audit: 23 findings fixed, and the traps found along the way
+
+A full correctness/API/performance/DRY audit. Every finding below was reproduced
+before being fixed and re-reproduced by an independent verifier afterwards. The
+entries worth carrying forward are the *reasoning*, not the diffs.
+
+### Two memory-safety defects, both reachable from the public API
+
+- **`skipObject`/`skipArray` recursed with no bound** (`skip.go`). This entry's own
+  MaxDepth note used to say "Get/Set/SkipValue are iterative or path-bounded and
+  needed nothing" — true of `skipContainerFast` and of `Get`'s loop, **false of the
+  scalar fallback underneath them**. Measured: `{"k":1,"a":[0,[[[…10M…]]]],"zz":7}`
+  (20 MB) through `json.Get` died with `fatal error: stack overflow`, which
+  `recover` cannot catch; 4M nesting survived. Reaching it on an AVX2 host needs one
+  detail — a *scalar first element* makes `SkipValue`'s fast-path probe decline, and
+  every nested container from there recurses unconditionally. Fixed by threading
+  `depth` through unexported `skipObjectDepth`/`skipArrayDepth` (the two-arg entries
+  stay inlinable wrappers, so `SkipValue` is unchanged). Locked by
+  `TestSkipDepthBound`.
+- **Presize hints were bounded by document bytes, not by possible element count**
+  (`count.go`). `CountArrayObjects` counts `{` before the first `]` *including braces
+  inside string values* — documented as harmless because "a miscount only mis-sizes,
+  never misdecodes", which is true of correctness and silent about memory, since the
+  count becomes a `make` capacity. Measured 65× amplification, linear in input
+  (2 MB → 130 MB, `len(items)=1 cap=2000001`).
+  **The fix, and the sizing lesson.** All three counters now clamp to what the byte
+  span can structurally hold (`(rb+1)/3` for objects, `(rb+1)/2` for scalars,
+  `span/2` for the extrapolation). The right target was not "bound the allocation"
+  but "bound the hint to what a *legal* document of this span could have produced" —
+  verified directly: post-fix, a 2 MB brace-bomb allocates 98 MB and a 2 MB **honest**
+  densest-legal array of the same element type allocates 96 MB, so crafted input buys
+  **1.02×** over simply sending real data. Anything tighter would under-size honest
+  documents. The residual `sizeof(element)` factor is the intrinsic JSON→Go expansion
+  ratio, not an attack — an absolute cap was considered and rejected on that basis.
+  Note the clamp is *deliberately* a no-op on unrepresentative leading elements (64
+  leading `""`/`{}` then one huge element extrapolate identically with or without
+  it); that shape is already inside the honest-document ceiling.
+
+### The methodology trap that nearly lost two findings
+
+A generated `UnmarshalJSON` makes its type a `json.Unmarshaler`, so
+`encoding/json.Unmarshal(doc, &target)` **delegates to lightning's own decoder** and
+compares it against itself. Measured against that broken baseline, the RawMessage-null
+and slice-element-reuse findings both "matched the stdlib exactly" and were nearly
+dismissed. Every stdlib differential must go through a defined twin with no methods —
+`type FooStd Foo`, which is exactly why `bench/` uses `type benchmarkStd Benchmark`.
+Against a real baseline both were genuine divergences. **Check any differential test
+in this repo for this trap before trusting it.**
+
+### Correctness fixes worth knowing
+
+- **`json.RawMessage` ignored JSON null**: a fresh target got nil where the stdlib
+  gets the four bytes `null`, and — worse under the reuse this library encourages —
+  a reused target silently kept the *previous* document's value.
+- **`parseRFC3339` validated the day only as 1..31**, so `2021-02-31` decoded to
+  March 3 with a nil error (month was already checked correctly). The failure mode
+  is the bad one: a plausible wrong date, not a rejection.
+- **`ReadNumberOrNull` captured malformed literals verbatim** (`1.2.3`, `-`, `1e`).
+  The fix's acceptance rule is **agreement with this library's own float reader**,
+  not with encoding/json — so `01` stays accepted, because `Valid` accepts it and
+  changing that would create a *new* Valid-vs-decoder divergence in the other
+  direction. That invariant is now a differential test.
+- **`SetPaths` edited every duplicate of a matched key**, where `Set`/`SetMany` stop
+  at the first — and whether it did depended on whether an *unrelated* path was
+  found, because the all-found early exit suppressed it. The 200k-document
+  differential that blessed the early exit as "a consistency fix" used unique-keyed
+  documents and could not see this. **A differential over inputs that lack the
+  feature under test proves nothing about it.**
+- **`GetPaths` descended duplicate parents where `Get` stops**, so the documented
+  "multi-path form of Get" disagreed with `Get`.
+- **`StripDefaults` ejected on a whitespace-only object in array position**, copying
+  the entire remainder through unstripped — output still valid JSON, so nothing
+  downstream noticed it had quietly stopped working.
+- **The checked edit wrappers validated everything except the keys.** `appendMember`
+  writes keys raw between quotes, so key `x":1,"role` injected a member and the
+  trailing `Valid(res)` passed it *because the forgery is well-formed*. The
+  precondition was documented — on the *unchecked* function, while the checked one
+  is sold as the untrusted-input path. New `ErrUnsafeKey`; the hot walker is
+  untouched, per the two-tier convention.
+
+### Generator: the whole class came from one hole
+
+`main.go` had **0.0% statement coverage** and no test file in the root package.
+Four confirmed defects lived in it, all of the same shape — *the generator exits 0
+printing "wrote …" and emits a package that does not compile*:
+`namedStruct` reserving its decoder name with a bare `g.used[fn] = true` instead of
+`g.uniq` (duplicate function names, order-dependent — swapping two fields fixes or
+breaks it); `assemble` deciding imports by substring-scanning the generated text,
+which a JSON *key literal* containing `time.Time` trivially fools; `isRaw` matching
+`RawMessage` from any package qualifier; and directive validation only seeing
+directives already attached to a type decl, so a blank line silently disables both
+the directive and its typo check. The fix that matters is the **generate-then-compile
+table test** (`generator_test.go`) — compilation is the assertion, and it closes the
+class rather than the instances. `//lightning:compact` likewise had *zero executed
+coverage*: its only test lives in the `bench` module, which `go test ./...` cannot
+reach and which every runner enters with `-run='^$'`; it now has a conformance case.
+
+### The SIMD/scalar skip paths are not interchangeable — now pinned
+
+See the corrected note in the `skipContainerFast` entry above. Three divergence
+classes, all confined to malformed input, all host-dependent because `SkipValue`
+picks the path by CPU feature. The third was found only by an exhaustive
+differential (708k malformed documents): a **stray backslash outside a string**,
+where `findEscaped64`'s pure bit math cannot know it is not in a string, producing a
+verdict that flips on 64-byte-grid alignment alone. Pinned by
+`TestSkipPathsDivergeOnMalformed` / `TestSkipBackslashAlignmentCliff` /
+`TestSkipDepthDivergence` — the `TestValidDivergesFromStdlib` pattern, which exists
+precisely so a documented disagreement cannot rot into an undocumented one.
+
+### `Valid`'s contract was overstated in four places
+
+`Valid` ≡ `DecodeAny` is real and fuzz-locked. "And therefore a generated
+`UnmarshalJSON` accepts" was not, in **either** direction, and had propagated to the
+package doc, `checked.go` and `valid_test.go`'s rationale. A generated decoder is
+stricter where the schema is, and looser in two ways — where it does not look
+(unknown fields take `SkipValue`'s bracket balancing) and, less obviously, **where it
+does**: `ReadInt64OrNull`/`ReadUint64OrNull` consume a digit-ish run and stop, so a
+known int field reads `1.2.3` as 1 with no error while `Valid` rejects the document.
+
+### CI gaps closed
+
+`go vet` ran on amd64 only, so **`asmdecl` never inspected the arm64 assembly** —
+and `go test`'s built-in vet subset does not include `asmdecl`, so the NEON side was
+checked by nothing. This is exactly the class of the recorded `maskBlock`
+result-offset bug (confirmed by experiment: that edit is reported by
+`GOARCH=arm64 go vet` and invisible to amd64). New `vet` and `fmt-check` targets;
+`bench-test` compiles the otherwise-unreachable `bench/get`.

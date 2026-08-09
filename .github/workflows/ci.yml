@@ -27,15 +27,36 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
+          # Key the module cache on both modules' lockfiles: bench/ is a separate
+          # module and the "Bench module tests" step below compiles it.
+          cache-dependency-path: |
+            go.sum
+            bench/go.sum
       # The generated decoders are gitignored, so a fresh checkout has none and the
-      # conformance package (and its test) would not compile. Generate them before
-      # linting; `make test` regenerates as needed via the same Makefile rule.
+      # conformance package (and its test) would not compile. Generate them on both
+      # arches — `go vet ./...` type-checks the whole module, so the Vet step needs
+      # them too; `make test` regenerates as needed via the same Makefile rule.
       - name: Generate
-        if: matrix.arch == 'amd64'
         run: make generate
-      # Prebuilt binary (no source compile) + cached binary and lint cache. Lint is
-      # architecture-independent (it analyzes source, not the built binary), so run
-      # it once on amd64 only; both arches still run the tests.
+      # Nothing else in CI checks formatting, and `make fix` (the fixer) only ever
+      # runs by hand. gofmt output is architecture-independent, so once is enough.
+      - name: Format
+        if: matrix.arch == 'amd64'
+        run: make fmt-check
+      # Vet runs on BOTH arches on purpose. Most analyzers only read source, but
+      # asmdecl is inherently per-GOARCH: on an amd64 runner it validates
+      # simd_amd64.s and skipfast_amd64.s against their Go declarations and never
+      # looks at the arm64 pair. `go test`'s built-in vet subset does not include
+      # asmdecl, so `make test` on the arm64 runner is not a substitute — without
+      # this step the NEON assembly is checked by nothing. (Verified by experiment:
+      # an off-by-4 result offset in skipfast_arm64.s fails `GOARCH=arm64 go vet`
+      # and is invisible to `GOARCH=amd64 go vet`.)
+      - name: Vet
+        run: make vet
+      # Prebuilt binary (no source compile) + cached binary and lint cache. This is
+      # the architecture-independent half of static analysis (style, unused,
+      # staticcheck), so it runs once on amd64; the architecture-dependent half is
+      # the Vet step above, which runs on both.
       - name: Lint
         if: matrix.arch == 'amd64'
         uses: golangci/golangci-lint-action@v9
@@ -43,6 +64,17 @@ jobs:
           version: v2.12.2
       - name: Test
         run: make test
+      # bench/ is a separate module, so `make test` (`go test ./...` in the main
+      # module) cannot reach it, and both benchmark runners enter it with a -run
+      # pattern that matches no test. Its committed parity tests therefore ran
+      # nowhere and could rot into a compile failure unnoticed; this compiles and
+      # runs the self-contained ones. Only the tests — the benchmarks stay out of
+      # CI (they download an ~8 MB input and measure for seconds a case). The Go
+      # toolchain may fetch a newer release here if bench/go.mod's `go` directive
+      # is ahead of the main module's; that is the same switch a contributor sees.
+      - name: Bench module tests
+        if: matrix.arch == 'amd64'
+        run: make bench-test
 
   # On a green main build, bump the patch of the latest vX.Y.Z tag (the Go module
   # version convention). Patch only: a major bump would require a /vN module path,

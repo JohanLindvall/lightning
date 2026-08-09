@@ -10,9 +10,17 @@ import "github.com/JohanLindvall/lightning/pkg/unstable"
 // whole document is replaced by rawVal.
 //
 // rawVal is inserted verbatim and must be a single well-formed JSON value. Newly
-// created keys are written as JSON strings without escaping, so they should not
-// contain characters that need escaping. Inter-token whitespace in in is
-// tolerated and preserved outside the edited span.
+// created keys are written as JSON strings without escaping — skipping that pass
+// is part of what keeps Set allocation-free — so a key containing '"', '\\' or a
+// control byte does not round-trip, and a key crafted to close its own string
+// (x":1,"role) splices attacker-chosen members into the result, which is
+// well-formed JSON and so passes any later validity check. Keys must therefore
+// come from the program, not from the input: SetChecked rejects an unsafe key
+// with ErrUnsafeKey. Inter-token whitespace in in is tolerated and preserved
+// outside the edited span.
+//
+// A key that occurs more than once in the same object is edited at its first
+// occurrence, as GetMany reads the first occurrence.
 //
 // out is filled from out[:0] and returned; pass a reusable buffer to avoid
 // allocation (a nil out allocates). out must not alias in.
@@ -172,10 +180,12 @@ func skipValueOrEnd(data []byte, i int) int {
 // Like Set it is best-effort and writes into out (filled from out[:0] and
 // returned); out must not alias in, which is never modified. rawVal[i] is
 // inserted verbatim and must be a single well-formed JSON value; created keys are
-// written as plain JSON strings without escaping. A non-object root is replaced
-// by a fresh object holding all the given members. Inter-token whitespace outside
-// the replaced values and the insertion point is preserved. If rawVal is shorter
-// than keys the extra keys are ignored.
+// written as plain JSON strings without escaping, so they must come from the
+// program rather than from untrusted input (see Set — SetManyChecked rejects an
+// unsafe key with ErrUnsafeKey). A non-object root is replaced by a fresh object
+// holding all the given members. Inter-token whitespace outside the replaced
+// values and the insertion point is preserved. If rawVal is shorter than keys the
+// extra keys are ignored.
 func SetMany(in, out []byte, rawVal [][]byte, keys []string) []byte {
 	out = out[:0]
 	n := len(keys)
@@ -291,11 +301,14 @@ func SetMany(in, out []byte, rawVal [][]byte, keys []string) []byte {
 // Like Set/SetMany it is best-effort and writes into out (filled from out[:0] and
 // returned); out must not alias in, which is never modified. Each rawVal[i] is
 // inserted verbatim and must be one well-formed JSON value; created keys are written
-// as plain JSON strings without escaping. A nil/empty path replaces the whole
-// document. When one requested path is a prefix of another, the shorter (which
-// replaces the whole subtree) wins and the longer is ignored. Inter-token whitespace
-// outside the edited spans is preserved. If rawVal is shorter than paths the surplus
-// paths are ignored.
+// as plain JSON strings without escaping, at every level of a path, so they must come
+// from the program rather than from untrusted input (see Set — SetPathsChecked
+// rejects an unsafe path element with ErrUnsafeKey). A nil/empty path replaces the
+// whole document. When one requested path is a prefix of another, the shorter (which
+// replaces the whole subtree) wins and the longer is ignored. A key occurring more
+// than once in the same object is edited at its first occurrence only, as in Set and
+// SetMany. Inter-token whitespace outside the edited spans is preserved. If rawVal is
+// shorter than paths the surplus paths are ignored.
 func SetPaths(in, out []byte, rawVal [][]byte, paths [][]string) []byte {
 	out = out[:0]
 	n := len(paths)
@@ -371,14 +384,20 @@ func setObject(in, out []byte, i, depth int, active []int, paths [][]string, raw
 
 		ending := -1 // an active path ending at this key (replace its value)
 		var recurse []int
+		// An already-matched path is skipped rather than re-applied, so a key that
+		// occurs twice in one object is edited at its first occurrence only — the
+		// rule Set and SetMany already follow. Without the matched[m] test every
+		// duplicate was rewritten, and since the root frame's all-matched early exit
+		// below returns before ever reaching a duplicate, whether a path's duplicates
+		// got edited depended on whether some *unrelated* path had also been found.
+		// The key compare still leads: it fails on almost every member, so the
+		// matched[m] load is skipped on the overwhelmingly common non-matching key.
 		for m, a := range active {
-			if paths[a][depth] != k {
+			if paths[a][depth] != k || matched[m] {
 				continue
 			}
-			if !matched[m] {
-				matched[m] = true
-				nmatched++
-			}
+			matched[m] = true
+			nmatched++
 			if depth+1 == len(paths[a]) {
 				if ending < 0 {
 					ending = a

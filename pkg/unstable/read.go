@@ -219,10 +219,57 @@ func ReadUint64OrNull(data []byte, i int) (uint64, int, error) {
 	return n, i, nil
 }
 
+// scanNumberToken measures the JSON number token at data[i] and reports whether
+// this library's own number decoder would accept it, returning the index just
+// past the token. It mirrors ReadFloat64OrNull byte for byte — scanFloat, then
+// strconv for the tokens scanFloat declines to resolve — and discards only the
+// value.
+//
+// Written out rather than shared with ReadFloat64OrNull on purpose: that reader
+// is the hot float path (see CLAUDE.md's float tiers) and is left byte-identical,
+// the same reason any.go inlines this fallback at its own call site instead of
+// routing through it. The mirror is not left to inspection — the accept sets are
+// compared over a generated corpus by TestReadNumberAcceptSetMatchesFloat64.
+//
+// It is deliberately not skipNumber, whose span is a strict superset of the
+// grammar: skipNumber consumes any run of [0-9.eE+-], so it happily measured
+// "1.2.3", "--1" and "1e" as tokens.
+func scanNumberToken(data []byte, i int) (int, error) {
+	_, end, fast, ok := scanFloat(data, i)
+	if !ok {
+		return end, ErrBadNumber
+	}
+	if fast {
+		return end, nil
+	}
+	// scanFloat extracted a well-formed token but declined to resolve it (>19
+	// significant digits, ambiguous rounding, or an exponent outside the table);
+	// strconv decides, and rejects an overflowing magnitude such as 1e309.
+	if _, perr := strconv.ParseFloat(unsafeStr(data[i:end]), 64); perr != nil {
+		return end, ErrBadNumber
+	}
+	return end, nil
+}
+
 // ReadNumberOrNull reads a JSON number (or null) at data[i] and returns its raw
-// literal as a string — the bytes a json.Number holds. The token bounds come from
-// the same scanner SkipValue uses, so the literal is captured verbatim without
-// parsing it to a float; a JSON null yields the empty string.
+// literal as a string — the bytes a json.Number holds — copied out verbatim, with
+// no value produced; a JSON null yields the empty string.
+//
+// The literal is validated before it is captured. Without that check the token
+// bounds came from a scanner that only measures a run of number bytes, so a
+// malformed literal ("1.2.3", "-", "--1", "1e") was stored intact and failed much
+// later and far from the decode, at the first .Float64()/.Int64() — and, worse,
+// this package's own Valid rejected documents the decoder had accepted.
+//
+// The acceptance rule is agreement with ReadFloat64OrNull, not with
+// encoding/json, because Valid checks numbers by running them through that reader
+// (see pkg/json/valid.go): matching it is what makes "Valid accepts exactly what
+// these decoders accept" true for json.Number fields as well. Two consequences
+// are deliberate and pinned by TestReadNumberAcceptSetMatchesFloat64: "01" and
+// ".5" stay accepted though encoding/json rejects them (a pre-existing, separate
+// divergence — narrowing it here would only move the disagreement), and a literal
+// whose magnitude overflows float64 ("1e309") is rejected though its digits are
+// well-formed.
 func ReadNumberOrNull(data []byte, i int) (string, int, error) {
 	if i >= len(data) {
 		return "", i, ErrTruncated
@@ -231,12 +278,11 @@ func ReadNumberOrNull(data []byte, i int) (string, int, error) {
 		end, err := ExpectNull(data, i)
 		return "", end, err
 	}
-	start := i
-	end, err := skipNumber(data, i)
+	end, err := scanNumberToken(data, i)
 	if err != nil {
 		return "", end, err
 	}
-	return string(data[start:end]), end, nil
+	return string(data[i:end]), end, nil
 }
 
 // ReadNumberNoCopyOrNull is ReadNumberOrNull but returns a string that aliases
@@ -250,12 +296,11 @@ func ReadNumberNoCopyOrNull(data []byte, i int) (string, int, error) {
 		end, err := ExpectNull(data, i)
 		return "", end, err
 	}
-	start := i
-	end, err := skipNumber(data, i)
+	end, err := scanNumberToken(data, i)
 	if err != nil {
 		return "", end, err
 	}
-	return unsafeStr(data[start:end]), end, nil
+	return unsafeStr(data[i:end]), end, nil
 }
 
 // ReadFloat64OrNull reads a JSON number (or null) at data[i] as a float64.

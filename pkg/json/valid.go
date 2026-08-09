@@ -10,11 +10,31 @@ const validStackWords = unstable.MaxDepth/64 + 1
 // value, optionally surrounded by whitespace, with no trailing content.
 //
 // Valid is the precondition check for this library's own decoders: it accepts
-// exactly what DecodeAny — and therefore a generated UnmarshalJSON — accepts, so
-// "Valid(data)" answers "will lightning decode this?". That is a deliberately
-// different question from encoding/json.Valid, whose answer is "does this match
-// the JSON grammar?", and the two differ in a few places because the decoder's
-// scanners are tuned for input already known to be JSON:
+// exactly what DecodeAny accepts, so "Valid(data)" answers "will DecodeAny read
+// this?". That equivalence is the one this package tests and holds itself to —
+// FuzzValidMatchesDecodeAny runs the two against each other and requires the same
+// verdict on every input — and it holds because Valid reuses the decoder's own
+// readers rather than reimplementing them.
+//
+// For a *generated* UnmarshalJSON, Valid is a guide rather than an equivalence,
+// and nothing tests it as one: a generated decoder shares these scanners (so the
+// divergences from encoding/json listed below apply to it as well) but then adds
+// the schema, which cuts both ways. It is stricter where the schema is — a value
+// Valid accepts is rejected if its type does not fit the field it lands in — and
+// looser in two distinct ways. It is looser where it does not look: an unknown
+// field's value is skipped with SkipValue's lenient bracket balancing, not parsed,
+// so malformed bytes inside a value the schema ignores can decode even though Valid
+// rejects the document. And it is looser where it *does* look, on the numeric
+// readers: ReadInt64OrNull and ReadUint64OrNull consume a run of digit-ish bytes
+// and stop, so a known int field decodes "1.2.3", "1e" and "1-2" as 1 with no
+// error, each of which Valid rejects. The second is the surprising one — the
+// leniency is not confined to the parts of the document the schema skips.
+// Read Valid as "this is well-formed JSON as lightning defines it", not as
+// "every generated decoder will accept this".
+//
+// That is a deliberately different question from encoding/json.Valid, whose answer
+// is "does this match the JSON grammar?", and the two differ in a few places
+// because the decoder's scanners are tuned for input already known to be JSON:
 //
 //   - Numbers follow the scanner's arithmetic, not the JSON grammar. A leading
 //     '+', a leading zero, and an empty fraction (+1, 01, 5., .5) are accepted;

@@ -25,6 +25,12 @@
 // JSON value). A []byte field follows encoding/json: both the stdlib's base64
 // string form and a JSON array of numbers decode into it.
 //
+// Numbers are converted to the field's declared type without a range check,
+// which is where the decoder deliberately parts company with encoding/json: an
+// out-of-range integer wraps to the field's width (256 into a uint8 is 0) and a
+// float32 beyond its range becomes ±Inf, where encoding/json would return an
+// UnmarshalTypeError. See the scalar method for the full account.
+//
 // Field mapping follows the `json:"..."` struct tag: a tag renames the key,
 // `json:"-"` omits the field, and a `Name|Alias` tag maps several JSON keys onto
 // one field. Untagged exported fields use the Go field name as the key. Unlike
@@ -57,6 +63,7 @@ import (
 	"go/parser"
 	"go/printer"
 	"go/token"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -79,7 +86,16 @@ func main() {
 	}
 }
 
-func generate(inPath string) error {
+// generate reads one schema file and writes its FOO_unmarshal.go, reporting
+// progress and non-fatal diagnostics on stderr.
+func generate(inPath string) error { return generateTo(inPath, os.Stderr) }
+
+// generateTo is generate with the diagnostic stream injected. Warnings are the
+// generator's only channel for "this compiles, but it is not what your source
+// asks for" (a misplaced directive, an unrecognized struct-tag option), so the
+// tests have to be able to read them; passing the writer down beats a package
+// global, which the parallel table test in generator_test.go would race on.
+func generateTo(inPath string, warn io.Writer) error {
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, inPath, nil, parser.SkipObjectResolution|parser.ParseComments)
 	if err != nil {
@@ -87,6 +103,7 @@ func generate(inPath string) error {
 	}
 
 	g := &gen{
+		warn:             warn,
 		fset:             fset,
 		pkg:              file.Name.Name,
 		structTypes:      map[string]*ast.StructType{},
@@ -116,6 +133,8 @@ func generate(inPath string) error {
 		g.pathFrag = sanitizeIdent(file.Name.Name)
 	}
 
+	g.collectQualifiers(file)
+
 	// Collect every top-level struct type, in source order, recording the
 	// //lightning:compact / :nocopy / :destructive / :arena directives each
 	// carries. Directive use is validated as it is collected: a typo'd
@@ -124,11 +143,13 @@ func generate(inPath string) error {
 	// user believes compact) is worse than failing, so an unknown
 	// //lightning:* name is an error; a known directive somewhere it cannot
 	// take effect only warns, since the generated code is still correct.
+	attached := map[*ast.CommentGroup]bool{}
 	for _, d := range file.Decls {
 		gd, ok := d.(*ast.GenDecl)
 		if !ok || gd.Tok != token.TYPE {
 			continue
 		}
+		attached[gd.Doc] = true
 		// A directive on the type(...) block applies to every spec inside, so
 		// unknown names in the block doc are diagnosed once, here.
 		for _, dir := range lightningDirectives(gd.Doc) {
@@ -141,6 +162,7 @@ func generate(inPath string) error {
 			if !ok {
 				continue
 			}
+			attached[ts.Doc] = true
 			for _, dir := range lightningDirectives(ts.Doc) {
 				if !knownDirectives[dir] {
 					g.errs = append(g.errs, fmt.Errorf("unknown directive //lightning:%s on type %s", dir, ts.Name.Name))
@@ -191,6 +213,33 @@ func generate(inPath string) error {
 			// bare directive silently did nothing.
 			if isStruct && g.nocopyTypes[ts.Name.Name] && !g.destructiveTypes[ts.Name.Name] {
 				g.warnf("//lightning:nocopy on struct type %s has no effect; use the ,nocopy tag on its string/raw fields", ts.Name.Name)
+			}
+		}
+	}
+	// Everything above reads directives the parser *attached* to a type
+	// declaration. A //lightning: comment anywhere else reaches none of it: it
+	// selects nothing and it escapes the typo check, both in silence. The two
+	// ways that happens are easy to write by accident — a blank line between the
+	// directive and its type is enough for go/ast to stop treating the comment as
+	// that type's doc, and a directive stranded above the package clause belongs
+	// to the file — and the cost is invisible (an //lightning:arena that never
+	// fires is ~29k allocations per decode back on marine_ik-shaped input). Report
+	// it the way a misplaced-but-attached directive is reported: a warning, since
+	// the generated code is still correct, just not what the source asks for.
+	for _, cg := range file.Comments {
+		if attached[cg] {
+			continue
+		}
+		for _, c := range cg.List {
+			dir, ok := directiveIn(c)
+			if !ok {
+				continue
+			}
+			pos := g.fset.Position(c.Pos())
+			if knownDirectives[dir] {
+				g.warnf("//lightning:%s at %s has no effect: it is not attached to a type declaration (a blank line between a directive and its type detaches it)", dir, pos)
+			} else {
+				g.warnf("//lightning:%s at %s is not a known directive, and is not attached to a type declaration", dir, pos)
 			}
 		}
 	}
@@ -269,12 +318,13 @@ func generate(inPath string) error {
 		// above so it can be inspected).
 		return fmt.Errorf("generated code did not parse, wrote unformatted %s: %w", outPath, ferr)
 	}
-	fmt.Fprintf(os.Stderr, "wrote %s\n", outPath)
+	fmt.Fprintf(warn, "wrote %s\n", outPath)
 	return nil
 }
 
 // gen holds the state accumulated while walking the type graph.
 type gen struct {
+	warn        io.Writer // diagnostic stream (os.Stderr in a real run)
 	fset        *token.FileSet
 	pkg         string
 	structTypes map[string]*ast.StructType
@@ -320,15 +370,91 @@ type gen struct {
 	depthFns    map[string]bool // generated function name -> takes a depth param
 	depthArg    string          // what a call site inside the current body passes
 
-	decoders []string // generated decoder functions, in creation order
-	errs     []error  // generation errors; reported together after the walk
+	// The identifiers the *input file* uses to qualify encoding/json and time,
+	// and whether the generated file ends up naming them. A qualifier is ""
+	// when the input does not import that package at all, which is what makes
+	// `mypkg.RawMessage` a foreign type rather than encoding/json's — see
+	// isRaw/isNumber/isTime. The need* flags are set where a qualified name is
+	// actually emitted (typeStr, numberRead) and decide the generated file's
+	// import block; see assemble for why they are not derived from the text.
+	jsonQual   string
+	timeQual   string
+	needJSON   bool
+	needTime   bool
+	needUnsafe bool
+
+	decoders []string        // generated decoder functions, in creation order
+	errs     []error         // generation errors; reported together after the walk
+	warned   map[string]bool // diagnostics already reported (see warnf)
 
 }
 
+// collectQualifiers records how the input file spells encoding/json and time.
+// The generated file is a *sibling* with its own import block, so it must both
+// recognize the schema's qualifier (an aliased `import ej "encoding/json"` makes
+// ej.RawMessage the real thing and json.RawMessage a foreign type) and re-import
+// under that same alias, since every type it emits is printed from the schema's
+// own AST. A blank or dot import contributes no qualifier: `_` names nothing and
+// a dot-imported RawMessage arrives as a bare identifier, which the generator
+// does not resolve.
+func (g *gen) collectQualifiers(file *ast.File) {
+	for _, imp := range file.Imports {
+		path, err := strconv.Unquote(imp.Path.Value)
+		if err != nil {
+			continue
+		}
+		name := path[strings.LastIndexByte(path, '/')+1:]
+		if imp.Name != nil {
+			name = imp.Name.Name
+		}
+		if name == "_" || name == "." {
+			continue
+		}
+		switch path {
+		case "encoding/json":
+			g.jsonQual = name
+		case "time":
+			g.timeQual = name
+		}
+	}
+}
+
+// typeStr renders a type expression as the Go source text the generated file
+// will contain — and, on the way through, records which of the two importable
+// packages that text names. Every emitted type name funnels through here (a
+// decoder's parameter type, a `var zero T`, a `new(T)`, a make), so it is the
+// one place that can decide the imports from what is genuinely emitted rather
+// than from a scan of the finished output. Uses that do not emit — memo keys,
+// the map-key-type comparison, an error message — are paired with a real
+// emission or with a failed run that writes no file, so noting them is harmless.
 func (g *gen) typeStr(e ast.Expr) string {
+	g.noteQualifiers(e)
 	var b strings.Builder
 	_ = printer.Fprint(&b, g.fset, e) // writing to a strings.Builder never fails
 	return b.String()
+}
+
+// noteQualifiers marks the packages a type expression names as needed by the
+// generated file. It walks the whole expression rather than testing its head,
+// because the type text may nest a qualified name arbitrarily deep — an
+// anonymous struct's field (struct{ W time.Time }, emitted verbatim as a
+// decoder's parameter type) is exactly the case a per-field flag missed.
+func (g *gen) noteQualifiers(e ast.Expr) {
+	ast.Inspect(e, func(n ast.Node) bool {
+		sel, ok := n.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		if id, ok := sel.X.(*ast.Ident); ok {
+			switch id.Name {
+			case g.jsonQual:
+				g.needJSON = true
+			case g.timeQual:
+				g.needTime = true
+			}
+		}
+		return true
+	})
 }
 
 func (g *gen) uniq(base string) string {
@@ -359,9 +485,19 @@ var knownDirectives = map[string]bool{
 	"arena":       true,
 }
 
+// directiveIn returns the name of the //lightning:* directive a single comment
+// line carries — the part after the colon — normalized the way hasDirective
+// matches: whitespace anywhere is collapsed first, so "//lightning:compact",
+// "// lightning:compact " and "// lightning: compact" are the one directive. A
+// line that merely mentions a directive mid-sentence does not match, since the
+// collapsed text has to *start* with "lightning:".
+func directiveIn(c *ast.Comment) (string, bool) {
+	text := strings.Join(strings.Fields(strings.TrimPrefix(c.Text, "//")), "")
+	return strings.CutPrefix(text, "lightning:")
+}
+
 // lightningDirectives returns the name of every //lightning:* directive in the
-// given comment groups (the part after the colon), normalized the same way
-// hasDirective matches them.
+// given comment groups.
 func lightningDirectives(groups ...*ast.CommentGroup) []string {
 	var out []string
 	for _, cg := range groups {
@@ -369,19 +505,32 @@ func lightningDirectives(groups ...*ast.CommentGroup) []string {
 			continue
 		}
 		for _, c := range cg.List {
-			text := strings.Join(strings.Fields(strings.TrimPrefix(c.Text, "//")), "")
-			if rest, ok := strings.CutPrefix(text, "lightning:"); ok {
-				out = append(out, rest)
+			if dir, ok := directiveIn(c); ok {
+				out = append(out, dir)
 			}
 		}
 	}
 	return out
 }
 
-// warnf reports a non-fatal diagnostic on stderr: the generated code is
-// correct, but not what the source's directives appear to ask for.
+// warnf reports a non-fatal diagnostic on the generator's diagnostic stream:
+// the generated code is correct, but not what the source appears to ask for.
+//
+// Identical messages are reported once. A field's diagnostics are produced while
+// its struct's decoder is generated, and one struct yields several decoders — a
+// shared named type reached from two roots, or the compact/destructive/arena
+// variants of one root — so without this a single mistyped tag option would be
+// echoed once per variant.
 func (g *gen) warnf(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, "warning: "+format+"\n", args...)
+	msg := fmt.Sprintf("warning: "+format+"\n", args...)
+	if g.warned[msg] {
+		return
+	}
+	if g.warned == nil {
+		g.warned = map[string]bool{}
+	}
+	g.warned[msg] = true
+	fmt.Fprint(g.warn, msg)
 }
 
 // warnDirectives warns that every directive in dirs is ineffective on the named
@@ -669,8 +818,16 @@ func (g *gen) namedStruct(name string) string {
 	if fn, ok := g.memo[key]; ok {
 		return fn
 	}
-	fn := g.decFn("decode" + name + g.csuf())
-	g.used[fn] = true
+	// Through g.uniq like every other emitter (anonStruct, valueDecoder,
+	// arrayDecoder, sliceDecoder, mapDecoder), not a bare g.used write: reserving
+	// the name without first READING the reservation set let a named struct take
+	// a name an anonymous struct had already been given — `type Item` plus a
+	// field `Item struct{...}` both wanted decodeItem, and the loser's rename
+	// never happened, so the generator exited 0 having emitted the function
+	// twice. It was order-dependent (uniq renames whichever emitter runs second),
+	// which made a plain field reorder flip a working schema to one that does not
+	// compile.
+	fn := g.uniq(g.decFn("decode" + name + g.csuf()))
 	g.memo[key] = fn // set before body so recursive types terminate
 	// Likewise set before the body: a recursive schema calls back into fn while
 	// fn's own body is still being generated, and that call must spell the same
@@ -722,8 +879,12 @@ type fieldInfo struct {
 // depth, and seen guards against the (illegal-in-Go, but cheap to defend) cycle.
 func (g *gen) collectFields(st *ast.StructType, prefix string, depth int, allocs []string, seen map[string]bool, out *[]fieldInfo) {
 	for _, f := range st.Fields.List {
-		tagNames, skip, nocopy, lax, unwrap := jsonTag(f.Tag)
-		if skip {
+		tag := jsonTag(f.Tag)
+		tagNames, nocopy, lax, unwrap := tag.names, tag.nocopy, tag.lax, tag.unwrap
+		if len(tag.unknown) > 0 {
+			g.warnTagOptions(tag.unknown, fieldLabel(f))
+		}
+		if tag.skip {
 			continue
 		}
 		if len(f.Names) == 0 { // embedded (anonymous) field
@@ -1130,13 +1291,13 @@ func (g *gen) field(dest string, expr ast.Expr, hint string, nocopy, lax bool) s
 		return g.unsupportedf("unknown type %q for %s", t.Name, dest)
 
 	case *ast.SelectorExpr:
-		if t.Sel.Name == "RawMessage" || t.Sel.Name == "RawValue" {
+		if g.isRaw(t) {
 			return g.rawMessage(dest, nocopy)
 		}
-		if isNumber(t) {
+		if g.isNumber(t) {
 			return g.numberRead(dest, nocopy)
 		}
-		if isTime(t) {
+		if g.isTime(t) {
 			return g.timeRead(dest, lax)
 		}
 		return g.unsupportedf("unsupported type %s for %s", g.typeStr(t), dest)
@@ -1273,6 +1434,30 @@ func (g *gen) valueDecoder(expr ast.Expr, hint string, nocopy, lax bool) string 
 	return fn
 }
 
+// scalar emits the read for a leaf field of a builtin kind.
+//
+// Range behavior differs from encoding/json, deliberately and in the decoder's
+// favor — record it here, where the conversions are emitted, because nothing in
+// the generated code says so:
+//
+//   - Integers are read as int64/uint64 and then CONVERTED to the field's width,
+//     so an out-of-range value wraps rather than being rejected: 256 into a uint8
+//     is 0, 300 into an int8 is 44, and a value past int64 wraps in the reader
+//     itself (9223372036854775808 into an int64 is -9223372036854775808).
+//     encoding/json returns an UnmarshalTypeError for each of those and leaves
+//     the field alone. A negative literal in an unsigned field is still an error
+//     (the reader rejects the '-'), and a fractional or exponent literal in an
+//     integer field fails as a syntax error at the container level, since the
+//     reader stops at the '.'/'e' the enclosing loop then does not accept.
+//   - float32 is read as a float64 and converted, so a value beyond float32's
+//     range becomes ±Inf (1e39) instead of an UnmarshalTypeError. float64 itself
+//     rejects an out-of-range literal (1e400) in the reader.
+//
+// The reason is that a range check costs a compare and a branch per number on
+// paths that are otherwise a few instructions per digit, to detect input a
+// schema-matched producer cannot emit. It is a documented trade, not an
+// oversight: a decoder that must reject out-of-range numbers has to check the
+// decoded field itself.
 func (g *gen) scalar(dest, name string, nocopy bool) string {
 	switch {
 	case name == "string":
@@ -1342,9 +1527,25 @@ i = end`, dest, val)
 	return g.unsupportedf("internal: scalar kind %q not handled for %s", name, dest)
 }
 
+// rawMessage emits the read for a json.RawMessage field: the value's span is
+// found with SkipValue and handed over verbatim.
+//
+// A JSON null is captured like any other value — the field ends up holding the
+// four bytes "null" — which is what encoding/json does: json.RawMessage is an
+// Unmarshaler, and "to unmarshal JSON into a value implementing Unmarshaler,
+// Unmarshal calls that value's UnmarshalJSON method, INCLUDING when the input is
+// a JSON null", so RawMessage.UnmarshalJSON stores the literal. Leaving the
+// field untouched on null (what this emitted before) broke that two ways: a
+// fresh target could not tell a null value from an absent key — the very
+// distinction a raw field exists to preserve — and a target being reused across
+// documents silently kept the PREVIOUS document's value where the new one says
+// null, which is the reuse pattern this library encourages elsewhere.
+//
+// Default copies the bytes (like encoding/json's json.RawMessage); nocopy
+// aliases the input, which the caller must then keep unchanged. Both spellings
+// capture null identically — the aliased "null" is four bytes of the input like
+// any other span.
 func (g *gen) rawMessage(dest string, nocopy bool) string {
-	// Default copies the bytes (like encoding/json's json.RawMessage); nocopy
-	// aliases the input, which the caller must then keep unchanged.
 	assign := fmt.Sprintf("%s = append(%s[:0], data[start:end]...)", dest, dest)
 	if nocopy {
 		assign = fmt.Sprintf("%s = data[start:end]", dest)
@@ -1354,26 +1555,30 @@ end, err := unstable.SkipValue(data, i)
 if err != nil {
 	return end, err
 }
-if data[start] != 'n' {
-	%s
-}
+%s
 i = end`, assign)
 }
 
 // numberRead emits the read for a json.Number field: capture the number token's
 // raw literal as a string and convert it to json.Number. nocopy aliases the input
 // (json.Number's underlying type is string, so the conversion never copies).
+//
+// This is the one place a qualified name is emitted without going through
+// typeStr — the conversion is spelled by hand — so it is also where the
+// encoding/json import is claimed for it. It uses the schema's own qualifier, so
+// an aliased import stays consistent between the conversion and the import block.
 func (g *gen) numberRead(dest string, nocopy bool) string {
 	reader := "unstable.ReadNumberOrNull"
 	if nocopy {
 		reader = "unstable.ReadNumberNoCopyOrNull"
 	}
+	g.needJSON = true
 	return fmt.Sprintf(`s, end, err := %s(data, i)
 if err != nil {
 	return end, err
 }
-%s = json.Number(s)
-i = end`, reader, dest)
+%s = %s.Number(s)
+i = end`, reader, dest, g.jsonQual)
 }
 
 func (g *gen) timeRead(dest string, lax bool) string {
@@ -1668,6 +1873,11 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax, root bool) st
 			presize = "	lightningArrStart := i\n"
 			growCall = "unstable.GrowSliceEst(*out, lightningArrStart, i, len(data))"
 		}
+		// The capacity hint below is the generated code's only use of unsafe, so
+		// this is where that import is claimed (the same emit-site rule as
+		// typeStr's noteQualifiers — a JSON key literal reading "unsafe.Sizeof"
+		// used to claim it through the old text scan).
+		g.needUnsafe = true
 		grow = fmt.Sprintf(`var zero %[1]s
 		if *out == nil {
 			*out = make([]%[1]s, 1, max(4, 256/max(1, int(unsafe.Sizeof(zero)))))
@@ -1823,17 +2033,17 @@ func (g *gen) slicePresize(elt ast.Expr, eltStr string) string {
 		return g.slicePresize(t.X, eltStr)
 	case *ast.SelectorExpr:
 		switch {
-		case isNumber(t):
+		case g.isNumber(t):
 			// A json.Number element is a bare number token — a scalar — so the
 			// cheaper comma-counting scan sizes the slice.
 			counter = "unstable.CountArrayScalars"
-		case isTime(t):
+		case g.isTime(t):
 			// An RFC 3339 timestamp or Unix-timestamp number never contains a
 			// comma or bracket, so the cheap comma-counting scan sizes a
 			// []time.Time too — far cheaper than CountArrayElements, which would
 			// skipString past every element. (time-array −15%.)
 			counter = "unstable.CountArrayScalars"
-		case isRaw(t):
+		case g.isRaw(t):
 			counter = "unstable.CountArrayElements"
 		}
 	}
@@ -2035,20 +2245,38 @@ func (g *gen) assemble(inPath string, methods []string) string {
 	}
 	code := body.String()
 
-	// "time" and "encoding/json" are needed only when a spelled type actually
-	// names them (time.Time, or json.RawMessage/RawValue/Number in an anonymous
-	// struct, slice or map element). Decide from the generated text rather than from
-	// heuristic flags: those both miss types nested inside an anonymous struct and
-	// over-fire on a nocopy raw field whose decode emits no json. reference. The
-	// tokens appear only as real type usages, never in the generated comments.
+	// "encoding/json", "time" and "unsafe" are imported only when the generated
+	// code actually names them: a json.Number conversion or a type text that
+	// spells json.RawMessage / time.Time (in an anonymous struct, a slice or map
+	// element, a pointee), and the unsafe.Sizeof in a slice's capacity hint.
+	//
+	// The flags are set where those names are EMITTED (typeStr's noteQualifiers,
+	// numberRead, sliceDecoder). This used to be decided by substring-scanning
+	// the finished text, on the premise that the tokens "appear only as real type
+	// usages" — but JSON key literals are emitted into the dispatch switch as
+	// string constants, so a field tagged `json:"time.Time"` produced `case
+	// "time.Time":` and an import of "time" that nothing used: a schema that
+	// generated cleanly and did not compile. Setting the flag at the emit site
+	// rather than per field also answers what the text scan was introduced to
+	// fix — it sees a type nested inside an anonymous struct (typeStr renders the
+	// whole struct text) and it does not fire for a nocopy raw field, whose
+	// decode emits no qualified name at all.
+	//
+	// The qualifier is the schema's own (see collectQualifiers), so a file that
+	// imports encoding/json under an alias generates code spelling that alias and
+	// importing it under the same name.
 	imports := []string{strconv.Quote(unstablePkg)}
-	if strings.Contains(code, "json.RawMessage") || strings.Contains(code, "json.RawValue") || strings.Contains(code, "json.Number") {
-		imports = append(imports, `json "encoding/json"`)
+	if g.needJSON {
+		imports = append(imports, fmt.Sprintf("%s %q", g.jsonQual, "encoding/json"))
 	}
-	if strings.Contains(code, "time.Time") {
-		imports = append(imports, `"time"`)
+	if g.needTime {
+		if g.timeQual == "time" {
+			imports = append(imports, `"time"`)
+		} else {
+			imports = append(imports, fmt.Sprintf("%s %q", g.timeQual, "time"))
+		}
 	}
-	if strings.Contains(code, "unsafe.Sizeof") {
+	if g.needUnsafe {
 		imports = append(imports, `"unsafe"`)
 	}
 
@@ -2064,47 +2292,109 @@ func (g *gen) assemble(inPath string, methods []string) string {
 	return b.String()
 }
 
-// jsonTag returns the JSON key(s) from a struct tag, whether the field is
-// excluded (`json:"-"`), and whether the "nocopy" and "lax" options are present.
-// The name field may list several pipe-separated names
-// (`json:"Status|EdgeResponseStatus"`), each of which maps the same field; any
-// of them in the input fills the field. Comma-separated options follow the name,
-// as in encoding/json; the recognized options are "nocopy", which makes string
-// and raw fields alias the input bytes instead of copying them, and "lax", which
-// makes a type mismatch on the field's value a no-op (the value is skipped and
-// the field left unset) rather than an error.
-func jsonTag(tag *ast.BasicLit) (names []string, skip, nocopy, lax, unwrap bool) {
+// tagInfo is one field's parsed `json:"..."` tag.
+type tagInfo struct {
+	names   []string // the JSON key(s) the field answers to
+	skip    bool     // json:"-": never read from the input
+	nocopy  bool
+	lax     bool
+	unwrap  bool
+	unknown []string // options the generator does not act on, for diagnostics
+}
+
+// jsonTag parses a field's `json:"..."` struct tag. The name may list several
+// pipe-separated names (`json:"Status|EdgeResponseStatus"`), each of which maps
+// the same field; any of them in the input fills it. Comma-separated options
+// follow the name, as in encoding/json. The generator acts on three:
+//
+//   - "nocopy": string and raw fields alias the input bytes instead of copying
+//     them, so the caller must keep the input alive and unchanged;
+//   - "lax": a type mismatch on this field's value is a no-op (the value is
+//     skipped and the field left unset) rather than an error;
+//   - "unwrap": the value is a string whose contents are themselves the JSON to
+//     decode into the field.
+//
+// "omitempty" is accepted in silence: it is encode-only, so it means nothing to
+// a decoder, and it is on real structs everywhere. Any other option is returned
+// in unknown for the caller to warn about — a typo'd ",nocpy" turning off the
+// aliasing the author asked for is a silent performance regression, and
+// encoding/json's ",string" is a silent *semantic* one.
+func jsonTag(tag *ast.BasicLit) tagInfo {
 	if tag == nil {
-		return nil, false, false, false, false
+		return tagInfo{}
 	}
 	s, err := strconv.Unquote(tag.Value)
 	if err != nil {
-		return nil, false, false, false, false
+		return tagInfo{}
 	}
 	v := reflect.StructTag(s).Get("json")
 	if v == "" {
-		return nil, false, false, false, false
+		return tagInfo{}
 	}
 	parts := strings.Split(v, ",")
 	if parts[0] == "-" && len(parts) == 1 {
-		return nil, true, false, false, false
+		return tagInfo{skip: true}
 	}
+	var t tagInfo
 	for _, o := range parts[1:] {
 		switch o {
 		case "nocopy":
-			nocopy = true
+			t.nocopy = true
 		case "lax":
-			lax = true
+			t.lax = true
 		case "unwrap":
-			unwrap = true
+			t.unwrap = true
+		case "", "omitempty":
+			// A trailing comma, and the stdlib's encode-only option.
+		default:
+			t.unknown = append(t.unknown, o)
 		}
 	}
 	for _, n := range strings.Split(parts[0], "|") {
 		if n != "" {
-			names = append(names, n)
+			t.names = append(t.names, n)
 		}
 	}
-	return names, false, nocopy, lax, unwrap
+	return t
+}
+
+// warnTagOptions reports the json-tag options the generator does not act on.
+//
+// This warns where an unknown //lightning: directive is a hard error, and the
+// asymmetry is deliberate: a //lightning: directive can only have come from this
+// generator, so an unrecognized one is unambiguously a mistake, while a json tag
+// is encoding/json's vocabulary too. A schema migrating from the stdlib carries
+// options that are simply meaningless here, and failing the build on them would
+// break working code for no safety gain. A warning still catches what silence
+// cost — the typo that quietly disables aliasing, and ",string", whose absence
+// changes what the schema decodes.
+func (g *gen) warnTagOptions(opts []string, field string) {
+	for _, o := range opts {
+		if o == "string" {
+			// encoding/json's ",string" decodes the value from a JSON string
+			// wrapping the number/bool. Ignoring it silently would decode a
+			// migrated schema differently from the stdlib it came from.
+			g.warnf("json tag option %q on %s is not implemented: the value is decoded with the field's declared Go type (for a whole JSON document embedded in a string, see the unwrap option)", o, field)
+			continue
+		}
+		g.warnf("unrecognized json tag option %q on %s; it is ignored (this generator understands nocopy, lax and unwrap)", o, field)
+	}
+}
+
+// fieldLabel names a struct field for a diagnostic: its declared name(s), or,
+// for an embedded field, the type it embeds.
+func fieldLabel(f *ast.Field) string {
+	if len(f.Names) == 0 {
+		if n := embeddedName(f.Type); n != "" {
+			return "embedded field " + n
+		}
+		return "embedded field"
+	}
+	names := make([]string, len(f.Names))
+	for i, n := range f.Names {
+		names[i] = n.Name
+	}
+	return "field " + strings.Join(names, ", ")
 }
 
 func cap1(s string) string {
@@ -2346,37 +2636,36 @@ func unparen(expr ast.Expr) ast.Expr {
 	}
 }
 
-func isRaw(expr ast.Expr) bool {
-	if p, ok := expr.(*ast.ParenExpr); ok {
-		return isRaw(p.X)
+// qualified reports whether expr is the selector pkg.name, where pkg is the
+// identifier the *input file* imports that package under (see
+// collectQualifiers) — never a hardcoded "json"/"time", so an aliased import
+// resolves and, more importantly, a same-named type from somewhere else does
+// not. An empty qual means the package is not imported at all, so nothing
+// matches it: a bare `mypkg.RawMessage` is then reported as the unsupported
+// type it is rather than decoded as encoding/json's and emitted with no import.
+func qualified(expr ast.Expr, qual, name string) bool {
+	if qual == "" {
+		return false
 	}
-	sel, ok := expr.(*ast.SelectorExpr)
-	return ok && (sel.Sel.Name == "RawMessage" || sel.Sel.Name == "RawValue")
-}
-
-func isNumber(expr ast.Expr) bool {
-	if p, ok := expr.(*ast.ParenExpr); ok {
-		return isNumber(p.X)
-	}
-	sel, ok := expr.(*ast.SelectorExpr)
-	if !ok || sel.Sel.Name != "Number" {
+	sel, ok := unparen(expr).(*ast.SelectorExpr)
+	if !ok || sel.Sel.Name != name {
 		return false
 	}
 	pkg, ok := sel.X.(*ast.Ident)
-	return ok && pkg.Name == "json"
+	return ok && pkg.Name == qual
 }
 
-func isTime(expr ast.Expr) bool {
-	if p, ok := expr.(*ast.ParenExpr); ok {
-		return isTime(p.X)
-	}
-	sel, ok := expr.(*ast.SelectorExpr)
-	if !ok || sel.Sel.Name != "Time" {
-		return false
-	}
-	pkg, ok := sel.X.(*ast.Ident)
-	return ok && pkg.Name == "time"
+// isRaw is the single spelling of the "this is encoding/json's raw-JSON type"
+// predicate, used by both the field emitter and slicePresize. It was duplicated
+// in field() once, and the copies are exactly the kind that drift apart.
+// json.RawValue is the json/v2 spelling of the same thing.
+func (g *gen) isRaw(expr ast.Expr) bool {
+	return qualified(expr, g.jsonQual, "RawMessage") || qualified(expr, g.jsonQual, "RawValue")
 }
+
+func (g *gen) isNumber(expr ast.Expr) bool { return qualified(expr, g.jsonQual, "Number") }
+
+func (g *gen) isTime(expr ast.Expr) bool { return qualified(expr, g.timeQual, "Time") }
 
 func isScalar(name string) bool {
 	switch name {

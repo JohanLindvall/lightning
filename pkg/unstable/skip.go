@@ -15,9 +15,14 @@ import (
 // over. A scalar-element array ('[1,2,...]') keeps the indexStructural skip,
 // where a single vectorized scan already reaches the closing bracket and the
 // mask path would only add per-block work. The array probe is a heuristic; a
-// wrong guess (or a miss on malformed input) only costs speed, never
-// correctness — both paths are bracket-balancers that agree on every value the
-// other accepts.
+// wrong guess only costs speed, never correctness — both paths are bracket
+// balancers that return the same end index for every well-formed value.
+//
+// Off the well-formed set the two paths are not interchangeable, so which one
+// runs is observable: see skipContainerFast's comment for the exact divergences
+// (unbalanced brackets of the other type, and nesting past MaxDepth, which the
+// recursive scalar path rejects with ErrMaxDepth and the iterative SIMD path
+// accepts). Every caller treats such input as an error or a presize miss.
 func SkipValue(data []byte, i int) (int, error) {
 	if i >= len(data) {
 		return i, ErrTruncated
@@ -104,7 +109,36 @@ func skipNumber(data []byte, i int) (int, error) {
 	return i, nil
 }
 
-func skipObject(data []byte, i int) (int, error) {
+// skipObject and skipArray are the scalar container skips SkipValue falls back
+// to when the SIMD in-string-mask scan is unavailable or declines (see
+// skipContainerFast). They are *mutually recursive* — one Go frame per nesting
+// level — so they carry the same MaxDepth bound the other recursive walkers do
+// (decodeValue/decodeAnyObject/decodeAnyArray, stripper.handle). Without it the
+// recursion is unbounded and a hostile document exhausts the goroutine stack:
+// measured, a 20 MB array of the [0,[[[…]]]] shape (the leading scalar makes
+// SkipValue's fast-path probe decline, so every nested '[' recursed) died with
+// "goroutine stack exceeds 1000000000-byte limit / fatal error: stack overflow",
+// which recover *cannot* catch — the process goes down instead of an error
+// coming back. The bound belongs here rather than at the call sites because this
+// path is reachable from all of them: Get/Lookup/GetMany/GetPaths/Set/SetMany/
+// SetPaths/ObjectEach/ArrayEach, CountArrayElements, and every generated
+// decoder's unknown-field skip.
+//
+// depth counts enclosing containers with the outermost at 1, exactly as
+// decodeAny* does, so MaxDepth levels are accepted and level MaxDepth+1 returns
+// ErrMaxDepth — the same input set encoding/json accepts depth-wise. Cost is one
+// compare per '{' or '[', which CLAUDE.md measured as flat (p=0.161) for the
+// analogous DecodeAny bound. The two-argument entry points are kept so the
+// differential oracle and benchmarks spell them unchanged; they are trivially
+// inlinable, so the extra frame is compiled away.
+func skipObject(data []byte, i int) (int, error) { return skipObjectDepth(data, i, 1) }
+
+func skipArray(data []byte, i int) (int, error) { return skipArrayDepth(data, i, 1) }
+
+func skipObjectDepth(data []byte, i, depth int) (int, error) {
+	if depth > MaxDepth {
+		return i, ErrMaxDepth
+	}
 	// data[i] == '{'
 	i++
 	for i < len(data) {
@@ -118,13 +152,13 @@ func skipObject(data []byte, i int) (int, error) {
 		case '}':
 			return i + 1, nil
 		case '{':
-			end, err := skipObject(data, i)
+			end, err := skipObjectDepth(data, i, depth+1)
 			if err != nil {
 				return end, err
 			}
 			i = end
 		case '[':
-			end, err := skipArray(data, i)
+			end, err := skipArrayDepth(data, i, depth+1)
 			if err != nil {
 				return end, err
 			}
@@ -142,7 +176,10 @@ func skipObject(data []byte, i int) (int, error) {
 	return i, ErrTruncated
 }
 
-func skipArray(data []byte, i int) (int, error) {
+func skipArrayDepth(data []byte, i, depth int) (int, error) {
+	if depth > MaxDepth {
+		return i, ErrMaxDepth
+	}
 	// data[i] == '['
 	i++
 	for i < len(data) {
@@ -154,13 +191,13 @@ func skipArray(data []byte, i int) (int, error) {
 		case ']':
 			return i + 1, nil
 		case '[':
-			end, err := skipArray(data, i)
+			end, err := skipArrayDepth(data, i, depth+1)
 			if err != nil {
 				return end, err
 			}
 			i = end
 		case '{':
-			end, err := skipObject(data, i)
+			end, err := skipObjectDepth(data, i, depth+1)
 			if err != nil {
 				return end, err
 			}

@@ -8,8 +8,9 @@
 // The toolkit falls into four groups:
 //
 //   - Read — extract raw values by key or path without decoding the rest of the
-//     document: [Get]/[GetCompact], [Lookup]/[LookupCompact] (Get with a
-//     found/not-found answer instead of an error), [GetMany]/[GetManyCompact]
+//     document: [Get]/[GetCompact], [Lookup]/[LookupCompact] (Get without its
+//     offset return, for when the value's position in the input is not needed —
+//     a missing key is still ErrKeyNotFound), [GetMany]/[GetManyCompact]
 //     (several top-level keys in one pass), [GetPaths]/[GetPathsCompact] (several
 //     nested paths in one prefix-sharing pass), and [ObjectEach]/[ObjectEachCompact]
 //     and [ArrayEach]/[ArrayEachCompact] (iterate an object's members or an
@@ -26,8 +27,10 @@
 //     parses a single JSON number.
 //   - Check — [Valid] reports whether a document is one well-formed JSON value,
 //     without allocating or building the decoded value. It accepts exactly what
-//     this library's decoders accept, which differs in a few documented ways from
-//     encoding/json.Valid.
+//     [DecodeAny] accepts — that equivalence is the one this package fuzz-tests —
+//     which differs in a few documented ways from encoding/json.Valid. For a
+//     generated UnmarshalJSON it is a guide rather than an equivalence, in both
+//     directions; see [Valid].
 //
 // The edit and transform operations are best effort: they return only a []byte and
 // pass input they cannot interpret through rather than failing. For untrusted input

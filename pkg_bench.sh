@@ -32,14 +32,18 @@ BENCHCOUNT="${BENCHCOUNT:-1}"
 	echo
 } > "$RESULTS"
 
-# -run='^$' disables the unit tests so only benchmarks run. The target is ./pkg/...,
-# not ./..., on purpose: every main-module Benchmark* lives under pkg/ (pkg/json,
-# pkg/unstable), and the other packages (conformance, the root generator) import
-# *generated* decoders that are gitignored — absent on a fresh checkout (e.g. CI,
-# which does not `make generate` before benchmarking), so `go test ./...` would fail
-# to build them and report a benchmark failure even though no benchmark ran there.
-# The bench/ comparison suite is a separate module and is not matched either way. A
-# named benchmark filter can be passed as the first argument.
+# -run='^$' disables the unit tests so only benchmarks run. That costs no coverage:
+# every ./pkg/... test is a main-module test, so `make test` (and CI) already runs
+# it. Only the *separate* bench module has tests nothing else reaches — see the test
+# pass in bench/run_bench.sh and the bench-test target in the Makefile.
+#
+# The target is ./pkg/..., not ./..., on purpose: every main-module Benchmark* lives
+# under pkg/ (pkg/json, pkg/unstable), and the other packages (conformance, the root
+# generator) import *generated* decoders that are gitignored — absent on a fresh
+# checkout unless `make generate` has run — so `go test ./...` would fail to build
+# them and report a benchmark failure even though no benchmark ran there. The bench/
+# comparison suite is a separate module and is not matched either way. A named
+# benchmark filter can be passed as the first argument.
 #
 # -timeout=0 disables Go's default 10-minute test timeout: at a long BENCHTIME the
 # whole suite (dozens of sub-benchmarks in one `go test` run) easily exceeds 10

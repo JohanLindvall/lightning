@@ -1,4 +1,4 @@
-.PHONY: all download check bench bench-md update-tools fix test generate
+.PHONY: all download check bench bench-md update-tools fix test generate vet fmt-check bench-test
 
 GOPATH := $(shell go env GOPATH)
 GOBIN := $(GOPATH)/bin
@@ -29,6 +29,48 @@ generate: conformance/data_unmarshal.go
 # on test, inherits it).
 conformance/data_unmarshal.go: conformance/data.go main.go
 	go run . conformance/data.go
+
+# `go vet` over the whole main module. Run this on EVERY architecture that ships,
+# not just one: asmdecl is inherently per-GOARCH. On an amd64 host it checks
+# simd_amd64.s and skipfast_amd64.s against their Go declarations and never looks
+# at the arm64 pair, and vice versa — so an amd64-only vet leaves the NEON
+# assembly checked by nothing. `go test`'s built-in vet subset (atomic, bool,
+# buildtags, directive, errorsas, ifaceassert, nilfunc, printf, stringintconv,
+# tests) does not include asmdecl either, so running the tests is not a
+# substitute. The class of bug this catches is real and recorded in CLAUDE.md:
+# maskBlock's result offsets move because Go 8-aligns the result block after the
+# `isArray bool` argument, and a hand-written +28(FP) where +32(FP) is required
+# reads the wrong words at run time while assembling and testing cleanly on the
+# other arch. Confirmed by experiment: that exact edit is reported by
+# `GOARCH=arm64 go vet ./pkg/unstable/` and is invisible to `GOARCH=amd64 go vet`.
+vet: conformance/data_unmarshal.go
+	go vet ./...
+
+# Fail if anything is not gofmt-clean. `fix` below is the fixer; this is the gate,
+# so formatting drift is reported rather than landed. It walks the whole tree —
+# gofmt follows directories, not modules, so the separate bench module is covered
+# too — including the generated decoders, which the generator emits through
+# go/format and which must therefore stay clean.
+fmt-check:
+	@unformatted=$$(gofmt -l .); \
+	if [ -n "$$unformatted" ]; then \
+		echo "not gofmt-clean (run 'make fix'):"; \
+		echo "$$unformatted"; \
+		exit 1; \
+	fi
+
+# Compile and run the bench module's own tests. bench/ is a separate module, so
+# `make test`'s `go test ./...` cannot reach it, and both benchmark runners enter
+# it with a -run pattern that deliberately matches no test (they are measuring,
+# not testing). That left bench/get/get_bench_test.go — the jsonparser/gjson
+# parity tests for Get and ObjectEach — compiled by nothing and executed by
+# nothing, free to rot into a build failure unnoticed. This target is that guard.
+# ./get is the only package listed because it is the only one whose test file is
+# self-contained: its input.json and the sibling cloudflare/input.json are both
+# committed, whereas every other case's test needs the gitignored harness that
+# bench/run_bench.sh writes (see the test pass in that script, which covers those).
+bench-test:
+	cd bench && go test -count=1 ./get/
 
 # Run every benchmark: first the package microbenchmarks in the main module, then
 # the comparison suite. bench/ is a separate module (so its benchmark-only deps

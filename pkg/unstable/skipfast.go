@@ -18,11 +18,51 @@ import "math/bits"
 // number of find_escaped/prefix_xor invocations vs two 32-byte blocks. maskBlock
 // (AVX2 asm on amd64, NEON on arm64, scalar elsewhere) returns four uint64s —
 // quote, backslash, and the container's *own* open and close brackets (it is told
-// which via isArray, and never computes the other type's brackets). Counting only
-// that pair ignores a stray bracket of the other type, matching skipObject/
-// skipArray exactly, so the SIMD and scalar skip paths never diverge (including on
-// malformed input). All the bit math below is plain Go, unit/differential testable
-// independent of the asm.
+// which via isArray, and never computes the other type's brackets). All the bit
+// math below is plain Go, unit/differential testable independent of the asm.
+//
+// What the two skip paths guarantee, precisely: on a *well-formed* (bracket-
+// balanced) value they return the identical end index, which is what the 50k-doc
+// differential fuzz and the block-boundary corpus lock. They are NOT
+// interchangeable off that set, and an earlier version of this comment wrongly
+// claimed they "never diverge (including on malformed input)". Three divergences
+// are real, and because SkipValue picks between the paths by CPU feature, all
+// make SkipValue's answer on bad input host-dependent:
+//
+//   - Unbalanced brackets of the *other* type. This loop ignores them entirely;
+//     skipObject/skipArray *descend* into them (skipObject calls skipArray on a
+//     nested '['), so the scalar path keeps looking for the inner container's
+//     close. Measured: `{"a":[}` + slack gives (7, nil) here and (87,
+//     ErrTruncated) there; `{"a":[}]}` gives 7 vs 9 — accept/reject and the end
+//     index both differ.
+//   - Nesting past MaxDepth. This loop is genuinely iterative (depth is an int,
+//     no recursion, no per-level state), so it has no stack to overflow and
+//     accepts any depth; the recursive scalar path must bound itself and returns
+//     ErrMaxDepth past MaxDepth (see skip.go). MaxDepth is documented as a
+//     library-wide limit, so this path is the lenient outlier, not the scalar
+//     one.
+//   - A stray backslash *outside* a string. findEscaped64 is a pure bit
+//     operation on the block's backslash bitmap: it does not know the backslash
+//     is not inside a string, so it masks the following byte out of the quote
+//     bitmap, and a `\"` sitting between tokens silently changes where the
+//     in-string regions begin. The scalar path has no such state — indexStructural
+//     simply never stops on a backslash. This one diverges in *both* directions
+//     and, uniquely, is sensitive to where the 64-byte grid falls, so the same
+//     logical document flips verdict on padding alone. Measured:
+//     `{"a":1,\"b":2,"pad":"…"}` gives (93, ErrTruncated) here and (93, nil)
+//     there — the fast path rejecting what the scalar accepts, the opposite of
+//     the first bullet; `{\"}` + slack gives (4, nil) vs (84, ErrTruncated); and
+//     `{` + N spaces + `\}` is accepted at N=62, rejected at N=63, accepted again
+//     at N=64, because at N=63 the backslash is the block's last byte, so
+//     prevEscaped carries into the tail and swallows the container's own closing
+//     brace. TestSkipPathsDivergeOnMalformed pins all three classes.
+//
+// None costs correctness today — every caller treats such input as an error
+// or, for the presize counters, as a hint that missed — but do not build on the
+// two paths agreeing outside well-formed values. Converging the depth case means
+// clamping depth here *and* in the whole-loop assembly scans (skipBlocks*), which
+// carry depth in a register and return it but never test it; that is a hot-loop
+// change on three assembly implementations, so it is deliberately not done here.
 
 // prefixXor64 returns the inclusive prefix XOR of x: bit i of the result is the
 // parity (XOR) of bits 0..i of x. Run over a block's real-quote bitmap it turns
@@ -59,8 +99,10 @@ func findEscaped64(backslash uint64, prevEscaped *uint64) uint64 {
 // skipContainerFast skips the JSON container that opens at data[i] (data[i] is
 // open, the matching close is '}' for '{' and ']' for '['), returning the index
 // just past the close. It counts only that bracket pair outside strings; a stray
-// bracket of the other type is ignored, exactly as skipObject/skipArray do. A
-// truncated/malformed container returns ErrTruncated.
+// bracket of the other type is ignored rather than descended into, which is one
+// of the two documented divergences from skipObject/skipArray above. A
+// truncated container returns ErrTruncated. Depth is an int, not recursion, so
+// arbitrarily deep input is safe here (and, unlike the scalar path, accepted).
 func skipContainerFast(data []byte, i int, open byte) (int, error) {
 	close := byte('}')
 	if open == '[' {

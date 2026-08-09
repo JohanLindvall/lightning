@@ -58,6 +58,14 @@ func randValue(r *rand.Rand, depth int) any {
 	return s
 }
 
+// TestSkipContainerFastMatches differentially tests skipContainerFast against
+// the scalar oracle. Every direct call to it is gated on fastSkipAvail, the same
+// gate TestSkipBlocksVariants applies (via useSkipBlocks) before flipping the
+// dispatch flags: on an amd64 without AVX2 the Go block loop reaches maskBlock,
+// which is AVX2-only assembly, so an ungated call SIGILLs instead of failing —
+// and skipContainerFast is not the production path there anyway (SkipValue only
+// dispatches to it when fastSkipAvail). The SkipValue and truncation checks
+// below stay ungated: they exercise whichever path this machine really uses.
 func TestSkipContainerFastMatches(t *testing.T) {
 	// Hand-picked tricky cases (brackets/quotes/escapes inside strings).
 	cases := []string{
@@ -68,12 +76,18 @@ func TestSkipContainerFastMatches(t *testing.T) {
 		`["\"","}","{","[\\]"]`,
 		`{"k":"a\\\\\\\"b}c"}`,
 	}
-	for _, c := range cases {
-		data := []byte(c)
-		want, werr := refSkip(data, 0)
-		got, gerr := skipContainerFast(data, 0, data[0])
-		if got != want || (werr == nil) != (gerr == nil) {
-			t.Errorf("%q: fast=(%d,%v) ref=(%d,%v)", c, got, gerr, want, werr)
+	// These are all under 64 bytes, so the block loop (and maskBlock with it) is
+	// never entered — but that is an accident of the corpus, not a property of
+	// the test, so gate here too rather than leave a trap for the next case
+	// somebody adds.
+	if fastSkipAvail {
+		for _, c := range cases {
+			data := []byte(c)
+			want, werr := refSkip(data, 0)
+			got, gerr := skipContainerFast(data, 0, data[0])
+			if got != want || (werr == nil) != (gerr == nil) {
+				t.Errorf("%q: fast=(%d,%v) ref=(%d,%v)", c, got, gerr, want, werr)
+			}
 		}
 	}
 
@@ -102,10 +116,12 @@ func TestSkipContainerFastMatches(t *testing.T) {
 		for _, pad := range []int{0, 40} {
 			data := append(append([]byte{}, doc...), []byte(strings.Repeat(" ", pad))...)
 			want, werr := refSkip(data, 0)
-			got, gerr := skipContainerFast(data, 0, data[0])
-			if got != want || (werr == nil) != (gerr == nil) {
-				t.Fatalf("iter %d pad %d: fast=(%d,%v) ref=(%d,%v)\ndoc=%s",
-					iter, pad, got, gerr, want, werr, doc)
+			if fastSkipAvail {
+				got, gerr := skipContainerFast(data, 0, data[0])
+				if got != want || (werr == nil) != (gerr == nil) {
+					t.Fatalf("iter %d pad %d: fast=(%d,%v) ref=(%d,%v)\ndoc=%s",
+						iter, pad, got, gerr, want, werr, doc)
+				}
 			}
 			// SkipValue is now the production dispatch; it must agree with the
 			// pre-existing skipObject/skipArray oracle on every valid value.
@@ -171,8 +187,14 @@ func boundaryDocs() []string {
 // TestSkipContainerBoundaries runs the crafted block-boundary corpus through the
 // production skipContainerFast (whatever implementation is live on this arch)
 // against the scalar oracle, with and without trailing slack so both the block
-// and tail paths see every case.
+// and tail paths see every case. Its documents deliberately straddle the 64-byte
+// block grid, so they do reach maskBlock — hence the fastSkipAvail gate (see
+// TestSkipContainerFastMatches for why an ungated call is a SIGILL, not a
+// failure, on a pre-AVX2 amd64).
 func TestSkipContainerBoundaries(t *testing.T) {
+	if !fastSkipAvail {
+		t.Skip("skipContainerFast's maskBlock has no SIMD implementation here")
+	}
 	for _, c := range boundaryDocs() {
 		for _, pad := range []int{0, 70} {
 			data := []byte(c + strings.Repeat(" ", pad))

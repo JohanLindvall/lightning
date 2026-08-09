@@ -212,8 +212,26 @@ func (s *stripper) handle(read, write, depth int) (int, int) {
 	switch in[read] {
 	case '{':
 		read++
-		if read != dataLen && in[read] == '}' {
-			return read + 1, write
+		// Peek past inter-token whitespace for the close, exactly as the member-value
+		// container branch below does. Without the peek "{ }" was not recognized as
+		// empty, so the member loop hit '}' where it wanted a key and fell into
+		// eject() — which by contract copies the *whole remaining input* through
+		// verbatim, leaving every later member unstripped (and, in RemoveWhitespace
+		// mode, unminified) behind output that still looks like valid JSON. read is
+		// deliberately left where it was when the container is not empty: the member
+		// loop needs the leading whitespace to preserve it. (The skip is expanded
+		// here rather than factored into a helper for the reason CLAUDE.md records:
+		// a helper wrapping the two-compare fast path plus SkipWSRun costs more than
+		// the inliner's budget, so it would cost a call frame per container.)
+		peekObj := read
+		if !compact && peekObj < dataLen && in[peekObj] <= ' ' {
+			peekObj++
+			if peekObj < dataLen && in[peekObj] <= ' ' {
+				peekObj = unstable.SkipWSRun(in, peekObj+1)
+			}
+		}
+		if peekObj < dataLen && in[peekObj] == '}' {
+			return peekObj + 1, write
 		}
 		startWrite := write
 		out[write] = '{'
@@ -377,8 +395,21 @@ func (s *stripper) handle(read, write, depth int) (int, int) {
 		}
 	case '[':
 		read++
-		if read != dataLen && in[read] == ']' {
-			return read + 1, write
+		// The same whitespace peek as the object case above. "[ ]" reached the right
+		// answer without it — the element loop's lone whitespace-only "element" is an
+		// empty scalar token that emits nothing, so the array still came out empty
+		// and was dropped — but only by a longer route through findDelimiter, and
+		// only as long as that route holds. Deciding emptiness here makes the two
+		// container cases agree by construction.
+		peekArr := read
+		if !compact && peekArr < dataLen && in[peekArr] <= ' ' {
+			peekArr++
+			if peekArr < dataLen && in[peekArr] <= ' ' {
+				peekArr = unstable.SkipWSRun(in, peekArr+1)
+			}
+		}
+		if peekArr < dataLen && in[peekArr] == ']' {
+			return peekArr + 1, write
 		}
 		startWrite := write
 		out[write] = '['

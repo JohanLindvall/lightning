@@ -259,6 +259,76 @@ type LaxSharedAnyPlain struct {
 	V any `json:"v,lax"`
 }
 
+// CompactShared is the type both roots below reach. It holds one of every
+// container the generator emits an inter-token SkipWS into — an object (itself),
+// a generated slice loop, a map loop, a fixed-size array loop — plus a dynamic
+// `any` field, which is the one field kind whose *reader* has a compact variant
+// (unstable.DecodeValueCompact). //lightning:compact elides the skip at every
+// one of those sites, so a decoder built under the directive must reject
+// whitespace at each of them.
+//
+// The slice and array element types are deliberately strings, and the map value
+// an int reached through the map loop, rather than a []int/[N]int field: those
+// route to the batched pkg/unstable readers, which do their own whitespace
+// skipping and stay whitespace-tolerant under the directive. A batched field
+// here would silently weaken TestCompactDirective's rejection assertions.
+type CompactShared struct {
+	Name string         `json:"name"`
+	Vals []string       `json:"vals"`
+	M    map[string]int `json:"m"`
+	A    [2]string      `json:"a"`
+	Any  any            `json:"any"`
+}
+
+// CompactDoc carries //lightning:compact: every inter-token SkipWS in its
+// decoders — and in the decoders of every type it reaches — is elided at compile
+// time, so it decodes whitespace-free input and *rejects* input with whitespace
+// between tokens. CompactPlain below is the same shape without the directive,
+// and both reach the same CompactShared, so the pair pins the two halves of the
+// directive at once: the elision itself, and the fact that the compact and plain
+// decoders for a shared type stay distinct (memo keys carry g.prefix +
+// g.cmark()). It is declared FIRST, like LaxSharedDestructive above, so a memo
+// key that lost that distinction would generate the compact variant first and
+// hand it to the plain root.
+//
+// Exercised by TestCompactDirective.
+//
+//lightning:compact
+type CompactDoc struct {
+	N     CompactShared   `json:"n"`
+	Items []CompactShared `json:"items"`
+}
+
+// CompactPlain is CompactDoc without the directive: same fields, same shared
+// element type, ordinary whitespace-skipping decoders. It is the control for
+// every rejection TestCompactDirective asserts of CompactDoc — without it, a
+// "compact rejects whitespace" test could pass because the input was malformed
+// for some unrelated reason.
+type CompactPlain struct {
+	N     CompactShared   `json:"n"`
+	Items []CompactShared `json:"items"`
+}
+
+// NoCopyList is the slice half of //lightning:nocopy (NoCopyMap above is the map
+// half): a slice root whose string elements alias the input instead of being
+// copied. Exercised by TestNoCopyDirective.
+//
+//lightning:nocopy
+type NoCopyList []string
+
+// RawNullDoc pins json.RawMessage's treatment of a JSON null to encoding/json's:
+// RawMessage implements json.Unmarshaler, and Unmarshal calls UnmarshalJSON
+// "including when the input is a JSON null", so the field ends up holding the
+// four bytes "null" — it is NOT left untouched. The generator used to skip the
+// assignment for a null, which was invisible on a fresh target (nil either way)
+// and wrong on a reused one, where the field silently kept the previous
+// document's value. Exercised by TestRawMessageNull.
+type RawNullDoc struct {
+	R    json.RawMessage   `json:"r"`
+	NC   json.RawMessage   `json:"nc,nocopy"`
+	Many []json.RawMessage `json:"many"`
+}
+
 // UnwrapPtr covers the unwrap tag on a *pointer* field: the pointer null probe
 // in the generated inner decoder reads data[i] unguarded (safe everywhere else
 // because the enclosing loop guarantees a value byte), so the unwrap closure
