@@ -549,3 +549,59 @@ func TestDecodeByteSlice(t *testing.T) {
 		t.Fatal("invalid base64 accepted")
 	}
 }
+
+// TestDecodeByteSliceErrorPublishesPartial locks the error semantics of the
+// base64 arm. Decode fills the destination quantum by quantum before it reports
+// a bad one, so when the backing is *out's own — the reuse this reader exists to
+// support — the caller's previous bytes are already overwritten when the error
+// arrives. Returning without touching *out therefore did not preserve the old
+// value (nothing can); it only left the old LENGTH describing rewritten bytes,
+// so the caller saw a silent splice of two documents. The reader now publishes
+// the decoded prefix on every return like its siblings, which is both honest and
+// self-consistent: len(*out) is what was actually decoded.
+func TestDecodeByteSliceErrorPublishesPartial(t *testing.T) {
+	// "QUJD" decodes to "ABC" before the "####" quantum fails, and the target is
+	// long enough that its backing is reused (the corrupting case).
+	for _, fn := range []struct {
+		name string
+		call func(*[]byte, []byte, int) (int, error)
+	}{
+		{"DecodeByteSlice", DecodeByteSlice},
+		{"DecodeByteSliceArena", func(o *[]byte, d []byte, i int) (int, error) {
+			var a Arena
+			return DecodeByteSliceArena(o, d, i, &a)
+		}},
+	} {
+		b := []byte("0123456789abcdef")
+		before := &b[0]
+		if _, err := fn.call(&b, []byte(`"QUJD####"`), 0); err == nil {
+			t.Fatalf("%s: invalid base64 accepted, got %q", fn.name, b)
+		}
+		if string(b) != "ABC" {
+			t.Errorf("%s: *out = %q, want the decoded prefix %q", fn.name, b, "ABC")
+		}
+		if &b[0] != before {
+			t.Errorf("%s: error path reallocated instead of reusing the backing", fn.name)
+		}
+	}
+
+	// The same publish happens when the backing was freshly allocated, so the
+	// semantics do not depend on the target's capacity — a caller could not
+	// reason about them otherwise.
+	var fresh []byte
+	if _, err := DecodeByteSlice(&fresh, []byte(`"QUJD####"`), 0); err == nil {
+		t.Fatal("invalid base64 accepted")
+	}
+	if string(fresh) != "ABC" {
+		t.Errorf("fresh target: *out = %q, want %q", fresh, "ABC")
+	}
+
+	// A failure before any byte is decoded leaves an empty (not stale) value.
+	stale := []byte("0123456789abcdef")
+	if _, err := DecodeByteSlice(&stale, []byte(`"####"`), 0); err == nil {
+		t.Fatal("invalid base64 accepted")
+	}
+	if len(stale) != 0 {
+		t.Errorf("*out = %q, want empty", stale)
+	}
+}

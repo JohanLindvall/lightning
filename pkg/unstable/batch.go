@@ -780,6 +780,14 @@ func DecodeUintArray[T uintKind](out []T, data []byte, i int) (int, error) {
 // included) shared with every other uint slice. null yields a nil slice. Like
 // the other slice readers it replaces *out's contents, reusing its backing when
 // the decoded bytes fit.
+//
+// On a decode error *out holds the prefix that did decode, the partial-progress
+// semantics the readers here share — and here it is not merely a convention:
+// reusing the backing means a failed base64 decode has already overwritten the
+// caller's previous bytes, so leaving *out alone would report a stale length
+// over rewritten data. encoding/json, which always decodes into a fresh buffer,
+// leaves its target untouched instead; a caller that must keep the old value
+// across a failed decode has to keep its own copy.
 func DecodeByteSlice(out *[]byte, data []byte, i int) (int, error) {
 	return decodeByteSlice(out, data, i, nil)
 }
@@ -815,10 +823,13 @@ func decodeByteSlice(out *[]byte, data []byte, i int, a *Arena) (int, error) {
 	} else {
 		b = b[:need]
 	}
+	// Publish the decode on every return, like every other reader in this file.
+	// base64.Decode fills b quantum by quantum and only then reports a bad one, so
+	// when b is *out's reused backing the caller's previous bytes are already gone
+	// by the time the error surfaces — returning with *out's old length left it
+	// describing bytes that had been overwritten, a silent mix of the previous
+	// document and this one. b[:n] instead says exactly what was decoded.
 	n, derr := base64.StdEncoding.Decode(b, unsafeBytes(s))
-	if derr != nil {
-		return end, derr
-	}
 	*out = b[:n]
-	return end, nil
+	return end, derr
 }
