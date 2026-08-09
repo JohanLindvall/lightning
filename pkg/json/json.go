@@ -107,6 +107,12 @@ const MaxDepth = unstable.MaxDepth
 // When in contains no escapes the returned string aliases in directly without
 // copying, so the caller must keep in unchanged while the result is in use.
 // When escapes are present a new string is allocated.
+//
+// Only escapes are decoded: the bytes between them are copied through as they
+// are, so raw invalid UTF-8 survives into the result where encoding/json would
+// coerce it to U+FFFD. Call utf8.ValidString if that matters to you. (An
+// unpaired \u surrogate escape is the one thing normalized to U+FFFD, because
+// no byte sequence encodes it.)
 func UnescapeString(in []byte) (string, error) {
 	return unstable.UnescapeString(in)
 }
@@ -125,12 +131,18 @@ func UnescapeStringInto(in, out []byte) (string, error) {
 	return unstable.UnescapeStringInto(in, out)
 }
 
-// ParseFloat parses the JSON number in b as a float64. It takes the scanner's
+// ParseFloat parses the number in b as a float64. It takes the scanner's
 // fast paths — Clinger (an exact mantissa with a small decimal exponent becomes
 // a single multiply or divide), then Eisel-Lemire for longer mantissas and
 // larger exponents — and falls back to strconv.ParseFloat for the rest.
 // b must be exactly one number with no surrounding whitespace; trailing bytes or
 // an empty input yield an error.
+//
+// It accepts the numbers the rest of this library accepts rather than exactly
+// the JSON grammar's: a leading '+' as well as '-' (ParseFloat([]byte("+5")) is
+// 5, nil), leading zeros, an empty integer part and an empty fraction are all
+// read, while a magnitude no float64 can hold (1e309) is ErrBadNumber. [Valid]
+// documents that accept set and why it is shared.
 func ParseFloat(b []byte) (float64, error) {
 	return unstable.ParseFloat(b)
 }
@@ -143,6 +155,12 @@ func ParseFloat(b []byte) (float64, error) {
 //
 // Trailing content after the first complete value (other than whitespace) is an
 // error.
+//
+// It accepts exactly the documents [Valid] accepts, so the leniencies listed
+// there are DecodeAny's too: numbers follow the scanner's grammar rather than
+// JSON's (+5 decodes to float64(5)), and string contents are handed back
+// verbatim — invalid UTF-8 included, where encoding/json coerces it to U+FFFD.
+// Only an unpaired \u surrogate escape is normalized to U+FFFD, as it is there.
 func DecodeAny(data []byte) (any, error) {
 	return decodeAny(data, false)
 }

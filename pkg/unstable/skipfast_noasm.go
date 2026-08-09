@@ -6,7 +6,12 @@ package unstable
 // slower than the indexStructural skip), so SkipValue stays on the current path.
 const fastSkipAvail = false
 
-// useSkipBlocks: the whole-loop assembly block scan is amd64-only.
+// useSkipBlocks is false because this file covers the architectures with no
+// assembly at all. Both SIMD arches have the whole-loop block scan: amd64
+// (skipBlocksAVX2/skipBlocksAVX512, gated on the CPU features) and arm64
+// (skipBlocksNEON, unconditional since NEON is baseline). Here skipBlocks below
+// is unreachable — fastSkipAvail already keeps SkipValue off the fast path — and
+// panics rather than pretending to scan.
 const useSkipBlocks = false
 
 func skipBlocks(data []byte, pos, depth int, isArray bool) (end, ndepth int, prevEscaped, prevInString uint64) {

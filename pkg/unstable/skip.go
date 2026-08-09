@@ -19,10 +19,12 @@ import (
 // balancers that return the same end index for every well-formed value.
 //
 // Off the well-formed set the two paths are not interchangeable, so which one
-// runs is observable: see skipContainerFast's comment for the exact divergences
-// (unbalanced brackets of the other type, and nesting past MaxDepth, which the
-// recursive scalar path rejects with ErrMaxDepth and the iterative SIMD path
-// accepts). Every caller treats such input as an error or a presize miss.
+// runs — and therefore what SkipValue answers on malformed input — depends on
+// the host CPU. skipfast.go's header enumerates the divergence classes (three
+// as of this writing) and TestSkipPathsDivergeOnMalformed pins them; that list
+// is the authority and is deliberately not restated here, since a second copy
+// is what let this comment go stale while claiming to be exhaustive. Every
+// caller treats such input as an error or a presize miss.
 func SkipValue(data []byte, i int) (int, error) {
 	if i >= len(data) {
 		return i, ErrTruncated
@@ -90,6 +92,18 @@ func SkipString(data []byte, i int) (int, error) {
 	}
 }
 
+// skipNumber measures a number token; it does not validate one. Any non-empty
+// run of [0-9.eE+-] is a token, so SkipValue([]byte("+"), 0) is (1, nil) and
+// "-", "e", ".", "1.2.3" and "+-e." are number spans too — only an empty run
+// (a byte that starts none of the other value kinds, e.g. 'x') is ErrBadNumber.
+// That is deliberate and consistent with the rest of the skip path being a
+// bracket balancer rather than a parser: SkipValue's job is to find where a
+// value ends so the caller can step over it, and the readers that produce a
+// value from those same bytes are the ones that decide it is a number —
+// ReadFloat64OrNull/ReadNumberOrNull reject every literal above, and Valid,
+// which runs the document through those readers, rejects the document. Only a
+// caller that mistakes SkipValue for validation is surprised here; pkg/json's
+// checked wrappers exist because the fast walkers make exactly this trade.
 func skipNumber(data []byte, i int) (int, error) {
 	start := i
 	if i < len(data) && data[i] == '-' {

@@ -4,6 +4,15 @@ import "strconv"
 
 // DecodeValue decodes an arbitrary JSON value at data[i] into the standard Go
 // representation (nil, bool, float64, string, []any, map[string]any).
+//
+// It reads through this package's readers, so it inherits their accept set
+// rather than the JSON grammar's: numbers take scanFloat's superset (a leading
+// '+', leading zeros, an empty integer part or fraction — DecodeValue("+5") is
+// float64(5), and so is the element of "[+5]"; see ParseFloat for the full
+// list), and strings come back with their bytes verbatim, invalid UTF-8
+// included, where encoding/json coerces to U+FFFD (see ReadStringOrNull). Both
+// leniencies are shared with Valid, which is what lets Valid promise it accepts
+// exactly what this does.
 func DecodeValue(data []byte, i int) (any, int, error) {
 	return decodeValue(data, i, false, 0)
 }
