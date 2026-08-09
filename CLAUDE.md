@@ -2038,3 +2038,47 @@ gives `he\"\"\\\"`. Fixed in the doc on both sides (the non-overlap requirement
 here, the reason and a pointer back on `UnescapeStringInto`), with no runtime
 overlap check on the hot path, per the two-tier convention. Whenever a doc points
 at a sibling's buffer convention, check the direction of the size change first.
+
+### Two more stdlib divergences, pinned rather than "fixed"
+
+- **`ReadTimeOrNull` unescapes; `time.Time.UnmarshalJSON` does not.** Its doc
+  claimed to match "how encoding/json decodes time.Time". It reads the string
+  *value* and parses that, where the stdlib parses the raw quoted bytes without
+  unescaping (`TODO(https://go.dev/issue/47353)` in time.go), so any `\uXXXX` in a
+  timestamp — legal JSON for a legal instant — is accepted here and rejected there.
+  Tightening would be a regression, so the doc was scoped and
+  `TestReadTimeAcceptsEscapedTimestamps` pins both halves. **A second correction
+  came out of writing it:** the stdlib's authority is `parseStrictRFC3339`, not
+  `time.Parse`, and its extra RFC 3339 checks are currently *compiled out*
+  (`case true: return t, nil`, pending go.dev/issue/54580). So "lightning ≡
+  encoding/json on escape-free input" is true on this toolchain and is a **premise,
+  not an identity** — the test runs the whole `dateCorpus()` through both, so
+  re-enabling 54580 surfaces here rather than as a silent new divergence.
+- **Raw invalid UTF-8 passes through where encoding/json coerces to U+FFFD.**
+  Stated in the README since forever, tested by nothing.
+  `TestStringsPassInvalidUTF8Through` now covers all seven paths that could differ
+  (copy / nocopy / destructive readers, `ReadKey`, `DecodeValue` value and map key,
+  `decodeEscaped`'s literal runs, `UnescapeString`) and asserts the stdlib premise
+  in the same test. Sabotage-verified in both places it could be closed — the
+  reader's `string(rest[:k])` and `decodeEscaped`'s `unsafeStr(buf)`.
+
+Prose rot found in the same pass, all verified before editing: `simd.go` /
+`simd_other.go` pointed at a `simd_noasm.go` that does not exist (the scalar
+dispatch file is `simd_scalar.go`); `skipfast_noasm.go` still called the whole-loop
+block scan "amd64-only" after `skipBlocksNEON` landed; and `SkipValue`'s doc
+re-enumerated `skipfast.go`'s divergence classes and listed two of three — the exact
+cross-file-copy rot the audit section warns about, now replaced by a pointer to the
+single authoritative list. `skipNumber` gained a seam note: it *measures* a number
+token rather than validating one, so `SkipValue([]byte("+"), 0)` is `(1, nil)` and
+`-`, `e`, `.`, `1.2.3` are spans too — consistent with the bracket-balancer
+contract, but it reads as validation without the note. `ParseFloat`/`DecodeValue`
+docs likewise now state their accept set (`+5` is 5) instead of saying "the JSON
+number in b"; the behavior is `Valid`-consistent and deliberate.
+
+**Method note worth keeping.** The claim "these are comment-only changes" was not
+left to `git diff`: a probe binary exercising the touched entry points was built
+against the tree before and after, and the normalized whole-binary disassembly
+(175 569 instruction lines) hashed identically. The raw binaries *do* differ —
+pclntab and DWARF line numbers shift when you insert comments — so a naive binary
+comparison would have looked like a code change and a naive `diff` of the source
+proves nothing about codegen. Disassemble and normalize.

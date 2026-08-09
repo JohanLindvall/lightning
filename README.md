@@ -272,7 +272,21 @@ are *silent*.
   Go type and byte offset. Tolerating a type mismatch on a particular field is
   what the [`lax`](#the-lax-tag-option) option is for.
 - **Invalid UTF-8 is passed through** rather than replaced with U+FFFD — see
-  [Limits and untrusted input](#limits-and-untrusted-input).
+  [Limits and untrusted input](#limits-and-untrusted-input). Pinned across every
+  string path (copy, nocopy, destructive, object keys, the dynamic `any` decoder,
+  `UnescapeString`) by `unstable.TestStringsPassInvalidUTF8Through`.
+- **A `time.Time` written with `\uXXXX` escapes decodes here and fails in
+  `encoding/json`.** lightning reads the JSON string's *value* and parses that;
+  `time.Time.UnmarshalJSON` parses the raw bytes between the quotes without
+  unescaping them ([go.dev/issue/47353](https://go.dev/issue/47353)), so
+  `"2021-01-01T00:00:00Z"` — legal JSON denoting a legal instant — errors
+  there and decodes to `2021-01-01 00:00:00 +0000 UTC` here. The divergence only
+  ever accepts *more*, and on an escape-free timestamp the two agree on both
+  acceptance and instant. lightning's authority for the grammar is
+  `time.Parse(time.RFC3339, …)`, which is also what the stdlib currently reduces
+  to — its extra RFC 3339 strictness is compiled out pending
+  [go.dev/issue/54580](https://go.dev/issue/54580), so that agreement is a
+  premise the tests check rather than an identity.
 - **Duplicate keys: last wins when decoding, first wins in the toolkit.** A
   generated `UnmarshalJSON` decodes every occurrence in document order, so the last
   one survives — matching `encoding/json`. The [`pkg/json`](pkg/json) lookup and
@@ -1119,7 +1133,14 @@ Worth knowing before pointing this at input you don't control:
   U+FFFD for malformed bytes; lightning returns them verbatim, so a decoded
   `string` is not guaranteed to be valid UTF-8. (Unpaired `\uXXXX` surrogates *are*
   replaced with U+FFFD, matching `encoding/json`.) This is lossless rather than
-  lenient, but check with `utf8.Valid` if you need the guarantee.
+  lenient, but check with `utf8.Valid` if you need the guarantee. Pinned across
+  every string path by `unstable.TestStringsPassInvalidUTF8Through`.
+- **A skipped number is measured, not validated.** `SkipValue` — what an unknown
+  field's value, a `lax` mismatch's leftovers and the toolkit's walkers step over
+  — takes a number token as a run of `[0-9.eE+-]`, so `+`, `-` and `1.2.3` are
+  number *spans* to it. That is the same bracket-balancer trade this section
+  already describes for containers, and the reason the `…Checked` wrappers exist:
+  the typed readers and `Valid` do reject those.
 - **Numbers are validated by arithmetic, not by grammar** — see the table under
   [Checking validity](#checking-validity) for what that accepts. A number that
   overflows its destination **wraps** (sized ints) or **saturates to ±Inf**
