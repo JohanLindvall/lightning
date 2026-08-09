@@ -1948,3 +1948,79 @@ time.Time}` — both standard-library-owned, i.e. the behaviour the differential
 measure lightning *against* rather than a way for the comparison to short-circuit
 back into lightning's own decoder. Any future twin holding a stdlib type with its
 own `UnmarshalJSON` needs the same treatment.
+
+### The in-place mode of a rewriter is a separate contract from its output
+
+`StripDefaults` documents `output == input[:0]`, and the walk earns it by never
+writing past its own read cursor — writes only ever land on consumed bytes. One
+member shape violated it: a member whose value is a container has its key, colon
+and the recursion's whole output written speculatively and rewound when the value
+strips to nothing, and the code after the rewind re-read the key (for `keepKey`)
+and the member's original span (to re-emit a kept member) out of the input it had
+just overwritten. Under any left shift — a dropped sibling ahead of it, or removed
+whitespace — the member silently vanished from the output or came out garbled,
+*while the output stayed valid JSON*. The fresh-buffer path was always correct, so
+every committed test passed; `TestStripDefaultsInPlace` existed and happened to
+use an input with no keep-container member.
+
+Two lessons. **(1)** In-place is not "the same function with a different buffer":
+it needs its own property test, and the right one is **`in-place ≡ fresh, byte for
+byte, for every input`** — a differential over generated documents ×
+defaults/keep pools × every whitespace mode, checked for **non-vacuity** (17.8% of
+the generated documents actually reach the shape under test; 3M pairs run during
+development, 120k committed). **(2)** The invariant to restore is "nothing the code
+will still read has been overwritten", not "add a copy somewhere". Here that means:
+hoist the decision that is a pure function of already-read bytes (the keep test),
+and snapshot only the span a *later* read needs, on the one path that can need it —
+a `stripper.scratch` grown with `append(s.scratch[:0], …)`, so an ordinary member
+allocates nothing and 0 allocs/op survives. One shared scratch is enough for all
+nesting levels because a deeper frame replaces it only by snapshotting a kept
+member of its own, and such a member is always emitted, which leaves every
+enclosing container non-empty — so no outer frame ever reaches back for the
+snapshot it lost. That argument is the load-bearing part; it lives next to the
+buffer.
+
+The snapshot's end comes from `SkipValue` over the same value, which agrees with
+the walk on every well-formed one. They part on malformed input — a bare token
+holding a quote (`{"b":{"k":q"w,"a}b":0}}`) makes `SkipValue` open a string the
+walk does not, leaving it outside a string where the walk is inside one, so it
+stops at an earlier `}` — hence the guarded fallback to emitting from the input.
+Reachable, and tested.
+
+**Cost control on a fix like this took three measured rounds.** Parameterizing
+`emitField` with a `src`/`base` pair costs **88** against the inliner's 80, so
+`emitField` stops inlining and every *kept member's* emit pays a call frame — the
+obvious "DRY the two forms" move is the expensive one here. Expanding the early
+decision inline grew `handle` by **9.4%** of its instructions and cost the pretty
+benchmark ~4%; calling a helper per container member cost the same again. Landed:
+`emitField` byte-identical, both new arms out of line, and `keepKey`'s own length
+pre-filter leading the container branch so an ordinary container member pays one
+compare. `handle` +3.0% instructions; all three StripDefaults benchmarks flat
+(n=16, pinned, geomean −0.4%, p ≥ 0.10) and still 0 B/op. **Instruction count of
+the hot function is the noise-free proxy** to lean on when the box cannot resolve
+2% — the same conclusion the null-guard measurement reached from the other
+direction.
+
+### `Valid` is not a test for "the transform produced nothing"
+
+`StripDefaultsChecked` gated on `len(res) > 0 && !Valid(res)`, which reads as
+"empty is the documented consumed-document case, anything else must be valid". It
+is wrong for `PreserveWhitespace`, which keeps the document's outer whitespace: a
+fully-stripped document leaves a whitespace-only, *non-empty* remainder, so the
+wrapper returned `ErrInvalidJSON` for input it had just validated. The predicate
+has to be "holds no token" (`unstable.SkipWS(res, 0) == len(res)` — the same
+lenient `<= 0x20` notion the stripper copied those bytes through with), and the
+wrapper normalizes to an empty slice so `len()` stays the caller's one test in
+every mode.
+
+### Escaping has no in-place form — and the doc said it did
+
+`EscapeStringInto`'s doc said it mirrors "the in/out convention of
+`UnescapeStringInto`", whose doc explicitly blesses `out == in[:0]`. That is safe
+only because unescaping *shrinks* — the same property `//lightning:destructive` is
+built on. Escaping lengthens, so an aliasing `out` overruns input the scan has not
+read and then rescans its own output: `EscapeStringInto(s, s[:0])` on `he"llo`
+gives `he\"\"\\\"`. Fixed in the doc on both sides (the non-overlap requirement
+here, the reason and a pointer back on `UnescapeStringInto`), with no runtime
+overlap check on the hot path, per the two-tier convention. Whenever a doc points
+at a sibling's buffer convention, check the direction of the size change first.

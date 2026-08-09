@@ -120,7 +120,9 @@ func UnescapeString(in []byte) (string, error) {
 // Pass out == in (e.g. in[:0]) to decode truly in place. The returned string
 // aliases the buffer it was built in, which the caller must keep unchanged
 // while the result is in use; when out aliases in, in's original bytes are
-// overwritten.
+// overwritten. In place is safe here only because unescaping never lengthens a
+// string, so the write cursor always trails the read cursor. The reverse
+// direction has no such form: EscapeStringInto's out must not overlap s.
 func UnescapeStringInto(in, out []byte) (string, error) {
 	return unstable.UnescapeStringInto(in, out)
 }
