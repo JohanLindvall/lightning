@@ -1518,17 +1518,15 @@ func (g *gen) unsupportedf(format string, args ...any) string {
 // anyway — and never on a field that decodes, so no successful decode pays for
 // it. Correctness outranks the skip rate of a mistyped value in any case.
 //
-// The commit carries nullGuard's rule as well, for the types that need it. A
-// lax value decodes into a fresh zero scratch, so on an explicit null a type
-// whose null arm leaves its destination alone (a scalar, time.Time,
-// json.Number, a struct, a fixed-size array) hands back that zero and the commit
-// wrote it over the field — reintroducing, through the lax path only, exactly
-// the divergence nullGuard closes for a plain field, and making json:"i" and
-// json:"i,lax" disagree with each other on {"i":null}. Types whose null arm
-// *assigns* (nil for slice/map/pointer/any, the literal "null" for
-// json.RawMessage) must keep the unconditional commit, since for them the
-// scratch holds the value encoding/json would store — which is why this is
-// nullAssigns and not a blanket guard.
+// The commit has to reproduce whatever the field's plain form does on an
+// explicit null, because a lax value decodes into a fresh zero scratch and then
+// writes it. For a nested struct or a fixed-size array the plain form leaves the
+// field alone, so an unconditional commit would zero it through the lax path
+// only, making json:"n" and json:"n,lax" disagree on {"n":null}; those are
+// guarded. Every other kind already agrees with the scratch — a slice, map,
+// pointer or any is nil'd, json.RawMessage takes the literal "null", and a
+// scalar, json.Number or time.Time stores the zero (nullGuard's documented
+// divergence) — so those commit unconditionally. See nullAssigns.
 func (g *gen) laxField(dest string, expr ast.Expr, hint string, nocopy bool) string {
 	fn := g.valueDecoder(expr, hint, nocopy, true)
 	if fn == "" {
@@ -1553,29 +1551,45 @@ i = end`, g.typeStr(expr), fn, dest, g.depthArgFor(fn), g.arenaArg(), commit)
 }
 
 // nullAssigns reports whether a JSON null decoded into a field of this type
-// *sets* the field rather than leaving it as it was — encoding/json's split,
-// which the generated decoders follow: a slice, map, pointer or any becomes nil
-// and a json.RawMessage takes the literal "null", while a scalar, json.Number,
-// time.Time, struct or fixed-size array is untouched ("unmarshaling a JSON null
-// into any other Go type has no effect on the value").
+// *sets* the field rather than leaving it as it was. Only laxField asks:
+// everywhere else the null arm lives inside the decoder for the type itself, so
+// whichever emitter ran has already made the distinction — and the point of this
+// function is that a ",lax" field must land on the SAME answer its plain
+// counterpart does, or json:"i" and json:"i,lax" disagree with each other on
+// {"i":null}, which no user could be expected to predict.
 //
-// Only laxField needs to ask: everywhere else the null arm lives inside the
-// decoder for the type itself, so the distinction is already made by whichever
-// emitter ran. A field's *ast.Ident is a scalar, a named struct or `any` — the
-// generator rejects a named slice/map as a field type — so the Ident arm only
-// has to separate `any` out.
+// So this tracks the emitted behavior, not encoding/json's rule, and the two
+// part company in one place. A slice, map, pointer or any is nil'd and a
+// json.RawMessage takes the literal "null" — parity, and the scratch a lax field
+// decodes into already holds exactly that, so the commit is unconditional. A
+// nested struct and a fixed-size array are left untouched — also parity, and
+// here the scratch holds a zero the commit must NOT write, so those are guarded.
+// A scalar, json.Number or time.Time stores the zero (see nullGuard: a deliberate
+// divergence, documented in the README), and the lax scratch holds that same
+// zero, so committing it unconditionally is what keeps lax and plain agreeing.
+// Were nullGuard's parity version ever restored, those three kinds would move to
+// the guarded side here in the same change.
+//
+// A field's *ast.Ident is a scalar, a named struct or `any` — the generator
+// rejects a named slice/map as a field type — so the Ident arm only has to
+// separate `any` and named structs out.
 func (g *gen) nullAssigns(expr ast.Expr) bool {
 	switch t := unparen(expr).(type) {
 	case *ast.StarExpr, *ast.MapType, *ast.InterfaceType:
 		return true
 	case *ast.ArrayType:
 		return t.Len == nil // a slice is nil'd; a fixed-size array is untouched
+	case *ast.StructType:
+		return false // a nested struct is left untouched
 	case *ast.Ident:
-		return t.Name == "any"
+		if _, ok := g.structTypes[t.Name]; ok {
+			return false // a named nested struct, likewise
+		}
+		return true // a scalar stores the zero, and `any` is nil'd
 	case *ast.SelectorExpr:
-		return g.isRaw(t) // RawMessage stores "null"; Number and Time do not
+		return true // RawMessage stores "null"; Number and Time store the zero
 	}
-	return false
+	return true
 }
 
 // valueDecoder returns the name of a function decoding the JSON value at data[i]
@@ -1631,41 +1645,47 @@ func (g *gen) valueDecoder(expr ast.Expr, hint string, nocopy, lax bool) string 
 	return fn
 }
 
-// nullGuard wraps the assignment of a leaf reader's result so an explicit JSON
-// null leaves dest untouched, which is what encoding/json documents:
-// "unmarshaling a JSON null into any other Go type has no effect on the value and
-// produces no error". Every *OrNull reader reports a null by returning the ZERO
-// value with a nil error, so assigning it unconditionally zeroed the field
-// instead. That is invisible on a fresh target — the zero was already there — and
-// wrong on exactly the targets this library tells callers to use: a struct seeded
-// with defaults before decoding, and a target reused across documents, where a
-// null silently wiped the previous value.
+// nullGuard assigns a leaf reader's result to dest. It is a seam, not a
+// transformation: an explicit JSON null into a scalar, json.Number or time.Time
+// field STORES THE ZERO VALUE here, which is a deliberate divergence from
+// encoding/json ("unmarshaling a JSON null into any other Go type has no effect
+// on the value") and is documented as such in the README. Every *OrNull reader
+// reports a null by returning the zero value with a nil error, so the plain
+// assignment below is what produces it.
 //
-// The guard tests the value's first byte rather than the returned value, because
-// only the byte separates "the value was null" from "the value was an empty
-// string / 0 / false". It is exact — a JSON value starting with 'n' can only be
-// null, since anything else fails in the reader — and in bounds, for two reasons
-// that hold at every emission site by construction:
+// The parity version was built and then reverted, and the reasoning is worth
+// keeping because the correctness case for it is real. Guarding the assignment —
 //
-//   - i still holds the value's start. The templates below assign i = end only
-//     after the guard, no *OrNull reader skips leading whitespace of its own, and
-//     every enclosing loop skips whitespace and rejects truncation before the
-//     read, so data[i] is precisely the value's first byte.
-//   - data[i] is in range. Every *OrNull reader returns ErrTruncated when
-//     i >= len(data), so reaching the guard at all (err == nil) proves
-//     i < len(data) — the bound does not depend on the caller.
+//	if data[i] != 'n' { dest = val }
 //
-// Guarding the assignment rather than the read is what keeps this off the hot
-// path: the readers stay byte-identical and a non-null value pays one compare on
-// a byte already in cache. Composite kinds need no guard — slice, map, pointer
-// and any decoders have their own null arms, a fixed-size array is documented as
-// left untouched, and json.RawMessage deliberately stores the literal "null".
-// Inside a slice, array or map element the guard is a no-op either way, since
-// those decode into a freshly zeroed slot.
+// — is exact and in bounds at every emission site by construction: i still holds
+// the value's start (the templates assign i = end only afterwards, and no
+// *OrNull reader skips leading whitespace of its own), and data[i] is in range
+// *because the reader returned nil*, since every one of them returns
+// ErrTruncated when i >= len(data). Only the first byte separates "the value was
+// null" from "the value was an empty string / 0 / false", so testing the byte is
+// the only correct test.
+//
+// What sank it was cost against benefit on the hot path. The guard fires once
+// per scalar field read — cloudflare's 45-field decoder grew 1620 -> 1937
+// instructions, and the compiler could not prove the index, so each guard also
+// carries a bounds check (+25 panicBounds stubs; they land out of line in the
+// cold tail, but the compare stays inline). Static estimate is 1-2% on that
+// decoder, which the repo's own noise floor cannot separate from zero, and no
+// measurement on hand could resolve it either way. Set against that: the
+// divergence is invisible on a fresh target, since "leave the value alone" and
+// "store the zero" coincide there, so it costs every decode to change behavior
+// only for callers who seed or reuse a target AND send explicit nulls. Documented
+// beats paid-for-by-everyone; if that trade is ever revisited, restoring the
+// guard is one line here plus the nullAssigns note in laxField.
+//
+// Composite kinds never reach this: slice, map, pointer and any decoders have
+// their own null arms (all nil'ing, per encoding/json), a fixed-size array and a
+// nested struct are left untouched, and json.RawMessage stores the literal
+// "null". Inside a slice, array or map element the distinction cannot be observed
+// at all, since those decode into a freshly zeroed slot.
 func nullGuard(dest, val string) string {
-	return fmt.Sprintf(`if data[i] != 'n' { // an explicit null leaves the field as it was
-	%s = %s
-}`, dest, val)
+	return fmt.Sprintf(`%s = %s`, dest, val)
 }
 
 // scalar emits the read for a leaf field of a builtin kind.

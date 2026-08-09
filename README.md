@@ -143,7 +143,7 @@ for _, doc := range docs {
 ```
 
 Reuse here is *storage* reuse, not *value* reuse, and that is the one place where it
-parts company with `encoding/json`. Three rules cover it, and only the last is a
+parts company with `encoding/json`. Three rules cover it, and two of them carry a
 divergence:
 
 - **Struct fields are decoded in place.** A field the document omits keeps the value
@@ -152,18 +152,21 @@ divergence:
   already points to* (a nil pointer allocates; JSON `null` sets it back to nil), so
   pointer-dense schemas reuse allocation-free. Zero the target yourself if you need
   absent-means-zero.
-- **An explicit `null` follows `encoding/json`'s rule, which splits by kind.**
-  "Unmarshaling a JSON null into any other Go type has no effect on the value and
-  produces no error", so `{"n":null}` leaves a `string`, `bool`, integer, float,
-  `json.Number`, `time.Time`, nested struct or `[N]T` field **exactly as it was** —
-  the same as an omitted key. The kinds a null *does* reach are set: a slice, map,
-  pointer or `any` field becomes nil, and a `json.RawMessage` field takes the four
-  bytes `null` (its `UnmarshalJSON` is called with them, as in the stdlib). The rule
-  is the same for a field tagged `lax`. Like the pointer rule above, this is only
-  observable when the target is not already zero — a struct seeded with defaults, or
-  one reused across documents — which is exactly the pattern this section is about.
-  At the **root**, the same split applies to the receiver: `UnmarshalJSON("null")` on
-  a named slice or map type sets it to nil, and on a struct type does nothing.
+- **An explicit `null` splits by kind, and one of those kinds diverges.** A slice,
+  map, pointer or `any` field becomes nil, a `json.RawMessage` field takes the four
+  bytes `null`, and a nested struct or `[N]T` field is left **exactly as it was** —
+  all as in `encoding/json`. A **leaf** field, though — `string`, `bool`, integer,
+  float, `json.Number`, `time.Time` — is set to its **zero value**, where
+  `encoding/json` would leave it alone ("unmarshaling a JSON null into any other Go
+  type has no effect on the value"). So `{"n":null}` clears a seeded `Name`, and is
+  *not* the same as omitting the key. See
+  [the divergence list](#differences-from-encodingjson) for why. The rule is the same
+  for a field tagged `lax`, deliberately: `json:"n"` and `json:"n,lax"` never
+  disagree about a null. Like the pointer rule above, none of this is observable
+  unless the target is not already zero — a struct seeded with defaults, or one
+  reused across documents — which is exactly the pattern this section is about.
+  At the **root**, `UnmarshalJSON("null")` on a named slice or map type sets it to
+  nil and on a struct type does nothing, both as in `encoding/json`.
 - **Container elements are reset before they are filled.** Every slice element,
   fixed-array element and map value starts from its zero value, so nothing carries
   over from the previous document into an element. The *storage* is still reused:
@@ -172,7 +175,7 @@ divergence:
   document's members over them — clear or replace a map field yourself if you need it
   to hold only the latest document — and a fixed-size array is zeroed in full.
 
-`encoding/json` differs on the second rule: it decodes a slice or array element
+`encoding/json` differs on the third rule too: it decodes a slice or array element
 *into* whatever that element already holds, so a field absent from the later document
 survives from the earlier one. With `Items []Inner` where `Inner` is `{A int; B string}`:
 
@@ -207,6 +210,24 @@ document yields the values the stdlib yields. The list below is the set of
 deliberate divergences — worth reading once before migrating, because most of them
 are *silent*.
 
+- **An explicit `null` clears a leaf field instead of leaving it alone.**
+  `encoding/json` documents that "unmarshaling a JSON null into any other Go type
+  has no effect on the value", so `{"name":null}` leaves a seeded `Name` at its
+  previous value. lightning stores the **zero value** in a `string`, `bool`,
+  integer, float, `json.Number` or `time.Time` field instead — `{"name":null}`
+  clears it. The other kinds match the stdlib exactly: a slice, map, pointer or
+  `any` becomes nil, a `json.RawMessage` takes the literal `null`, and a nested
+  struct or `[N]T` is left untouched. The reason is cost: every `*OrNull` reader
+  reports a null by returning the zero value, so honoring the stdlib rule means
+  testing the value's first byte at **every leaf field of every decode** to change
+  the outcome only for a null that arrives at an already-populated field. Since
+  the two rules coincide whenever the target starts out zeroed — a freshly
+  declared value, the overwhelmingly common case — the difference is only
+  reachable if you seed a target with defaults or
+  [reuse](#reusing-a-decode-target) one across documents *and* the later document
+  sends an explicit null. If you rely on that, keep the value yourself or compare
+  against a sentinel; a field tagged `lax` follows the same rule, so the two
+  spellings never disagree.
 - **Key matching is exact and case-sensitive.** `encoding/json` tries an exact
   match and then falls back to a case-insensitive one, so `{"ITEMS":[…]}` fills a
   field tagged `json:"items"`. lightning has no fallback: a key that isn't

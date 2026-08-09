@@ -229,32 +229,31 @@ func TestDestructiveDirective(t *testing.T) {
 		t.Errorf("input was not mutated; in-place unescape did not write through")
 	}
 
-	// The null rule has to survive the mutation. The guard that implements it
-	// re-reads data[i] AFTER the reader has run, and this is the one reader that
-	// writes into data while running — so the byte it re-reads had better still
-	// be the value's first byte. It is: the in-place unescape starts at the
-	// string BODY (i+1) and its write cursor only ever trails its own read
-	// cursor, so the opening quote at data[i] is never overwritten, and a
-	// preceding field's unescape never reaches past its own closing quote.
+	// The null rule has to hold here too, including on a buffer this decoder has
+	// already rewritten: a nocopy string field clears on null (the documented
+	// leaf divergence — see nullGuard) and a slice field nils (parity). Worth a
+	// case of its own because destructive is the one mode that mutates data while
+	// decoding it, so a later field's null is read out of a buffer that no longer
+	// matches the caller's original bytes.
 	seeded := DestructiveDoc{Name: "keep", Tags: []string{"t"}}
 	nulls := []byte(`{"name":null,"tags":null}`)
 	if err := seeded.UnmarshalJSON(nulls); err != nil {
 		t.Fatal(err)
 	}
-	if seeded.Name != "keep" {
-		t.Errorf("null cleared a destructive nocopy string: %q, want %q", seeded.Name, "keep")
+	if seeded.Name != "" {
+		t.Errorf("null into a destructive nocopy string: %q, want the zero value", seeded.Name)
 	}
 	if seeded.Tags != nil {
 		t.Errorf("null left a slice field at %v, want nil", seeded.Tags)
 	}
-	// And with a *mutating* read of the same field earlier in the same document,
-	// so the guard runs on a buffer the decoder has already written into.
+	// And with a *mutating* read earlier in the same document, so the null is
+	// decoded after the in-place unescape has written into the buffer.
 	mixed := []byte(`{"tags":["a\tb","c\nd"],"name":null}`)
 	seeded2 := DestructiveDoc{Name: "keep2"}
 	if err := seeded2.UnmarshalJSON(mixed); err != nil {
 		t.Fatal(err)
 	}
-	if seeded2.Name != "keep2" || len(seeded2.Tags) != 2 || seeded2.Tags[0] != "a\tb" {
+	if seeded2.Name != "" || len(seeded2.Tags) != 2 || seeded2.Tags[0] != "a\tb" {
 		t.Errorf("got %#v", seeded2)
 	}
 }
@@ -875,19 +874,34 @@ func seedNullDoc() NullDoc {
 	}
 }
 
-// TestNullFieldsMatchStdlib pins encoding/json's null rule field by field, on a
-// SEEDED target — the only place the rule is observable, since into a fresh
-// target "leave the value alone" and "store the zero value" are the same thing.
-// That is exactly why the divergence survived: every benchmark, and most of this
-// suite, decodes into a freshly declared value.
+// zeroNullLeaves applies lightning's one deliberate departure from
+// encoding/json's null rule to a stdlib result, so the tests below can say
+// "identical to encoding/json except exactly this" instead of hand-writing an
+// expected struct. An explicit null stores the ZERO value in a scalar,
+// json.Number or time.Time field, where encoding/json leaves it as it was; every
+// other kind agrees (see nullGuard in main.go for why the parity version was
+// reverted, and the README's divergence list).
+func zeroNullLeaves(d *NullDoc) {
+	d.Str, d.StrNC, d.Bool = "", "", false
+	d.I, d.I8, d.I64, d.U, d.U16 = 0, 0, 0, 0, 0
+	d.F32, d.F64 = 0, 0
+	d.Num, d.NumNC = "", ""
+	d.Time = time.Time{}
+}
+
+// TestNullFieldsDivergeFromStdlib pins the null rule field by field on a SEEDED
+// target — the only place any of it is observable, since into a fresh target
+// "leave the value alone" and "store the zero value" are the same thing. That is
+// why the difference went unnoticed for so long: every benchmark, and most of
+// this suite, decodes into a freshly declared value.
 //
-// The expectation is not spelled out here but taken from a methodless twin, so
-// the test states "lightning agrees with encoding/json" rather than "lightning
-// does what I believe encoding/json does". Against the unfixed generator every
-// scalar row fails (Str "" vs "keep", I 0 vs 1, a zero Time, a zeroed Nested)
-// while the slice/map/pointer/any/raw rows pass, which is the split the fix is
-// built around.
-func TestNullFieldsMatchStdlib(t *testing.T) {
+// The test is built like TestValidDivergesFromStdlib: the expectation comes from
+// a methodless twin with a NAMED transformation applied, so it asserts two things
+// at once — that the divergence is exactly what it claims to be, and that it
+// reaches no further. A future change that widened it to, say, nested structs, or
+// that quietly closed it, fails here either way. Nothing about this is a fix
+// waiting to happen: it is the recorded trade in nullGuard.
+func TestNullFieldsDivergeFromStdlib(t *testing.T) {
 	allNull := []byte(`{"str":null,"strNC":null,"bool":null,"i":null,"i8":null,` +
 		`"i64":null,"u":null,"u16":null,"f32":null,"f64":null,"num":null,` +
 		`"numNC":null,"time":null,"nested":null,"arr":null,"sl":null,"strs":null,` +
@@ -907,8 +921,18 @@ func TestNullFieldsMatchStdlib(t *testing.T) {
 		if err := l.UnmarshalJSON(allNull); err != nil {
 			t.Fatalf("lightning: %v", err)
 		}
-		if !reflect.DeepEqual(NullDoc(std), l) {
-			t.Errorf("null into a seeded target diverges:\n stdlib    %+v\n lightning %+v", std, l)
+		want := NullDoc(std)
+		zeroNullLeaves(&want)
+		if !reflect.DeepEqual(want, l) {
+			t.Errorf("null into a seeded target is not stdlib-with-zeroed-leaves:\n want      %+v\n lightning %+v", want, l)
+		}
+		// Spelled out as well as derived, so the divergence is legible here and
+		// not only in the helper: the leaves go to zero, the composites do not.
+		if l.Str != "" || l.I != 0 || !l.Time.IsZero() || l.Num != "" {
+			t.Errorf("a null leaf should store the zero value: %+v", l)
+		}
+		if l.Nested.Count != 11 || l.Arr != [3]int{1, 2, 3} {
+			t.Errorf("a null nested struct or fixed array must be left alone: %+v %v", l.Nested, l.Arr)
 		}
 	})
 
@@ -930,9 +954,10 @@ func TestNullFieldsMatchStdlib(t *testing.T) {
 	})
 
 	t.Run("reuse", func(t *testing.T) {
-		// The shape a real caller hits: decode a full document, then one whose
-		// fields are null. The second decode must leave the first document's
-		// scalars in place and nil the reference kinds.
+		// The shape a real caller hits, and the one the divergence actually costs
+		// something: decode a full document, then one whose fields are null. The
+		// second decode nils the reference kinds like the stdlib, but clears the
+		// first document's scalars where the stdlib would have kept them.
 		full := []byte(`{"str":"one","strNC":"oneNC","bool":true,"i":10,"i8":11,` +
 			`"i64":12,"u":13,"u16":14,"f32":1.5,"f64":2.5,"num":3.5,"numNC":4.5,` +
 			`"time":"2021-03-04T05:06:07Z","nested":{"name":"x","count":9},` +
@@ -951,18 +976,22 @@ func TestNullFieldsMatchStdlib(t *testing.T) {
 		if err := l.UnmarshalJSON(allNull); err != nil {
 			t.Fatalf("lightning: %v", err)
 		}
-		if l.Str != "one" || l.I != 10 {
-			t.Errorf("a reused target lost the previous document's scalars: %+v", l)
+		if l.Str != "" || l.I != 0 {
+			t.Errorf("a null over a reused target should clear the scalar: %+v", l)
 		}
-		if !reflect.DeepEqual(NullDoc(std), l) {
-			t.Errorf("null over a reused target diverges:\n stdlib    %+v\n lightning %+v", std, l)
+		want := NullDoc(std)
+		zeroNullLeaves(&want)
+		if !reflect.DeepEqual(want, l) {
+			t.Errorf("null over a reused target is not stdlib-with-zeroed-leaves:\n want      %+v\n lightning %+v", want, l)
 		}
 	})
 
 	t.Run("lax", func(t *testing.T) {
 		// The same rule reached through ",lax", which decodes into a scratch
-		// value and commits it. That commit has to repeat the per-kind decision,
-		// or json:"i" and json:"i,lax" disagree with each other on {"i":null}.
+		// value and commits it. That commit has to reproduce whatever the field's
+		// plain form does, or json:"i" and json:"i,lax" disagree with each other
+		// on {"i":null} — so a lax leaf zeroes (the divergence) while a lax
+		// nested struct or fixed array is left alone (parity), exactly as above.
 		laxNull := []byte(`{"str":null,"i":null,"f64":null,"num":null,"time":null,` +
 			`"nested":null,"arr":null,"sl":null,"m":null,"p":null,"a":null,"r":null}`)
 		p := 42
@@ -981,8 +1010,23 @@ func TestNullFieldsMatchStdlib(t *testing.T) {
 		if err := l.UnmarshalJSON(laxNull); err != nil {
 			t.Fatalf("lightning: %v", err)
 		}
-		if !reflect.DeepEqual(NullLaxDoc(std), l) {
-			t.Errorf("null into a seeded lax target diverges:\n stdlib    %+v\n lightning %+v", std, l)
+		want := NullLaxDoc(std)
+		want.Str, want.I, want.F64, want.Num, want.Time = "", 0, 0, "", time.Time{}
+		if !reflect.DeepEqual(want, l) {
+			t.Errorf("null into a seeded lax target is not stdlib-with-zeroed-leaves:\n want      %+v\n lightning %+v", want, l)
+		}
+
+		// The property that makes the above worth testing at all: whatever the
+		// rule is, the two spellings of the same field agree on it.
+		var plain NullDoc
+		plain.Str, plain.I, plain.F64 = "keep", 1, 2.5
+		plain.Nested, plain.Arr = Nested{Name: "n", Count: 11}, [3]int{1, 2, 3}
+		if err := plain.UnmarshalJSON([]byte(`{"str":null,"i":null,"f64":null,"nested":null,"arr":null}`)); err != nil {
+			t.Fatalf("lightning: %v", err)
+		}
+		if plain.Str != l.Str || plain.I != l.I || plain.F64 != l.F64 ||
+			plain.Nested != l.Nested || plain.Arr != l.Arr {
+			t.Errorf("json:\"x\" and json:\"x,lax\" disagree on null:\n plain %+v\n lax   %+v", plain, l)
 		}
 	})
 
@@ -1025,9 +1069,18 @@ func TestNullFieldsMatchStdlib(t *testing.T) {
 			t.Errorf("a null element over a seeded slice must reset, got %v", s.Sl)
 		}
 		// The nested struct's own fields ARE reached by the document, so their
-		// nulls follow the field rule: over a seeded Nested they keep the seed.
-		if s.Nested.Name != "n" || s.Nested.Count != 11 {
-			t.Errorf("null inside a seeded nested struct overwrote it: %+v", s.Nested)
+		// nulls follow the leaf rule and clear the seed — where a null for the
+		// struct as a whole would have left it untouched. Both halves asserted,
+		// since the interesting part is that the two differ.
+		if s.Nested.Name != "" || s.Nested.Count != 0 {
+			t.Errorf("null leaves inside a seeded nested struct should clear: %+v", s.Nested)
+		}
+		w := seedNullDoc()
+		if err := w.UnmarshalJSON([]byte(`{"nested":null}`)); err != nil {
+			t.Fatalf("lightning: %v", err)
+		}
+		if w.Nested.Name != "n" || w.Nested.Count != 11 {
+			t.Errorf("a null for the whole nested struct must leave it alone: %+v", w.Nested)
 		}
 	})
 }

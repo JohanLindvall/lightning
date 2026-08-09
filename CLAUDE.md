@@ -1831,32 +1831,51 @@ the error, so a walk that returned the wrong end would pass every Valid test —
 including the 14M-exec fuzz — while making a lax field resume in the middle of the
 value it just skipped.
 
-### An explicit JSON null zeroed scalar fields
+### An explicit JSON null zeroes a leaf field — found, fixed, then reverted to a documented divergence
 
 Every `*OrNull` reader signals a null by returning the **zero value with a nil
-error**, and the emitted code assigned it unconditionally — so `{"s":null}` wiped a
+error**, and the emitted code assigns it unconditionally — so `{"s":null}` wipes a
 string/bool/int/uint/float/`json.Number`/`time.Time` field where encoding/json
 documents "unmarshaling a JSON null into any other Go type has no effect on the
-value". Invisible on a fresh target (the zero was already there) and wrong on
+value". Invisible on a fresh target (the zero was already there) and observable on
 exactly the targets this library promotes: a struct seeded with defaults, and one
-reused across documents.
+reused across documents. Composite kinds were already right — slice/map/pointer/any
+nil, `json.RawMessage` takes the literal `null`, nested struct and `[N]T` untouched.
 
-The guard is on the **assignment**, not the read: `if data[i] != 'n' { dest = v }`.
-Two invariants make it exact and in bounds at every emission site, both worth
-keeping: `i` still holds the value's start (the templates assign `i = end` only
-after the guard, and no `*OrNull` reader skips leading whitespace of its own), and
-**`data[i]` is in range *because the reader returned nil*** — every one of them
-returns `ErrTruncated` when `i >= len(data)`, so the bound does not depend on the
-caller. Guarding the assignment leaves the readers byte-identical.
+**The parity fix was built, verified, and then deliberately reverted.** Keep the
+mechanism, because it is correct and one line away: guard the *assignment*, not
+the read — `if data[i] != 'n' { dest = val }` in `nullGuard`. It is exact (only the
+first byte separates "was null" from "was an empty string / 0 / false") and in
+bounds at every emission site by construction: `i` still holds the value's start
+(the templates assign `i = end` only after, and no `*OrNull` reader skips leading
+whitespace of its own), and **`data[i]` is in range *because the reader returned
+nil*** — every one of them returns `ErrTruncated` when `i >= len(data)`, so the
+bound does not depend on the caller. It survives `//lightning:destructive`, whose
+in-place unescape writes into `data` while decoding, since the writes start at the
+string *body* and never touch the value's first byte.
 
-The rule splits by kind and **`laxField` has to repeat the split** (`nullAssigns`):
-a lax value decodes into a fresh zero scratch and commits it, so for the kinds whose
-null arm leaves the destination alone (scalar, `time.Time`, `json.Number`, struct,
-`[N]T`) the commit needed the same guard — otherwise `json:"i"` and `json:"i,lax"`
-disagreed with each other on `{"i":null}` — while the kinds whose null arm *assigns*
-(nil for slice/map/pointer/`any`, the literal `null` for `json.RawMessage`) keep the
-unconditional commit.
+What sank it was cost against benefit. The guard fires once per leaf field read:
+cloudflare's 45-field decoder grew **1620 → 1937 instructions**, and the compiler
+could not prove the index, so each guard also carries a bounds check (**+25
+`panicBounds` stubs**; 52 of 53 land out of line in the cold tail, but the compare
+stays inline). Static estimate ~1–2% on that decoder — under the repo's own noise
+floor, and no measurement available could separate it from zero (see the harness
+entry below). Against that: because the two rules coincide whenever the target
+starts out zeroed, the guard makes *every* decode pay to change behavior only for
+callers who seed or reuse a target **and** receive an explicit null. Documented
+beats paid-for-by-everyone. The README's divergence list now carries it, and
+`TestNullFieldsDivergeFromStdlib` pins it the way `TestValidDivergesFromStdlib`
+pins Valid's: the expectation is a methodless twin's result with a **named**
+transformation (`zeroNullLeaves`) applied, so the test fails both if the
+divergence widens and if it silently closes.
 
+**`laxField` has to track whatever `nullGuard` does** (`nullAssigns`), because a
+lax value decodes into a fresh zero scratch and then commits it. With the guard
+reverted, a lax leaf commits unconditionally (matching the plain leaf's zeroing)
+while a lax nested struct or `[N]T` stays guarded (matching the plain form's
+"leave it alone"). The invariant to preserve is not "follow encoding/json" but
+**`json:"n"` and `json:"n,lax"` never disagree** — restoring the parity guard means
+moving the three leaf kinds back to the guarded side in the same change.
 ### A null at the ROOT left a named slice or map alone
 
 `genUnmarshal` intercepts a null document and returns before calling the root
@@ -1886,41 +1905,40 @@ buffer; that divergence is documented on `DecodeByteSlice`.
 
 ### Measuring the null guard: interleaving two *binaries* does not control for layout
 
-The null guard is the only change here that adds hot-path work (~5 instructions per
-matched scalar field), so it was measured — on a **contended laptop** (i7-1360P,
-load 15–22 from concurrent agents, powersave governor), where per-rep paired deltas
-span −14%…+29%. Four harnesses, benchstat verdict `~` in all six comparisons:
+The guard was the only change in this pass that adds hot-path work, and measuring
+it is the reason it was reverted rather than kept on faith. Two lessons outlived
+the change itself.
 
-- cross-binary interleaved n=14: cloudflare −0.8% (p=0.659)
-- cross-binary interleaved n=30: cloudflare **+4.0%** (p=0.060), citm +0.5%
-- cross-binary **ABBA** n=30: cloudflare +3.3% (p=0.408), citm +0.8% (p=0.633);
-  robust paired estimators read +2.5…+3.5% on cloudflare
-- **both decoders in ONE binary**, n=30: cloudflare **−1.2%** (p=0.756),
-  citm **−0.6%** (p=0.686)
+**Interleaving two binaries does not control for link layout.** Cross-binary
+interleaved runs (n=14 and n=30, and an ABBA order-alternating variant) put
+cloudflare at +0.8% to +4.0% with robust paired estimators reading +2.5…+3.5%,
+while putting **both decoders in ONE binary** — rename the schema's top-level
+types, as `run_bench.sh` already does for its destructive/arena twins — measured
+−1.2% (p=0.756). That is the same "adding code shifts a micro-benchmark a few %
+with no change to executed instructions" effect the float-array entry records,
+showing up as a *between-binary* rather than a within-binary artifact. A second
+methodology note from the same exercise: a fixed base-then-opt arm order *within*
+each rep biases every rep the same way, so alternate it (ABBA). Interleaving alone
+is not enough — position within a rep has to alternate too.
 
-**The lesson: interleaving two binaries does not control for link layout.** Put both
-variants in one binary (rename the schema's top-level types, as `run_bench.sh`
-already does for its destructive/arena twins) and the apparent +3% disappears —
-the same "adding code shifts a micro-benchmark a few % with no change to executed
-instructions" effect the float-array entry records, showing up as a *between-binary*
-rather than a within-binary artifact. Second methodology note: a fixed
-base-then-opt arm order *within* each rep biases every rep the same way; alternate
-it (ABBA). Interleaving alone is not enough — position within a rep has to alternate
-too.
+**Same-binary is still not enough when the two decoders are different functions.**
+A follow-up role-swap experiment — build the pair twice, swapping which *type name*
+carries the guard, so position and benchmark order stay fixed and only the guard
+moves — produced medians saying the guard costs 3–10% and minimums saying it saves
+3–5%, *in both orientations*. Contradictory estimators are the signature of a
+noise-dominated measurement, and the machine was the reason: an unrelated `ffmpeg`
+transcode was holding ~11 of 16 threads at load ~15. **Check what else is on the
+box before trusting any of these numbers** — the harness cannot rescue a busy
+machine, and "interleaved" is not a synonym for "valid".
 
-Static confirmation, which is load-independent and agreed with the same-binary
-result: cloudflare's decoder grows 1611 → 1928 instructions, but **+25 of those are
-`runtime.panicBounds` sites and objdump puts them in the cold function tail**; the
-call structure is otherwise byte-identical (`indexQuoteOrBackslashSSE2` still
-inlines at the readKey site, no `memequal`, no new `SkipWSRun` frame — the guard did
-*not* push the wide decoder past the inliner's big-caller threshold, the documented
-failure mode for adding code to `string_unicode`-sized decoders). citm's root
-decoder is byte-identical (766 instructions both ways; its scalars live in nested
-decoders). A hoisted variant (probe `data[i]` *before* the reader call) does **not**
-let the compiler prove the index (still 53 panicBounds) and saves only 57
-instructions, so it was not adopted. The escape hatch, if a pinned box ever
-disagrees, is one line: make `nullGuard` return `dest = val`.
-
+What did decide it was static and load-independent: instruction counts and an
+**identical call structure** (same 14 `ReadStringOrNull`, 11 `ReadInt64OrNull`, 3
+`SkipValue`, 17 write barriers, 2 `memmove` — no lost inlining, no new frames, so
+the guard did *not* push the wide decoder past the inliner's big-caller threshold,
+the documented failure mode for `string_unicode`-sized decoders). A hoisted variant
+(probe `data[i]` *before* the reader call) does not let the compiler prove the
+index either — still 53 `panicBounds` — and saves only 57 instructions, so it is
+not the way out if this is ever revisited.
 ### Testing note that generalized
 
 `time.Time` implements `json.Unmarshaler`, so `TestStdlibTwinsAreReflectionOnly`'s
