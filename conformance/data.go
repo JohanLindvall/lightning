@@ -374,3 +374,54 @@ type LaxArrays struct {
 	I [2]int32   `json:"i,lax"`
 	U [4]uint16  `json:"u,lax"`
 }
+
+// EmbedTime and EmbedRaw embed a type that carries its own UnmarshalJSON, which
+// is where lightning's field promotion parts company with encoding/json. Go
+// promotes the embedded method to the OUTER struct, so encoding/json sees the
+// whole struct as a json.Unmarshaler and hands it the entire document — the
+// sibling fields are never looked at. lightning promotes fields, not methods: the
+// embed decodes as a named field keyed by its type name and the siblings decode
+// normally. Both are pinned by TestEmbeddedUnmarshalerDivergesFromStdlib.
+type EmbedTime struct {
+	time.Time
+	A int `json:"a"`
+}
+
+// EmbedRaw is the same shape with json.RawMessage, whose promoted UnmarshalJSON
+// succeeds rather than failing — so the stdlib silently swallows the whole
+// document into the embedded field instead of reporting anything.
+type EmbedRaw struct {
+	json.RawMessage
+	B int `json:"b"`
+}
+
+// EmbedNumber is the control: json.Number is a defined string type with NO
+// UnmarshalJSON of its own, so nothing is promoted and both decoders treat the
+// embed as a named field. It is what keeps the divergence above attributable to
+// the promoted method rather than to embedding a foreign type as such.
+type EmbedNumber struct {
+	json.Number
+	C int `json:"c"`
+}
+
+// UnwrapTrailing covers the unwrap option's trailing-content rule: the wrapped
+// string holds a whole JSON document, so content after its top-level value is an
+// error — the check a root UnmarshalJSON makes. The generated closure used to
+// stop at the end of the first value and ignore the rest. L pairs the option
+// with lax, whose contract the check has to respect from the inside: a wrapped
+// value of the wrong TYPE is still swallowed, while trailing content is
+// malformed JSON and so still fails. Exercised by
+// TestUnwrapRejectsTrailingContent.
+type UnwrapTrailing struct {
+	W Nested `json:"w,unwrap"`
+	L Nested `json:"l,unwrap,lax"`
+	X int    `json:"x"`
+}
+
+// UnwrapRoot has Nested's shape but is referenced by nothing, so it is a root
+// with its own UnmarshalJSON: the same bytes decoded directly, which is the
+// behavior TestUnwrapRejectsTrailingContent holds the wrapped decode to.
+type UnwrapRoot struct {
+	Name  string `json:"name"`
+	Count int    `json:"count"`
+}
