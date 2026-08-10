@@ -854,8 +854,7 @@ func (g *gen) arenaArg() string {
 
 // genUnmarshal emits the UnmarshalJSON method for a named root type and makes sure
 // its decoder (and everything it reaches under the current g.compact/g.destructive/
-// g.nocopy flags) is generated. For a //lightning:destructive type the doc comment
-// warns that the method mutates its input.
+// g.nocopy flags) is generated.
 func (g *gen) genUnmarshal(name string) string {
 	// The decode call differs for a slice or map root: its decoder takes *[]T or
 	// *map[string]V, and the receiver *Name (whose underlying type matches) is
@@ -897,27 +896,12 @@ func (g *gen) genUnmarshal(name string) string {
 		fn := g.namedStruct(name)
 		call = fmt.Sprintf("%s(v, data, i%s%s)", fn, g.depthArgFor(fn), rootArenaArg)
 	}
-	var doc string
-	if g.destructive {
-		doc = fmt.Sprintf(`// UnmarshalJSON parses JSON into the %[1]s, unescaping every "nocopy" string
-// field directly into data instead of allocating. This MUTATES and effectively
-// destroys data: the bytes of every escaped string are overwritten, so data is no
-// longer valid JSON afterward and must not be read or aliased again.`, name)
-	} else {
-		doc = fmt.Sprintf(`// UnmarshalJSON parses JSON into the %[1]s. Fields whose json tag carries the
-// "nocopy" option alias the input data instead of copying it; if any are
-// present, the caller must keep data unchanged while the result is in use.`, name)
-	}
-	if g.arena {
-		doc += `
-// Small numeric-slice backings are carved from shared per-call arena chunks
-// (//lightning:arena): retaining such a slice keeps its whole chunk reachable,
-// so decode, process, and discard the result together rather than holding on
-// to a few small slices from it.`
-	}
-	return fmt.Sprintf(`%[2]s
-func (v *%[1]s) UnmarshalJSON(data []byte) error {
-	%[4]si := unstable.SkipWS(data, 0)
+	// No doc comment (or any other comment) is emitted: generated files carry
+	// only the top-of-file "Code generated ... DO NOT EDIT." header. The nocopy /
+	// destructive / arena caveats the method's doc comment used to state live in
+	// the README's directive documentation instead.
+	return fmt.Sprintf(`func (v *%[1]s) UnmarshalJSON(data []byte) error {
+	%[3]si := unstable.SkipWS(data, 0)
 	if i >= len(data) {
 		return unstable.ErrTruncated
 	}
@@ -929,9 +913,9 @@ func (v *%[1]s) UnmarshalJSON(data []byte) error {
 		if unstable.SkipWS(data, end) != len(data) {
 			return unstable.ErrInvalidJSON
 		}
-		%[5]sreturn nil
+		%[4]sreturn nil
 	}
-	end, err := %[3]s
+	end, err := %[2]s
 	if err != nil {
 		return err
 	}
@@ -939,7 +923,7 @@ func (v *%[1]s) UnmarshalJSON(data []byte) error {
 		return unstable.ErrInvalidJSON
 	}
 	return nil
-}`, name, doc, call, arenaDecl, nullReset)
+}`, name, call, arenaDecl, nullReset)
 }
 
 // namedStruct returns (generating on first use) the decoder for a named struct.
@@ -1538,13 +1522,15 @@ func (g *gen) laxField(dest string, expr ast.Expr, hint string, nocopy bool) str
 	}
 	commit := "} else {\n\t" + dest + " = lax\n}"
 	if !g.nullAssigns(expr) {
-		commit = "} else if data[i] != 'n' { // an explicit null leaves the field as it was\n\t" + dest + " = lax\n}"
+		// The data[i] != 'n' guard: an explicit null leaves the field as it was.
+		commit = "} else if data[i] != 'n' {\n\t" + dest + " = lax\n}"
 	}
+	// The error arm skips with SkipValueStrict, not SkipValue: a "lax" mismatch
+	// is swallowed only for a well-formed value — the strict walk rejects
+	// malformed JSON that a bracket balancer would have skipped.
 	return fmt.Sprintf(`var lax %[1]s
 end, err := %[2]s(&lax, data, i%[4]s%[5]s)
 if err != nil {
-	// A "lax" mismatch is swallowed only for a well-formed value: the strict
-	// walk rejects malformed JSON that a bracket balancer would have skipped.
 	end, err = unstable.SkipValueStrict(data, i)
 	if err != nil {
 		return end, err
@@ -1889,6 +1875,11 @@ i = end`
 // everything after it — the one place the option's "parsed as a fresh input"
 // contract did not hold. Trailing WHITESPACE is still fine (it is on the root
 // path too), which is why the check skips whitespace before comparing.
+//
+// The closure's early return on an all-whitespace body is load-bearing: like an
+// empty string it leaves the zero value, and inner assumes a value byte at
+// data[i] (a pointer field's null probe reads it unguarded), so inner must not
+// run in that case.
 func unwrapField(inner string) string {
 	return fmt.Sprintf(`body, bend, berr := unstable.Unwrap(data, i)
 if berr != nil {
@@ -1898,15 +1889,10 @@ if len(body) > 0 {
 	if _, ierr := func(data []byte, i int) (int, error) {
 		i = unstable.SkipWS(data, i)
 		if i >= len(data) {
-			// All-whitespace body: like an empty string, leave the zero value.
-			// inner assumes a value byte at data[i] (a pointer field's null
-			// probe reads it unguarded), so it must not run here.
 			return i, nil
 		}
 %s
 		if unstable.SkipWS(data, i) != len(data) {
-			// Content after the wrapped document's value, rejected exactly as
-			// a root UnmarshalJSON rejects it.
 			return i, unstable.ErrInvalidJSON
 		}
 		return i, nil
@@ -2161,6 +2147,18 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax, root bool) st
 	}
 	// Trailing commas ([1,]) are rejected by the first-iteration flag, as in
 	// genStructBody (see there — a rotated loop regressed cloudflare +11%).
+	//
+	// The guarded [:0] reset below: decoding an array into a slice replaces its
+	// contents rather than appending to them, matching encoding/json ("Unmarshal
+	// resets the slice length to zero and then appends each element"). The backing
+	// array is kept, so reuse stays allocation-free; a nil slice stays nil through
+	// [:0], leaving the presize and first-append capacity hint to fire only for
+	// the fresh case.
+	//
+	// The grow block precedes the element decode so the element decodes in place
+	// into the freshly grown zero slot and never lives in an escaping local
+	// (which would cost a heap allocation per element for slices of
+	// structs/pointers).
 	body := fmt.Sprintf(`func %[1]s(out *[]%[2]s, data []byte, i int%[7]s) (int, error) {
 	if i >= len(data) {
 		return i, unstable.ErrTruncated
@@ -2176,11 +2174,6 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax, root bool) st
 	if data[i] != '[' {
 		return i, unstable.ErrExpectArray
 	}
-	// Decoding an array into a slice replaces its contents rather than appending
-	// to them, matching encoding/json ("Unmarshal resets the slice length to zero
-	// and then appends each element"). The backing array is kept, so reuse stays
-	// allocation-free; a nil slice stays nil through [:0], leaving the presize and
-	// first-append capacity hint below to fire only for the fresh case.
 	if len(*out) != 0 {
 		*out = (*out)[:0]
 	}
@@ -2196,9 +2189,6 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax, root bool) st
 			}
 			return i, unstable.ErrInvalidJSON
 		}
-		// Grow the slice by one zero element and decode in place into the new
-		// slot, so the element never lives in an escaping local (which would
-		// cost a heap allocation per element for slices of structs/pointers).
 		%[6]s
 		%[3]s
 		%[5]s
