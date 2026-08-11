@@ -13,6 +13,9 @@ func indexStructuralAVX2(b []byte) int
 //go:noescape
 func indexEscapeSSE2(b []byte) int
 
+//go:noescape
+func indexEscapeNonASCIISSE2(b []byte) int
+
 var useAVX2 = cpu.X86.HasAVX2
 
 // indexEscape returns the index of the first byte that JSON string encoding must
@@ -23,6 +26,15 @@ var useAVX2 = cpu.X86.HasAVX2
 // is a per-block PMINUB(v, 0x1f) == v.
 func indexEscape(b []byte) int {
 	return indexEscapeSSE2(b)
+}
+
+// indexEscapeNonASCII is indexEscape with the predicate widened by non-ASCII
+// bytes (>= 0x80) — the scan behind EscapeStringInto's UTF-8 handling. Same
+// structure and inlinability as indexEscape; the widening costs one POR of the
+// raw chunk per block (PMOVMSKB reads sign bits, which for the raw bytes are
+// exactly the non-ASCII lanes).
+func indexEscapeNonASCII(b []byte) int {
+	return indexEscapeNonASCIISSE2(b)
 }
 
 // indexCloseOrEscape returns the index of the first '"' or '\\' byte in b, or

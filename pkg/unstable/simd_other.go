@@ -23,10 +23,11 @@ func escSwarHasByte(v uint64, b byte) uint64 {
 // SwarNeedsEscape reports (nonzero, high bit per matching lane) which of the
 // eight packed bytes in v JSON string encoding must escape — a control byte
 // < 0x20, '"' or '\\'. It is the one shared spelling of that predicate:
-// indexEscapeScalar's clean-run scan and pkg/json's EscapeStringInto per-run
-// probe both use it, so the escape byte set lives in one place. Pure bit math
-// with no calls, so it inlines into both (EscapeStringInto's gate depends on
-// that — re-check -gcflags=-m if this grows).
+// indexEscapeScalar's clean-run scan and pkg/json's escape-walk per-run probe
+// (escapeValidInto, and via SwarNeedsEscapeOrNonASCII below, EscapeStringInto)
+// all build on it, so the escape byte set lives in one place. Pure bit math
+// with no calls, so it inlines into all of them (the escape walks' gates depend
+// on that — re-check -gcflags=-m if this grows).
 func SwarNeedsEscape(v uint64) uint64 {
 	return escSwarHasLess(v, 0x20) | escSwarHasByte(v, '"') | escSwarHasByte(v, '\\')
 }
@@ -44,6 +45,47 @@ func indexEscapeScalar(b []byte) int {
 	}
 	for ; i < len(b); i++ {
 		if c := b[i]; c < 0x20 || c == '"' || c == '\\' {
+			return i
+		}
+	}
+	return i
+}
+
+// SwarNeedsEscapeOrNonASCII is SwarNeedsEscape widened by the non-ASCII lanes
+// (high bit set): a nonzero result means some lane JSON string encoding must
+// escape OR is >= 0x80, and the LOWEST set bit marks the first such lane. It is
+// the predicate behind EscapeStringInto's UTF-8 handling: the escape walk runs
+// on it until the first non-ASCII byte decides (once, via utf8.Valid) whether
+// the rest of the input is clean UTF-8 or needs U+FFFD substitution.
+//
+// Contract: only the LOWEST set bit is meaningful — higher bits may be false
+// positives. The has-less trick's `&^ v` term exists to keep a borrow out of a
+// lane whose own value is >= 0x20 from flagging it; dropping it and OR-ing v
+// instead makes the widened predicate one op CHEAPER than SwarNeedsEscape
+// itself ((v-0x20·lo)|v vs (v-0x20·lo)&^v, then &hi either way). The dropped
+// term readmits exactly two lane kinds: high-bit lanes (wanted) and a lane
+// whose 0x20-subtraction borrowed from a LOWER underflowing lane — and such a
+// lower lane is < 0x20, i.e. a true match below the false positive, so
+// TrailingZeros64 never lands on the false one. Both callers (EscapeStringInto's
+// per-run probe, indexEscapeNonASCIIScalar's word loop) take only the first
+// match. Same inlining constraint as SwarNeedsEscape: pure bit math, no calls.
+func SwarNeedsEscapeOrNonASCII(v uint64) uint64 {
+	return ((v-escSwarLo*0x20)|v)&escSwarHi | escSwarHasByte(v, '"') | escSwarHasByte(v, '\\')
+}
+
+// indexEscapeNonASCIIScalar is the portable fallback for indexEscapeNonASCII:
+// indexEscapeScalar's scan with the widened SwarNeedsEscapeOrNonASCII predicate —
+// the first escape byte or non-ASCII byte (>= 0x80), or len(b) if neither.
+func indexEscapeNonASCIIScalar(b []byte) int {
+	i := 0
+	for ; i+8 <= len(b); i += 8 {
+		v := binary.LittleEndian.Uint64(b[i:])
+		if SwarNeedsEscapeOrNonASCII(v) != 0 {
+			break
+		}
+	}
+	for ; i < len(b); i++ {
+		if c := b[i]; c < 0x20 || c >= 0x80 || c == '"' || c == '\\' {
 			return i
 		}
 	}

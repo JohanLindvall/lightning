@@ -323,10 +323,13 @@ are *silent*.
   `*json.UnmarshalTypeError` or `*json.SyntaxError` carrying the offending field,
   Go type and byte offset. Tolerating a type mismatch on a particular field is
   what the [`lax`](#the-lax-tag-option) option is for.
-- **Invalid UTF-8 is passed through** rather than replaced with U+FFFD — see
-  [Limits and untrusted input](#limits-and-untrusted-input). Pinned across every
-  string path (copy, nocopy, destructive, object keys, the dynamic `any` decoder,
-  `UnescapeString`) by `unstable.TestStringsPassInvalidUTF8Through`.
+- **Invalid UTF-8 is passed through when decoding** rather than replaced with
+  U+FFFD — see [Limits and untrusted input](#limits-and-untrusted-input). Pinned
+  across every string path (copy, nocopy, destructive, object keys, the dynamic
+  `any` decoder, `UnescapeString`) by
+  `unstable.TestStringsPassInvalidUTF8Through`. (The *escape* direction —
+  `EscapeString`/`EscapeStringInto`, which produce JSON — substitutes U+FFFD
+  exactly as `encoding/json` does when marshaling.)
 - **A `time.Time` written with `\uXXXX` escapes decodes here and fails in
   `encoding/json`.** lightning reads the JSON string's *value* and parses that;
   `time.Time.UnmarshalJSON` parses the raw bytes between the quotes without
@@ -858,7 +861,12 @@ Both return a string that aliases a buffer, so keep that buffer unchanged while
 the result is in use.
 
 **Escaping** (raw value → escaped body, escaping `"`, `\`, and control bytes;
-`/` is left as-is and `\b`/`\f` are written in `\u00XX` form):
+`/` is left as-is and `\b`/`\f` are written in `\u00XX` form. Bytes that are not
+part of a well-formed UTF-8 sequence are replaced with U+FFFD, as `encoding/json`
+does when marshaling — a JSON text must be valid UTF-8 (RFC 8259), and decoders
+substitute U+FFFD rather than error, so passing raw bytes through would become
+silent corruption downstream; the replacement is written as the raw three-byte
+UTF-8 encoding, not the `\ufffd` escape):
 
 - `EscapeString(s []byte, out *strings.Builder)` — writes the escaped form of
   `s` to `out`. The common no-escape case is detected with a vectorized scan and
@@ -1204,10 +1212,13 @@ Worth knowing before pointing this at input you don't control:
   is a capacity-planning fact rather than an attack, and applies equally to
   `encoding/json`. Size your request-body limit against your widest element type,
   not against the JSON.
-- **Invalid UTF-8 is passed through**, not replaced. `encoding/json` substitutes
-  U+FFFD for malformed bytes; lightning returns them verbatim, so a decoded
-  `string` is not guaranteed to be valid UTF-8. (Unpaired `\uXXXX` surrogates *are*
-  replaced with U+FFFD, matching `encoding/json`.) This is lossless rather than
+- **Invalid UTF-8 is passed through when decoding**, not replaced.
+  `encoding/json` substitutes U+FFFD for malformed bytes; lightning returns them
+  verbatim, so a decoded `string` is not guaranteed to be valid UTF-8. (Unpaired
+  `\uXXXX` surrogates *are* replaced with U+FFFD, matching `encoding/json`, and
+  the escape direction — `EscapeString`/`EscapeStringInto` — substitutes U+FFFD
+  for malformed bytes exactly as `encoding/json` does when marshaling, so JSON
+  *produced* by this package is valid UTF-8.) This is lossless rather than
   lenient, but check with `utf8.Valid` if you need the guarantee. Pinned across
   every string path by `unstable.TestStringsPassInvalidUTF8Through`.
 - **A skipped number is measured, not validated.** `SkipValue` — what an unknown

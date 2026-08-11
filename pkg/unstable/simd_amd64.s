@@ -382,3 +382,153 @@ esc_notfound:
 esc_tfound:
 	MOVQ DI, ret+24(FP)
 	RET
+
+// func indexEscapeNonASCIISSE2(b []byte) int
+//
+// indexEscapeSSE2's scan with the predicate widened by non-ASCII bytes: returns
+// the index of the first '"' (0x22), '\\' (0x5c), control byte < 0x20 OR byte
+// >= 0x80, or len(b) if none. The widening is one POR of the raw chunk into the
+// match vector before each PMOVMSKB: PMOVMSKB reads only the per-lane sign bit,
+// the match lanes are already 0x00/0xFF, so OR-ing the raw bytes sets exactly the
+// non-ASCII lanes' sign bits — no extra compare, no extra splat. Everything else
+// (SSE2 first 32 bytes, AVX2 switch for long clean runs, 16-byte loop, scalar
+// tail) is byte-for-byte indexEscapeSSE2.
+TEXT ·indexEscapeNonASCIISSE2(SB), NOSPLIT, $0-32
+	MOVQ b_base+0(FP), SI
+	MOVQ b_len+8(FP), CX
+	XORQ DI, DI
+	CMPQ CX, $16
+	JL   escu_tail
+	MOVOU quoteMask<>(SB), X0
+	MOVOU bslashMask<>(SB), X1
+	MOVOU ctrlMask<>(SB), X6
+
+escu_loop32:
+	CMPQ CX, $32
+	JL   escu_loop16
+	MOVOU (SI)(DI*1), X2         // first 16 bytes
+	MOVOU X2, X3
+	PCMPEQB X0, X3              // == '"'
+	MOVOU X2, X7
+	PCMPEQB X1, X7             // == '\\'
+	POR     X7, X3
+	MOVOU X2, X7
+	PMINUB X6, X7              // min(v, 0x1f)
+	PCMPEQB X2, X7            // == v  -> control byte
+	POR     X7, X3
+	POR     X2, X3             // raw sign bits -> non-ASCII lanes
+	PMOVMSKB X3, AX
+	TESTL    AX, AX
+	JNZ      escu_found
+	MOVOU 16(SI)(DI*1), X4      // second 16 bytes
+	MOVOU X4, X5
+	PCMPEQB X0, X5
+	MOVOU X4, X7
+	PCMPEQB X1, X7
+	POR     X7, X5
+	MOVOU X4, X7
+	PMINUB X6, X7
+	PCMPEQB X4, X7
+	POR     X7, X5
+	POR     X4, X5             // raw sign bits -> non-ASCII lanes
+	PMOVMSKB X5, AX
+	TESTL    AX, AX
+	JNZ      escu_found16
+	ADDQ     $32, DI
+	SUBQ     $32, CX
+	MOVBLZX ·useAVX2(SB), AX
+	TESTL   AX, AX
+	JNZ     escu_avx_setup
+	JMP     escu_loop32
+
+escu_avx_setup:
+	VMOVDQU quoteMask<>(SB), Y0
+	VMOVDQU bslashMask<>(SB), Y1
+	VMOVDQU ctrlMask<>(SB), Y6
+
+escu_avx_loop:
+	CMPQ CX, $32
+	JL   escu_avx_done
+	VMOVDQU (SI)(DI*1), Y2
+	VPCMPEQB Y0, Y2, Y3
+	VPCMPEQB Y1, Y2, Y4
+	VPOR      Y4, Y3, Y3
+	VPMINUB   Y6, Y2, Y4        // min(v, 0x1f)
+	VPCMPEQB  Y2, Y4, Y4        // == v  -> control byte
+	VPOR      Y4, Y3, Y3
+	VPOR      Y2, Y3, Y3        // raw sign bits -> non-ASCII lanes
+	VPMOVMSKB Y3, AX
+	TESTL     AX, AX
+	JNZ       escu_avx_found
+	ADDQ      $32, DI
+	SUBQ      $32, CX
+	JMP       escu_avx_loop
+
+escu_avx_found:
+	BSFL AX, AX
+	ADDQ DI, AX
+	MOVQ AX, ret+24(FP)
+	VZEROUPPER
+	RET
+
+escu_avx_done:
+	VZEROUPPER
+
+escu_loop16:
+	CMPQ CX, $16
+	JL   escu_tail
+	MOVOU (SI)(DI*1), X2
+	MOVOU X2, X3
+	PCMPEQB X0, X3
+	MOVOU X2, X7
+	PCMPEQB X1, X7
+	POR     X7, X3
+	MOVOU X2, X7
+	PMINUB X6, X7
+	PCMPEQB X2, X7
+	POR     X7, X3
+	POR     X2, X3             // raw sign bits -> non-ASCII lanes
+	PMOVMSKB X3, AX
+	TESTL    AX, AX
+	JNZ      escu_found
+	ADDQ     $16, DI
+	SUBQ     $16, CX
+	JMP      escu_loop16
+
+escu_found16:
+	ADDQ $16, DI                 // match was in the second 16-byte half
+
+escu_found:
+	BSFL AX, AX
+	ADDQ DI, AX
+	MOVQ AX, ret+24(FP)
+	RET
+
+escu_tail:
+	TESTQ CX, CX
+	JZ    escu_notfound
+
+escu_tailloop:
+	// Sign-extended load + one signed compare covers control AND non-ASCII
+	// bytes: as int8, 0x80..0xFF are negative and 0x00..0x1F are below 0x20,
+	// while clean ASCII 0x20..0x7F is not — so the tail costs exactly the same
+	// three compares per byte as indexEscapeSSE2's.
+	MOVBLSX (SI)(DI*1), AX
+	CMPL    AX, $0x20
+	JL      escu_tfound                // control byte or non-ASCII byte
+	CMPL    AX, $0x22
+	JE      escu_tfound
+	CMPL    AX, $0x5c
+	JE      escu_tfound
+	INCQ    DI
+	DECQ    CX
+	JNZ     escu_tailloop
+
+escu_notfound:
+	MOVQ b_len+8(FP), AX
+	MOVQ AX, ret+24(FP)
+	RET
+
+escu_tfound:
+	MOVQ DI, ret+24(FP)
+	RET

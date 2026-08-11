@@ -19,3 +19,12 @@ func IndexCloseOrEscape(b []byte) int { return indexCloseOrEscape(b) }
 // only the escape byte at the returned index is expanded. SIMD (SSE2/AVX2) on
 // amd64, SWAR elsewhere.
 func IndexEscape(b []byte) int { return indexEscape(b) }
+
+// IndexEscapeNonASCII returns the index of the first byte that is either one
+// JSON string encoding must escape (a control byte < 0x20, '"' or '\\') or a
+// non-ASCII byte (>= 0x80), or len(b) if none. It is the scan behind
+// EscapeStringInto's UTF-8 handling: the walk runs on it until the first
+// non-ASCII byte, where one utf8.Valid call decides between the plain escape
+// path and U+FFFD substitution — so the widened predicate costs the pure-ASCII
+// common case only an extra OR per SIMD block over IndexEscape.
+func IndexEscapeNonASCII(b []byte) int { return indexEscapeNonASCII(b) }

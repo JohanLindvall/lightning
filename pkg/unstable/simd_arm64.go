@@ -11,6 +11,9 @@ func indexStructuralNEON(b []byte) int
 //go:noescape
 func indexEscapeNEON(b []byte) int
 
+//go:noescape
+func indexEscapeNonASCIINEON(b []byte) int
+
 // indexCloseOrEscape returns the index of the first '"' or '\\' byte in b, or
 // len(b) if neither is present. The NEON routine handles every length itself —
 // its 16-byte loop falls through to a scalar tail for the final <16 bytes — so
@@ -31,6 +34,14 @@ func indexCloseOrEscape(b []byte) int {
 // VUMIN(chunk, 0x1f) == chunk (NEON's form of amd64's PMINUB(v, 0x1f) == v).
 func indexEscape(b []byte) int {
 	return indexEscapeNEON(b)
+}
+
+// indexEscapeNonASCII is indexEscape with the predicate widened by non-ASCII
+// bytes (>= 0x80) — the scan behind EscapeStringInto's UTF-8 handling. Same
+// structure and inlinability as indexEscape; the widening is VUSHR $7 + VORR of
+// the raw chunk per block (see the asm).
+func indexEscapeNonASCII(b []byte) int {
+	return indexEscapeNonASCIINEON(b)
 }
 
 // structuralPrescan is how many leading bytes indexStructural scans with the

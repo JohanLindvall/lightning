@@ -244,3 +244,90 @@ snone:
 stf:
 	MOVD R2, ret+24(FP)
 	RET
+
+// func indexEscapeNonASCIINEON(b []byte) int
+//
+// indexEscapeNEON's scan with the predicate widened by non-ASCII bytes: returns
+// the index of the first '"' (0x22), '\\' (0x5c), control byte < 0x20 OR byte
+// >= 0x80, or len(b) if none. The widening is VUSHR $7 of the raw chunk (0x01
+// per non-ASCII lane, no splat needed) VORR-ed into the match vector — the
+// RBIT/CLZ recovery finds the first nonzero LANE, and a 0x01 lane's set bit
+// stays inside its lane, so any nonzero marker value recovers the same index as
+// the 0xFF compare lanes. Everything else is byte-for-byte indexEscapeNEON.
+TEXT ·indexEscapeNonASCIINEON(SB), NOSPLIT, $0-32
+	MOVD b_base+0(FP), R0
+	MOVD b_len+8(FP), R1
+	MOVD $0, R2                  // R2 = current offset
+	MOVD $0x22, R3
+	VDUP R3, V0.B16              // V0 = '"' x16
+	MOVD $0x5c, R3
+	VDUP R3, V1.B16              // V1 = '\\' x16
+	MOVD $0x1f, R3
+	VDUP R3, V5.B16              // V5 = 0x1f x16 (largest control byte)
+
+euloop16:
+	SUB  R2, R1, R7              // R7 = remaining = len - offset
+	CMP  $16, R7
+	BLT  eutail
+	ADD  R0, R2, R8             // R8 = &b[offset]
+	VLD1 (R8), [V2.B16]
+	VCMEQ V0.B16, V2.B16, V3.B16 // V3 = (chunk == '"')
+	VCMEQ V1.B16, V2.B16, V4.B16 // V4 = (chunk == '\\')
+	VORR  V4.B16, V3.B16, V3.B16
+	VUMIN V5.B16, V2.B16, V4.B16 // V4 = min(chunk, 0x1f)
+	VCMEQ V4.B16, V2.B16, V4.B16 // V4 = (chunk == min) -> control byte (<= 0x1f)
+	VORR  V4.B16, V3.B16, V3.B16
+	VUSHR $7, V2.B16, V4.B16     // V4 = 0x01 per non-ASCII lane (high bit set)
+	VORR  V4.B16, V3.B16, V3.B16 // V3 = any of the four (nonzero per matching lane)
+	VMOV V3.D[0], R9            // low 8 lanes
+	VMOV V3.D[1], R10           // high 8 lanes
+	CBNZ R9, eulow8
+	CBNZ R10, euhigh8
+	ADD  $16, R2
+	B    euloop16
+
+eulow8:
+	RBIT R9, R11
+	CLZ  R11, R11               // trailing zeros of R9 = first set bit
+	LSR  $3, R11, R11           // /8 -> first matching byte (lane 0..7)
+	ADD  R2, R11, R11
+	MOVD R11, ret+24(FP)
+	RET
+
+euhigh8:
+	RBIT R10, R11
+	CLZ  R11, R11
+	LSR  $3, R11, R11           // lane within high half (0..7)
+	ADD  $8, R11, R11           // lanes 8..15
+	ADD  R2, R11, R11
+	MOVD R11, ret+24(FP)
+	RET
+
+eutail:
+	CMP  R1, R2
+	BGE  eunotfound
+
+eutailloop:
+	// Sign-extending load (MOVB) + one signed compare covers control AND
+	// non-ASCII bytes: as int8, 0x80..0xFF are negative and 0x00..0x1F are
+	// below 0x20, while clean ASCII 0x20..0x7F is not — the same three
+	// compares per byte as indexEscapeNEON's tail.
+	ADD   R0, R2, R8
+	MOVB  (R8), R9
+	CMP   $0x20, R9
+	BLT   eutfound             // control byte or non-ASCII byte (signed)
+	CMP   $0x22, R9
+	BEQ   eutfound
+	CMP   $0x5c, R9
+	BEQ   eutfound
+	ADD   $1, R2
+	CMP   R1, R2
+	BLT   eutailloop
+
+eunotfound:
+	MOVD R1, ret+24(FP)
+	RET
+
+eutfound:
+	MOVD R2, ret+24(FP)
+	RET

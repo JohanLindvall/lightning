@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-// TestIndexVariantsFlip differentially tests both dispatch arms of the two
+// TestIndexVariantsFlip differentially tests both dispatch arms of the three
 // string scanners against the scalar oracle — the live-flag run in
 // TestIndexFunctionsMatchScalar only exercises the widest path the machine
 // supports, so the pure-SSE2 long-string loop (taken when useAVX2 is false)
@@ -43,7 +43,7 @@ func TestIndexVariantsFlip(t *testing.T) {
 			continue // machine lacks AVX2
 		}
 		useAVX2 = v.avx2
-		for _, c := range []byte{'"', '\\', 0x00, 0x1f, ' ', 'z'} {
+		for _, c := range []byte{'"', '\\', 0x00, 0x1f, ' ', 'z', 0x7f, 0x80, 0xff} {
 			for pos := 0; pos < len(base); pos++ {
 				b := []byte(base)
 				b[pos] = c
@@ -53,6 +53,9 @@ func TestIndexVariantsFlip(t *testing.T) {
 				if got, want := indexEscapeSSE2(b), indexEscapeScalar(b); got != want {
 					t.Fatalf("%s: indexEscape(%q@%d) = %d, want %d", v.name, c, pos, got, want)
 				}
+				if got, want := indexEscapeNonASCIISSE2(b), indexEscapeNonASCIIScalar(b); got != want {
+					t.Fatalf("%s: indexEscapeNonASCII(%q@%d) = %d, want %d", v.name, c, pos, got, want)
+				}
 			}
 		}
 		for iter := 0; iter < 5000; iter++ {
@@ -60,7 +63,7 @@ func TestIndexVariantsFlip(t *testing.T) {
 			b := make([]byte, n)
 			for i := range b {
 				if rng.Intn(24) == 0 {
-					b[i] = []byte{'"', '\\', 0x07, 0x1f, ' '}[rng.Intn(5)]
+					b[i] = []byte{'"', '\\', 0x07, 0x1f, ' ', 0x7f, 0x80, 0xc3, 0xff}[rng.Intn(9)]
 				} else {
 					b[i] = byte('a' + rng.Intn(26))
 				}
@@ -70,6 +73,9 @@ func TestIndexVariantsFlip(t *testing.T) {
 			}
 			if got, want := indexEscapeSSE2(b), indexEscapeScalar(b); got != want {
 				t.Fatalf("%s: random len %d: indexEscape = %d, want %d (%q)", v.name, n, got, want, b)
+			}
+			if got, want := indexEscapeNonASCIISSE2(b), indexEscapeNonASCIIScalar(b); got != want {
+				t.Fatalf("%s: random len %d: indexEscapeNonASCII = %d, want %d (%q)", v.name, n, got, want, b)
 			}
 		}
 	}

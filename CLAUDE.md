@@ -787,6 +787,62 @@ byte-identical when adding cold paths; push new logic out-of-line.
   Measured (M2, n=8): **path_with_backslash −26.8%, json_in_json −20.1%,
   mostly_clean_one_quote −19.7%, prose −18.5%, control_bytes −15.1%**, B/op
   −46…−70%; clean cases exactly flat (they never reach the scratch).
+- **Escaping coerces ill-formed UTF-8 to U+FFFD** (`EscapeString`/
+  `EscapeStringInto`, matching what encoding/json does when marshaling — RFC 8259
+  requires a JSON text be valid UTF-8, and decoders substitute U+FFFD rather than
+  error, so raw bytes passed through verbatim became silent corruption
+  downstream; the *decode* direction still passes invalid UTF-8 through, that
+  divergence is unchanged). The design that keeps it ~free on the hot paths:
+  **(1)** `EscapeStringInto`'s walk runs on a predicate widened by non-ASCII
+  bytes (`SwarNeedsEscapeOrNonASCII` per word, `IndexEscapeNonASCII` =
+  `indexEscapeNonASCII{SSE2,NEON}` per run) until the **first non-ASCII byte
+  decides the rest of the input ONCE** with `utf8.Valid`: valid → the remainder
+  continues under `escapeValidInto` (byte-for-byte the old EscapeStringInto —
+  the plain predicate, so multibyte sequences don't break its clean runs);
+  invalid → `escapeInvalidInto`, a DecodeRune walk substituting U+FFFD per
+  ill-formed byte (raw 3-byte form, not `�`) with `escapeValidInto` on the
+  runs between (valid by construction), ASCII advanced by byte compare so
+  DecodeRune runs only at non-ASCII positions. A pure-ASCII string never leaves
+  the widened walk and pays only the predicate delta; the non-ASCII test rides
+  in the escape switch's **default arm** (control bytes are the only other kind
+  that lands there), so `\\`/`"`/\t\r\n emission is untouched. **(2)** The
+  widened predicate costs no extra ops — three tricks, each measured after the
+  naive form regressed 5–9%: the amd64 asm ORs the **raw chunk** into the match
+  vector before `PMOVMSKB` (sign bits ARE the non-ASCII lanes — one POR/block,
+  no compare, no splat; NEON needs `VUSHR $7`+`VORR`, its RBIT/CLZ recovery
+  takes any nonzero lane marker); the asm scalar tail and the Go byte walk use
+  a **sign-extended compare** (`int8(c) < 0x20` covers control AND ≥0x80 in one
+  test — same three compares per byte as the plain tail); and the SWAR word
+  form **drops the has-less `&^v` term and ORs `v`** instead
+  (`((v-0x20·lo)|v)&hi`), one op cheaper than `SwarNeedsEscape` itself — sound
+  because the dropped term readmits only high-bit lanes (wanted) and
+  borrow-from-below false positives that always sit ABOVE a true match, and
+  both callers take only `TrailingZeros64`. That contract ("only the lowest set
+  bit is meaningful") is documented on the predicate. `EscapeString`'s
+  clean-prefix probe uses the widened scanner; on a non-ASCII hit it decides
+  with `utf8.Valid` and resumes the probe with the plain scanner (a remainder
+  first met at an *escape* byte has NOT been decided and must go through
+  `EscapeStringInto`, not `escapeValidInto` — missing that was a real bug the
+  reference test caught). Cross-binary interleaved ABBA A/B (two independent
+  runs, n=10 and n=8, pinned Meteor Lake, agreeing): geomean **−3.6%**,
+  sentence_clean −19.8%, prose −10.1%, short_clean −9.0%, control_bytes −8.2%,
+  json_in_json −4.3%; residuals log_line_clean **+2.6%** and
+  mostly_clean_one_quote +1.5% — the POR-per-block price on long clean vector
+  runs, at/below the noise floor and bought back severalfold elsewhere; the
+  Builder `EscapeString` is flat-to-better everywhere. New costs only where
+  semantics demand them: valid unicode text pays one `utf8.Valid` pass
+  (unicode_clean 154ns/169B ≈ 1 GB/s — a SIMD UTF-8 validator is the known
+  future lever), ill-formed input pays the substitution walk
+  (invalid_utf8_dense 365ns/132B). Locked by the rewritten
+  UTF-8-aware `escapeReference` (all 256 bytes, UTF-8 corners incl. overlong/
+  surrogate/truncated shapes straddling the 8/16/32/48-byte boundaries, two
+  fuzz loops, and every input checked through BOTH EscapeStringInto and the
+  Builder EscapeString), the `indexEscapeNonASCII` arms of
+  `TestIndexFunctionsMatchScalar`/`TestIndexVariantsFlip`, and
+  `TestIndexEscapeNonASCIIScalarOracle` (SWAR scalar vs naive loop, every byte
+  at every lane offset). arm64: builds + `GOARCH=arm64 go vet` (asmdecl) clean;
+  **not yet run on hardware or qemu** (this box has neither) — needs the usual
+  M2/qemu differential pass before the NEON arm counts as verified.
 - **Dynamic `any` path (`any.go`)**: the number case calls the private
   `scanFloat` directly (strconv fallback inlined at the site, mirroring
   `ReadFloat64OrNull` byte for byte) instead of going through the non-inlinable

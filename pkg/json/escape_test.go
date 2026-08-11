@@ -4,13 +4,29 @@ import (
 	"math/rand"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
-// escapeReference is a deliberately simple byte-by-byte escaper used to
-// validate the SWAR-optimized EscapeStringInto.
+// escapeReference is a deliberately simple escaper used to validate the
+// SWAR/SIMD-optimized EscapeStringInto: byte-by-byte for ASCII, with non-ASCII
+// bytes walked rune-by-rune so every byte that is not part of a well-formed
+// UTF-8 sequence becomes U+FFFD (utf8.DecodeRune's r == RuneError && size == 1
+// convention, which is also encoding/json's) and valid sequences pass through
+// verbatim.
 func escapeReference(s []byte) string {
 	var b strings.Builder
-	for _, c := range s {
+	for i := 0; i < len(s); {
+		c := s[i]
+		if c >= utf8.RuneSelf {
+			r, size := utf8.DecodeRune(s[i:])
+			if r == utf8.RuneError && size == 1 {
+				b.WriteString("�")
+			} else {
+				b.Write(s[i : i+size])
+			}
+			i += size
+			continue
+		}
 		switch {
 		case c == '"':
 			b.WriteString(`\"`)
@@ -29,6 +45,7 @@ func escapeReference(s []byte) string {
 		default:
 			b.WriteByte(c)
 		}
+		i++
 	}
 	return b.String()
 }
@@ -40,18 +57,59 @@ func escapeReference(s []byte) string {
 func TestEscapeStringIntoReference(t *testing.T) {
 	check := func(in []byte) {
 		t.Helper()
-		got := string(EscapeStringInto(in, nil))
-		if want := escapeReference(in); got != want {
+		want := escapeReference(in)
+		if got := string(EscapeStringInto(in, nil)); got != want {
 			t.Fatalf("EscapeStringInto(%q) = %q, want %q", in, got, want)
+		}
+		// EscapeString has its own dispatch (clean-prefix probe, UTF-8 decision);
+		// hold it to the same reference over the same corpus.
+		var sb strings.Builder
+		EscapeString(in, &sb)
+		if got := sb.String(); got != want {
+			t.Fatalf("EscapeString(%q) = %q, want %q", in, got, want)
 		}
 	}
 
 	for v := 0; v < 256; v++ {
 		check([]byte{byte(v)})
-		// Embed at offsets that cross the 8-byte word boundary.
+		// Embed at offsets that cross the 8-byte word boundary. A high byte here
+		// is an isolated continuation/start byte between ASCII runs — ill-formed,
+		// so it must come back as U+FFFD.
 		buf := append([]byte("clean123"), byte(v))
 		buf = append(buf, "clean456"...)
 		check(buf)
+	}
+
+	// UTF-8 corners: valid multibyte sequences (which must pass through verbatim
+	// and not break clean runs), ill-formed shapes DecodeRune rejects byte by byte
+	// (truncations, bare continuations, overlongs, surrogates, out-of-range), and
+	// both straddling the scanner boundaries — the 8-byte SWAR word, the 16/32-byte
+	// SIMD blocks, and the 48-byte minVectorRun gate. Escapes on both sides of a
+	// multibyte char pin the dispatch back into the valid walk.
+	utf8Cases := [][]byte{
+		[]byte("héllo"),
+		[]byte("héllo \"wörld\"\n"),
+		[]byte("日本語のテキスト"),
+		[]byte("emoji \U0001F600 tail"),
+		[]byte("\xc3"),                        // truncated 2-byte sequence
+		[]byte("abc\xc3"),                     // truncated at end of input
+		[]byte("\x80tail"),                    // bare continuation byte first
+		[]byte("a\xed\xa0\x80b"),              // surrogate half (rejected per byte)
+		[]byte("a\xc0\xafb"),                  // overlong encoding
+		[]byte("a\xf5\x80\x80\x80b"),          // out of range
+		[]byte("\xc3\x28"),                    // bad continuation
+		[]byte("ok\xffbad\xfe"),               // 0xff/0xfe never appear in UTF-8
+		[]byte(strings.Repeat("x", 47) + "é"), // straddles minVectorRun
+		[]byte(strings.Repeat("x", 48) + "é" + strings.Repeat("y", 48)),
+		[]byte(strings.Repeat("x", 63) + "\xc3\xa9"),                       // straddles a 64-byte grid
+		[]byte(strings.Repeat("x", 31) + "\xc3" + strings.Repeat("y", 32)), // invalid at block edge
+		[]byte(strings.Repeat("é", 40)),                                    // dense valid multibyte
+		[]byte(strings.Repeat("\xff", 40)),                                 // dense invalid
+		[]byte("\"quote\x80then\\slash"),                                   // escapes around invalid
+		[]byte("é\"é"),                                                     // escape between valid multibyte
+	}
+	for _, c := range utf8Cases {
+		check(c)
 	}
 
 	r := rand.New(rand.NewSource(1))
@@ -65,6 +123,26 @@ func TestEscapeStringIntoReference(t *testing.T) {
 				b[i] = []byte{'"', '\\'}[r.Intn(2)]
 			default:
 				b[i] = byte(0x20 + r.Intn(0xe0)) // printable / high byte
+			}
+		}
+		check(b)
+	}
+
+	// A second fuzz interleaving whole valid runes (multibyte included) with raw
+	// high bytes and escapes, so well-formed sequences and ill-formed bytes mix in
+	// the same input — the shape the per-byte fuzz above only rarely produces.
+	for n := 0; n < 5000; n++ {
+		var b []byte
+		for k := r.Intn(16); k > 0; k-- {
+			switch r.Intn(6) {
+			case 0:
+				b = utf8.AppendRune(b, rune(0x80+r.Intn(0x2FFFF)))
+			case 1:
+				b = append(b, byte(0x80+r.Intn(0x80))) // raw high byte
+			case 2:
+				b = append(b, []byte{'"', '\\', '\n', 0x01}[r.Intn(4)])
+			default:
+				b = append(b, byte(0x20+r.Intn(0x5f))) // clean ASCII
 			}
 		}
 		check(b)
@@ -174,6 +252,10 @@ var escapeBenchCases = []struct {
 	{"prose_with_quotes", []byte("She said \"hello\" and then\nwalked away.")},
 	{"control_bytes", []byte("line1\nline2\tcol\r\x00\x01\x02\x1f end")},
 	{"mostly_clean_one_quote", []byte(strings.Repeat("plain text content ", 16) + `"`)},
+	{"unicode_clean", []byte(strings.Repeat("Motörhead spelade i Köln — 日本語テキスト här. ", 4))},
+	{"unicode_with_quotes", []byte("Hon sa \"hej\" på svenska,\nsen 中文字 och é och \\ till slut.")},
+	{"invalid_utf8_one_byte", []byte(strings.Repeat("plain text content ", 16) + "\xff")},
+	{"invalid_utf8_dense", []byte(strings.Repeat("ok\xff\xc3(bad\x80 ", 12))},
 }
 
 // BenchmarkEscapeString measures escaping onto a reused strings.Builder, the
