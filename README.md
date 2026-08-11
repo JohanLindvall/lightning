@@ -887,6 +887,14 @@ much input is left: a run shorter than 48 bytes — every short string, and ever
 short gap between two escapes — is walked a word at a time with SWAR instead, since
 the vector call's setup would cost more than it saves there.
 
+The UTF-8 handling rides in that same scan rather than costing a pass of its own:
+the walk runs on a variant widened by non-ASCII bytes until the first one decides
+the rest of the input once with `utf8.Valid` — valid text (unicode prose)
+continues under the plain scanner so multibyte characters don't break clean runs,
+and only actually ill-formed input takes the U+FFFD substitution walk. A
+pure-ASCII string never pays more than the widened predicate, which costs the
+same per word as the plain one.
+
 ## Number parsing
 
 The [`pkg/json`](pkg/json) package also exposes the scanner's float parser:

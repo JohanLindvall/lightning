@@ -1,6 +1,7 @@
 package json
 
 import (
+	ejson "encoding/json"
 	"math/rand"
 	"strings"
 	"testing"
@@ -146,6 +147,62 @@ func TestEscapeStringIntoReference(t *testing.T) {
 			}
 		}
 		check(b)
+	}
+}
+
+// TestEscapeStringMatchesStdlibCoercion pins the doc claim that the escapers
+// substitute U+FFFD for ill-formed UTF-8 "exactly as encoding/json replaces them
+// when marshaling". The two escapers spell things differently — encoding/json
+// HTML-escapes <, > and &, and writes the replacement character as the six-byte
+// \ufffd escape where lightning emits its raw three UTF-8 bytes — so equality is
+// checked where it is defined: the string VALUE both encodings decode back to.
+// A premise check asserts the stdlib really coerced each ill-formed input, so
+// the differential cannot pass vacuously on a corpus of valid strings.
+func TestEscapeStringMatchesStdlibCoercion(t *testing.T) {
+	corpus := [][]byte{
+		[]byte("plain ascii"),
+		[]byte("héllo \"wörld\"\n"),
+		[]byte("日本語 emoji \U0001F600"),
+		[]byte("\xc3"),               // truncated 2-byte sequence
+		[]byte("abc\xc3"),            // truncated at end
+		[]byte("\x80tail"),           // bare continuation byte
+		[]byte("a\xed\xa0\x80b"),     // surrogate half
+		[]byte("a\xc0\xafb"),         // overlong
+		[]byte("a\xf5\x80\x80\x80b"), // out of range
+		[]byte("ok\xffbad\xfe"),
+		[]byte(strings.Repeat("\xff", 40)),
+		[]byte("\"quote\x80then\\slash\tand\x01ctl"),
+	}
+	for _, bc := range escapeBenchCases {
+		corpus = append(corpus, bc.in)
+	}
+	sawCoercion := false
+	for _, in := range corpus {
+		stdEnc, err := ejson.Marshal(string(in))
+		if err != nil {
+			t.Fatalf("stdlib Marshal(%q): %v", in, err)
+		}
+		var want string
+		if err := ejson.Unmarshal(stdEnc, &want); err != nil {
+			t.Fatalf("stdlib round-trip of %q: %v", in, err)
+		}
+		if !utf8.Valid(in) {
+			if want == string(in) {
+				t.Fatalf("premise broken: stdlib did not coerce ill-formed %q", in)
+			}
+			sawCoercion = true
+		}
+		doc := append(EscapeStringInto(in, []byte{'"'}), '"')
+		var got string
+		if err := ejson.Unmarshal(doc, &got); err != nil {
+			t.Fatalf("EscapeStringInto(%q) produced %q, not a decodable JSON string: %v", in, doc, err)
+		}
+		if got != want {
+			t.Fatalf("EscapeStringInto(%q) decodes to %q, encoding/json's escaping decodes to %q", in, got, want)
+		}
+	}
+	if !sawCoercion {
+		t.Fatal("test bug: corpus held no ill-formed input, the differential proved nothing")
 	}
 }
 

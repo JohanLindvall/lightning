@@ -132,7 +132,11 @@ func TestReadTimeAcceptsEscapedTimestamps(t *testing.T) {
 // contents are handed back byte for byte, so raw invalid UTF-8 survives the
 // decode, where encoding/json coerces every invalid byte to U+FFFD. README calls
 // this out ("invalid UTF-8 is passed through") and nothing tested it, so the
-// property could have drifted — in either direction — unnoticed.
+// property could have drifted — in either direction — unnoticed. This is
+// DECODE-only: the escape direction (pkg/json's EscapeString/EscapeStringInto)
+// coerces ill-formed bytes to U+FFFD like the stdlib, pinned by pkg/json's
+// TestEscapeStringMatchesStdlibCoercion — the two directions differ on purpose
+// (decoding is lossless, produced JSON must be valid UTF-8).
 //
 // Every path that could differ is covered: the copying reader, the two aliasing
 // readers (nocopy and destructive), the key reader, the dynamic any decoder

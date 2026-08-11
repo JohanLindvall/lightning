@@ -22,7 +22,9 @@
 //   - Transform — [StripDefaults] drops object members equal to a set of default
 //     values; [EscapeString]/[EscapeStringInto] and
 //     [UnescapeString]/[UnescapeStringInto] convert between a Go string and a JSON
-//     string body; [DecodeAny] decodes a whole document into the generic
+//     string body (escaping coerces ill-formed UTF-8 to U+FFFD as encoding/json
+//     does when marshaling; unescaping passes it through, see each function);
+//     [DecodeAny] decodes a whole document into the generic
 //     nil/bool/float64/string/[]any/map[string]any representation; [ParseFloat]
 //     parses a single JSON number.
 //   - Check — [Valid] reports whether a document is one well-formed JSON value,

@@ -838,9 +838,13 @@ byte-identical when adding cold paths; push new logic out-of-line.
   surrogate/truncated shapes straddling the 8/16/32/48-byte boundaries, two
   fuzz loops, and every input checked through BOTH EscapeStringInto and the
   Builder EscapeString), the `indexEscapeNonASCII` arms of
-  `TestIndexFunctionsMatchScalar`/`TestIndexVariantsFlip`, and
+  `TestIndexFunctionsMatchScalar`/`TestIndexVariantsFlip`,
   `TestIndexEscapeNonASCIIScalarOracle` (SWAR scalar vs naive loop, every byte
-  at every lane offset). arm64: builds + `GOARCH=arm64 go vet` (asmdecl) clean;
+  at every lane offset), and `TestEscapeStringMatchesStdlibCoercion` — the
+  "exactly as encoding/json" claim held to the stdlib itself, compared where
+  equality is defined (the string value both encodings decode back to, since
+  the stdlib HTML-escapes and spells the replacement as `\ufffd`), with a
+  premise check that the stdlib really coerced each ill-formed input. arm64: builds + `GOARCH=arm64 go vet` (asmdecl) clean;
   **not yet run on hardware or qemu** (this box has neither) — needs the usual
   M2/qemu differential pass before the NEON arm counts as verified.
 - **Dynamic `any` path (`any.go`)**: the number case calls the private

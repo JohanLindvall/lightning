@@ -65,13 +65,16 @@ func allValid(in []byte, rawVal [][]byte) bool {
 	return true
 }
 
-// keysSafe reports whether every key can be written raw between two quotes, i.e.
-// whether escaping would leave it unchanged. It asks the scanner rather than
-// spelling the byte set out again: unstable.IndexEscape is what EscapeString
-// itself scans with, over unstable.SwarNeedsEscape, the repo's single definition
-// of "JSON must escape this byte". So a key is safe exactly when EscapeString
-// would copy it through — bytes JSON does not require escaped (0x7f, any UTF-8
-// sequence) are left alone, and the check rejects only keys Set would mangle.
+// keysSafe reports whether every key holds no byte JSON requires escaped, i.e.
+// whether writing it raw between two quotes yields a well-formed member name. It
+// asks the scanner rather than spelling the byte set out again:
+// unstable.IndexEscape scans over unstable.SwarNeedsEscape, the repo's single
+// definition of "JSON must escape this byte" — so bytes JSON does not require
+// escaped (0x7f, any non-ASCII byte) are left alone, and the check rejects only
+// keys Set would mangle. UTF-8 well-formedness is deliberately NOT checked,
+// matching Valid's own leniency (the edit API is byte-level throughout); this is
+// one place the check is looser than EscapeString, which since the U+FFFD
+// coercion would rewrite an ill-formed key rather than copy it through.
 func keysSafe(keys []string) bool {
 	for _, k := range keys {
 		if unstable.IndexEscape([]byte(k)) != len(k) {
