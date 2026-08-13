@@ -479,6 +479,39 @@ byte-identical when adding cold paths; push new logic out-of-line.
   arm64's worst lag vs amd64 (skip-heavy ~0.36 of amd64's speedup-over-stdlib) — the
   residual gap is intrinsic: NEON is 16-byte and has no `PMOVMSKB`, so even the cascade
   does more work than amd64's `VPMOVMSKB` over 32-byte AVX2.
+  **The cascade's last step now serves two classes at once (`CLASS2`).** The
+  four-step cascade ends `S = ADDP(R, R)`, feeding the same register twice purely
+  to halve its 16 bytes into the packed 8 — but `ADDP(Vn,Vm)` puts pairwise(Vn)
+  in the low half and pairwise(Vm) in the high half, so handing it **two
+  different classes' R** packs both 64-bit masks into one register: `D[0]` is the
+  first class's, `D[1]` the second's. `CLASS3` is the cascade stopped one step
+  short and `CLASS2` pairs two of them, so the block's four classes cost **two**
+  final ADDPs instead of four — 52 → 50 vector ops per 64-byte block. That is
+  worth having because the loop is **vector-issue-bound**, which was measured
+  rather than assumed: on Neoverse N2 it retires **86.8 instructions per 64-byte
+  block in 27.2 cycles** (IPC 3.19), and ~53 of those instructions are
+  vector-pipe ops which at 2 pipes floor the block at ~26.5 cycles — i.e. the
+  loop is within ~3% of its issue limit and only fewer vector ops can help.
+  Interleaved A/B (n=8, pinned N2): `BenchmarkSkipBlocksVariant` **stringObj
+  −3.00%, numberObj −3.72%, nestedMixed −1.32%**, `BenchmarkSkipContainer`
+  stringObj −3.72%, nestedMixed −1.28% (all p=0.000, geomean −2.61%), and the
+  `pkg/json` toolkit inherits it — **GetManyWithSkip −2.99%, GetPathsWithSkip
+  −2.34%**. nestedMixed gains least because its share of GP bit-walk work per
+  block is highest. Locked by the existing `TestSkipBlocksVariants` (goloop and
+  NEON differentially against the scalar oracle over the fuzz corpus plus
+  `boundaryDocs()`), which passes unchanged — the pairing is an algebraic
+  identity, not a new approximation.
+  **Sized and rejected in the same pass**: dropping the four cross-domain `VMOV`s
+  by `VST1`-ing the two paired registers to the stack and reloading with two
+  `LDP`s. It would move 4 ops off the (bottleneck) vector pipe onto the load/store
+  pipes, but a 64-bit load from a 128-bit store does not store-forward on these
+  cores, and the loop carries `depth`/`prevEscaped`/`prevInString` in registers
+  across iterations — so the stall would land squarely on the loop-carried
+  dependency. Not attempted. Reducing the four classes to three via the
+  open/close bit-1 relationship (`{`/`[` have bit 1 set, `}`/`]` clear, so
+  `(c|2)==0x7D` matches either bracket) also does **not** pay: the combined
+  bracket fold needs an extra `VORR` per chunk, making it 17 ops, so
+  bracket+close is 30 ops against the 26 that open+close already costs.
 - **amd64 whole-loop skip assembly (`skipBlocksAVX2`/`skipBlocksAVX512`) + Go-loop
   fast paths.** Profiling the fast skip showed `maskBlock` (the vector kernel) at
   only ~15%: the loop was **latency-bound on the loop-carried
@@ -1678,6 +1711,47 @@ total samples. The filtered M2 profiles match the documented cost structure:
 citm SkipWSRun ~22% of decode, cloudflare scanner ~30% + unknown-field skips
 ~33%, gsoc scanner+decodeEscaped — all already-attacked or documented-intrinsic;
 no new addressable hot spot surfaced.
+
+## Neoverse N2 validation and the arm64 prologue work (2026-08-13)
+
+Every arm64 number in this file up to this point was measured on **Apple M2**,
+which is an unusual proxy for the machines that actually run this library in
+production: an extremely wide OoO core with a huge reorder window. This session
+was the first on a **server arm64 core — Neoverse N2** (Azure Cobalt-class,
+3.41 GHz, SVE2/PMULL present, 2 cores, idle, pinned with `taskset`). Read the
+arm64 entries above with that split in mind: where an entry says "M2", the
+mechanism has now usually been re-checked here, and the notable outcomes are:
+
+- **The M-class-window hypothesis is wrong for the string scanner.** The
+  standing suspicion was that arm64's rejected scanner micro-opts were an M2
+  artifact (M2 hides short savings that Zen 4 exposes) and that a narrow server
+  core would flip them. Re-measured, the movemask-reduction rejection holds with
+  the *same sign and similar magnitude* on N2 (+2.79% geomean). Recorded in the
+  rejection entry so nobody re-litigates it a third time on a third core.
+- **`perf` is the tiebreaker, and `pprof -disasm` lies here.** N2's decode runs
+  at IPC 3.49 with a 0.057% branch-miss rate, so the scanner is issue-bound;
+  the 46% of samples sitting on one `CBNZ` is skid, not a dependency stall. Every
+  arm64 idea in this session was sized with `perf stat` counters first, and the
+  two that survived (`VMOVI`+peel, `CLASS2`) are both pure instruction removal.
+  **On this box PMU counters need `kernel.perf_event_paranoid <= 1`** (it ships
+  at 4, which silently blocks everything); it is currently set to 1.
+- **Vector-issue-bound is a measurable state, not a hand-wave.** The NEON skip
+  loop retires 86.8 instructions per 64-byte block in 27.2 cycles, of which ~53
+  are vector-pipe ops — at 2 vector pipes that floors the block at ~26.5 cycles.
+  That number is what justified `CLASS2` (a 2-op saving) and what killed the
+  larger ideas around it: with the loop within ~3% of its issue limit, only
+  removing vector ops can help, and the ways to remove more (stack round-trip for
+  the `VMOV`s, folding open/close into one bracket class) each cost more than
+  they save. Recompute this ratio before proposing anything else for that loop.
+- **Correctness closed out.** `indexEscapeNonASCIINEON` — the last assembly in
+  the tree that had never executed on an arm64 CPU (added when the author's box
+  had neither hardware nor qemu) — now passes natively, as do all four NEON
+  scanners' exhaustive differentials, the skip-path variant tests and
+  `GOARCH=arm64 go vet`'s asmdecl.
+- **Still-open lever, re-confirmed closed by the toolchain**: `<ABIInternal>` is
+  rejected outside `package runtime` on Go 1.26, so ~13 instructions of ABI
+  marshaling per scanner call remain unavoidable. That is the biggest single
+  remaining arm64 decode win and it is gated on a Go change, not on this repo.
 
 ## Session 2026-08 fixes worth knowing (correctness/API)
 

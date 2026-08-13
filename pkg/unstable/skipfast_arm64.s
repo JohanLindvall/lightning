@@ -6,9 +6,8 @@ DATA bitWeights<>+0(SB)/8, $0x8040201008040201
 DATA bitWeights<>+8(SB)/8, $0x8040201008040201
 GLOBL bitWeights<>(SB), RODATA|NOPTR, $16
 
-// CLASS folds splat s against all four 16-byte chunks (V6..V9) into the 64-bit
-// class mask in dst — chunk k's 16 bits at bit offset 16k — with a single
-// vector→GP move.
+// A "class fold" turns splat s, compared against all four 16-byte chunks (V6..V9),
+// into the 64-bit class mask for the block — chunk k's 16 bits at bit offset 16k.
 //
 // Each chunk's compare (lanes 0x00/0xFF) is ANDed with the {1,2,...,128} bit
 // weights, so a matching lane becomes its bit value. A four-step ADDP cascade then
@@ -20,28 +19,44 @@ GLOBL bitWeights<>(SB), RODATA|NOPTR, $16
 // A1), Q=ADDP(A2,A3), R=ADDP(P,Q), S=ADDP(R,R) keeps chunk order and never
 // overflows a byte — a full 8-lane half sums to 255.) This replaces a per-chunk
 // gather that did four cross-domain VMOVs and twelve ADDPs plus shift/OR stitching.
-#define CLASS(s, dst) \
-	VCMEQ s, V6.B16, V20.B16        \
-	VAND  V16.B16, V20.B16, V20.B16 \
+//
+// CLASS3 is that fold stopped one cascade step short: dst holds R = ADDP(P,Q),
+// whose 16 bytes are [c0(0-3),c0(4-7),c0(8-11),c0(12-15), c1(...)] in the low half
+// and chunks 2,3 in the high half. One more ADDP packs it to the 64-bit mask.
+#define CLASS3(s, dst) \
+	VCMEQ s, V6.B16, dst            \
+	VAND  V16.B16, dst, dst         \
 	VCMEQ s, V7.B16, V21.B16        \
 	VAND  V16.B16, V21.B16, V21.B16 \
 	VCMEQ s, V8.B16, V22.B16        \
 	VAND  V16.B16, V22.B16, V22.B16 \
 	VCMEQ s, V9.B16, V23.B16        \
 	VAND  V16.B16, V23.B16, V23.B16 \
-	VADDP V21.B16, V20.B16, V20.B16 \
+	VADDP V21.B16, dst, dst         \
 	VADDP V23.B16, V22.B16, V22.B16 \
-	VADDP V22.B16, V20.B16, V20.B16 \
-	VADDP V20.B16, V20.B16, V20.B16 \
-	VMOV  V20.D[0], dst
+	VADDP V22.B16, dst, dst
+
+// CLASS2 finishes TWO classes with a single shared final ADDP, which is what makes
+// it cheaper than two CLASS folds. ADDP(Vn,Vm) puts pairwise(Vn) in the low half
+// and pairwise(Vm) in the high half, and the last cascade step of a class is
+// exactly pairwise(R) — so feeding it class a's R and class b's R packs both
+// masks into one register at once: D[0] is a's, D[1] is b's. That drops the
+// per-class cascade from four ADDPs to three-and-a-half, i.e. two vector ops per
+// 64-byte block (52 -> 50), on a loop measured to be vector-issue-bound.
+#define CLASS2(sa, sb, da, db) \
+	CLASS3(sa, V20.B16)             \
+	CLASS3(sb, V17.B16)             \
+	VADDP V17.B16, V20.B16, V20.B16 \
+	VMOV  V20.D[0], da              \
+	VMOV  V20.D[1], db
 
 // func maskBlock(b []byte, isArray bool) (quote, bslash, open, close uint64)
 //
 // Returns, for the 64 bytes at b[:64], the bitmap of `"`, `\\`, and the
 // container's open/close brackets — `[`/`]` when isArray, else `{`/`}`; bit j set
 // when b[j] is that byte. NEON; the caller guarantees 64 readable bytes. The
-// 64-byte block is four 16-byte chunks (V6..V9); each class folds to its 64-bit
-// mask via the CLASS cascade above.
+// 64-byte block is four 16-byte chunks (V6..V9); the classes fold to their 64-bit
+// masks two at a time via the CLASS2 cascade above.
 TEXT ·maskBlock(SB), NOSPLIT, $0-64
 	MOVD b_base+0(FP), R0
 	MOVD $0x22, R1
@@ -67,10 +82,8 @@ haveBrackets:
 
 	VLD1 (R0), [V6.B16, V7.B16, V8.B16, V9.B16] // four 16-byte chunks
 
-	CLASS(V0.B16, R10)
-	CLASS(V1.B16, R11)
-	CLASS(V2.B16, R12)
-	CLASS(V3.B16, R13)
+	CLASS2(V0.B16, V1.B16, R10, R11)  // quote, bslash
+	CLASS2(V2.B16, V3.B16, R12, R13)  // open, close
 
 	MOVD R10, quote+32(FP)
 	MOVD R11, bslash+40(FP)
@@ -107,8 +120,8 @@ haveBrackets:
 // Register map: R0=data base, R1=len-64 (last valid block start), R2=pos,
 // R16=data cursor (R0+R2), R3=depth, R4=prevEscaped (0/1), R5=prevInString
 // (0/all-ones), R6=evenBits 0x5555...; R10-R13 the block's quote/bslash/open/
-// close masks (CLASS outputs), R7-R9/R14/R15 scratch. V0-V3 splats, V16 bit
-// weights, V6-V9 chunks, V20-V24 scratch.
+// close masks (CLASS2 outputs), R7-R9/R14/R15 scratch. V0-V3 splats, V16 bit
+// weights, V6-V9 chunks, V17/V20-V24 scratch.
 TEXT ·skipBlocksNEON(SB), NOSPLIT, $0-80
 	MOVD data_base+0(FP), R0
 	MOVD data_len+8(FP), R1
@@ -143,10 +156,8 @@ blockLoop:
 	CMP  R1, R2
 	BGT  exhausted
 	VLD1 (R16), [V6.B16, V7.B16, V8.B16, V9.B16]
-	CLASS(V0.B16, R10)         // quote
-	CLASS(V1.B16, R11)         // bslash
-	CLASS(V2.B16, R12)         // open
-	CLASS(V3.B16, R13)         // close
+	CLASS2(V0.B16, V1.B16, R10, R11)  // quote, bslash
+	CLASS2(V2.B16, V3.B16, R12, R13)  // open, close
 
 	// escaped (R15): skip the add-carry chain when no backslash in the block
 	// and none pending from the previous one.
