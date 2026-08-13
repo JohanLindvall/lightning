@@ -340,8 +340,9 @@ byte-identical when adding cold paths; push new logic out-of-line.
   no regression on citm / large-json / canada (whose `SkipValue`/presize use
   early-exits within a block via the scalar prescan, so it never reaches the loop).
   arm64 mirrors the change (correctness verified under qemu — full pkg/unstable test suite +
-  an exhaustive 0–255 × boundary-offset differential); its speedup is unmeasured
-  here (qemu isn't cycle-accurate) and wants a real-arm64/CI run to confirm. The
+  an exhaustive 0–255 × boundary-offset differential; **re-verified natively on a
+  Neoverse N2, 2026-08-13**, where the whole suite and `go vet`'s asmdecl pass on
+  real hardware rather than emulation). The
   string scanner
   (`indexQuoteOrBackslashSSE2`) is a **length-adaptive hybrid**: the first 32-byte
   block is SSE2, so short keys/values return with no AVX2 state and no VZEROUPPER;
@@ -351,6 +352,40 @@ byte-identical when adding cold paths; push new logic out-of-line.
   are unchanged; long strings win (string_unicode −9%, twitter/large-json ~−1%).
   Don't make it pure-AVX2: the per-call VZEROUPPER regresses the short-string
   common case (the reason SSE2 was chosen originally).
+- **arm64 scanner prologue: `VMOVI` splats + a peeled first block** (all four
+  NEON scanners in `simd_arm64.s` — `indexQuoteOrBackslashNEON`,
+  `indexEscapeNEON`, `indexEscapeNonASCIINEON`, `indexStructuralNEON`). On a
+  **Neoverse N2** the string scanner is the single hottest thing in the library:
+  **31% flat on cloudflare, 15% on citm** (`pprof -disasm`), and a call is ~26
+  executed instructions of which **~13 are ABI and setup**, not scanning. Three
+  changes, all pure instruction removal with nothing added to the latency chain.
+  **(1)** Each `MOVD $imm, Rn` + `VDUP Rn, Vd.B16` splat pair becomes one
+  **`VMOVI $imm, Vd.B16`** — the assembler *does* spell it, and it builds the
+  splat inside the vector unit from an 8-bit immediate, so two instructions and a
+  GP→SIMD transfer become one instruction with no general-register dependency at
+  all (the splats are ready before the argument loads retire). This supersedes
+  the older note that VDUP-from-GPR was the cheap form: it was cheaper than a
+  RODATA `VLD1`, but `VMOVI` beats both. **(2)** The **first 16-byte block is
+  peeled** out of the loop. The scanners are called on
+  `string-body + rest-of-document` and the corpus median string is 8–16 bytes
+  (cloudflare 16, citm 8, twitter 11), so the overwhelmingly common outcome is a
+  match in block 0 — the peeled copy loads straight from the base pointer with no
+  offset register, no bound, no address `ADD`, and returns through its own
+  recovery labels that add no block offset. **(3)** The loop **hoists its bound**
+  (`len-16`) instead of recomputing `remaining = len - offset` every iteration.
+  Net for the dominant single-block call: **26 → 20 executed instructions**.
+  Interleaved ABBA A/B (n=10, pinned N2, `VMOVI`+peel and the CLASS2 skip change
+  below together): **cloudflare −3.02%, string_unicode −3.01%, golang_source
+  −2.20%, twitter_status −1.36%, citm_catalog −1.22%** (all p≤0.007),
+  canada_geometry flat (float-bound control), geomean **−1.78%**; the escape
+  direction (`BenchmarkEscapeString`/`Into`, 26 shapes) is flat-to-better with no
+  case moving more than ~1.3% either way. **Why instruction removal and not
+  latency**: `perf stat` on the cloudflare decode measures **IPC 3.49** with a
+  **0.057% branch-miss rate** and 25% backend stalls — the loop is issue-bound,
+  not mispredict-bound, so the lever is fewer instructions. The 730 ms that
+  `pprof -disasm` piles on the second `CBNZ` is retirement skid, **not** a
+  removable stall on the second cross-domain `VMOV` — proven by the failed
+  experiment recorded in the rejected list below.
 - **Date parsing**: `daysFromCivilCached` uses a year-start-days table (built from
   `daysFromCivil`) for 1970–2261; falls back to the general algorithm otherwise.
   `parseRFC3339`'s fractional-seconds loop accumulates at most nine digits (bounded
@@ -845,8 +880,13 @@ byte-identical when adding cold paths; push new logic out-of-line.
   equality is defined (the string value both encodings decode back to, since
   the stdlib HTML-escapes and spells the replacement as `\ufffd`), with a
   premise check that the stdlib really coerced each ill-formed input. arm64: builds + `GOARCH=arm64 go vet` (asmdecl) clean;
-  **not yet run on hardware or qemu** (this box has neither) — needs the usual
-  M2/qemu differential pass before the NEON arm counts as verified.
+  **now verified on real hardware (Neoverse N2, 2026-08-13)** — the full
+  pkg/unstable and pkg/json suites pass natively, including the
+  `indexEscapeNonASCII` arms of `TestIndexFunctionsMatchScalar` /
+  `TestIndexVariantsFlip`, the all-bytes+fuzz `TestEscapeStringIntoReference` and
+  `TestEscapeStringMatchesStdlibCoercion`. The NEON arm of the UTF-8 coercion work
+  counts as verified; `indexEscapeNonASCIINEON` was the last asm in the tree that
+  had never executed on an arm64 CPU.
 - **Dynamic `any` path (`any.go`)**: the number case calls the private
   `scanFloat` directly (strconv fallback inlined at the site, mirroring
   `ReadFloat64OrNull` byte for byte) instead of going through the non-inlinable
@@ -1429,6 +1469,30 @@ no regressions.)
   wrapper inline (above), not touching the block body. Don't re-attempt mask-
   reduction tricks without a way to *shorten single-call latency*, not block
   throughput.
+
+  **Re-tested on Neoverse N2 (2026-08-13) and still rejected — the verdict is not
+  M-class-specific.** The natural suspicion was that these rejections were an
+  artifact of M2's very wide OoO window (the same window that hides the savings
+  Zen 4 exposes, per the M2 re-validation section), and that a narrow server core
+  would flip them. It does not. Variant (2) rebuilt on top of the `VMOVI`+peel
+  prologue — `VUSHR $4, V3.H8` + `VUZP1` + one `FMOVD`, so a single cross-domain
+  move and a *single* unified exit label instead of two `VMOV`s and two `CBNZ`s —
+  measured **+2.79% geomean (cloudflare +4.83%, string_unicode +6.96%,
+  twitter_status +1.97%, golang_source +1.71%, citm +1.31%, all p=0.000, n=8
+  interleaved)**, i.e. the same sign and roughly the same magnitude as M2's
+  +2.7…+9.2%. Two extra vector ops on the compare→branch path cost more than the
+  cross-domain move and the branch they remove, on both microarchitectures.
+  This also **corrects a tempting misreading of the profile**: `pprof -disasm` puts
+  ~46% of the scanner's samples on the *second* `CBNZ`, which looks exactly like a
+  stall waiting for the second `VMOV`. It is not — `perf stat` shows a 0.057%
+  branch-miss rate and IPC 3.49, and removing that very `VMOV` made things worse.
+  Treat the disasm concentration as retirement skid; the function is issue-bound,
+  and only removing instructions (the `VMOVI`/peel work above) helps.
+  The Go assembler still cannot spell `SHRN` (checked against
+  `cmd/internal/obj/arm64` on Go 1.26: the vector mnemonic list has no narrowing
+  shift), so the one-instruction form of this trick remains unavailable without
+  raw `WORD` encoding — and since the two-instruction form loses by 2.8%, the
+  one-instruction form would at best roughly break even.
 - **arm64 register-ABI (`<ABIInternal>`) for the NEON scanners** — the asm is
   ABI0, so every (very hot) call spills base/len/cap to the stack and reloads the
   result; declaring the functions `<ABIInternal>` would pass the slice in R0/R1/R2
@@ -1436,6 +1500,12 @@ no regressions.)
   `<ABIInternal>` selector outside `package runtime`** ("ABI selector only
   permitted when compiling runtime"), so this is simply unavailable to a
   third-party package. No workaround that doesn't fork the toolchain.
+  **Re-checked on Go 1.26 (2026-08-13): still rejected with the same error**, so
+  the ~13 instructions of ABI marshaling per scanner call (2 caller stores, the
+  callee's 2 argument loads, the result store and load) remain the floor under
+  the string scanner — which is why the `VMOVI`/peel work attacked the *setup*
+  instructions instead. Re-test this whenever the Go version moves: it is the
+  single largest remaining win available in the arm64 decode path.
 - **arm64 32-byte-unrolled `indexQuoteOrBackslashNEON` for long strings.** The
   bench-md flags string_unicode (long unicode text fields) as arm64's #2 lag vs
   amd64 (~0.68), and the scanner is ~51% of that decode; amd64 wins partly by

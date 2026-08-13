@@ -4,11 +4,28 @@
 // the result mask moved into general registers finds the first nonzero byte.
 //
 // indexQuoteOrBackslashNEON builds its two comparison splats ('"', '\\') per call
-// with MOVD-immediate + VDUP rather than loading a RODATA table: on amd64 the
-// equivalent constants live in RODATA because building them inline needs
-// VPBROADCASTB (a GP→XMM domain crossing that dominates a single-block call), but
-// arm64's VDUP-from-GPR has no such penalty, so the inline form is cheaper than a
-// VLD1 (no load-use latency) and measures ~2% faster on the get benchmark.
+// with VMOVI rather than loading a RODATA table: on amd64 the equivalent constants
+// live in RODATA because building them inline needs VPBROADCASTB (a GP→XMM domain
+// crossing that dominates a single-block call), but VMOVI materializes the splat
+// inside the vector unit from an 8-bit immediate, so the inline form costs one
+// instruction with no load-use latency *and* no domain crossing at all.
+//
+// This replaced a MOVD-immediate + VDUP pair per splat, which was already cheaper
+// than a RODATA VLD1 (~2% on the get benchmark) but still spent two instructions
+// and a GP→SIMD transfer per constant. VMOVI is a strict improvement on both: the
+// splats no longer depend on any general register, so they are ready before the
+// argument loads retire. Verified byte-identical to the VDUP form (see
+// TestIndexFunctionsMatchScalar and the exhaustive oracle tests in simd_test.go).
+//
+// Each scanner also peels its first 16-byte block out of the loop. The scanners
+// are called on `string-body + rest-of-document`, and the overwhelmingly common
+// outcome is a match inside that first block (median JSON string length is 8-16
+// bytes across the corpus), so the peeled copy loads straight from the base
+// pointer with no offset arithmetic, no loop-bound recomputation and no counter
+// update — 20 executed instructions instead of 26 for the dominant case. Only a
+// string that survives 16 clean bytes pays for the loop counters, and the loop
+// itself hoists its bound (len-16) out rather than recomputing `remaining` per
+// iteration.
 //
 // indexStructuralNEON instead classifies its five target bytes with simdjson's
 // shuffle trick — two TBL (NEON's VPSHUFB) lookups into the nibble tables below,
@@ -30,29 +47,58 @@ GLOBL structTablesArm<>(SB), RODATA|NOPTR, $48
 // Returns the index of the first '"' or '\\' byte in b, or len(b) if neither
 // is present. Scans 16 bytes per iteration with NEON, then a scalar tail.
 TEXT ·indexQuoteOrBackslashNEON(SB), NOSPLIT, $0-32
-	MOVD b_base+0(FP), R0
-	MOVD b_len+8(FP), R1
-	MOVD $0, R2                  // R2 = current offset
-	MOVD $0x22, R3
-	VDUP R3, V0.B16              // V0 = '"' x16
-	MOVD $0x5c, R3
-	VDUP R3, V1.B16              // V1 = '\\' x16
+	MOVD  b_base+0(FP), R0
+	MOVD  b_len+8(FP), R1
+	VMOVI $0x22, V0.B16          // V0 = '"' x16
+	VMOVI $0x5c, V1.B16          // V1 = '\\' x16
+	CMP   $16, R1
+	BLT   shortInput
 
-loop16:
-	SUB  R2, R1, R7              // R7 = remaining = len - offset
-	CMP  $16, R7
-	BLT  tail
-	ADD  R0, R2, R8              // R8 = &b[offset]
-	VLD1 (R8), [V2.B16]
+	// Peeled first block (see the file header): loads at the base pointer, so
+	// no offset register, no bound, no address ADD on the critical path.
+	VLD1  (R0), [V2.B16]
 	VCMEQ V0.B16, V2.B16, V3.B16 // V3 = (chunk == '"')
 	VCMEQ V1.B16, V2.B16, V4.B16 // V4 = (chunk == '\\')
-	VORR V3.B16, V4.B16, V3.B16  // V3 = either match (0xFF per lane)
-	VMOV V3.D[0], R9             // low 8 lanes
-	VMOV V3.D[1], R10            // high 8 lanes
+	VORR  V3.B16, V4.B16, V3.B16 // V3 = either match (0xFF per lane)
+	VMOV  V3.D[0], R9            // low 8 lanes
+	VMOV  V3.D[1], R10           // high 8 lanes
+	CBNZ  R9, firstLow8
+	CBNZ  R10, firstHigh8
+
+	MOVD  $16, R2                // R2 = current offset
+	SUB   $16, R1, R12           // R12 = last offset holding a full block
+
+loop16:
+	CMP  R12, R2
+	BGT  tail                    // fewer than 16 bytes left
+	ADD  R0, R2, R8              // R8 = &b[offset]
+	VLD1 (R8), [V2.B16]
+	VCMEQ V0.B16, V2.B16, V3.B16
+	VCMEQ V1.B16, V2.B16, V4.B16
+	VORR V3.B16, V4.B16, V3.B16
+	VMOV V3.D[0], R9
+	VMOV V3.D[1], R10
 	CBNZ R9, low8
 	CBNZ R10, high8
 	ADD  $16, R2
 	B    loop16
+
+	// The peeled block's recoveries are separate from the loop's so that the
+	// common case adds no offset (its block starts at 0).
+firstLow8:
+	RBIT R9, R11
+	CLZ  R11, R11                // trailing zeros of R9 = first set bit
+	LSR  $3, R11, R11            // /8 -> first matching byte (lane 0..7)
+	MOVD R11, ret+24(FP)
+	RET
+
+firstHigh8:
+	RBIT R10, R11
+	CLZ  R11, R11
+	LSR  $3, R11, R11            // lane within high half (0..7)
+	ADD  $8, R11, R11            // lanes 8..15
+	MOVD R11, ret+24(FP)
+	RET
 
 low8:
 	RBIT R9, R11
@@ -70,6 +116,9 @@ high8:
 	ADD  R2, R11, R11
 	MOVD R11, ret+24(FP)
 	RET
+
+shortInput:
+	MOVD ZR, R2                  // buffer shorter than one block: scan from 0
 
 tail:
 	CMP  R1, R2
@@ -101,36 +150,64 @@ tfound:
 // indexQuoteOrBackslashNEON (16 bytes/iter, scalar tail) with one extra per-block
 // test for control bytes: VUMIN(chunk, 0x1f) == chunk, true exactly when the lane
 // is <= 0x1f (the NEON form of amd64's PMINUB(v, 0x1f) == v). The three compare
-// splats are built with VDUP-from-GPR, no RODATA load.
+// splats are built with VMOVI, no RODATA load and no GP→SIMD transfer; the first
+// block is peeled as in indexQuoteOrBackslashNEON (see the file header).
 TEXT ·indexEscapeNEON(SB), NOSPLIT, $0-32
-	MOVD b_base+0(FP), R0
-	MOVD b_len+8(FP), R1
-	MOVD $0, R2                  // R2 = current offset
-	MOVD $0x22, R3
-	VDUP R3, V0.B16              // V0 = '"' x16
-	MOVD $0x5c, R3
-	VDUP R3, V1.B16              // V1 = '\\' x16
-	MOVD $0x1f, R3
-	VDUP R3, V5.B16              // V5 = 0x1f x16 (largest control byte)
+	MOVD  b_base+0(FP), R0
+	MOVD  b_len+8(FP), R1
+	VMOVI $0x22, V0.B16          // V0 = '"' x16
+	VMOVI $0x5c, V1.B16          // V1 = '\\' x16
+	VMOVI $0x1f, V5.B16          // V5 = 0x1f x16 (largest control byte)
+	CMP   $16, R1
+	BLT   eshortInput
 
-eloop16:
-	SUB  R2, R1, R7              // R7 = remaining = len - offset
-	CMP  $16, R7
-	BLT  etail
-	ADD  R0, R2, R8             // R8 = &b[offset]
-	VLD1 (R8), [V2.B16]
+	VLD1  (R0), [V2.B16]
 	VCMEQ V0.B16, V2.B16, V3.B16 // V3 = (chunk == '"')
 	VCMEQ V1.B16, V2.B16, V4.B16 // V4 = (chunk == '\\')
 	VORR  V4.B16, V3.B16, V3.B16
 	VUMIN V5.B16, V2.B16, V4.B16 // V4 = min(chunk, 0x1f)
 	VCMEQ V4.B16, V2.B16, V4.B16 // V4 = (chunk == min) -> control byte (<= 0x1f)
 	VORR  V4.B16, V3.B16, V3.B16 // V3 = any of the three (0xFF per matching lane)
-	VMOV V3.D[0], R9            // low 8 lanes
-	VMOV V3.D[1], R10           // high 8 lanes
+	VMOV  V3.D[0], R9            // low 8 lanes
+	VMOV  V3.D[1], R10           // high 8 lanes
+	CBNZ  R9, efirstLow8
+	CBNZ  R10, efirstHigh8
+
+	MOVD  $16, R2                // R2 = current offset
+	SUB   $16, R1, R12           // R12 = last offset holding a full block
+
+eloop16:
+	CMP  R12, R2
+	BGT  etail                   // fewer than 16 bytes left
+	ADD  R0, R2, R8             // R8 = &b[offset]
+	VLD1 (R8), [V2.B16]
+	VCMEQ V0.B16, V2.B16, V3.B16
+	VCMEQ V1.B16, V2.B16, V4.B16
+	VORR  V4.B16, V3.B16, V3.B16
+	VUMIN V5.B16, V2.B16, V4.B16
+	VCMEQ V4.B16, V2.B16, V4.B16
+	VORR  V4.B16, V3.B16, V3.B16
+	VMOV V3.D[0], R9
+	VMOV V3.D[1], R10
 	CBNZ R9, elow8
 	CBNZ R10, ehigh8
 	ADD  $16, R2
 	B    eloop16
+
+efirstLow8:
+	RBIT R9, R11
+	CLZ  R11, R11               // trailing zeros of R9 = first set bit
+	LSR  $3, R11, R11           // /8 -> first matching byte (lane 0..7)
+	MOVD R11, ret+24(FP)
+	RET
+
+efirstHigh8:
+	RBIT R10, R11
+	CLZ  R11, R11
+	LSR  $3, R11, R11           // lane within high half (0..7)
+	ADD  $8, R11, R11           // lanes 8..15
+	MOVD R11, ret+24(FP)
+	RET
 
 elow8:
 	RBIT R9, R11
@@ -148,6 +225,9 @@ ehigh8:
 	ADD  R2, R11, R11
 	MOVD R11, ret+24(FP)
 	RET
+
+eshortInput:
+	MOVD ZR, R2                 // buffer shorter than one block: scan from 0
 
 etail:
 	CMP  R1, R2
@@ -180,27 +260,56 @@ etfound:
 TEXT ·indexStructuralNEON(SB), NOSPLIT, $0-32
 	MOVD b_base+0(FP), R0
 	MOVD b_len+8(FP), R1
-	MOVD $0, R2
 	MOVD $structTablesArm<>(SB), R3
 	VLD1 (R3), [V0.B16, V1.B16, V2.B16] // structLo, structHi, 0x0f mask
+	CMP  $16, R1
+	BLT  sshortInput
 
-sloop:
-	SUB  R2, R1, R7
-	CMP  $16, R7
-	BLT  stail
-	ADD  R0, R2, R8
-	VLD1  (R8), [V5.B16]              // chunk
+	VLD1  (R0), [V5.B16]              // chunk
 	VAND  V2.B16, V5.B16, V6.B16     // low nibbles
 	VTBL  V6.B16, [V0.B16], V6.B16   // structLo[lowNibble]
 	VUSHR $4, V5.B16, V7.B16         // high nibbles (per-byte shift)
 	VTBL  V7.B16, [V1.B16], V7.B16   // structHi[highNibble]
 	VAND  V7.B16, V6.B16, V6.B16     // nonzero byte where structural
+	VMOV  V6.D[0], R9
+	VMOV  V6.D[1], R10
+	CBNZ  R9, sfirstLow8
+	CBNZ  R10, sfirstHigh8
+
+	MOVD  $16, R2
+	SUB   $16, R1, R12                // last offset holding a full block
+
+sloop:
+	CMP  R12, R2
+	BGT  stail
+	ADD  R0, R2, R8
+	VLD1  (R8), [V5.B16]
+	VAND  V2.B16, V5.B16, V6.B16
+	VTBL  V6.B16, [V0.B16], V6.B16
+	VUSHR $4, V5.B16, V7.B16
+	VTBL  V7.B16, [V1.B16], V7.B16
+	VAND  V7.B16, V6.B16, V6.B16
 	VMOV V6.D[0], R9
 	VMOV V6.D[1], R10
 	CBNZ R9, slow8
 	CBNZ R10, shigh8
 	ADD  $16, R2
 	B    sloop
+
+sfirstLow8:
+	RBIT R9, R11
+	CLZ  R11, R11
+	LSR  $3, R11, R11
+	MOVD R11, ret+24(FP)
+	RET
+
+sfirstHigh8:
+	RBIT R10, R11
+	CLZ  R11, R11
+	LSR  $3, R11, R11
+	ADD  $8, R11, R11
+	MOVD R11, ret+24(FP)
+	RET
 
 slow8:
 	RBIT R9, R11
@@ -218,6 +327,9 @@ shigh8:
 	ADD  R2, R11, R11
 	MOVD R11, ret+24(FP)
 	RET
+
+sshortInput:
+	MOVD ZR, R2                       // buffer shorter than one block: scan from 0
 
 stail:
 	CMP  R1, R2
@@ -255,22 +367,15 @@ stf:
 // stays inside its lane, so any nonzero marker value recovers the same index as
 // the 0xFF compare lanes. Everything else is byte-for-byte indexEscapeNEON.
 TEXT ·indexEscapeNonASCIINEON(SB), NOSPLIT, $0-32
-	MOVD b_base+0(FP), R0
-	MOVD b_len+8(FP), R1
-	MOVD $0, R2                  // R2 = current offset
-	MOVD $0x22, R3
-	VDUP R3, V0.B16              // V0 = '"' x16
-	MOVD $0x5c, R3
-	VDUP R3, V1.B16              // V1 = '\\' x16
-	MOVD $0x1f, R3
-	VDUP R3, V5.B16              // V5 = 0x1f x16 (largest control byte)
+	MOVD  b_base+0(FP), R0
+	MOVD  b_len+8(FP), R1
+	VMOVI $0x22, V0.B16          // V0 = '"' x16
+	VMOVI $0x5c, V1.B16          // V1 = '\\' x16
+	VMOVI $0x1f, V5.B16          // V5 = 0x1f x16 (largest control byte)
+	CMP   $16, R1
+	BLT   eushortInput
 
-euloop16:
-	SUB  R2, R1, R7              // R7 = remaining = len - offset
-	CMP  $16, R7
-	BLT  eutail
-	ADD  R0, R2, R8             // R8 = &b[offset]
-	VLD1 (R8), [V2.B16]
+	VLD1  (R0), [V2.B16]
 	VCMEQ V0.B16, V2.B16, V3.B16 // V3 = (chunk == '"')
 	VCMEQ V1.B16, V2.B16, V4.B16 // V4 = (chunk == '\\')
 	VORR  V4.B16, V3.B16, V3.B16
@@ -279,12 +384,48 @@ euloop16:
 	VORR  V4.B16, V3.B16, V3.B16
 	VUSHR $7, V2.B16, V4.B16     // V4 = 0x01 per non-ASCII lane (high bit set)
 	VORR  V4.B16, V3.B16, V3.B16 // V3 = any of the four (nonzero per matching lane)
-	VMOV V3.D[0], R9            // low 8 lanes
-	VMOV V3.D[1], R10           // high 8 lanes
+	VMOV  V3.D[0], R9            // low 8 lanes
+	VMOV  V3.D[1], R10           // high 8 lanes
+	CBNZ  R9, eufirstLow8
+	CBNZ  R10, eufirstHigh8
+
+	MOVD  $16, R2                // R2 = current offset
+	SUB   $16, R1, R12           // R12 = last offset holding a full block
+
+euloop16:
+	CMP  R12, R2
+	BGT  eutail                  // fewer than 16 bytes left
+	ADD  R0, R2, R8             // R8 = &b[offset]
+	VLD1 (R8), [V2.B16]
+	VCMEQ V0.B16, V2.B16, V3.B16
+	VCMEQ V1.B16, V2.B16, V4.B16
+	VORR  V4.B16, V3.B16, V3.B16
+	VUMIN V5.B16, V2.B16, V4.B16
+	VCMEQ V4.B16, V2.B16, V4.B16
+	VORR  V4.B16, V3.B16, V3.B16
+	VUSHR $7, V2.B16, V4.B16
+	VORR  V4.B16, V3.B16, V3.B16
+	VMOV V3.D[0], R9
+	VMOV V3.D[1], R10
 	CBNZ R9, eulow8
 	CBNZ R10, euhigh8
 	ADD  $16, R2
 	B    euloop16
+
+eufirstLow8:
+	RBIT R9, R11
+	CLZ  R11, R11               // trailing zeros of R9 = first set bit
+	LSR  $3, R11, R11           // /8 -> first matching byte (lane 0..7)
+	MOVD R11, ret+24(FP)
+	RET
+
+eufirstHigh8:
+	RBIT R10, R11
+	CLZ  R11, R11
+	LSR  $3, R11, R11           // lane within high half (0..7)
+	ADD  $8, R11, R11           // lanes 8..15
+	MOVD R11, ret+24(FP)
+	RET
 
 eulow8:
 	RBIT R9, R11
@@ -302,6 +443,9 @@ euhigh8:
 	ADD  R2, R11, R11
 	MOVD R11, ret+24(FP)
 	RET
+
+eushortInput:
+	MOVD ZR, R2                 // buffer shorter than one block: scan from 0
 
 eutail:
 	CMP  R1, R2
