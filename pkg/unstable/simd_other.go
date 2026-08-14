@@ -93,10 +93,13 @@ func indexEscapeNonASCIIScalar(b []byte) int {
 }
 
 // The generic, architecture-independent scalar implementations of the SIMD scan
-// primitives. The amd64 (SSE2/AVX2) and arm64 (NEON) dispatchers fall back to
-// these for short buffers, and on architectures with no SIMD version they are the
-// sole implementation (simd_scalar.go is the dispatch file that routes to them).
-// TestIndexFunctionsMatchScalar checks the SIMD routines against them.
+// primitives. The amd64 (SSE2/AVX2) and arm64 (NEON, or SVE2 where the core has
+// it) dispatchers fall back to these for short buffers, and on architectures with
+// no SIMD version they are the sole implementation (simd_scalar.go is the dispatch
+// file that routes to them). TestIndexFunctionsMatchScalar checks the SIMD
+// routines against them, and the per-arch TestIndexVariantsFlip tests each
+// dispatch arm separately — a scanner with more than one vector body would
+// otherwise have only the host's preferred one covered.
 
 // indexCloseOrEscapeScalar is the portable fallback for indexCloseOrEscape: it
 // returns the index of the first '"' or '\\' in b, or len(b) if neither is

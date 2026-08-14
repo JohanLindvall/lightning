@@ -121,7 +121,7 @@ func decodeEscaped(buf, data []byte, start, i int, quoted bool) (string, int, er
 			// quote) in one vectorized pass — but only when there is a run. Densely
 			// escaped strings (\uXXXX-per-character CJK text) sit on a '\' every
 			// other step, so checking the current byte first skips a whole
-			// indexCloseOrEscape/SSE2 call per escape.
+			// indexCloseOrEscape call — and the vector scan behind it — per escape.
 			c := data[i]
 			if c != '\\' && c != '"' {
 				rest := data[i:]

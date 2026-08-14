@@ -31,6 +31,21 @@ func maskBlock(b []byte, isArray bool) (quote, bslash, open, close uint64)
 // Measured on Apple M2 (BenchmarkSkipBlocksVariant, n=8, benchstat): the NEON
 // whole-loop beats the Go maskBlock loop stringObj -34.0%, numberObj -34.7%,
 // nestedMixed -28.7% (geomean -32.5%, all p=0.000).
+//
+// THIS LOOP STAYS NEON EVEN ON AN SVE2 CORE, unlike the four scanners in
+// simd_arm64.s. It is not an oversight: this algorithm needs a 64-bit BITMAP per
+// character class, because the escape and in-string masks are built with GP
+// bit math (add-with-carry and a prefix XOR) and the brackets are balanced by
+// walking set bits. SVE has no cheap predicate-to-general-register extraction
+// before SVE2.1's PMOV, which these cores do not have — CNTP yields only a
+// population count, not the mask. The one way to get the bits out is to STR the
+// predicate to the stack and reload it, which at a 128-bit vector length means
+// four 2-byte stores feeding one 8-byte load: that cannot store-forward on any
+// core, and the stall would land directly on the loop-carried
+// depth/prevEscaped/prevInString chain. That is the same trade already rejected
+// for this loop's cross-domain VMOVs (see CLAUDE.md), so SVE2 would have to pay
+// it four times over to remove them. Do not port this loop to SVE without a
+// predicate-to-GP move.
 var useSkipBlocks = true
 
 func skipBlocks(data []byte, pos, depth int, isArray bool) (end, ndepth int, prevEscaped, prevInString uint64) {

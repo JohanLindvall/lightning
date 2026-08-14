@@ -880,7 +880,8 @@ UTF-8 encoding, not the `\ufffd` escape):
   the two directions differ — `UnescapeStringInto` takes `out == in[:0]` precisely
   because unescaping only shrinks.)
 
-Clean runs are skipped with a vectorized scan (`indexEscapeSSE2`/`indexEscapeNEON`,
+Clean runs are skipped with a vectorized scan (`indexEscapeSSE2` on amd64,
+`indexEscapeNEON` or an SVE2 body on arm64 — see [SIMD scanning](#simd-scanning) —
 which classify `"`, `\` and control bytes in one pass), so a string needing little
 or no escaping costs roughly one `memcpy`. The scanner is chosen per run by how
 much input is left: a run shorter than 48 bytes — every short string, and every

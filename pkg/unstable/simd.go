@@ -26,8 +26,8 @@ func IndexCloseOrEscape(b []byte) int { return indexCloseOrEscape(b) }
 // IndexEscape returns the index of the first byte that JSON string encoding must
 // escape — a control byte < 0x20, '"' or '\\' — or len(b) if none. It is the
 // scan behind EscapeString/EscapeStringInto: a clean run is copied out in bulk and
-// only the escape byte at the returned index is expanded. SIMD (SSE2/AVX2) on
-// amd64, SWAR elsewhere.
+// only the escape byte at the returned index is expanded. SIMD on amd64
+// (SSE2/AVX2) and arm64 (NEON, or SVE2 where the core has it); SWAR elsewhere.
 func IndexEscape(b []byte) int { return indexEscape(b) }
 
 // IndexEscapeNonASCII returns the index of the first byte that is either one
