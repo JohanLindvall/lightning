@@ -205,7 +205,7 @@ func assemble(as, objdump string, mnemonics []string) (encs []string, err error)
 	if err != nil {
 		return nil, err
 	}
-	defer os.RemoveAll(dir)
+	defer func() { _ = os.RemoveAll(dir) }()
 
 	var buf bytes.Buffer
 	fmt.Fprintf(&buf, "\t.arch %s\n\t.text\n", arch)
@@ -247,7 +247,7 @@ func disassemble(as, objdump string, hexes []string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer os.RemoveAll(dir)
+	defer func() { _ = os.RemoveAll(dir) }()
 
 	var buf bytes.Buffer
 	fmt.Fprintf(&buf, "\t.arch %s\n\t.text\n", arch)
@@ -328,7 +328,7 @@ func acceptsAArch64(as string) bool {
 	if err != nil {
 		return false
 	}
-	defer os.RemoveAll(dir)
+	defer func() { _ = os.RemoveAll(dir) }()
 	src := filepath.Join(dir, "p.s")
 	if err := os.WriteFile(src, []byte("\t.arch "+arch+"\n\t.text\n\tmatch p2.b, p1/z, z0.b, z1.b\n"), 0o644); err != nil {
 		return false

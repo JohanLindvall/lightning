@@ -1,4 +1,4 @@
-.PHONY: all download check bench bench-md update-tools fix test generate vet fmt-check bench-test sveasm sveasm-check
+.PHONY: all download check lint bench bench-md update-tools fix test generate vet fmt-check bench-test sveasm sveasm-check
 
 GOPATH := $(shell go env GOPATH)
 GOBIN := $(GOPATH)/bin
@@ -11,8 +11,19 @@ all: fix check
 download: go.mod go.sum
 	go mod download
 
-check: $(GOBIN)/golangci-lint test
-	golangci-lint run ./...
+check: lint test
+
+# Lint BOTH architectures, for the same reason `vet` does. The premise this
+# target used to rest on — that static analysis is architecture-independent and
+# so needs one run — is false wherever a package has per-arch files: `unused`
+# only sees the files selected by the build tags, so a Go declaration reachable
+# only from the *other* architecture's code reads as dead. The concrete case is
+# pkg/unstable/simd_arm64.go, whose NEON routines are tail-called from the SVE2
+# entry points in assembly; linting only amd64 never compiles that file at all.
+# golangci-lint honours GOARCH, so both passes run on either host.
+lint: $(GOBIN)/golangci-lint
+	GOARCH=amd64 golangci-lint run ./...
+	GOARCH=arm64 golangci-lint run ./...
 
 test: conformance/data_unmarshal.go
 	go test -cover ./...

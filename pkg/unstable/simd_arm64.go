@@ -4,15 +4,31 @@ package unstable
 
 import "golang.org/x/sys/cpu"
 
+// Three of the four NEON routines below have no Go caller: the SVE2 entry points
+// in simd_arm64.s reach them with a tail branch (`B ·indexEscapeNEON(SB)`) when
+// useSVE2 is clear, which is what keeps the Go dispatch a single unconditional
+// call. The `unused` linter reads Go only, so it sees a dead declaration and says
+// so — a blind spot of the same family as asmdecl's, not a finding. The
+// declarations themselves are load-bearing regardless of who calls them: asmdecl
+// validates the assembly's frame offsets against exactly these signatures, and
+// `go vet` reports assembly with no Go prototype.
+//
+// (CI never sees this, because the Lint step runs on amd64 only, where all four
+// are behind a build tag. It is a real gap — `unused` is architecture-dependent
+// wherever per-arch files are — and was checked by hand here.)
+
+//nolint:unused // called from assembly; see above
 //go:noescape
 func indexQuoteOrBackslashNEON(b []byte) int
 
 //go:noescape
 func indexStructuralNEON(b []byte) int
 
+//nolint:unused // called from assembly; see above
 //go:noescape
 func indexEscapeNEON(b []byte) int
 
+//nolint:unused // called from assembly; see above
 //go:noescape
 func indexEscapeNonASCIINEON(b []byte) int
 

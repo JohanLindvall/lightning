@@ -75,12 +75,19 @@ jobs:
           fi
       - name: SVE encodings
         run: make sveasm-check
-      # Prebuilt binary (no source compile) + cached binary and lint cache. This is
-      # the architecture-independent half of static analysis (style, unused,
-      # staticcheck), so it runs once on amd64; the architecture-dependent half is
-      # the Vet step above, which runs on both.
+      # Prebuilt binary (no source compile) + cached binary and lint cache.
+      #
+      # Runs on BOTH arches, like Vet, and for a closely related reason. This step
+      # was amd64-only on the premise that lint is the architecture-independent
+      # half of static analysis — which is false for any package with per-arch
+      # files, because a linter only sees the files the build tags select. `unused`
+      # is the sharp case: pkg/unstable/simd_arm64.go's NEON routines are reached
+      # from the SVE2 entry points by an assembly tail branch, so on an arm64 build
+      # they read as dead declarations, and on an amd64 build the file is not
+      # compiled at all — meaning neither the finding nor its absence was ever
+      # established by CI. `make lint` does both arches from one host if you want
+      # them locally.
       - name: Lint
-        if: matrix.arch == 'amd64'
         uses: golangci/golangci-lint-action@v9
         with:
           version: v2.12.2
