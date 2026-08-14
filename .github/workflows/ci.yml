@@ -53,6 +53,28 @@ jobs:
       # and is invisible to `GOARCH=amd64 go vet`.)
       - name: Vet
         run: make vet
+      # pkg/unstable's arm64 SVE2 scanners spell their instructions as WORD
+      # constants, because the Go assembler has no SVE mnemonics — so nothing in
+      # the Go toolchain can tell whether a constant is the instruction its
+      # comment claims, and one wrong nibble assembles, links and runs as a
+      # different instruction. internal/sveasm re-derives every constant from the
+      # mnemonic beside it with the GNU assembler; this step is the gate that
+      # fails if the two ever drift apart. It needs an aarch64 assembler, which is
+      # what the install step provides: the cross-assembler on the amd64 runner
+      # (sveasm prefers it, so the gate is not arm64-only) and the native binutils
+      # on the arm64 one. Runs on both arches because it is cheap and because a
+      # contributor may edit the assembly from either.
+      - name: Install aarch64 assembler
+        run: |
+          set -eux
+          sudo apt-get update
+          if [ "$(uname -m)" = "x86_64" ]; then
+            sudo apt-get install -y binutils-aarch64-linux-gnu
+          else
+            sudo apt-get install -y binutils
+          fi
+      - name: SVE encodings
+        run: make sveasm-check
       # Prebuilt binary (no source compile) + cached binary and lint cache. This is
       # the architecture-independent half of static analysis (style, unused,
       # staticcheck), so it runs once on amd64; the architecture-dependent half is

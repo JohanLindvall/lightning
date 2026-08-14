@@ -392,6 +392,119 @@ byte-identical when adding cold paths; push new logic out-of-line.
   so the per-digit `<9` test stays out of the loop) and scales to nanoseconds with
   one `pow10nano[fd]` multiply instead of a trailing `for fd<9 { nsec*=10 }` pad:
   time-array −1%.
+- **arm64 SVE2 scanner bodies** (`simd_arm64.s`'s SVE2 section, gated by
+  `useSVE2 = cpu.ARM64.HasSVE2` in `simd_arm64.go`; encodings generated and
+  checked by `internal/sveasm`). All four scanners get a second body used on cores
+  that implement SVE2 — Neoverse N2/V2, Graviton4 and later; **not** Apple
+  M-series or Neoverse N1/V1, which keep the NEON routines unchanged. The string
+  scanner was **31.2% flat of cloudflare** and 12.6% of citm on N2 (measured, this
+  box), i.e. the hottest thing in the library and the thing two prior sessions had
+  already tuned to its NEON floor. SVE wins on three axes at once, all of them
+  instruction removal — which is what the N2 counters say these scanners are bound
+  by (IPC 3.49, 0.057% branch-miss rate: issue-bound, not mispredict-bound):
+  **(1) predication deletes the tail.** `WHILELO` sizes the predicate to the bytes
+  actually left and an SVE load never touches memory for an inactive lane, so one
+  loop body covers the short buffer, the full blocks and the ragged final block —
+  the NEON form's `CMP $16` head test, its scalar byte tail and its separate
+  short-input entry all vanish, with the branches that chose between them.
+  **(2) `MATCH` does a character class in one instruction.** It compares each byte
+  against all sixteen bytes of the corresponding 128-bit segment of its second
+  operand, so two `VCMEQ` + `VORR` collapse to one op, and `indexStructural`'s
+  whole simdjson shuffle trick (`VAND`/`VTBL`/`VUSHR`/`VTBL`/`VAND`, five ops plus
+  a 48-byte RODATA load) collapses to the same one. **(3) the result never leaves
+  the vector domain**: `MATCH` sets NZCV, so "did this block match" is a branch
+  rather than two `VMOV` cross-domain moves feeding two `CBNZ`s, and recovery is
+  `BRKB` (lanes before the first true) + `INCP` — one transfer instead of two, no
+  `RBIT`/`CLZ`/`LSR`, and the two half-block recovery paths fold into one.
+  The bodies are **vector-length agnostic** (`WHILELO`/`INCB`/`INCP`), so a
+  256-bit implementation scans 32 bytes a block with the same code and no
+  re-verification; `MATCH`'s per-segment semantics are why each match set must
+  hold its bytes in *every* 128-bit segment, which `TRN1`-of-two-`DUP`s and
+  `LD1RQB` both guarantee at any VL. Interleaved ABBA A/B (n=10, pinned,
+  benchstat): **string_unicode −12.3%, cloudflare-compact −11.6%,
+  cloudflare-nocopy −10.2%, cloudflare −8.3%, twitter_status −4.3%, golang_source
+  −2.6%, synthea_fhir −2.4%, citm_catalog −2.3%**; canada_geometry −0.6% and
+  large-json flat (p=0.14) are the float-bound controls. Toolkit: `SkipContainer/
+  numberArr` **−33.8%**, `SkipContainer/stringObj` −12.4%, `GetManyWithSkip`
+  −6.2%, `StripDefaults` −6.2%, `StripDefaultsCompact` −5.6%, `GetPathsWithSkip`
+  −4.2%. Escape direction (after the CMPHS fold below): `EscapeStringInto`
+  url_clean −50%, log_line_clean −22%, mostly_clean_one_quote −21%,
+  invalid_utf8_one_byte −18%; `EscapeString` sentence_clean −23%, log_line_clean
+  −6.3%; geomean −7.1%, no case worse than +2.3% (`EscapeStringInto/unicode_clean`,
+  which is dominated by its `utf8.Valid` pass).
+
+  **THE GATE MUST LIVE IN THE ASSEMBLY, and this is the whole design constraint.**
+  The natural spelling — `if useSVE2 { return sve(b) }; return neon(b)` in the Go
+  dispatch wrapper — gives that wrapper two calls, which costs **124 against the
+  inliner's budget of 80**, so `indexCloseOrEscape` stops inlining into
+  `ReadKey`/`ReadStringOrNull`/`SkipString`/`decodeEscaped` and every generated
+  decoder. That is the exact regression the "make the dispatch wrapper itself
+  inlinable" entry above records as worth 5.4% on cloudflare when it was fixed in
+  the other direction, so it would have eaten most of the win. Reading the flag
+  in assembly keeps the Go side a single unconditional call (cost 61, still
+  inlined) and costs the SVE2 path three instructions — an `ADRP`+`LDRB` pair
+  independent of the argument setup plus a perfectly-predicted not-taken `CBZ`;
+  non-SVE2 cores pay those three and one taken branch into the unchanged NEON
+  routine. Same shape as amd64, which reads `·useAVX2(SB)` inside `simd_amd64.s`.
+  Measured directly: a gated call and an unconditional SVE2 call are
+  indistinguishable (7.86 vs 7.90 ns at an 8-byte match). `indexStructural` is the
+  one exception — it keeps a Go-level `if useSVE2`, because it already carries a
+  length test and the 16-byte scalar prescan and is far past the inline budget
+  either way.
+
+  **PREDICATE-PIPE ISSUE IS THE REAL BUDGET, not instruction count.** The first
+  `indexEscapeNonASCII` body used `MATCH`, `CMPLO`, `ORR`, `CMPLT`, `ORRS` — five
+  *predicate* ops per block — and was the one scanner of the four that **lost** to
+  NEON on long clean runs (`EscapeString/log_line_clean` **+4.4%**,
+  `mostly_clean_one_quote` **+5.3%**, `invalid_utf8_one_byte` +5.3%) *despite
+  executing far fewer instructions*: NEON spreads its eight vector ops over two
+  vector pipes, where predicate ops serialize on one. The fix folds the two range
+  halves into one compare — the widened predicate wants "not in [0x20, 0x7f]", and
+  subtracting the low end makes that a single unsigned test, `(c - 0x20) >= 0x60`,
+  true for exactly `0x00-0x1f` (which wrap to `0xe0-0xff`) and `0x80-0xff` — so a
+  `SUB` (an ordinary *vector* op) plus a `CMPHS` replace the `CMPLO`/`CMPLT` pair
+  and the `ORR` joining them: **five predicate ops become three**, and every one of
+  those regressions turned into a −2…−22% win. When adding to an SVE loop here,
+  count predicate ops, not instructions.
+
+  **Two facts that make this safe, both verified rather than assumed.** *Predicate
+  registers survive.* `runtime.asyncPreempt` saves `V0-V31` and knows nothing of
+  `P0-P15`, so a goroutine switch mid-body would lose them — but hand-written
+  assembly is **never an async safe point**: `isAsyncSafePoint` returns false for
+  any frame with `abi.FuncFlagAsm` set ("This is assembly code. Don't assume it's
+  well-formed."). The only interruption a leaf asm body can take is a signal,
+  across which the kernel saves and restores the full SVE state, so no predicate
+  value outlives a context the kernel restores. (At VL=128 the `Z` registers *are*
+  the `V` registers, so the vector half is covered by `asyncPreempt` anyway; the
+  argument above is what covers a wider implementation.) *The encodings are
+  derived, not pasted.* The Go assembler has no SVE mnemonics (checked on Go
+  1.26), so these instructions are `WORD` constants — unreviewable by eye, and one
+  wrong nibble assembles, links and runs as a different instruction. So the
+  mnemonic in the comment is the source of truth and `internal/sveasm` derives the
+  constant from it with GNU `as`: `make sveasm` rewrites, `make sveasm-check` is
+  the CI gate (wired into ci.yml on both arches, which install
+  binutils-aarch64-linux-gnu on amd64 — the tool prefers the cross-assembler so
+  the gate is not arm64-only). It caught real drift while being written: the first
+  version's regexp excluded `/` and so silently skipped 19 of 41 lines, every one
+  of them a predicate operand (`p1/z`).
+
+  Locked by `TestIndexVariantsFlip` and `TestIndexArm64Lengths`
+  (`simd_arm64_test.go`), which drive **both** bodies on one machine by flipping
+  `useSVE2` — the live-flag tests only ever exercise whichever body the host
+  selects, so without this the NEON routines would go untested on an SVE2 core and
+  the SVE2 ones cannot run at all elsewhere. Sabotage-verified: `BRKB`→`BRKA` (the
+  off-by-one in position recovery) and `MATCH`'s `z1.b`→`z2.b` (half the character
+  class) are both caught immediately.
+
+  **What SVE2 does NOT help, sized and skipped:** the `skipBlocksNEON` container
+  loop needs per-class 64-bit *bitmaps*, and SVE has no cheap predicate→GP
+  extraction before SVE2.1's `PMOV`. The alternative — `STR` the predicate to the
+  stack and reload it — is four 2-byte stores feeding one 8-byte load, which
+  cannot store-forward on any core and would stall on the loop-carried
+  depth/escape/in-string chain, the same trade already rejected for the `VMOV`s
+  there. `SkipWSRun` is likewise untouched: it is an *inlinable* Go function and
+  any call inside it (SVE needs one) pushes it past the budget, which is exactly
+  how the recorded SSE2 whitespace attempt regressed.
 - **SIMD in-string-mask container skip** (`skipfast.go` + `skipfast_amd64.s` /
   `skipfast_arm64.s`, the sonic-rs `skip_container` / JSONSki technique). `SkipValue`
   used to land on each structural byte with `indexStructural` and call `SkipString`
@@ -1554,6 +1667,12 @@ no regressions.)
   path only adds latency. Confirms the existing "arm64 string scanner is latency-
   bound and resists mask-reduction" finding; the string_unicode lag is **intrinsic**
   (NEON 16-byte vs AVX2 32-byte compare width), not closable in the block body.
+  **Scope correction (2026-08-14):** "intrinsic" was right about *NEON* and wrong
+  as a claim about arm64. The lag is closable — just not with NEON: the SVE2
+  scanners below cut string_unicode **−12.3%** on a Neoverse N2, because SVE
+  attacks the two things this experiment could not (the scalar tail, and the
+  per-block instruction count) instead of the `VMOV` traffic it wrongly blamed.
+  The NEON verdict stands for cores without SVE2 (Apple M-series, N1/V1).
 - **Key interning / map presizing in the dynamic `any` decoder**
   (`decodeAnyObject`, the `DecodeValue`/`json.DecodeAny` path): twitterescaped's
   `DecodeAny` is bound by building `map[string]any` — `mapassign` plus bucket
@@ -1659,6 +1778,14 @@ no regressions.)
   there) and read ~flat. Implemented as a per-case source duplicate, **not** a
   generator twin (a `-inplace-twin` flag emitting a second `UnmarshalJSONInPlace`
   method was prototyped and dropped in favour of the simpler duplicate).
+- **After touching any SVE instruction in `simd_arm64.s`, run `make sveasm`.**
+  Those instructions are `WORD` constants (the Go assembler has no SVE mnemonics),
+  and the mnemonic in the trailing comment — not the hex — is the source of truth:
+  `internal/sveasm` assembles the comments with GNU `as` and rewrites the
+  constants from them. Write a new instruction as `WORD $0x00000000 // <mnemonic>`
+  and let `make sveasm` fill it in; never hand-compute an encoding. `make
+  sveasm-check` is the gate (CI runs it on both arches). A second `//` in the
+  comment starts prose and is preserved: `// match p2.b, p1/z, z0.b, z1.b // why`.
 - End-of-session: run the full suite (`go test ./...`), keep gofmt clean
   (the `daysFromCivil` comment-alignment flag is pre-existing — ignore it),
   and regenerate the committed benchmark markdown via `make bench-md`. That runs
@@ -1750,8 +1877,11 @@ mechanism has now usually been re-checked here, and the notable outcomes are:
   `GOARCH=arm64 go vet`'s asmdecl.
 - **Still-open lever, re-confirmed closed by the toolchain**: `<ABIInternal>` is
   rejected outside `package runtime` on Go 1.26, so ~13 instructions of ABI
-  marshaling per scanner call remain unavoidable. That is the biggest single
-  remaining arm64 decode win and it is gated on a Go change, not on this repo.
+  marshaling per scanner call remain unavoidable. It is gated on a Go change, not
+  on this repo. (Called "the biggest single remaining arm64 decode win" here until
+  2026-08-14; SVE2 turned out to be bigger, and it was available all along on this
+  very box — see the next section. The ABI cost is still there, now a *larger*
+  share of a shorter function.)
 
 ## Session 2026-08 fixes worth knowing (correctness/API)
 

@@ -1,5 +1,15 @@
 package unstable
 
+// The arm64 SVE2 scanners spell their instructions as WORD constants, because
+// the Go assembler has no SVE mnemonics; internal/sveasm regenerates those
+// constants from the mnemonics written in their comments. The directive lives
+// here rather than in simd_arm64.go so that `go generate ./...` reaches it from
+// any host — the tool prefers the aarch64 cross-assembler and so is not itself
+// arm64-only, whereas a directive inside a `//go:build arm64` file would be
+// skipped everywhere else. `make sveasm-check` is the gate; see the Makefile.
+//
+//go:generate go run ../../internal/sveasm -w simd_arm64.s
+
 // This file holds the exported, inlinable wrappers over the per-architecture
 // SIMD scanners (defined in simd_amd64.go / simd_arm64.go, with simd_scalar.go
 // dispatching every other architecture to the generic implementations in

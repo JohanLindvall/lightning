@@ -475,3 +475,251 @@ eunotfound:
 eutfound:
 	MOVD R2, ret+24(FP)
 	RET
+
+// ---------------------------------------------------------------------------
+// SVE2 scanners.
+//
+// The routines above are the NEON baseline, which every arm64 CPU can run. On a
+// core that also implements SVE2 (Neoverse N2/V2, Graviton4, ...) the three hot
+// string scanners take an SVE2 body instead, selected by the useSVE2 flag read
+// at the top of each entry point below. Three properties of SVE make that body
+// strictly shorter than the NEON one — this is instruction removal, which is
+// what the N2 measurements say these scanners are bound by (IPC 3.49 with a
+// 0.057% branch-miss rate: issue-bound, not mispredict-bound):
+//
+//  1. PREDICATION REMOVES THE TAIL. WHILELO builds a predicate covering only the
+//     bytes actually left, and an SVE load never touches memory for an inactive
+//     lane. One loop body therefore handles the short buffer, the full blocks and
+//     the ragged final block alike: the NEON form's `CMP $16` head test, its
+//     scalar byte tail and its separate short-input entry all disappear, along
+//     with the branches that pick between them.
+//
+//  2. MATCH DOES A WHOLE CHARACTER CLASS IN ONE OP. SVE2's MATCH compares every
+//     byte of the data against ALL SIXTEEN bytes of the corresponding 128-bit
+//     segment of its second operand, so a set of up to 16 target bytes costs one
+//     instruction: two VCMEQ plus a VORR collapse to one MATCH, and for the
+//     structural set simdjson's whole shuffle trick (VAND, VTBL, VUSHR, VTBL,
+//     VAND — five ops and a 48-byte RODATA load) collapses to the same one.
+//
+//  3. THE RESULT NEVER LEAVES THE VECTOR DOMAIN. MATCH — and CMPLO/CMPLT/ORRS —
+//     set NZCV directly, so "did this block match" is a plain branch rather than
+//     NEON's two VMOV cross-domain moves feeding two CBNZs. Position recovery is
+//     BRKB (the lanes before the first true) plus INCP (add their count to the
+//     offset): one cross-domain transfer instead of two, no RBIT/CLZ/LSR bit
+//     arithmetic, and the two half-block recovery paths fold into one because
+//     BRKB counts across the whole vector.
+//
+// The bodies are VECTOR-LENGTH AGNOSTIC: WHILELO sizes the predicate, INCB
+// advances by however many bytes a vector holds, INCP counts lanes. The same
+// code therefore scans 16 bytes per block on a 128-bit implementation (N2) and
+// 32 or 64 on a wider one, with no change and no re-verification. MATCH's
+// per-segment semantics are why each match set must hold the target bytes in
+// EVERY 128-bit segment; TRN1-of-two-DUPs and LD1RQB (load-and-replicate-quad)
+// both do that by construction, at any vector length.
+//
+// WHY THE FEATURE GATE IS HERE AND NOT IN GO. The natural spelling is an `if
+// useSVE2` in the Go dispatch wrapper, but that gives the wrapper two calls,
+// which costs 124 against the inliner's budget of 80 — indexCloseOrEscape stops
+// inlining into ReadKey/ReadStringOrNull/SkipString/decodeEscaped and every
+// generated decoder, the regression CLAUDE.md records as worth ~5% on cloudflare
+// when it was fixed in the other direction. Reading the flag in assembly keeps
+// the Go side a single unconditional call (cost 61, still inlined) and costs the
+// SVE2 path three instructions: an ADRP+LDRB pair independent of the argument
+// setup, and a perfectly-predicted not-taken CBZ. Non-SVE2 cores pay those three
+// plus one taken branch into the unchanged NEON routine. Same shape as the
+// amd64 side, which reads ·useAVX2(SB) inside simd_amd64.s for the same reason.
+//
+// The Go assembler has no SVE mnemonics (checked on Go 1.26), so the SVE
+// instructions are emitted as WORD constants. Every encoding below was produced
+// by GNU as 2.42 from the mnemonic in the trailing comment, and `objdump -d` of
+// the built archive is what re-checks that they landed as intended; the
+// differential tests (TestIndexVariantsFlip, TestIndexFunctionsMatchScalar) pin
+// the behaviour. Control flow stays in ordinary Go asm: SVE's condition aliases
+// are just NZCV, so ANY is NE and NONE is EQ, and BNE/BEQ read them directly.
+//
+// Async preemption cannot fire inside hand-written assembly — isAsyncSafePoint
+// rejects any frame with abi.FuncFlagAsm set — so no goroutine switch can happen
+// between these instructions. That is what makes predicate registers safe here:
+// runtime.asyncPreempt saves V0-V31 but knows nothing of P0-P15, so a preemption
+// mid-body would be the one way to lose them. The only interruption a leaf asm
+// body can take is a signal, across which the kernel saves and restores the full
+// SVE state, and no predicate value outlives such a context.
+
+// The structural match set: one 128-bit quad holding '{', '}', '[' and ']' with
+// the remaining lanes filled with '"'. LD1RQB replicates it into every segment.
+// Bytes: 7b 7d 5b 5d 22 22 22 22 | 22 22 22 22 22 22 22 22
+DATA sveStructSet<>+0(SB)/8, $0x222222225d5b7d7b
+DATA sveStructSet<>+8(SB)/8, $0x2222222222222222
+GLOBL sveStructSet<>(SB), RODATA|NOPTR, $16
+
+// func indexQuoteOrBackslashArm64(b []byte) int
+//
+// The arm64 entry point for the '"'-or-'\\' scan: index of the first such byte,
+// or len(b). Runs the SVE2 body below on an SVE2 core and tail-calls the NEON
+// routine otherwise. The match set is built in-register as alternating '"'/'\\'
+// bytes, so there is no table and no memory operand on the critical path.
+TEXT ·indexQuoteOrBackslashArm64(SB), NOSPLIT, $0-32
+	MOVBU ·useSVE2(SB), R9
+	CBZ   R9, qbNEON
+	MOVD  b_base+0(FP), R0
+	MOVD  b_len+8(FP), R1
+	WORD $0x2538c441 // mov z1.b, #34 // '"'
+	WORD $0x2538cb82 // mov z2.b, #92 // '\\'
+	WORD $0x05227021 // trn1 z1.b, z1.b, z2.b // -> 22 5c 22 5c ... per segment
+	MOVD  ZR, R2
+
+qbLoop:
+	WORD $0x25211c41 // whilelo p1.b, x2, x1 // active lanes = min(VL, len-x2)
+	BEQ  qbNone      // b.none: the offset reached the end
+	WORD $0xa4024400 // ld1b {z0.b}, p1/z, [x0, x2]
+	WORD $0x45218402 // match p2.b, p1/z, z0.b, z1.b
+	BNE  qbFound     // b.any
+	WORD $0x0430e3e2 // incb x2
+	B    qbLoop
+
+qbFound:
+	WORD $0x25904443 // brkb p3.b, p1/z, p2.b // lanes before the first match
+	WORD $0x252c8862 // incp x2, p3.b // x2 += how many there were
+	MOVD R2, ret+24(FP)
+	RET
+
+qbNone:
+	MOVD R1, ret+24(FP)
+	RET
+
+qbNEON:
+	B ·indexQuoteOrBackslashNEON(SB) // args are already in place at FP
+
+// func indexEscapeArm64(b []byte) int
+//
+// The arm64 entry point for the escape scan: first '"', '\\' or control byte
+// < 0x20, or len(b). The control-byte half is one unsigned CMPLO against #32,
+// where NEON needs a VUMIN and a VCMEQ.
+TEXT ·indexEscapeArm64(SB), NOSPLIT, $0-32
+	MOVBU ·useSVE2(SB), R9
+	CBZ   R9, esNEON
+	MOVD  b_base+0(FP), R0
+	MOVD  b_len+8(FP), R1
+	WORD $0x2538c441 // mov z1.b, #34
+	WORD $0x2538cb82 // mov z2.b, #92
+	WORD $0x05227021 // trn1 z1.b, z1.b, z2.b
+	MOVD  ZR, R2
+
+esLoop:
+	WORD $0x25211c41 // whilelo p1.b, x2, x1
+	BEQ  esNone
+	WORD $0xa4024400 // ld1b {z0.b}, p1/z, [x0, x2]
+	WORD $0x45218402 // match p2.b, p1/z, z0.b, z1.b
+	WORD $0x24282403 // cmplo p3.b, p1/z, z0.b, #32 // unsigned <, i.e. <= 0x1f
+	WORD $0x25c34442 // orrs p2.b, p1/z, p2.b, p3.b
+	BNE  esFound
+	WORD $0x0430e3e2 // incb x2
+	B    esLoop
+
+esFound:
+	WORD $0x25904443 // brkb p3.b, p1/z, p2.b
+	WORD $0x252c8862 // incp x2, p3.b
+	MOVD R2, ret+24(FP)
+	RET
+
+esNone:
+	MOVD R1, ret+24(FP)
+	RET
+
+esNEON:
+	B ·indexEscapeNEON(SB)
+
+// func indexEscapeNonASCIIArm64(b []byte) int
+//
+// The arm64 entry point for the widened escape scan: indexEscapeArm64's
+// predicate plus non-ASCII bytes.
+//
+// The two range halves are folded into ONE compare. What the widened predicate
+// wants is "the byte is not in [0x20, 0x7f]" — a control byte below that range
+// or a non-ASCII byte above it — and subtracting the low end turns the interval
+// into a single unsigned test: (c - 0x20) >= 0x60 holds for exactly 0x00-0x1f
+// (which wrap to 0xe0-0xff) and 0x80-0xff (which land on 0x60-0xdf), and fails
+// for the printable ASCII between them. So a SUB and a CMPHS replace the
+// separate CMPLO/CMPLT pair and the ORR that joined them.
+//
+// That is worth more than the one instruction it saves, because the two it
+// removes are PREDICATE ops while the one it adds is an ordinary vector op, and
+// predicate issue is this loop's limit on N2. The first version of this routine
+// — MATCH, CMPLO, ORR, CMPLT, ORRS, five predicate ops per block — was the one
+// scanner of the four that LOST to NEON on long clean runs (EscapeString
+// log_line_clean +4.4%, mostly_clean_one_quote +5.3%) despite executing fewer
+// instructions in total: NEON spreads its eight vector ops over two vector
+// pipes, where predicate ops serialize on one. At three predicate ops the long
+// runs come back. SUB is unpredicated, so it also computes on the lanes the
+// zeroing load left at zero; harmless, because CMPHS is predicated and those
+// lanes cannot reach the result.
+TEXT ·indexEscapeNonASCIIArm64(SB), NOSPLIT, $0-32
+	MOVBU ·useSVE2(SB), R9
+	CBZ   R9, euNEON
+	MOVD  b_base+0(FP), R0
+	MOVD  b_len+8(FP), R1
+	WORD $0x2538c441 // mov z1.b, #34
+	WORD $0x2538cb82 // mov z2.b, #92
+	WORD $0x05227021 // trn1 z1.b, z1.b, z2.b
+	WORD $0x2538c403 // mov z3.b, #32 // the interval's low end
+	MOVD  ZR, R2
+
+euLoop:
+	WORD $0x25211c41 // whilelo p1.b, x2, x1
+	BEQ  euNone
+	WORD $0xa4024400 // ld1b {z0.b}, p1/z, [x0, x2]
+	WORD $0x45218402 // match p2.b, p1/z, z0.b, z1.b
+	WORD $0x04230404 // sub z4.b, z0.b, z3.b
+	WORD $0x24380483 // cmphs p3.b, p1/z, z4.b, #96 // outside [0x20, 0x7f]
+	WORD $0x25c34442 // orrs p2.b, p1/z, p2.b, p3.b
+	BNE  euFound
+	WORD $0x0430e3e2 // incb x2
+	B    euLoop
+
+euFound:
+	WORD $0x25904443 // brkb p3.b, p1/z, p2.b
+	WORD $0x252c8862 // incp x2, p3.b
+	MOVD R2, ret+24(FP)
+	RET
+
+euNone:
+	MOVD R1, ret+24(FP)
+	RET
+
+euNEON:
+	B ·indexEscapeNonASCIINEON(SB)
+
+// func indexStructuralSVE2(b []byte) int
+//
+// SVE2 twin of indexStructuralNEON: first '{', '}', '[', ']' or '"', or len(b).
+// All five bytes live in one MATCH. Unlike the three scanners above this one is
+// reached through a Go-level `if useSVE2` rather than an in-assembly gate: its
+// dispatcher (indexStructural) already carries a length test and a 16-byte
+// scalar prescan, so it is far past the inline budget either way and the branch
+// costs nothing there.
+TEXT ·indexStructuralSVE2(SB), NOSPLIT, $0-32
+	MOVD b_base+0(FP), R0
+	MOVD b_len+8(FP), R1
+	MOVD $sveStructSet<>(SB), R3
+	WORD $0x2518e3e0 // ptrue p0.b
+	WORD $0xa4002061 // ld1rqb {z1.b}, p0/z, [x3] // 16 bytes -> every segment
+	MOVD ZR, R2
+
+stLoop:
+	WORD $0x25211c41 // whilelo p1.b, x2, x1
+	BEQ  stNone
+	WORD $0xa4024400 // ld1b {z0.b}, p1/z, [x0, x2]
+	WORD $0x45218402 // match p2.b, p1/z, z0.b, z1.b
+	BNE  stFound
+	WORD $0x0430e3e2 // incb x2
+	B    stLoop
+
+stFound:
+	WORD $0x25904443 // brkb p3.b, p1/z, p2.b
+	WORD $0x252c8862 // incp x2, p3.b
+	MOVD R2, ret+24(FP)
+	RET
+
+stNone:
+	MOVD R1, ret+24(FP)
+	RET
