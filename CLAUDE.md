@@ -1414,6 +1414,33 @@ no regressions.)
   they cost ~nothing. The readKey/StripDefaults inline trick pays where the
   inline path *skips work* (no-escape key alias, WS fast path), not where it
   merely removes a call around identical work.
+
+  **Re-tried from the other end on Neoverse N2 (2026-08-14) and still rejected —
+  and this run explains the mechanism the entry above only named.** The variant
+  was the cheap half: move the no-escape close-quote scan into `SkipValue`'s `'"'`
+  case *in Go* (one site, no generated-code bloat, so none of the i-cache/layout
+  cost the version above paid), splitting `SkipString`'s loop into a
+  `skipStringBody` entered past the opening quote so an escaped string **resumes**
+  there instead of rescanning. It saves exactly one frame per skipped string.
+  Motivated by a post-SVE2 N2 profile that looked damning: `SkipString` **9.5%
+  flat** while driving only ~6% of actual scanning, a 1.6:1 ratio that reads as
+  pure frame overhead. Interleaved A/B (n=10, pinned N2): **flat on every case** —
+  cloudflare p=0.117, citm p=0.579, skip-heavy p=0.591, string_unicode p=0.158,
+  golang_source p=0.436, twitter p=0.529 — with synthea_fhir **+1.17%**. Reverted.
+
+  **Why the 9.5% is not frame overhead, which is the reusable part:**
+  `indexCloseOrEscape` *inlines into* `SkipString`, so the ABI marshaling around
+  the assembly call — the argument stores, the result load — is attributed to
+  `SkipString`, not to `indexQuoteOrBackslashArm64`. That marshaling is the bulk
+  of the 9.5%, and moving the block to `SkipValue` does not remove a byte of it;
+  it only removes `SkipString`'s own prologue/epilogue, which is what measured as
+  nothing. So a Go function that wraps an inlined asm call **always** carries a
+  flat share that looks like removable overhead and is not — the only way to
+  remove it is a register ABI, which `<ABIInternal>` blocks. Check whether a hot
+  Go function's flat time is really its own instructions before costing a frame
+  removal from it. Note this also settles the open question in the entry above:
+  the M2 result was **not** an M-class-OoO artifact, since a narrow server core
+  reproduces it.
 - **The readKey inline trick in pkg/json's `get.go`** (`getMany`/`walkPaths`/
   `objectEach`/`objectField` pay a non-inlined `unstable.ReadKey`, cost 212, per
   member; `SkipWS`/`SkipWSCompact`/`IndexCloseOrEscape` already inline there).
@@ -1786,6 +1813,16 @@ no regressions.)
   and let `make sveasm` fill it in; never hand-compute an encoding. `make
   sveasm-check` is the gate (CI runs it on both arches). A second `//` in the
   comment starts prose and is preserved: `// match p2.b, p1/z, z0.b, z1.b // why`.
+- **The committed `bench/*_arm64.md` tables do not show the SVE2 path**, and were
+  deliberately not regenerated when it landed (2026-08-14). They carry
+  "cpu: unknown (4 cores)" and so come from a different host than the 2-core
+  Neoverse N2 the SVE2 work was measured on; overwriting them here would mix
+  machines within one per-arch table, which is the thing the per-arch split
+  exists to prevent. Whether a regenerated table shows the SVE2 numbers depends
+  entirely on whether the host implements SVE2 — a NEON-only arm64 runner
+  produces the same numbers as before. So read those tables as "arm64, some
+  host", and take the SVE2 deltas from the interleaved A/B in the SVE2 entry
+  above, not from them.
 - End-of-session: run the full suite (`go test ./...`), keep gofmt clean
   (the `daysFromCivil` comment-alignment flag is pre-existing — ignore it),
   and regenerate the committed benchmark markdown via `make bench-md`. That runs
