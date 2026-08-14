@@ -880,7 +880,8 @@ UTF-8 encoding, not the `\ufffd` escape):
   the two directions differ — `UnescapeStringInto` takes `out == in[:0]` precisely
   because unescaping only shrinks.)
 
-Clean runs are skipped with a vectorized scan (`indexEscapeSSE2`/`indexEscapeNEON`,
+Clean runs are skipped with a vectorized scan (`indexEscapeSSE2` on amd64,
+`indexEscapeNEON` or an SVE2 body on arm64 — see [SIMD scanning](#simd-scanning) —
 which classify `"`, `\` and control bytes in one pass), so a string needing little
 or no escaping costs roughly one `memcpy`. The scanner is chosen per run by how
 much input is left: a run shorter than 48 bytes — every short string, and every
@@ -1078,7 +1079,8 @@ functions are untouched, so code that doesn't call these pays nothing for them.
 
 Several hot scan loops use a single vectorized pass instead of byte-at-a-time
 work, with kernels in `pkg/unstable/simd_{amd64,arm64}.s` and
-`pkg/unstable/skipfast_{amd64,arm64}.s` (arm64 uses NEON/ASIMD, amd64 SSE2/AVX2):
+`pkg/unstable/skipfast_{amd64,arm64}.s` (amd64 uses SSE2/AVX2/AVX-512, arm64
+NEON/ASIMD, plus **SVE2** where the core has it):
 
 - **next `"` or `\` in a string** — replaces two `bytes.IndexByte` scans; speeds
   up string-heavy payloads. On amd64 it uses SSE2 (16-byte vectors, two compares
@@ -1115,11 +1117,29 @@ each architecture's **baseline, mandatory** vector ISA — no runtime gate:
   CPU has it (Go itself requires it); the string scanner uses it directly.
 - **arm64 requires NEON / Advanced SIMD (ASIMD).** ASIMD is mandatory in the
   ARMv8-A baseline that Go targets, so every arm64 CPU has it; the string scanner
-  uses it directly. (This unconditional call is also what lets the dispatch
-  inline into its callers.)
+  uses it directly. The Go-side call stays unconditional even where SVE2 is used
+  (the choice is made in the assembly), which is what lets the dispatch inline
+  into its callers.
 
-The **optional** features are all on amd64 and all runtime-detected via
-`golang.org/x/sys/cpu`:
+The **optional** features are runtime-detected via `golang.org/x/sys/cpu`. On
+arm64 there is one:
+
+- **SVE2**, on cores that have it (Neoverse N2/V2, Graviton4 and later; not Apple
+  M-series or Neoverse N1/V1), replaces the NEON body of all four scanners with a
+  shorter one. `WHILELO` predication covers the ragged end of the buffer, so the
+  scalar tail loop and the short-input entry disappear entirely; SVE2's `MATCH`
+  tests a whole character class of up to 16 bytes in one instruction (it replaces
+  two compares and an OR in the string scanner, and the entire five-op nibble
+  shuffle in the structural one); and because `MATCH` sets the condition flags
+  directly, the two cross-domain moves NEON needs to test a block are gone. The
+  bodies are vector-length agnostic, so a 256-bit implementation scans 32 bytes
+  per block with the same code. Measured on a Neoverse N2: **−8…−12% end-to-end
+  on string-heavy documents** (cloudflare, string_unicode), −2…−4% on the rest,
+  and −34% on skipping a scalar array. The feature check is made inside the
+  assembly rather than in Go, so the dispatch stays a single call and keeps
+  inlining into its callers.
+
+And on amd64:
 
 - **AVX2** drives the structural-byte scanner and the whole-container skip. Without
   it the structural scan falls back to scalar code and `SkipValue` stays on the
@@ -1130,9 +1150,11 @@ The **optional** features are all on amd64 and all runtime-detected via
   carryless multiply for the in-string prefix XOR. All three are universally
   present alongside AVX2; the gate is a correctness belt, not a real branch.
 
-On arm64 everything uses NEON directly, with no gate. Inputs shorter than the
-vector width, and platforms other than amd64/arm64, take the scalar
-(`bytes.IndexByte`-based) path.
+On arm64 the NEON path needs no gate and is always available; SVE2 only ever
+replaces a NEON body with a faster one, so the answers are identical either way
+(a differential test drives both bodies against a scalar oracle on the same
+machine). Inputs shorter than the vector width, and platforms other than
+amd64/arm64, take the scalar (`bytes.IndexByte`-based) path.
 
 Behavior is identical across every path, and that is tested rather than assumed:
 each primitive is fuzzed against a scalar reference, `SkipValue`/decode round-trips

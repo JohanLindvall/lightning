@@ -1,5 +1,15 @@
 package unstable
 
+// The arm64 SVE2 scanners spell their instructions as WORD constants, because
+// the Go assembler has no SVE mnemonics; internal/sveasm regenerates those
+// constants from the mnemonics written in their comments. The directive lives
+// here rather than in simd_arm64.go so that `go generate ./...` reaches it from
+// any host — the tool prefers the aarch64 cross-assembler and so is not itself
+// arm64-only, whereas a directive inside a `//go:build arm64` file would be
+// skipped everywhere else. `make sveasm-check` is the gate; see the Makefile.
+//
+//go:generate go run ../../internal/sveasm -w simd_arm64.s
+
 // This file holds the exported, inlinable wrappers over the per-architecture
 // SIMD scanners (defined in simd_amd64.go / simd_arm64.go, with simd_scalar.go
 // dispatching every other architecture to the generic implementations in
@@ -16,8 +26,8 @@ func IndexCloseOrEscape(b []byte) int { return indexCloseOrEscape(b) }
 // IndexEscape returns the index of the first byte that JSON string encoding must
 // escape — a control byte < 0x20, '"' or '\\' — or len(b) if none. It is the
 // scan behind EscapeString/EscapeStringInto: a clean run is copied out in bulk and
-// only the escape byte at the returned index is expanded. SIMD (SSE2/AVX2) on
-// amd64, SWAR elsewhere.
+// only the escape byte at the returned index is expanded. SIMD on amd64
+// (SSE2/AVX2) and arm64 (NEON, or SVE2 where the core has it); SWAR elsewhere.
 func IndexEscape(b []byte) int { return indexEscape(b) }
 
 // IndexEscapeNonASCII returns the index of the first byte that is either one

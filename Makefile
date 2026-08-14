@@ -1,4 +1,4 @@
-.PHONY: all download check bench bench-md update-tools fix test generate vet fmt-check bench-test
+.PHONY: all download check lint bench bench-md update-tools fix test generate vet fmt-check bench-test sveasm sveasm-check
 
 GOPATH := $(shell go env GOPATH)
 GOBIN := $(GOPATH)/bin
@@ -11,8 +11,19 @@ all: fix check
 download: go.mod go.sum
 	go mod download
 
-check: $(GOBIN)/golangci-lint test
-	golangci-lint run ./...
+check: lint test
+
+# Lint BOTH architectures, for the same reason `vet` does. The premise this
+# target used to rest on — that static analysis is architecture-independent and
+# so needs one run — is false wherever a package has per-arch files: `unused`
+# only sees the files selected by the build tags, so a Go declaration reachable
+# only from the *other* architecture's code reads as dead. The concrete case is
+# pkg/unstable/simd_arm64.go, whose NEON routines are tail-called from the SVE2
+# entry points in assembly; linting only amd64 never compiles that file at all.
+# golangci-lint honours GOARCH, so both passes run on either host.
+lint: $(GOBIN)/golangci-lint
+	GOARCH=amd64 golangci-lint run ./...
+	GOARCH=arm64 golangci-lint run ./...
 
 test: conformance/data_unmarshal.go
 	go test -cover ./...
@@ -58,6 +69,30 @@ fmt-check:
 		echo "$$unformatted"; \
 		exit 1; \
 	fi
+
+# Regenerate the hand-encoded SVE instructions in the arm64 assembly from the
+# mnemonics in their comments. The Go assembler has no SVE mnemonics (Go 1.26),
+# so pkg/unstable's SVE2 scanners spell those instructions as WORD constants —
+# and a bare 32-bit constant is unreviewable: one wrong nibble is a different
+# instruction that still assembles, links and runs. So the mnemonic is the source
+# of truth and the constant is derived from it by internal/sveasm, which
+# assembles the comments with the GNU assembler.
+#
+# Run this after editing any SVE instruction; sveasm-check below is the gate that
+# fails if the two ever drift apart. Needs an aarch64 assembler: binutils on an
+# arm64 host, or binutils-aarch64-linux-gnu (the cross-assembler) on any host —
+# the tool prefers the cross one so the check also runs on amd64.
+SVEASM_FILES = pkg/unstable/simd_arm64.s
+
+sveasm:
+	go run ./internal/sveasm -w $(SVEASM_FILES)
+
+# The CI gate for the above. Kept out of `check` for the same reason `vet` and
+# `fmt-check` are: it needs a tool a contributor may not have installed, so it is
+# a separate target CI wires up explicitly (see .github/workflows/ci.yml), rather
+# than a hidden prerequisite that breaks an unrelated local build.
+sveasm-check:
+	go run ./internal/sveasm $(SVEASM_FILES)
 
 # Compile and run the bench module's own tests. bench/ is a separate module, so
 # `make test`'s `go test ./...` cannot reach it, and both benchmark runners enter
