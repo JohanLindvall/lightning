@@ -38,7 +38,7 @@ func SwarNeedsEscape(v uint64) uint64 {
 func indexEscapeScalar(b []byte) int {
 	i := 0
 	for ; i+8 <= len(b); i += 8 {
-		v := binary.LittleEndian.Uint64(b[i:])
+		v := binary.LittleEndian.Uint64(b[i : i+8])
 		if SwarNeedsEscape(v) != 0 {
 			break
 		}
@@ -79,7 +79,7 @@ func SwarNeedsEscapeOrNonASCII(v uint64) uint64 {
 func indexEscapeNonASCIIScalar(b []byte) int {
 	i := 0
 	for ; i+8 <= len(b); i += 8 {
-		v := binary.LittleEndian.Uint64(b[i:])
+		v := binary.LittleEndian.Uint64(b[i : i+8])
 		if SwarNeedsEscapeOrNonASCII(v) != 0 {
 			break
 		}

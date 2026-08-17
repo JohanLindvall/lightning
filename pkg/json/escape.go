@@ -102,7 +102,7 @@ func EscapeStringInto(s []byte, out []byte) []byte {
 		// Find the next byte to escape or non-ASCII byte; scanner choice per run
 		// as in escapeValidInto (see minVectorRun there).
 		if n-i >= minVectorRun {
-			v := binary.LittleEndian.Uint64(s[i:])
+			v := binary.LittleEndian.Uint64(s[i : i+8])
 			if m := unstable.SwarNeedsEscapeOrNonASCII(v); m != 0 {
 				i += bits.TrailingZeros64(m) >> 3
 			} else {
@@ -110,7 +110,7 @@ func EscapeStringInto(s []byte, out []byte) []byte {
 			}
 		} else {
 			for i+8 <= n {
-				v := binary.LittleEndian.Uint64(s[i:])
+				v := binary.LittleEndian.Uint64(s[i : i+8])
 				if m := unstable.SwarNeedsEscapeOrNonASCII(v); m != 0 {
 					i += bits.TrailingZeros64(m) >> 3
 					break
@@ -194,7 +194,7 @@ func escapeValidInto(s []byte, out []byte) []byte {
 		// left in the run — decided once per run, so there is no per-word bookkeeping
 		// to tax the common short/escape-dense cases (see minVectorRun).
 		if n-i >= minVectorRun {
-			v := binary.LittleEndian.Uint64(s[i:])
+			v := binary.LittleEndian.Uint64(s[i : i+8])
 			if m := unstable.SwarNeedsEscape(v); m != 0 {
 				i += bits.TrailingZeros64(m) >> 3
 			} else {
@@ -202,7 +202,7 @@ func escapeValidInto(s []byte, out []byte) []byte {
 			}
 		} else {
 			for i+8 <= n {
-				v := binary.LittleEndian.Uint64(s[i:])
+				v := binary.LittleEndian.Uint64(s[i : i+8])
 				if m := unstable.SwarNeedsEscape(v); m != 0 {
 					i += bits.TrailingZeros64(m) >> 3
 					break
