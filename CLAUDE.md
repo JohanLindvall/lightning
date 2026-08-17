@@ -100,6 +100,30 @@ byte-identical when adding cold paths; push new logic out-of-line.
   overhead is diluted by the surrounding string/object work. citm_catalog is flat
   despite the most 9-digit IDs: its bottleneck is key reading and map building, not
   int parsing.
+
+  **The digit step is one function, `tryParse4Digits`, not `is4Digits` followed
+  by `parse4Digits` (2026-08-17).** Every SWAR fold here — both readers above,
+  batch.go's four array readers, and `scanFloat`'s fraction loop — used to test
+  and then fold, and the split paid for its constants twice: `is4Digits`'
+  `0x06060606` (an `ADD` operand) and `0x33333333` (a `CMP` operand) are not
+  AArch64 bitmask immediates, so each cost a `MOVD` plus three `MOVK`s **inside
+  the loop and again on the back edge**, and `parse4Digits` then materialised
+  `0x30303030` for a subtraction of its own. Deciding on the SAME
+  `d = w - 0x30303030` the fold already needs removes one constant outright and
+  trades the other two for one: `(d | (d + 0x76767676)) & 0x80808080 != 0` is the
+  classic packed-digit test — a byte below '0' wraps `d` to ≥ 0xd0 so its own top
+  bit flags it, and adding 0x76 pushes anything in 0x0a..0x7f into the top bit
+  while a real digit reaches only 0x7f. It is **exactly** `is4Digits`, not an
+  approximation: a lane can only be disturbed by a carry out of the lane below,
+  and a carrying lane has already set its own flag, so the OR is nonzero either
+  way (the proof runs in both directions, and
+  `TestTryParse4DigitsMatchesIs4Digits` checks every digit-adjacent byte
+  combination plus 2M random words against both old functions, which are kept for
+  exactly that). Interleaved A/B (n=6): **numbers −5.4%, mesh −1.1%**, and citm /
+  golang_source / canada / large-json / twitter each −0.8…−1.4% but individually
+  inside the noise floor; geomean −1.1%, no regressions. Note `numbers` had gone
+  **+2.2%** on the scanner work two commits earlier and this more than takes it
+  back — a reminder that a case flat on one axis can be sensitive on another.
 - **Batched scalar-array readers** (`batch.go`: `DecodeFloat64Slice`, the generic
   `DecodeIntSlice`/`DecodeUintSlice`, and the fixed-size `DecodeFloat64Array`/
   `DecodeIntArray`/`DecodeUintArray`). The generated per-element loop paid a non-inlinable reader
@@ -386,6 +410,32 @@ byte-identical when adding cold paths; push new logic out-of-line.
   `pprof -disasm` piles on the second `CBNZ` is retirement skid, **not** a
   removable stall on the second cross-domain `VMOV` — proven by the failed
   experiment recorded in the rejected list below.
+- **The string scanner takes the scan START as an argument, not a `b[i:]`**
+  (`IndexCloseOrEscapeAt(data, i)` / `indexCloseOrEscapeAt`, backed by
+  `indexQuoteOrBackslashArm64(b []byte, i int)` and
+  `indexQuoteOrBackslashSSE2(b []byte, i int)`; `IndexCloseOrEscape(b)` remains as
+  `…At(b, 0)`). Every caller had the shape `k := IndexCloseOrEscape(data[i:])`
+  followed by arithmetic putting `i` back — and **that reslice is not free**. Go
+  lowers a slice expression to the len subtraction, the cap subtraction and a
+  negative-length clamp on the base pointer: **seven instructions**, in the
+  hottest loop of every generated decoder (once per object key) and inside
+  `ReadKey`/`ReadStringOrNull`/`ReadStringNoCopyOrNull`/
+  `ReadStringDestructiveOrNull`/`SkipString`/`decodeEscaped` (once per string
+  value and once per skipped string). It also *destroys* the registers holding
+  `len(data)`/`cap(data)`, which forces reloads in a wide decoder. Passing the
+  offset costs one more argument word and **nothing in the scan**: on arm64 `x2`
+  is the offset register the body already carries and merely starts at `i`
+  instead of zero; on amd64 `DI` likewise. The result is the ABSOLUTE index,
+  which is what every caller then wanted, so the `ks+k` additions go too.
+  Measured −20.7% on a key-read-shaped micro; end to end (interleaved ABBA, n=6):
+  **cloudflare-compact −9.5%, cloudflare-nocopy −9.0%, cloudflare −6.0%,
+  apache_builds −5.6%, string_unicode −5.1%, gsoc_2018 −4.2%**, twitter −3.8%,
+  update_center −3.6%, golang_source −3.5%, payload_large/github_events/
+  instruments −3.1%, large-json −2.7%, twitterescaped −2.6%, synthea −2.5%;
+  geomean **−2.7%**. The generated key read uses it via the `readKey` template, so
+  regenerating is required. **The matching change for the OTHER half of that line
+  — `UnsafeStr(data[ks:ke])` → an offset-taking `UnsafeStrRange` — was built and
+  rejected**; see the rejected list.
 - **Date parsing**: `daysFromCivilCached` uses a year-start-days table (built from
   `daysFromCivil`) for 1970–2261; falls back to the general algorithm otherwise.
   `parseRFC3339`'s fractional-seconds loop accumulates at most nine digits (bounded
@@ -432,6 +482,52 @@ byte-identical when adding cold paths; push new logic out-of-line.
   invalid_utf8_one_byte −18%; `EscapeString` sentence_clean −23%, log_line_clean
   −6.3%; geomean −7.1%, no case worse than +2.3% (`EscapeStringInto/unicode_clean`,
   which is dominated by its `utf8.Valid` pass).
+
+  **THE STEADY-STATE LOOP IS NOT PREDICATED — the WHILELO body is the tail, not
+  the loop (2026-08-17).** The first version of these bodies was the obvious one:
+  a single `WHILELO`-predicated block in a loop, which is what makes the ragged
+  end free. Measured on N2 it tops out at **23.6 GB/s, 2.3 cycles per 16-byte
+  block**, and the limit is the **predicate pipe** — `WHILELO` and `MATCH` are
+  both predicate ops issuing on the one M0 pipe, so two per block is two cycles
+  before anything else is counted. Predication earns its keep at the ragged end,
+  which happens once; paying for it every block is the mistake.
+  So the two bodies that cost ONE predicate op per block
+  (`indexQuoteOrBackslashArm64`, `indexStructuralSVE2`) are **staged**: two
+  unpredicated single blocks under a hoisted `PTRUE`, then one peeled two-vector
+  step, then a **four-vector loop**, with `WHILELO` reached only for the final
+  < VL bytes. Stage sizes come from the corpus, not from taste — 50% of
+  cloudflare's strings are under 16 bytes and 47% are 16-31 — so the two peeled
+  blocks carry the mass and never pay a loop bound. Measured with the match at
+  the offset a real caller sees (long buffer, early match), against the plain
+  WHILELO loop: **−5.6% at 4-12 bytes** (PTRUE also breaks the dependence of the
+  first load on the *length* argument, which WHILELO put on it — that part helps
+  every call), **−9.7% at 16-31**, −13…−21% through 128 bytes, and **−30…−47%
+  from 256 bytes up**, where the unrolled loop reaches 39 GB/s. End to end
+  (interleaved ABBA, n=6, pinned N2): **skip-heavy −45.0%, string_unicode
+  −11.2%**, cloudflare family −0.7…−0.8%, twitterescaped/update_center
+  −0.6…−0.7%, everything else flat, geomean −3.2%, no regressions. skip-heavy is
+  the outlier because its scalar arrays are pure `indexStructural` throughput.
+  The two ESCAPE scanners deliberately keep the plain `PTRUE` bulk loop with no
+  unrolled stages: their block costs **three** predicate ops (MATCH, the range
+  compare, ORRS), so one predicate pipe pins them at three cycles per vector
+  however few other instructions surround them — unrolling would remove loop
+  overhead that is not the limit and add transition bands for nothing. Dropping
+  the per-block `WHILELO` (four predicate ops to three) is the part that pays,
+  and that is all they take. Even so it is worth a lot, because the escape
+  scanners are the whole of the encode direction's clean-run scan:
+  `EscapeStringInto` **json_in_json −12.8%, log_line_clean −12.0%,
+  path_with_backslash −11.2%, mostly_clean_one_quote −9.6%, control_bytes −9.2%,
+  prose_with_quotes −8.4%**; `EscapeString` json_in_json −6.7%, log_line_clean
+  −4.8%. The toolkit inherits the rest: `SkipContainer/numberArr` **−46.7%**
+  (pure `indexStructural` throughput), `stringObj` −16.5%, `nestedMixed` −10.9%,
+  `GetManyWithSkip` −8.7%, `StripDefaultsPretty` −8.8%, `StripDefaults` −7.6%,
+  `Valid` −7.8%, `GetPathsWithSkip` −7.3%, the `Set` family −2.6…−7.2%; geomean
+  over every `pkg/...` microbenchmark **−4.6%**. The one measured regression is
+  `EscapeString/invalid_utf8_dense` **+3.1%** (and `…Into` +2.0%): the
+  substitution walk calls the scanner on very short runs between ill-formed
+  bytes, where the four-instruction PTRUE/CNTB/SUBS/BLO prologue is not
+  amortized. Accepted — it is the one shape in the suite made of nothing but
+  sub-vector runs, and the clean cases it pays for are 10× more common.
 
   **THE GATE MUST LIVE IN THE ASSEMBLY, and this is the whole design constraint.**
   The natural spelling — `if useSVE2 { return sve(b) }; return neon(b)` in the Go
@@ -751,6 +847,45 @@ byte-identical when adding cold paths; push new logic out-of-line.
   −1.6% (p=0.280), large-json and canada flat. Kept anyway because it is strictly
   less code, provably equivalent (the identity plus the exhaustive oracle test), and
   favourable in direction on every case measured — not because it is a measured win.
+
+  **Two later changes to the same loop, both real wins, both about instructions
+  the loop was paying for nothing (2026-08-17).** citm decodes at IPC 3.62 with a
+  0.18% branch-miss rate — issue-bound, so instructions removed are cycles
+  removed — and `SkipWSRun` was 19.75% of it, at ~5 cycles per 8-byte word for
+  what looks like a six-instruction loop. It was not six. **(1) The wide load is
+  `data[i : i+8]`, not `data[i:]`.** The open-ended reslice made the compiler
+  emit a second bounds compare, the len and cap subtractions with their negative
+  clamp, and `Uint64`'s own "at least 8 bytes" test — SIX extra instructions per
+  word, because the prove pass has to re-derive facts about a fresh slice value
+  that the loop condition already established. Every other SWAR load in the
+  package (read.go, batch.go, numeric.go) already used the explicit form; this
+  one was the exception. Worth 9-12% of the loop on citm-shaped runs.
+  **(2) The classify no longer needs the `0xA0A0…` constant.** `nws` is now
+  `((w&^hi + 0x5f5f…) | w) & hi`: `w &^ hi` leaves each lane ≤ 0x7f, so adding
+  0x5f tops out at 0xde and cannot carry between lanes, and the sum reaches 0x80
+  exactly when the lane is ≥ 0x21 — the `| w` folds in the ≥ 0x80 lanes, so the
+  union is exactly "> 0x20". One operation shorter and one step shallower than
+  the borrow-guard subtract, but the real cost was the constant: **0xa0 is not an
+  AArch64 bitmask immediate**, so `g` took a `MOVD` plus three `MOVK`s — inside
+  the loop, and again on the back edge — while `0x8080…`/`0x7f7f…` fold into
+  their `AND` as immediates. Interleaved micro over citm-shaped indent runs
+  (8/16/24/28 spaces): **−10.8%, −18.6%, −24.1%, −25.1%** for the pair. End to
+  end (n=6): **citm_catalog −9.8%, instruments −7.2%, mesh_pretty −6.2%,
+  twitter_status −3.7%, synthea_fhir −2.8%**, compact cases flat by construction.
+  Inline cost went 65 → 67, still under 80. Dropping the `w != sp` shortcut on
+  top of the cheaper classify was measured and is WORSE (+16% at indent 24), so
+  it stays.
+
+  **The AArch64 bitmask-immediate rule is the reusable lesson here.** A logical
+  op (`AND`/`ORR`/`EOR`) folds an immediate only when its byte pattern is a
+  *rotated run of ones*, replicated — 0x80, 0x7f, 0x20, 0x0f, 0xf0, 0x33 (as a
+  4-bit pattern) all qualify — and `ADD`/`SUB`/`CMP` take a 12-bit immediate and
+  nothing wider, so ANY splat they need is 1-4 instructions of materialisation,
+  re-emitted at each use because Go rematerialises constants rather than keeping
+  them live. When a SWAR constant lands on the wrong side of that line, prefer a
+  formulation that moves it to a logical op or removes it — and check the
+  disassembly, since the Go source looks identical either way. The same trap is
+  what `tryParse4Digits` fixes in the digit folds.
 - **Slice reuse replaces, and the reset is guarded.** Every slice decoder — the
   generated `sliceDecoder` loop and `batch.go`'s three readers — used to start from
   `*out`, so decoding into a **non-nil** slice *appended* to it. `[1,2]` decoded
@@ -1493,6 +1628,20 @@ no regressions.)
   Related watch-list from the same audit: `DecodeValue` (inline cost 77) and
   `skipNumber` (74) sit just under the 80 budget — re-check `-gcflags=-m` after
   any edit to either, as the SkipWSRun entry already mandates for itself.
+
+  **PARTLY WITHDRAWN (2026-08-17), and the distinction matters.** What that audit
+  proved is that the *`panicBounds` stubs* are free — they are cold, and the
+  compares guarding them are predicted. What it did not measure is the case where
+  the bound is written so loosely that the compiler emits **arithmetic, not just a
+  compare**: `SkipWSRun` said `binary.LittleEndian.Uint64(data[i:])`, and the
+  open-ended reslice cost a second bounds compare *plus* the len and cap
+  subtractions with their negative clamp *plus* `Uint64`'s own length test — six
+  real instructions per word, on an issue-bound loop (citm at IPC 3.62). Writing
+  `data[i : i+8]` — the spelling every other SWAR load in the package already
+  used — removed four of them and measured 9-12% of that loop. So: bounds
+  *checks* are free, bounds *arithmetic* is not, and the way to tell them apart is
+  to read the disassembly for `SUB`/`AND`/`NEG` around the load rather than to
+  count `panicBounds` labels.
 - **Whitespace run-length memoization (`wsGuess`)** — the tempting fix for
   SkipWSRun's ~24% flat share on citm-shaped indentation: remember the last
   run's length g per call site and verify a repeat with two compares
@@ -1518,6 +1667,51 @@ no regressions.)
   destructive-compare copy `MOVOU X2,X3` is move-eliminated to ~0 latency on
   current uarchs, so there is nothing to shave.)
 
+- **`UnsafeStrRange(b, i, j)` — an offset-taking `UnsafeStr` to kill the other
+  reslice on the key-read line.** After `IndexCloseOrEscapeAt` removed the
+  `data[ks:]` reslice from the scanner call, the line below it still said
+  `UnsafeStr(data[ks:ke])`, and a line profile puts that at **4.7% of
+  cloudflare-nocopy** — eight instructions of slice arithmetic for a value that
+  only ever needs a pointer and a length. `unsafe.String(&b[i], j-i)` removes
+  six of them. Built, wired through the generator, read.go, get.go and set.go,
+  fully green — and measured (n=6) **cloudflare −0.60% (p=0.009),
+  cloudflare-nocopy −0.87% (p=0.002), cloudflare-compact +0.82% (p=0.002)**,
+  everything else flat; geomean −0.47%. So four fifths of that 4.7% is
+  retirement skid, not removable work: the reslice's ALU ops hide under the
+  scanner call's latency. Reverted, because the price is a **new exported
+  unchecked-bound helper** (`j` is trusted, unlike a slice expression's cap
+  check) baked into generated code in downstream modules — a durable API cost
+  for a sub-noise win. If this is ever revisited, bound `j` too and expect ~0.5%.
+- **Fusing the object loop's four whitespace probes with the structural tests
+  that follow them** — the biggest-looking generator idea of the 2026-08-17 pass,
+  built twice and rejected both times. The setup: on compact input each member
+  pays four `if i < len(data) && data[i] <= ' '` blocks whose byte is then
+  re-bounded and re-loaded by the `}` / `"` / `:` / `,` test right after, and
+  cloudflare-nocopy-vs-cloudflare-compact prices the whole whitespace apparatus
+  at **2.9%**. **(1) Guard the probe with the expected byte** (`if i >= len(data)
+  || data[i] != ':' { <probe>; recheck }`, applied to the key→colon gap, which is
+  empty in compact AND in pretty output): cloudflare −1.68%, twitter −1.41%,
+  golang_source −1.51%, citm −1.20% … and **instruments +2.18% (p=0.000)**,
+  because `bench/instruments` is written `"key" : value` and there the guard is a
+  test that always fails. **(2) Share one load instead** — bound once, read the
+  byte into a `lightningC` local, test it against `' '` and then against the
+  structural byte, in both the struct and map loops. No input dependence, and it
+  removes ~12 instructions per member on paper. Measured (n=8): cloudflare
+  −3.02%, golang_source −2.96%, payload_large −1.90% against string_unicode
+  +0.99%, synthea +0.89%, instruments +0.80%, github_events +0.80%, citm +0.29%;
+  geomean −0.40%. `perf stat` explains the split and settles it — **executed
+  instructions per decode: cloudflare 15277→14851 (−2.8%) and golang_source
+  −2.2%, but citm +1.1%, instruments +2.2%, synthea +0.6%, string_unicode +0.4%**
+  — the form genuinely removes instructions where the gaps are empty and adds
+  them where they are not, so it is a bet on input formatting, not an
+  improvement. **(3)** The residue — hoisting readKey's `i >= len(data) ||
+  data[i] != '"'` into the loop, which is format-independent — measures **zero
+  instruction change on every case**: the compiler was already CSE-ing that load
+  and proving that bound. All three reverted; the object loop is back to the
+  shape the trailing-comma entry above insists on. Anyone re-attempting this
+  needs a *new* idea, not a rearrangement, and should size it with `perf stat`
+  instructions-per-op first, which costs a minute and would have ended each of
+  these three in one measurement.
 - **No-corpus determinations (quantified, don't build without a workload):**
   `[]float32`/`[]bool` batch readers — zero bench-corpus fields of those types
   (if a real workload appears, the `DecodeFloat64Slice` pattern ports
@@ -1679,6 +1873,15 @@ no regressions.)
   the string scanner — which is why the `VMOVI`/peel work attacked the *setup*
   instructions instead. Re-test this whenever the Go version moves: it is the
   single largest remaining win available in the arm64 decode path.
+  **Re-checked again on Go 1.26 (2026-08-17), same error, and the obvious
+  escape hatch is closed too**: Go 1.26 does ship a `simd/archsimd` package (the
+  route to writing a scanner in Go, which would get ABIInternal and inlining for
+  free), but every file in it is `*_amd64.go` and the whole package is behind
+  `goexperiment.simd` — there is no arm64 half. So the ~13 instructions of ABI
+  marshaling per call remain the floor, and they are now a *larger* share of a
+  scanner that the staged-loop work made shorter. The one thing that did reduce
+  them was removing an argument's worth of work at the call site rather than in
+  the ABI — see the `IndexCloseOrEscapeAt` entry.
 - **arm64 32-byte-unrolled `indexQuoteOrBackslashNEON` for long strings.** The
   bench-md flags string_unicode (long unicode text fields) as arm64's #2 lag vs
   amd64 (~0.68), and the scanner is ~51% of that decode; amd64 wins partly by
@@ -1813,16 +2016,19 @@ no regressions.)
   and let `make sveasm` fill it in; never hand-compute an encoding. `make
   sveasm-check` is the gate (CI runs it on both arches). A second `//` in the
   comment starts prose and is preserved: `// match p2.b, p1/z, z0.b, z1.b // why`.
-- **The committed `bench/*_arm64.md` tables do not show the SVE2 path**, and were
-  deliberately not regenerated when it landed (2026-08-14). They carry
-  "cpu: unknown (4 cores)" and so come from a different host than the 2-core
-  Neoverse N2 the SVE2 work was measured on; overwriting them here would mix
-  machines within one per-arch table, which is the thing the per-arch split
-  exists to prevent. Whether a regenerated table shows the SVE2 numbers depends
-  entirely on whether the host implements SVE2 — a NEON-only arm64 runner
-  produces the same numbers as before. So read those tables as "arm64, some
-  host", and take the SVE2 deltas from the interleaved A/B in the SVE2 entry
-  above, not from them.
+- **The committed `bench/*_arm64.md` tables are regenerated by CI, not from a
+  development box**, and a perf change should be landed without touching them —
+  a locally-generated table silently swaps the host the whole file describes.
+  (The tables were also left alone when SVE2 landed, 2026-08-14, for a related
+  reason recorded then: the ones of that day carried "cpu: unknown (4 cores)"
+  and so came from a different machine than the Neoverse N2 the work was measured
+  on.) The rule to remember is that **an arm64 table is only comparable to another
+  arm64 table from the same host**: whether it shows the SVE2 numbers at all
+  depends on whether the runner implements SVE2, and a NEON-only arm64 runner
+  produces the pre-SVE2 numbers with no indication in the file beyond the `cpu:`
+  header. Read that header before comparing anything, and take deltas from the
+  interleaved A/Bs in the entries above rather than by subtracting two committed
+  tables.
 - End-of-session: run the full suite (`go test ./...`), keep gofmt clean
   (the `daysFromCivil` comment-alignment flag is pre-existing — ignore it),
   and regenerate the committed benchmark markdown via `make bench-md`. That runs
@@ -1919,6 +2125,81 @@ mechanism has now usually been re-checked here, and the notable outcomes are:
   2026-08-14; SVE2 turned out to be bigger, and it was available all along on this
   very box — see the next section. The ABI cost is still there, now a *larger*
   share of a shorter function.)
+
+## Neoverse N2 performance pass (2026-08-17) — what moved and what the profile said
+
+Four changes landed, all measured with interleaved ABBA A/B on the pinned,
+otherwise-idle N2. Each has its own entry above; this section is the map of how
+they were found, because the *finding* method transferred better than any one
+fix. Cumulative on `BenchmarkLightning` (n=10 interleaved, vs the session's starting
+commit): **skip-heavy −45.2%, string_unicode −19.1%, citm_catalog −11.2%,
+cloudflare-compact −10.0%, instruments −9.9%, cloudflare-nocopy −9.8%,
+apache_builds −9.6%, twitter_status −7.8%, mesh_pretty −7.5%, synthea_fhir
+−7.1%, gsoc_2018 −6.3%, cloudflare −6.2%, github_events −5.7%, numbers −5.0%,
+large-json −4.9%, update_center −4.4%, payload_large −4.4%, golang_source −3.8%,
+marine_ik −2.7%, twitterescaped −2.5%, canada_geometry −2.3%, canada −2.1%,
+mesh −1.1%**, float-array/time-array flat; **no case regressed**. Geomean −7.5%.
+
+**Methodology trap worth not repeating:** five of those cases first measured
+"flat" because the `base_*.test` binaries for them had been overwritten with
+mid-session builds while profiling. Keep profiling binaries under their own
+prefix, and re-derive the baseline (stash, regenerate the decoders with the
+stashed generator, build) rather than reusing whatever is in the scratch dir —
+a generated decoder that calls a function the baseline lacks will not even
+build, which is the only reason it was caught.
+
+- **The profile said the scanner; `perf stat` said which kind of scanner
+  problem.** `indexQuoteOrBackslashArm64` was 40% of string_unicode and 24-28% of
+  the cloudflare family — but a length-sweep micro against the *realistic* call
+  shape (long buffer, early match, which is what "string-body + rest-of-document"
+  means) is what showed the WHILELO loop was predicate-pipe-bound rather than
+  short-of-work, and that is what the staged loop fixed. **Build the micro with
+  the caller's real buffer shape**: the first version of that sweep passed a
+  buffer ending at the match, and it ranked the candidate bodies differently.
+- **Two of the four wins were compiler artefacts, not algorithms.** `SkipWSRun`'s
+  `data[i:]` and the digit folds' non-bitmask-immediate constants were each
+  costing 4-6 instructions per iteration that the Go source gives no hint of. On
+  a machine running at IPC 3.6 those are cycles. The tell is always the same:
+  disassemble the loop and count what is *not* the algorithm.
+- **`pprof -disasm`/line profiles over-attribute call sites.** The key-read line
+  profiles at 16% flat on cloudflare-nocopy and the `UnsafeStr(data[ks:ke])` line
+  at 4.7%; removing the latter's eight instructions bought 0.87%. Line-level flat
+  time next to a call is largely retirement skid — size such a change by
+  *executed instructions* (`perf stat -e instructions` divided by the benchmark's
+  iteration count), which is noise-free and takes a minute.
+- **Formatting-dependent wins are not wins.** The object-loop fusion removed 2.8%
+  of cloudflare's executed instructions and *added* 1-2% of citm's and
+  instruments', because it bets on the inter-token gaps being empty. The corpus
+  is deliberately mixed, so the geomean came out −0.4% and it was reverted. Same
+  shape as the `"key" : value` regression the first variant hit.
+- **Not every case moves for the same reason.** `numbers` regressed +2.2% on the
+  scanner change (pure layout — it barely calls the scanner) and then went −5.4%
+  on the digit-fold change. Read a single case's delta as a hypothesis, not a
+  result, until a second change confirms the mechanism.
+
+**Left on the table, with sizings, for whoever picks this up next:**
+
+- **`skipNumber` is a byte loop and is 4.0% of cloudflare-nocopy** (35 of that
+  document's 48 keys are unknown, so the skip path is most of the decode; a
+  number token costs ~9 instructions per digit). The whole accept set —
+  `0-9 . e E + -` — is **15 bytes, which fits one SVE2 `MATCH`**, and SVE2 has
+  `NMATCH` for "first byte NOT in the set", so the token end is one vector scan
+  rather than a loop. The obstacles are that it would be a fourth scanner needing
+  amd64 and scalar twins, and that `skipNumber` is currently *inlined* into
+  `SkipValue` (cost 74), so it would trade a byte loop for a call. Worth ~2% on
+  skip-heavy schemas, roughly nothing elsewhere.
+- **`indexEscape`/`indexEscapeNonASCII` did not get the offset treatment**
+  `indexCloseOrEscape` did: `EscapeStringInto` still calls them as
+  `IndexEscapeNonASCII(s[i+8:])`. Deliberate — the escape walk's per-run gate
+  means each call covers at least `minVectorRun` (48) bytes, so one reslice
+  amortizes over a whole run rather than over one key, which is the opposite of
+  the decode path's economics. If the gate ever goes, revisit this with it.
+- **`bytes.Count` inside the presize counters is 4.4% of synthea_fhir**
+  (`CountArrayObjects` over its coding arrays). It is already two vectorized
+  passes and the rejected-list entry above records that hand-fusing them loses to
+  the runtime's own `IndexByte`/`Count`; what has *not* been tried is not counting
+  at all for arrays whose elements are this small, in the spirit of the
+  `[][N]scalar` presize-skip. Needs a cheap way to know the element is small.
 
 ## Session 2026-08 fixes worth knowing (correctness/API)
 

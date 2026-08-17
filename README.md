@@ -1126,17 +1126,26 @@ arm64 there is one:
 
 - **SVE2**, on cores that have it (Neoverse N2/V2, Graviton4 and later; not Apple
   M-series or Neoverse N1/V1), replaces the NEON body of all four scanners with a
-  shorter one. `WHILELO` predication covers the ragged end of the buffer, so the
-  scalar tail loop and the short-input entry disappear entirely; SVE2's `MATCH`
-  tests a whole character class of up to 16 bytes in one instruction (it replaces
-  two compares and an OR in the string scanner, and the entire five-op nibble
-  shuffle in the structural one); and because `MATCH` sets the condition flags
-  directly, the two cross-domain moves NEON needs to test a block are gone. The
-  bodies are vector-length agnostic, so a 256-bit implementation scans 32 bytes
-  per block with the same code. Measured on a Neoverse N2: **−8…−12% end-to-end
-  on string-heavy documents** (cloudflare, string_unicode), −2…−4% on the rest,
-  and −34% on skipping a scalar array. The feature check is made inside the
-  assembly rather than in Go, so the dispatch stays a single call and keeps
+  shorter one. SVE2's `MATCH` tests a whole character class of up to 16 bytes in
+  one instruction (it replaces two compares and an OR in the string scanner, and
+  the entire five-op nibble shuffle in the structural one); because `MATCH` sets
+  the condition flags directly, the two cross-domain moves NEON needs to test a
+  block are gone; and `WHILELO` predication covers the ragged end of the buffer,
+  so the scalar tail loop and the short-input entry disappear entirely.
+
+  Predication is the *tail*, not the loop: `WHILELO` and `MATCH` both issue on
+  the core's single predicate pipe, so a fully-predicated loop costs two cycles
+  per block before anything else is counted. The two scanners whose block is one
+  predicate op are therefore staged — two unpredicated blocks, a peeled pair, a
+  four-vector loop, and `WHILELO` only for the last partial vector — which is
+  where a corpus string almost always ends (half of a Cloudflare log's strings
+  are under 16 bytes). The bodies stay vector-length agnostic, so a 256-bit
+  implementation scans 32 bytes per block with the same code.
+
+  Measured on a Neoverse N2, end-to-end against the NEON path: **−19% on a
+  long-string document, −45% on skipping a large scalar array, −6…−10% on
+  string-heavy records**, −2…−4% on the rest. The feature check is made inside
+  the assembly rather than in Go, so the dispatch stays a single call and keeps
   inlining into its callers.
 
 And on amd64:
