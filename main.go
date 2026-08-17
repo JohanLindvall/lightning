@@ -547,9 +547,9 @@ var reservedIdents = map[string]bool{
 	// 1. decoder parameters and locals
 	"a": true, "b": true, "bend": true, "berr": true, "body": true, "data": true,
 	"depth": true, "end": true, "err": true, "f": true, "first": true, "i": true,
-	"idx": true, "ierr": true, "k": true, "key": true, "ks": true, "lax": true,
-	"m": true, "n": true, "ni": true, "out": true, "s": true, "start": true,
-	"t": true, "v": true, "val": true, "zero": true,
+	"idx": true, "ierr": true, "k": true, "ke": true, "key": true, "ks": true,
+	"lax": true, "m": true, "n": true, "ni": true, "out": true, "s": true,
+	"start": true, "t": true, "v": true, "val": true, "zero": true,
 	// 2. imports of the generated file
 	"unstable": true, "unsafe": true,
 	// 3. predeclared identifiers the generated code uses
@@ -777,10 +777,18 @@ func (g *gen) skipWS(dst, src string) string {
 
 // readKey emits the object-key read with its no-escape fast path written inline,
 // the way skipWS inlines the whitespace fast path. The common case — a quoted
-// key with no backslash escape — is an IndexCloseOrEscape scan plus an UnsafeStr
-// alias at the call site, costing no ReadKey call; only an escaped key (or an
-// error) falls back to unstable.ReadKey. It declares key and ni for the loop that
-// follows. The enclosing decoder returns (int, error).
+// key with no backslash escape — is an IndexCloseOrEscapeAt scan plus an
+// UnsafeStr alias at the call site, costing no ReadKey call; only an escaped key
+// (or an error) falls back to unstable.ReadKey. It declares key and ni for the
+// loop that follows. The enclosing decoder returns (int, error).
+//
+// The scan is IndexCloseOrEscapeAt(data, ks) rather than
+// IndexCloseOrEscape(data[ks:]): the reslice is not free — Go lowers it to seven
+// instructions (the len and cap subtractions and the negative-length clamp on
+// the base pointer) right here in the hottest loop of every decoder — where the
+// offset form hands the scanner the index register it already carries and comes
+// back with the absolute end this code then wants anyway, so the ks+k additions
+// go too.
 func (g *gen) readKey() string {
 	return `var key string
 	var ni int
@@ -788,8 +796,8 @@ func (g *gen) readKey() string {
 		return i, unstable.ErrInvalidJSON
 	}
 	ks := i + 1
-	if k := unstable.IndexCloseOrEscape(data[ks:]); ks+k < len(data) && data[ks+k] == '"' {
-		key, ni = unstable.UnsafeStr(data[ks:ks+k]), ks+k+1
+	if ke := unstable.IndexCloseOrEscapeAt(data, ks); ke < len(data) && data[ke] == '"' {
+		key, ni = unstable.UnsafeStr(data[ks:ke]), ke+1
 	} else {
 		var err error
 		if key, ni, err = unstable.ReadKey(data, i); err != nil {

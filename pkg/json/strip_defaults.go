@@ -427,10 +427,9 @@ func (s *stripper) handle(read, write, depth int) (int, int) {
 			// Inline the no-escape close-quote scan (one SIMD pass) so the common
 			// unescaped key skips SkipString's non-inlinable call frame; escaped or
 			// truncated keys fall back to SkipString. Same trick on the value reads below.
-			krest := in[read+1:]
-			kk := unstable.IndexCloseOrEscape(krest)
-			keyEnd := read + kk + 2
-			if kk >= len(krest) || krest[kk] != '"' {
+			ke := unstable.IndexCloseOrEscapeAt(in, read+1)
+			keyEnd := ke + 1
+			if ke >= dataLen || in[ke] != '"' {
 				var err error
 				if keyEnd, err = unstable.SkipString(in, read); err != nil {
 					return eject()
@@ -472,10 +471,9 @@ func (s *stripper) handle(read, write, depth int) (int, int) {
 			if read < dataLen {
 				switch in[read] {
 				case '"':
-					vrest := in[read+1:]
-					vk := unstable.IndexCloseOrEscape(vrest)
-					valEnd := read + vk + 2
-					if vk >= len(vrest) || vrest[vk] != '"' {
+					ve := unstable.IndexCloseOrEscapeAt(in, read+1)
+					valEnd := ve + 1
+					if ve >= dataLen || in[ve] != '"' {
 						var err error
 						if valEnd, err = unstable.SkipString(in, read); err != nil {
 							// Bad string: eject from the original position.
@@ -687,10 +685,9 @@ func (s *stripper) handle(read, write, depth int) (int, int) {
 			}
 		}
 	case '"':
-		srest := in[read+1:]
-		sk := unstable.IndexCloseOrEscape(srest)
-		send := read + sk + 2
-		if sk >= len(srest) || srest[sk] != '"' {
+		se := unstable.IndexCloseOrEscapeAt(in, read+1)
+		send := se + 1
+		if se >= dataLen || in[se] != '"' {
 			var err error
 			if send, err = unstable.SkipString(in, read); err != nil {
 				return eject()

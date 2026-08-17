@@ -201,7 +201,7 @@ func hasLiteral(data []byte, i int, lit string) bool {
 func strictString(data []byte, i int) (int, error) {
 	i++ // opening quote
 	for {
-		i += indexCloseOrEscape(data[i:])
+		i = indexCloseOrEscapeAt(data, i)
 		if i >= len(data) {
 			return i, ErrTruncated // unterminated: ran out before a closing quote
 		}

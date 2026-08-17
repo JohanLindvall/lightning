@@ -14,15 +14,14 @@ func ReadKey(data []byte, i int) (string, int, error) {
 		return "", i, ErrInvalidJSON
 	}
 	i++
-	rest := data[i:]
-	k := indexCloseOrEscape(rest)
-	if k == len(rest) {
+	e := indexCloseOrEscapeAt(data, i)
+	if e == len(data) {
 		return "", len(data), ErrTruncated
 	}
-	if rest[k] == '\\' {
-		return decodeStringEscaped(data, i, i+k)
+	if data[e] == '\\' {
+		return decodeStringEscaped(data, i, e)
 	}
-	return unsafeStr(rest[:k]), i + k + 1, nil
+	return unsafeStr(data[i:e]), e + 1, nil
 }
 
 // ReadStringOrNull reads a JSON string (or null) at data[i], copying the bytes
@@ -53,15 +52,14 @@ func ReadStringOrNull(data []byte, i int) (string, int, error) {
 		return "", i, ErrInvalidJSON
 	}
 	i++
-	rest := data[i:]
-	k := indexCloseOrEscape(rest)
-	if k == len(rest) {
+	e := indexCloseOrEscapeAt(data, i)
+	if e == len(data) {
 		return "", len(data), ErrTruncated
 	}
-	if rest[k] == '\\' {
-		return decodeStringEscaped(data, i, i+k)
+	if data[e] == '\\' {
+		return decodeStringEscaped(data, i, e)
 	}
-	return string(rest[:k]), i + k + 1, nil
+	return string(data[i:e]), e + 1, nil
 }
 
 // ReadStringNoCopyOrNull is like ReadStringOrNull but, for strings without
@@ -81,15 +79,14 @@ func ReadStringNoCopyOrNull(data []byte, i int) (string, int, error) {
 		return "", i, ErrInvalidJSON
 	}
 	i++
-	rest := data[i:]
-	k := indexCloseOrEscape(rest)
-	if k == len(rest) {
+	e := indexCloseOrEscapeAt(data, i)
+	if e == len(data) {
 		return "", len(data), ErrTruncated
 	}
-	if rest[k] == '\\' {
-		return decodeStringEscaped(data, i, i+k)
+	if data[e] == '\\' {
+		return decodeStringEscaped(data, i, e)
 	}
-	return unsafeStr(rest[:k]), i + k + 1, nil
+	return unsafeStr(data[i:e]), e + 1, nil
 }
 
 // ReadStringDestructiveOrNull is ReadStringNoCopyOrNull but, for a string that
@@ -115,21 +112,20 @@ func ReadStringDestructiveOrNull(data []byte, i int) (string, int, error) {
 		return "", i, ErrInvalidJSON
 	}
 	i++
-	rest := data[i:]
-	k := indexCloseOrEscape(rest)
-	if k == len(rest) {
+	e := indexCloseOrEscapeAt(data, i)
+	if e == len(data) {
 		return "", len(data), ErrTruncated
 	}
-	if rest[k] == '\\' {
+	if data[e] == '\\' {
 		// Decode into data starting at the body offset i: buf aliases data[i:] with
 		// length 0 and cap to the document end, so decodeEscaped's appends write
 		// through into data. The write cursor trails the read cursor (unescaping only
 		// shrinks), so it never clobbers a byte not yet consumed, and cap is large
 		// enough that append never reallocates away from data.
 		buf := data[i:i:len(data)]
-		return decodeEscaped(buf, data, i, i+k, true)
+		return decodeEscaped(buf, data, i, e, true)
 	}
-	return unsafeStr(rest[:k]), i + k + 1, nil
+	return unsafeStr(data[i:e]), e + 1, nil
 }
 
 // ReadInt64OrNull reads a JSON integer (or null) at data[i]. Fractional and

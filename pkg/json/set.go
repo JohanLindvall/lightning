@@ -87,8 +87,8 @@ func setSpan(in, rawVal []byte, keys []string) (start, end int, insert []byte, m
 				break
 			}
 			ks := p + 1
-			if kk := unstable.IndexCloseOrEscape(in[ks:]); ks+kk < len(in) && in[ks+kk] == '"' {
-				k, np = unstable.UnsafeStr(in[ks:ks+kk]), ks+kk+1
+			if e := unstable.IndexCloseOrEscapeAt(in, ks); e < len(in) && in[e] == '"' {
+				k, np = unstable.UnsafeStr(in[ks:e]), e+1
 			} else {
 				var err error
 				if k, np, err = unstable.ReadKey(in, p); err != nil {
@@ -240,8 +240,8 @@ func SetMany(in, out []byte, rawVal [][]byte, keys []string) []byte {
 			break
 		}
 		ks := p + 1
-		if kk := unstable.IndexCloseOrEscape(in[ks:]); ks+kk < len(in) && in[ks+kk] == '"' {
-			k, np = unstable.UnsafeStr(in[ks:ks+kk]), ks+kk+1
+		if e := unstable.IndexCloseOrEscapeAt(in, ks); e < len(in) && in[e] == '"' {
+			k, np = unstable.UnsafeStr(in[ks:e]), e+1
 		} else {
 			var err error
 			if k, np, err = unstable.ReadKey(in, p); err != nil {
@@ -418,8 +418,8 @@ func setObject(in, out []byte, i, depth int, active []int, paths [][]string, raw
 			break
 		}
 		ks := p + 1
-		if kk := unstable.IndexCloseOrEscape(in[ks:]); ks+kk < len(in) && in[ks+kk] == '"' {
-			k, np = unstable.UnsafeStr(in[ks:ks+kk]), ks+kk+1
+		if e := unstable.IndexCloseOrEscapeAt(in, ks); e < len(in) && in[e] == '"' {
+			k, np = unstable.UnsafeStr(in[ks:e]), e+1
 		} else {
 			var err error
 			if k, np, err = unstable.ReadKey(in, p); err != nil {

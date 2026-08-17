@@ -43,13 +43,12 @@ func decodeValue(data []byte, i int, compact bool, depth int) (any, int, error) 
 		// body is free, while the common clean string skips the non-inlined
 		// ReadStringOrNull call — only the SIMD scan itself remains
 		// (indexCloseOrEscape inlines here). The any path always copies, so
-		// string(rest[:k]) builds the same value; an escaped or truncated
+		// string(data[i+1:e]) builds the same value; an escaped or truncated
 		// string falls back to ReadStringOrNull, whose error identities and
 		// positions are unchanged (it re-checks data[i] == '"' and takes its
 		// existing escaped/truncated paths).
-		rest := data[i+1:]
-		if k := indexCloseOrEscape(rest); k < len(rest) && rest[k] == '"' {
-			return string(rest[:k]), i + k + 2, nil
+		if e := indexCloseOrEscapeAt(data, i+1); e < len(data) && data[e] == '"' {
+			return string(data[i+1 : e]), e + 1, nil
 		}
 		s, end, err := ReadStringOrNull(data, i)
 		return s, end, err
@@ -121,10 +120,9 @@ func decodeAnyObject(data []byte, i int, compact bool, depth int) (any, int, err
 		var key string
 		ni := -1
 		if data[i] == '"' {
-			rest := data[i+1:]
-			if k := indexCloseOrEscape(rest); k < len(rest) && rest[k] == '"' {
-				key = string(rest[:k])
-				ni = i + k + 2
+			if e := indexCloseOrEscapeAt(data, i+1); e < len(data) && data[e] == '"' {
+				key = string(data[i+1 : e])
+				ni = e + 1
 			}
 		}
 		if ni < 0 {

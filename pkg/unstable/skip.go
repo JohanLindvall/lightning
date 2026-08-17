@@ -74,18 +74,17 @@ func SkipString(data []byte, i int) (int, error) {
 	// data[i] == '"'
 	i++
 	for {
-		rest := data[i:]
-		k := indexCloseOrEscape(rest)
-		if k == len(rest) {
+		e := indexCloseOrEscapeAt(data, i)
+		if e == len(data) {
 			return len(data), ErrTruncated
 		}
-		if rest[k] == '"' {
-			return i + k + 1, nil
+		if data[e] == '"' {
+			return e + 1, nil
 		}
 		// Skip the escape sequence. For \uXXXX we only need to skip the
 		// backslash and the next char; subsequent bytes are processed on the
 		// next iteration.
-		i += k + 2
+		i = e + 2
 		if i > len(data) {
 			return len(data), ErrTruncated
 		}

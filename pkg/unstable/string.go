@@ -124,13 +124,12 @@ func decodeEscaped(buf, data []byte, start, i int, quoted bool) (string, int, er
 			// indexCloseOrEscape call — and the vector scan behind it — per escape.
 			c := data[i]
 			if c != '\\' && c != '"' {
-				rest := data[i:]
-				k := indexCloseOrEscape(rest)
-				if k == len(rest) {
+				e := indexCloseOrEscapeAt(data, i)
+				if e == len(data) {
 					break // unterminated string
 				}
-				buf = append(buf, rest[:k]...)
-				i += k
+				buf = append(buf, data[i:e]...)
+				i = e
 				c = data[i]
 			}
 			if c == '"' {

@@ -75,8 +75,8 @@ func getMany(data []byte, keys []string, out [][]byte, compact bool) ([][]byte, 
 			return out, unstable.ErrInvalidJSON
 		}
 		ks := i + 1
-		if k := unstable.IndexCloseOrEscape(data[ks:]); ks+k < len(data) && data[ks+k] == '"' {
-			key, ni = unstable.UnsafeStr(data[ks:ks+k]), ks+k+1
+		if e := unstable.IndexCloseOrEscapeAt(data, ks); e < len(data) && data[e] == '"' {
+			key, ni = unstable.UnsafeStr(data[ks:e]), e+1
 		} else {
 			var err error
 			if key, ni, err = unstable.ReadKey(data, i); err != nil {
@@ -261,8 +261,8 @@ func walkPaths(data []byte, i, depth int, active, free []int, paths [][]string, 
 			return i, unstable.ErrInvalidJSON, true
 		}
 		ks := i + 1
-		if k := unstable.IndexCloseOrEscape(data[ks:]); ks+k < len(data) && data[ks+k] == '"' {
-			key, ni = unstable.UnsafeStr(data[ks:ks+k]), ks+k+1
+		if e := unstable.IndexCloseOrEscapeAt(data, ks); e < len(data) && data[e] == '"' {
+			key, ni = unstable.UnsafeStr(data[ks:e]), e+1
 		} else {
 			var err error
 			if key, ni, err = unstable.ReadKey(data, i); err != nil {
@@ -508,8 +508,8 @@ func objectEach(data []byte, fn func(key string, value []byte) error, compact bo
 			return unstable.ErrInvalidJSON
 		}
 		ks := i + 1
-		if k := unstable.IndexCloseOrEscape(data[ks:]); ks+k < len(data) && data[ks+k] == '"' {
-			key, ni = unstable.UnsafeStr(data[ks:ks+k]), ks+k+1
+		if e := unstable.IndexCloseOrEscapeAt(data, ks); e < len(data) && data[e] == '"' {
+			key, ni = unstable.UnsafeStr(data[ks:e]), e+1
 		} else {
 			var err error
 			if key, ni, err = unstable.ReadKey(data, i); err != nil {
@@ -651,8 +651,8 @@ func objectField(data []byte, i int, key string, compact bool) (int, error) {
 			return i, unstable.ErrInvalidJSON
 		}
 		ks := i + 1
-		if n := unstable.IndexCloseOrEscape(data[ks:]); ks+n < len(data) && data[ks+n] == '"' {
-			k, ni = unstable.UnsafeStr(data[ks:ks+n]), ks+n+1
+		if e := unstable.IndexCloseOrEscapeAt(data, ks); e < len(data) && data[e] == '"' {
+			k, ni = unstable.UnsafeStr(data[ks:e]), e+1
 		} else {
 			var err error
 			if k, ni, err = unstable.ReadKey(data, i); err != nil {
