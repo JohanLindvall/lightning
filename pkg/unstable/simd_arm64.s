@@ -42,31 +42,42 @@ DATA structTablesArm<>+32(SB)/8, $0x0f0f0f0f0f0f0f0f // low-nibble mask
 DATA structTablesArm<>+40(SB)/8, $0x0f0f0f0f0f0f0f0f
 GLOBL structTablesArm<>(SB), RODATA|NOPTR, $48
 
-// func indexQuoteOrBackslashNEON(b []byte) int
+// func indexQuoteOrBackslashNEON(b []byte, i int) int
 //
-// Returns the index of the first '"' or '\\' byte in b, or len(b) if neither
-// is present. Scans 16 bytes per iteration with NEON, then a scalar tail.
-TEXT ·indexQuoteOrBackslashNEON(SB), NOSPLIT, $0-32
+// Returns the index in b of the first '"' or '\\' byte at or after i, or len(b)
+// if neither is present. Scans 16 bytes per iteration with NEON, then a scalar
+// tail.
+//
+// The scan START is an argument rather than something the caller expresses by
+// passing b[i:], because that reslice is not free: Go lowers it to seven
+// instructions (the len and cap subtractions, the negative-length clamp on the
+// base) at every call site, and this scanner is called once per object key and
+// once per string value. Taking the offset costs one more argument word and one
+// address ADD in the peeled block, and returns an ABSOLUTE index, which is what
+// every caller wanted anyway. Measured -20.7% on a key-read-shaped micro.
+TEXT ·indexQuoteOrBackslashNEON(SB), NOSPLIT, $0-40
 	MOVD  b_base+0(FP), R0
 	MOVD  b_len+8(FP), R1
+	MOVD  i+24(FP), R2
 	VMOVI $0x22, V0.B16          // V0 = '"' x16
 	VMOVI $0x5c, V1.B16          // V1 = '\\' x16
-	CMP   $16, R1
-	BLT   shortInput
+	SUB   $16, R1, R12           // R12 = last offset holding a full block
+	CMP   R12, R2
+	BGT   tail                   // fewer than 16 bytes left from i
 
-	// Peeled first block (see the file header): loads at the base pointer, so
-	// no offset register, no bound, no address ADD on the critical path.
-	VLD1  (R0), [V2.B16]
+	// Peeled first block (see the file header): the overwhelmingly common case
+	// returns from here, so it carries no loop bound and no counter update.
+	ADD   R0, R2, R8
+	VLD1  (R8), [V2.B16]
 	VCMEQ V0.B16, V2.B16, V3.B16 // V3 = (chunk == '"')
 	VCMEQ V1.B16, V2.B16, V4.B16 // V4 = (chunk == '\\')
 	VORR  V3.B16, V4.B16, V3.B16 // V3 = either match (0xFF per lane)
 	VMOV  V3.D[0], R9            // low 8 lanes
 	VMOV  V3.D[1], R10           // high 8 lanes
-	CBNZ  R9, firstLow8
-	CBNZ  R10, firstHigh8
+	CBNZ  R9, low8
+	CBNZ  R10, high8
 
-	MOVD  $16, R2                // R2 = current offset
-	SUB   $16, R1, R12           // R12 = last offset holding a full block
+	ADD   $16, R2
 
 loop16:
 	CMP  R12, R2
@@ -83,29 +94,12 @@ loop16:
 	ADD  $16, R2
 	B    loop16
 
-	// The peeled block's recoveries are separate from the loop's so that the
-	// common case adds no offset (its block starts at 0).
-firstLow8:
-	RBIT R9, R11
-	CLZ  R11, R11                // trailing zeros of R9 = first set bit
-	LSR  $3, R11, R11            // /8 -> first matching byte (lane 0..7)
-	MOVD R11, ret+24(FP)
-	RET
-
-firstHigh8:
-	RBIT R10, R11
-	CLZ  R11, R11
-	LSR  $3, R11, R11            // lane within high half (0..7)
-	ADD  $8, R11, R11            // lanes 8..15
-	MOVD R11, ret+24(FP)
-	RET
-
 low8:
 	RBIT R9, R11
 	CLZ  R11, R11                // trailing zeros of R9 = first set bit
 	LSR  $3, R11, R11            // /8 -> first matching byte (lane 0..7)
 	ADD  R2, R11, R11
-	MOVD R11, ret+24(FP)
+	MOVD R11, ret+32(FP)
 	RET
 
 high8:
@@ -114,11 +108,8 @@ high8:
 	LSR  $3, R11, R11            // lane within high half (0..7)
 	ADD  $8, R11, R11            // lanes 8..15
 	ADD  R2, R11, R11
-	MOVD R11, ret+24(FP)
+	MOVD R11, ret+32(FP)
 	RET
-
-shortInput:
-	MOVD ZR, R2                  // buffer shorter than one block: scan from 0
 
 tail:
 	CMP  R1, R2
@@ -136,11 +127,11 @@ tailloop:
 	BLT   tailloop
 
 notfound:
-	MOVD R1, ret+24(FP)
+	MOVD R1, ret+32(FP)
 	RET
 
 tfound:
-	MOVD R2, ret+24(FP)
+	MOVD R2, ret+32(FP)
 	RET
 
 // func indexEscapeNEON(b []byte) int
@@ -517,6 +508,36 @@ eutfound:
 // EVERY 128-bit segment; TRN1-of-two-DUPs and LD1RQB (load-and-replicate-quad)
 // both do that by construction, at any vector length.
 //
+// THE STAGED LOOP, and why WHILELO is not the steady state. The obvious SVE
+// body is one WHILELO-predicated block in a loop, which is what these scanners
+// were first written as — and on N2 it tops out at 23.6 GB/s, or 2.3 cycles per
+// 16-byte block. The limit is the PREDICATE PIPE: WHILELO and MATCH are both
+// predicate ops and both issue on the one M0 pipe, so two per block is two
+// cycles before anything else is counted. Predication is what makes the ragged
+// end free, but the ragged end happens once.
+//
+// So the bodies that cost ONE predicate op per block (indexQuoteOrBackslash,
+// indexStructural) are staged instead: two unpredicated single blocks under a
+// hoisted PTRUE, then one peeled two-vector step, then a four-vector loop, and
+// only the final < VL bytes go back to WHILELO. The stages are sized by where
+// the corpus actually ends a string — 50% of cloudflare's strings are under 16
+// bytes and 47% are 16-31, so the two peeled blocks carry the mass and never
+// pay a loop bound. Measured against the plain WHILELO loop with the match at
+// the offset a real caller would see (long buffer, early match): -5.6% at 4-12
+// bytes (PTRUE breaks the dependence of the first load on the length argument,
+// which WHILELO put on it), -9.7% at 16-31, -13% to -21% through 128, and
+// -30% to -47% from 256 bytes up, where the unrolled loop reaches 39 GB/s.
+// End to end that is skip-heavy -45%, string_unicode -11%, and the cloudflare
+// family -0.7%.
+//
+// The two escape scanners deliberately do NOT get the unrolled stages. Their
+// block costs three predicate ops (MATCH, the range compare, ORRS), so at one
+// predicate pipe they are pinned at three cycles per vector no matter how few
+// other instructions surround them: unrolling would remove loop overhead that
+// is not the limit and add transition bands for nothing. They take the PTRUE
+// bulk loop only, which is the part that pays — four predicate ops per block
+// down to three.
+//
 // WHY THE FEATURE GATE IS HERE AND NOT IN GO. The natural spelling is an `if
 // useSVE2` in the Go dispatch wrapper, but that gives the wrapper two calls,
 // which costs 124 against the inliner's budget of 80 — indexCloseOrEscape stops
@@ -552,39 +573,122 @@ DATA sveStructSet<>+0(SB)/8, $0x222222225d5b7d7b
 DATA sveStructSet<>+8(SB)/8, $0x2222222222222222
 GLOBL sveStructSet<>(SB), RODATA|NOPTR, $16
 
-// func indexQuoteOrBackslashArm64(b []byte) int
+// func indexQuoteOrBackslashArm64(b []byte, i int) int
 //
-// The arm64 entry point for the '"'-or-'\\' scan: index of the first such byte,
-// or len(b). Runs the SVE2 body below on an SVE2 core and tail-calls the NEON
-// routine otherwise. The match set is built in-register as alternating '"'/'\\'
-// bytes, so there is no table and no memory operand on the critical path.
-TEXT ·indexQuoteOrBackslashArm64(SB), NOSPLIT, $0-32
+// The arm64 entry point for the '"'-or-'\\' scan: the index in b of the first
+// such byte at or after i, or len(b). Runs the SVE2 body below on an SVE2 core
+// and tail-calls the NEON routine otherwise — the two share this frame layout,
+// which is what makes that tail branch legal. The match set is built in-register
+// as alternating '"'/'\\' bytes, so there is no table and no memory operand on
+// the critical path.
+//
+// This is the staged body described above: two unpredicated single blocks (which
+// is where a corpus string almost always ends), one peeled pair, a four-vector
+// loop for long text, and a predicated remainder. See indexQuoteOrBackslashNEON
+// for why the scan start is an argument rather than a b[i:] reslice at the call
+// site; here it is also free, because x2 is the offset register the body already
+// carries and merely starts at i instead of zero.
+TEXT ·indexQuoteOrBackslashArm64(SB), NOSPLIT, $0-40
 	MOVBU ·useSVE2(SB), R9
 	CBZ   R9, qbNEON
 	MOVD  b_base+0(FP), R0
 	MOVD  b_len+8(FP), R1
+	MOVD  i+24(FP), R2
 	WORD $0x2538c441 // mov z1.b, #34 // '"'
 	WORD $0x2538cb82 // mov z2.b, #92 // '\\'
 	WORD $0x05227021 // trn1 z1.b, z1.b, z2.b // -> 22 5c 22 5c ... per segment
-	MOVD  ZR, R2
+	WORD $0x2518e3e1 // ptrue p1.b
+	WORD $0x0420e3e3 // cntb x3 // x3 = VL, the bytes one vector holds
+	SUB   R3, R1, R4 // x4 = len-VL, the last offset a full vector may load from
+	CMP   R4, R2
+	BGT   qbTail // fewer than a vector of bytes left from i
 
-qbLoop:
-	WORD $0x25211c41 // whilelo p1.b, x2, x1 // active lanes = min(VL, len-x2)
-	BEQ  qbNone      // b.none: the offset reached the end
 	WORD $0xa4024400 // ld1b {z0.b}, p1/z, [x0, x2]
 	WORD $0x45218402 // match p2.b, p1/z, z0.b, z1.b
-	BNE  qbFound     // b.any
+	BNE   qbFound
 	WORD $0x0430e3e2 // incb x2
-	B    qbLoop
+	CMP   R4, R2
+	BGT   qbTail
+
+	WORD $0xa4024400 // ld1b {z0.b}, p1/z, [x0, x2]
+	WORD $0x45218402 // match p2.b, p1/z, z0.b, z1.b
+	BNE   qbFound
+	WORD $0x0430e3e2 // incb x2
+	LSL   $1, R3, R5 // x5 = 2*VL
+	ADD   R0, R2, R6 // x6 = the running pointer
+	ADD   R0, R1, R8
+	SUB   R5, R8, R8 // x8 = the last pointer a two-vector step may load from
+
+	CMP   R8, R6
+	BGT   qbSingle
+	WORD $0x858040c0 // ldr z0, [x6]
+	WORD $0x858044c4 // ldr z4, [x6, #1, mul vl]
+	WORD $0x45218402 // match p2.b, p1/z, z0.b, z1.b
+	BNE   qbHit0
+	WORD $0x45218482 // match p2.b, p1/z, z4.b, z1.b
+	BNE   qbHit1
+	ADD   R5, R6, R6
+	LSL   $1, R5, R9 // x9 = 4*VL
+	SUB   R5, R8, R10 // x10 = the last pointer a four-vector step may load from
+	CMP   R10, R6
+	BGT   qbSinglePtr
+
+qbLoop4:
+	WORD $0x858040c0 // ldr z0, [x6]
+	WORD $0x858044c4 // ldr z4, [x6, #1, mul vl]
+	WORD $0x858048c5 // ldr z5, [x6, #2, mul vl]
+	WORD $0x85804cc6 // ldr z6, [x6, #3, mul vl]
+	WORD $0x45218402 // match p2.b, p1/z, z0.b, z1.b
+	BNE   qbHit0
+	WORD $0x45218482 // match p2.b, p1/z, z4.b, z1.b
+	BNE   qbHit1
+	WORD $0x452184a2 // match p2.b, p1/z, z5.b, z1.b
+	BNE   qbHit2
+	WORD $0x452184c2 // match p2.b, p1/z, z6.b, z1.b
+	BNE   qbHit3
+	ADD   R9, R6, R6
+	CMP   R10, R6
+	BLE   qbLoop4
+
+qbSinglePtr:
+	SUB   R0, R6, R2
+
+qbSingle:
+	CMP   R4, R2
+	BGT   qbTail
+	WORD $0xa4024400 // ld1b {z0.b}, p1/z, [x0, x2]
+	WORD $0x45218402 // match p2.b, p1/z, z0.b, z1.b
+	BNE   qbFound
+	WORD $0x0430e3e2 // incb x2
+	B     qbSingle
+
+qbTail:
+	WORD $0x25211c41 // whilelo p1.b, x2, x1 // active lanes = min(VL, len-x2)
+	BEQ   qbNone // b.none: the offset reached the end
+	WORD $0xa4024400 // ld1b {z0.b}, p1/z, [x0, x2]
+	WORD $0x45218402 // match p2.b, p1/z, z0.b, z1.b
+	BNE   qbFound
+
+qbNone:
+	MOVD R1, ret+32(FP)
+	RET
+
+qbHit3:
+	ADD  R3, R6, R6
+
+qbHit2:
+	ADD  R3, R6, R6
+
+qbHit1:
+	ADD  R3, R6, R6
+
+qbHit0:
+	SUB  R0, R6, R2
 
 qbFound:
 	WORD $0x25904443 // brkb p3.b, p1/z, p2.b // lanes before the first match
 	WORD $0x252c8862 // incp x2, p3.b // x2 += how many there were
-	MOVD R2, ret+24(FP)
-	RET
-
-qbNone:
-	MOVD R1, ret+24(FP)
+	MOVD R2, ret+32(FP)
 	RET
 
 qbNEON:
@@ -595,6 +699,16 @@ qbNEON:
 // The arm64 entry point for the escape scan: first '"', '\\' or control byte
 // < 0x20, or len(b). The control-byte half is one unsigned CMPLO against #32,
 // where NEON needs a VUMIN and a VCMEQ.
+//
+// This one keeps a plain single-vector bulk loop rather than the quote
+// scanner's unrolled stages, and the reason is the predicate budget again. Its
+// block costs THREE predicate ops (MATCH, CMPLO, ORRS) where the quote
+// scanner's costs one, so at one predicate pipe the loop is already pinned at
+// three cycles per vector however few other instructions surround it: unrolling
+// removes loop overhead that is not the limit, and only adds the code and the
+// transition bands. Dropping the per-block WHILELO — four predicate ops to
+// three — is the part that does pay, and that is what the PTRUE bulk loop here
+// buys.
 TEXT ·indexEscapeArm64(SB), NOSPLIT, $0-32
 	MOVBU ·useSVE2(SB), R9
 	CBZ   R9, esNEON
@@ -603,27 +717,39 @@ TEXT ·indexEscapeArm64(SB), NOSPLIT, $0-32
 	WORD $0x2538c441 // mov z1.b, #34
 	WORD $0x2538cb82 // mov z2.b, #92
 	WORD $0x05227021 // trn1 z1.b, z1.b, z2.b
+	WORD $0x2518e3e1 // ptrue p1.b
 	MOVD  ZR, R2
+	WORD $0x0420e3e3 // cntb x3
+	SUBS  R3, R1, R4
+	BLO   esTail
 
 esLoop:
-	WORD $0x25211c41 // whilelo p1.b, x2, x1
-	BEQ  esNone
 	WORD $0xa4024400 // ld1b {z0.b}, p1/z, [x0, x2]
 	WORD $0x45218402 // match p2.b, p1/z, z0.b, z1.b
 	WORD $0x24282403 // cmplo p3.b, p1/z, z0.b, #32 // unsigned <, i.e. <= 0x1f
 	WORD $0x25c34442 // orrs p2.b, p1/z, p2.b, p3.b
-	BNE  esFound
+	BNE   esFound
 	WORD $0x0430e3e2 // incb x2
-	B    esLoop
+	CMP   R4, R2
+	BLE   esLoop
+
+esTail:
+	WORD $0x25211c41 // whilelo p1.b, x2, x1
+	BEQ   esNone
+	WORD $0xa4024400 // ld1b {z0.b}, p1/z, [x0, x2]
+	WORD $0x45218402 // match p2.b, p1/z, z0.b, z1.b
+	WORD $0x24282403 // cmplo p3.b, p1/z, z0.b, #32
+	WORD $0x25c34442 // orrs p2.b, p1/z, p2.b, p3.b
+	BNE   esFound
+
+esNone:
+	MOVD R1, ret+24(FP)
+	RET
 
 esFound:
 	WORD $0x25904443 // brkb p3.b, p1/z, p2.b
 	WORD $0x252c8862 // incp x2, p3.b
 	MOVD R2, ret+24(FP)
-	RET
-
-esNone:
-	MOVD R1, ret+24(FP)
 	RET
 
 esNEON:
@@ -653,6 +779,9 @@ esNEON:
 // runs come back. SUB is unpredicated, so it also computes on the lanes the
 // zeroing load left at zero; harmless, because CMPHS is predicated and those
 // lanes cannot reach the result.
+//
+// Same three predicate ops per block as indexEscapeArm64, so the same plain
+// PTRUE bulk loop rather than the quote scanner's unrolled stages.
 TEXT ·indexEscapeNonASCIIArm64(SB), NOSPLIT, $0-32
 	MOVBU ·useSVE2(SB), R9
 	CBZ   R9, euNEON
@@ -662,28 +791,41 @@ TEXT ·indexEscapeNonASCIIArm64(SB), NOSPLIT, $0-32
 	WORD $0x2538cb82 // mov z2.b, #92
 	WORD $0x05227021 // trn1 z1.b, z1.b, z2.b
 	WORD $0x2538c403 // mov z3.b, #32 // the interval's low end
+	WORD $0x2518e3e1 // ptrue p1.b
 	MOVD  ZR, R2
+	WORD $0x0420e3e3 // cntb x3
+	SUBS  R3, R1, R4
+	BLO   euTail
 
 euLoop:
-	WORD $0x25211c41 // whilelo p1.b, x2, x1
-	BEQ  euNone
 	WORD $0xa4024400 // ld1b {z0.b}, p1/z, [x0, x2]
 	WORD $0x45218402 // match p2.b, p1/z, z0.b, z1.b
 	WORD $0x04230404 // sub z4.b, z0.b, z3.b
 	WORD $0x24380483 // cmphs p3.b, p1/z, z4.b, #96 // outside [0x20, 0x7f]
 	WORD $0x25c34442 // orrs p2.b, p1/z, p2.b, p3.b
-	BNE  euFound
+	BNE   euFound
 	WORD $0x0430e3e2 // incb x2
-	B    euLoop
+	CMP   R4, R2
+	BLE   euLoop
+
+euTail:
+	WORD $0x25211c41 // whilelo p1.b, x2, x1
+	BEQ   euNone
+	WORD $0xa4024400 // ld1b {z0.b}, p1/z, [x0, x2]
+	WORD $0x45218402 // match p2.b, p1/z, z0.b, z1.b
+	WORD $0x04230404 // sub z4.b, z0.b, z3.b
+	WORD $0x24380483 // cmphs p3.b, p1/z, z4.b, #96
+	WORD $0x25c34442 // orrs p2.b, p1/z, p2.b, p3.b
+	BNE   euFound
+
+euNone:
+	MOVD R1, ret+24(FP)
+	RET
 
 euFound:
 	WORD $0x25904443 // brkb p3.b, p1/z, p2.b
 	WORD $0x252c8862 // incp x2, p3.b
 	MOVD R2, ret+24(FP)
-	RET
-
-euNone:
-	MOVD R1, ret+24(FP)
 	RET
 
 euNEON:
@@ -697,29 +839,106 @@ euNEON:
 // dispatcher (indexStructural) already carries a length test and a 16-byte
 // scalar prescan, so it is far past the inline budget either way and the branch
 // costs nothing there.
+//
+// One predicate op per block like the quote scanner, so the same staged body —
+// and its callers (SkipValue's container walk, the presize counters) hand it
+// the rest of the document, where a long run with no structural byte is exactly
+// a long string value.
 TEXT ·indexStructuralSVE2(SB), NOSPLIT, $0-32
 	MOVD b_base+0(FP), R0
 	MOVD b_len+8(FP), R1
-	MOVD $sveStructSet<>(SB), R3
-	WORD $0x2518e3e0 // ptrue p0.b
-	WORD $0xa4002061 // ld1rqb {z1.b}, p0/z, [x3] // 16 bytes -> every segment
+	MOVD $sveStructSet<>(SB), R7
+	WORD $0x2518e3e1 // ptrue p1.b
+	WORD $0xa40024e1 // ld1rqb {z1.b}, p1/z, [x7] // 16 bytes -> every segment
 	MOVD ZR, R2
+	WORD $0x0420e3e3 // cntb x3
+	SUBS R3, R1, R4
+	BLO  stTail
 
-stLoop:
+	WORD $0xa400a400 // ld1b {z0.b}, p1/z, [x0]
+	WORD $0x45218402 // match p2.b, p1/z, z0.b, z1.b
+	BNE  stFound
+	MOVD R3, R2
+	CMP  R4, R2
+	BGT  stTail
+
+	WORD $0xa4024400 // ld1b {z0.b}, p1/z, [x0, x2]
+	WORD $0x45218402 // match p2.b, p1/z, z0.b, z1.b
+	BNE  stFound
+	LSL  $1, R3, R5
+	MOVD R5, R2
+	ADD  R0, R5, R6
+	ADD  R0, R1, R8
+	SUB  R5, R8, R8
+
+	CMP  R8, R6
+	BGT  stSingle
+	WORD $0x858040c0 // ldr z0, [x6]
+	WORD $0x858044c4 // ldr z4, [x6, #1, mul vl]
+	WORD $0x45218402 // match p2.b, p1/z, z0.b, z1.b
+	BNE  stHit0
+	WORD $0x45218482 // match p2.b, p1/z, z4.b, z1.b
+	BNE  stHit1
+	ADD  R5, R6, R6
+	LSL  $1, R5, R9
+	SUB  R5, R8, R10
+	CMP  R10, R6
+	BGT  stSinglePtr
+
+stLoop4:
+	WORD $0x858040c0 // ldr z0, [x6]
+	WORD $0x858044c4 // ldr z4, [x6, #1, mul vl]
+	WORD $0x858048c5 // ldr z5, [x6, #2, mul vl]
+	WORD $0x85804cc6 // ldr z6, [x6, #3, mul vl]
+	WORD $0x45218402 // match p2.b, p1/z, z0.b, z1.b
+	BNE  stHit0
+	WORD $0x45218482 // match p2.b, p1/z, z4.b, z1.b
+	BNE  stHit1
+	WORD $0x452184a2 // match p2.b, p1/z, z5.b, z1.b
+	BNE  stHit2
+	WORD $0x452184c2 // match p2.b, p1/z, z6.b, z1.b
+	BNE  stHit3
+	ADD  R9, R6, R6
+	CMP  R10, R6
+	BLE  stLoop4
+
+stSinglePtr:
+	SUB  R0, R6, R2
+
+stSingle:
+	CMP  R4, R2
+	BGT  stTail
+	WORD $0xa4024400 // ld1b {z0.b}, p1/z, [x0, x2]
+	WORD $0x45218402 // match p2.b, p1/z, z0.b, z1.b
+	BNE  stFound
+	WORD $0x0430e3e2 // incb x2
+	B    stSingle
+
+stTail:
 	WORD $0x25211c41 // whilelo p1.b, x2, x1
 	BEQ  stNone
 	WORD $0xa4024400 // ld1b {z0.b}, p1/z, [x0, x2]
 	WORD $0x45218402 // match p2.b, p1/z, z0.b, z1.b
 	BNE  stFound
-	WORD $0x0430e3e2 // incb x2
-	B    stLoop
+
+stNone:
+	MOVD R1, ret+24(FP)
+	RET
+
+stHit3:
+	ADD  R3, R6, R6
+
+stHit2:
+	ADD  R3, R6, R6
+
+stHit1:
+	ADD  R3, R6, R6
+
+stHit0:
+	SUB  R0, R6, R2
 
 stFound:
 	WORD $0x25904443 // brkb p3.b, p1/z, p2.b
 	WORD $0x252c8862 // incp x2, p3.b
 	MOVD R2, ret+24(FP)
-	RET
-
-stNone:
-	MOVD R1, ret+24(FP)
 	RET

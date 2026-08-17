@@ -50,6 +50,19 @@ func TestIndexVariantsFlip(t *testing.T) {
 				if got, want := indexCloseOrEscape(b), indexCloseOrEscapeScalar(b); got != want {
 					t.Fatalf("%s: indexCloseOrEscape(%q@%d) = %d, want %d", v.name, c, pos, got, want)
 				}
+				// The offset form, on both bodies: a nonzero start moves the
+				// match relative to the peeled first block and the unrolled
+				// loop, which is exactly where the two bodies differ, and is
+				// how every caller actually uses the scanner.
+				for _, start := range []int{1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129} {
+					if start > len(b) {
+						continue
+					}
+					want := start + indexCloseOrEscapeScalar(b[start:])
+					if got := indexCloseOrEscapeAt(b, start); got != want {
+						t.Fatalf("%s: indexCloseOrEscapeAt(%q@%d, start %d) = %d, want %d", v.name, c, pos, start, got, want)
+					}
+				}
 				if got, want := indexEscape(b), indexEscapeScalar(b); got != want {
 					t.Fatalf("%s: indexEscape(%q@%d) = %d, want %d", v.name, c, pos, got, want)
 				}

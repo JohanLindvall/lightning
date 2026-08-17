@@ -19,7 +19,7 @@ import "golang.org/x/sys/cpu"
 
 //nolint:unused // called from assembly; see above
 //go:noescape
-func indexQuoteOrBackslashNEON(b []byte) int
+func indexQuoteOrBackslashNEON(b []byte, i int) int
 
 //go:noescape
 func indexStructuralNEON(b []byte) int
@@ -37,7 +37,7 @@ func indexEscapeNonASCIINEON(b []byte) int
 // simd_arm64.s for why the gate lives there rather than in Go.
 
 //go:noescape
-func indexQuoteOrBackslashArm64(b []byte) int
+func indexQuoteOrBackslashArm64(b []byte, i int) int
 
 //go:noescape
 func indexEscapeArm64(b []byte) int
@@ -72,7 +72,14 @@ var useSVE2 = cpu.ARM64.HasSVE2
 // would cost two calls (124 against the inliner's budget of 80) and lose that —
 // re-check `-gcflags=-m` after editing here, the inline is load-bearing.
 func indexCloseOrEscape(b []byte) int {
-	return indexQuoteOrBackslashArm64(b)
+	return indexQuoteOrBackslashArm64(b, 0)
+}
+
+// indexCloseOrEscapeAt is indexCloseOrEscape starting at i and returning an
+// absolute index — see indexQuoteOrBackslashNEON for why the offset is an
+// argument rather than a b[i:] at the call site.
+func indexCloseOrEscapeAt(b []byte, i int) int {
+	return indexQuoteOrBackslashArm64(b, i)
 }
 
 // indexEscape returns the index of the first byte JSON string encoding must escape

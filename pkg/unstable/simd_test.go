@@ -129,3 +129,59 @@ func TestIndexEscapeNonASCIIScalarOracle(t *testing.T) {
 		}
 	}
 }
+
+// TestIndexCloseOrEscapeAtOffsets sweeps the scan START, which is the axis the
+// offset form of the scanner added and the axis no other test covers: the
+// generated decoders and every Read* here call indexCloseOrEscapeAt(data, i)
+// with i deep inside the document, so the assembly's peeled first block and its
+// position recovery both work from a nonzero index. A body that forgot to add
+// the offset back — or added it twice, or peeled from the base pointer instead
+// of from base+i — still passes every len-0-start test.
+//
+// The oracle is the scalar scanner over the equivalent subslice, and every
+// length/start/match-position combination up to two full blocks past the widest
+// vector body is tried, so the peeled block, the two-vector step, the unrolled
+// loop and the predicated remainder are each entered at every alignment.
+func TestIndexCloseOrEscapeAtOffsets(t *testing.T) {
+	for n := 0; n <= 160; n++ {
+		base := make([]byte, n)
+		for i := range base {
+			base[i] = byte('a' + i%26)
+		}
+		for _, c := range []byte{'"', '\\'} {
+			for pos := -1; pos < n; pos++ { // -1 = no match anywhere
+				b := append([]byte(nil), base...)
+				if pos >= 0 {
+					b[pos] = c
+				}
+				for start := 0; start <= n; start++ {
+					want := start + indexCloseOrEscapeScalar(b[start:])
+					if got := indexCloseOrEscapeAt(b, start); got != want {
+						t.Fatalf("indexCloseOrEscapeAt(len %d, %q@%d, start %d) = %d, want %d",
+							n, c, pos, start, got, want)
+					}
+				}
+			}
+		}
+	}
+}
+
+// TestIndexCloseOrEscapeAtPastEnd pins the out-of-span answer. Nothing in the
+// tree passes i > len(b) today, but the two assembly bodies reach that case by
+// different routes — arm64 falls into its predicated remainder, amd64 computes a
+// negative byte count — and on amd64 an unguarded negative count walks off the
+// end of the buffer. len(b) is the answer either way, which is also what a scan
+// that found nothing returns.
+func TestIndexCloseOrEscapeAtPastEnd(t *testing.T) {
+	for _, n := range []int{0, 1, 8, 16, 33, 100} {
+		b := make([]byte, n)
+		for i := range b {
+			b[i] = '"'
+		}
+		for _, start := range []int{n, n + 1, n + 7, n + 64} {
+			if got := indexCloseOrEscapeAt(b, start); got != n {
+				t.Fatalf("indexCloseOrEscapeAt(len %d, start %d) = %d, want %d", n, start, got, n)
+			}
+		}
+	}
+}

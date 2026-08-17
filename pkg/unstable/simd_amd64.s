@@ -57,10 +57,12 @@ GLOBL nibbleMask<>(SB), RODATA|NOPTR, $32
 // finishes in one iteration) without the VZEROUPPER, and the second 16-byte load
 // is skipped entirely when the match lands in the first half. A 16-byte loop
 // then handles a final 16-31 byte span before the scalar tail.
-TEXT ·indexQuoteOrBackslashSSE2(SB), NOSPLIT, $0-32
+TEXT ·indexQuoteOrBackslashSSE2(SB), NOSPLIT, $0-40
 	MOVQ b_base+0(FP), SI
 	MOVQ b_len+8(FP), CX
-	XORQ DI, DI
+	MOVQ i+24(FP), DI            // scan offset; DI stays the absolute index
+	SUBQ DI, CX                  // CX = bytes left from i
+	JS   sse_notfound            // i past the end: no bytes, answer len(b)
 	MOVOU quoteMask<>(SB), X0    // low 16 bytes of the splat: '"' x16
 	MOVOU bslashMask<>(SB), X1   // '\\' x16
 
@@ -115,7 +117,7 @@ qb_avx_loop:
 qb_avx_found:
 	BSFL AX, AX
 	ADDQ DI, AX
-	MOVQ AX, ret+24(FP)
+	MOVQ AX, ret+32(FP)
 	VZEROUPPER
 	RET
 
@@ -144,7 +146,7 @@ sse_found16:
 sse_found:
 	BSFL AX, AX
 	ADDQ DI, AX
-	MOVQ AX, ret+24(FP)
+	MOVQ AX, ret+32(FP)
 	RET
 
 sse_tail:
@@ -163,11 +165,11 @@ sse_tailloop:
 
 sse_notfound:
 	MOVQ b_len+8(FP), AX
-	MOVQ AX, ret+24(FP)
+	MOVQ AX, ret+32(FP)
 	RET
 
 sse_tfound:
-	MOVQ DI, ret+24(FP)
+	MOVQ DI, ret+32(FP)
 	RET
 
 // func indexStructuralAVX2(b []byte) int

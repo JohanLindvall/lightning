@@ -5,7 +5,7 @@ package unstable
 import "golang.org/x/sys/cpu"
 
 //go:noescape
-func indexQuoteOrBackslashSSE2(b []byte) int
+func indexQuoteOrBackslashSSE2(b []byte, i int) int
 
 //go:noescape
 func indexStructuralAVX2(b []byte) int
@@ -55,7 +55,17 @@ func indexEscapeNonASCII(b []byte) int {
 // callers (ReadKey, the Read*String funcs, SkipString), removing a call layer
 // from the hottest path in object decoding.
 func indexCloseOrEscape(b []byte) int {
-	return indexQuoteOrBackslashSSE2(b)
+	return indexQuoteOrBackslashSSE2(b, 0)
+}
+
+// indexCloseOrEscapeAt is indexCloseOrEscape starting at i and returning an
+// absolute index. The offset is an argument rather than a b[i:] at the call site
+// because Go lowers that reslice to seven instructions (len and cap
+// subtractions, the negative-length clamp on the base) at every one of them, and
+// this scanner runs once per object key and once per string value; DI is the
+// index register the assembly already carries, so it simply starts at i.
+func indexCloseOrEscapeAt(b []byte, i int) int {
+	return indexQuoteOrBackslashSSE2(b, i)
 }
 
 // structuralPrescan is how many leading bytes indexStructural scans with the

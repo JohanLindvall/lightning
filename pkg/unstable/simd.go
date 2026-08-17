@@ -23,6 +23,22 @@ package unstable
 // escape/error fallback.
 func IndexCloseOrEscape(b []byte) int { return indexCloseOrEscape(b) }
 
+// IndexCloseOrEscapeAt is IndexCloseOrEscape starting the scan at i and
+// returning an ABSOLUTE index into b (len(b) if there is no '"' or '\\' at or
+// after i). It is what generated decoders and the readers here call, because
+// expressing the start as IndexCloseOrEscape(b[i:]) makes the caller pay for a
+// reslice — seven instructions on arm64: the len and cap subtractions and the
+// negative-length clamp on the base pointer — once per object key and once per
+// string value, where handing the offset to the scanner costs one argument word
+// and nothing in the scan itself. Measured -20.7% on a key-read-shaped micro,
+// and the absolute result is what every caller wanted anyway.
+//
+// An i past the end of b is not an error: the answer is len(b), the same as a
+// scan that found nothing. Every implementation agrees on that, and the amd64
+// one needs an explicit guard to (its byte count would otherwise go negative and
+// walk off the buffer), which TestIndexCloseOrEscapeAtPastEnd pins.
+func IndexCloseOrEscapeAt(b []byte, i int) int { return indexCloseOrEscapeAt(b, i) }
+
 // IndexEscape returns the index of the first byte that JSON string encoding must
 // escape — a control byte < 0x20, '"' or '\\' — or len(b) if none. It is the
 // scan behind EscapeString/EscapeStringInto: a clean run is copied out in bulk and

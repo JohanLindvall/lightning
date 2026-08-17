@@ -47,7 +47,7 @@ func TestIndexVariantsFlip(t *testing.T) {
 			for pos := 0; pos < len(base); pos++ {
 				b := []byte(base)
 				b[pos] = c
-				if got, want := indexQuoteOrBackslashSSE2(b), indexCloseOrEscapeScalar(b); got != want {
+				if got, want := indexQuoteOrBackslashSSE2(b, 0), indexCloseOrEscapeScalar(b); got != want {
 					t.Fatalf("%s: indexQuoteOrBackslash(%q@%d) = %d, want %d", v.name, c, pos, got, want)
 				}
 				if got, want := indexEscapeSSE2(b), indexEscapeScalar(b); got != want {
@@ -68,7 +68,7 @@ func TestIndexVariantsFlip(t *testing.T) {
 					b[i] = byte('a' + rng.Intn(26))
 				}
 			}
-			if got, want := indexQuoteOrBackslashSSE2(b), indexCloseOrEscapeScalar(b); got != want {
+			if got, want := indexQuoteOrBackslashSSE2(b, 0), indexCloseOrEscapeScalar(b); got != want {
 				t.Fatalf("%s: random len %d: indexQuoteOrBackslash = %d, want %d (%q)", v.name, n, got, want, b)
 			}
 			if got, want := indexEscapeSSE2(b), indexEscapeScalar(b); got != want {
