@@ -272,11 +272,11 @@ func decodeIntSlice[T intKind](out *[]T, data []byte, i int, a *Arena) (int, err
 				return i, ErrBadNumber
 			}
 			for i+4 <= len(data) {
-				w := binary.LittleEndian.Uint32(data[i : i+4])
-				if !is4Digits(w) {
+				v, ok := tryParse4Digits(binary.LittleEndian.Uint32(data[i : i+4]))
+				if !ok {
 					break
 				}
-				n = n*10000 + int64(parse4Digits(w))
+				n = n*10000 + int64(v)
 				i += 4
 			}
 			for i < len(data) {
@@ -410,11 +410,11 @@ func decodeUintSlice[T uintKind](out *[]T, data []byte, i int, a *Arena) (int, e
 				return i, ErrBadNumber
 			}
 			for i+4 <= len(data) {
-				w := binary.LittleEndian.Uint32(data[i : i+4])
-				if !is4Digits(w) {
+				v, ok := tryParse4Digits(binary.LittleEndian.Uint32(data[i : i+4]))
+				if !ok {
 					break
 				}
-				n = n*10000 + uint64(parse4Digits(w))
+				n = n*10000 + uint64(v)
 				i += 4
 			}
 			for i < len(data) {
@@ -608,11 +608,11 @@ func DecodeIntArray[T intKind](out []T, data []byte, i int) (int, error) {
 				}
 				var n int64
 				for i+4 <= len(data) {
-					w := binary.LittleEndian.Uint32(data[i : i+4])
-					if !is4Digits(w) {
+					v, ok := tryParse4Digits(binary.LittleEndian.Uint32(data[i : i+4]))
+					if !ok {
 						break
 					}
-					n = n*10000 + int64(parse4Digits(w))
+					n = n*10000 + int64(v)
 					i += 4
 				}
 				for i < len(data) {
@@ -715,11 +715,11 @@ func DecodeUintArray[T uintKind](out []T, data []byte, i int) (int, error) {
 				}
 				var n uint64
 				for i+4 <= len(data) {
-					w := binary.LittleEndian.Uint32(data[i : i+4])
-					if !is4Digits(w) {
+					v, ok := tryParse4Digits(binary.LittleEndian.Uint32(data[i : i+4]))
+					if !ok {
 						break
 					}
-					n = n*10000 + uint64(parse4Digits(w))
+					n = n*10000 + uint64(v)
 					i += 4
 				}
 				for i < len(data) {

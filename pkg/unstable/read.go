@@ -158,11 +158,11 @@ func ReadInt64OrNull(data []byte, i int) (int64, int, error) {
 	// run 9-18 digits), then a scalar tail for the last 1-3. n*10000+v matches the
 	// scalar n*10+d chain bit for bit, including the wrap past 2^63 on overflow.
 	for i+4 <= len(data) {
-		w := binary.LittleEndian.Uint32(data[i : i+4])
-		if !is4Digits(w) {
+		v, ok := tryParse4Digits(binary.LittleEndian.Uint32(data[i : i+4]))
+		if !ok {
 			break
 		}
-		n = n*10000 + int64(parse4Digits(w))
+		n = n*10000 + int64(v)
 		i += 4
 	}
 	for i < len(data) {
@@ -205,11 +205,11 @@ func ReadUint64OrNull(data []byte, i int) (uint64, int, error) {
 	// Fold four digits per SWAR chunk (see ReadInt64OrNull); the scalar tail picks
 	// up the last 1-3 digits.
 	for i+4 <= len(data) {
-		w := binary.LittleEndian.Uint32(data[i : i+4])
-		if !is4Digits(w) {
+		v, ok := tryParse4Digits(binary.LittleEndian.Uint32(data[i : i+4]))
+		if !ok {
 			break
 		}
-		n = n*10000 + uint64(parse4Digits(w))
+		n = n*10000 + uint64(v)
 		i += 4
 	}
 	for i < len(data) {

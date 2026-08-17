@@ -84,11 +84,13 @@ func scanFloat(data []byte, i int) (f float64, end int, fast, ok bool) {
 		// per chunk. The 1-3 digit tail (and any digits past the 19-digit budget)
 		// drops to the scalar loop below.
 		for mdigits+4 <= 19 && i+4 <= n {
-			w := binary.LittleEndian.Uint32(data[i : i+4])
-			if !is4Digits(w) {
+			// ok4, not ok: this function's result is a named `ok` return, and a
+			// `:=` here would shadow it inside the loop body.
+			v, ok4 := tryParse4Digits(binary.LittleEndian.Uint32(data[i : i+4]))
+			if !ok4 {
 				break
 			}
-			mant = mant*10000 + uint64(parse4Digits(w))
+			mant = mant*10000 + uint64(v)
 			mdigits += 4
 			digits += 4
 			exp -= 4
@@ -296,7 +298,9 @@ func ParseFloat(b []byte) (float64, error) {
 }
 
 // is4Digits reports whether the four bytes packed little-endian in w are all
-// ASCII digits '0'..'9' (the simdjson bit trick).
+// ASCII digits '0'..'9' (the simdjson bit trick). Kept for the differential
+// test that pins tryParse4Digits' accept set to it; the SWAR digit loops all
+// call tryParse4Digits, which decides and folds in one pass.
 func is4Digits(w uint32) bool {
 	return (w&0xF0F0F0F0)|(((w+0x06060606)&0xF0F0F0F0)>>4) == 0x33333333
 }
@@ -309,4 +313,39 @@ func parse4Digits(w uint32) uint32 {
 	hi := (w >> 8) & 0x00FF00FF
 	w = lo*10 + hi
 	return (w&0x0000FFFF)*100 + (w >> 16)
+}
+
+// tryParse4Digits folds the four bytes packed little-endian in w into the
+// integer they spell, reporting false (and leaving the value unspecified) if any
+// of them is not an ASCII digit. It is the digit step of every SWAR fold here —
+// ReadInt64OrNull/ReadUint64OrNull, batch.go's four array readers, and
+// scanFloat's fraction loop — replacing an is4Digits test followed by a
+// parse4Digits fold.
+//
+// It exists because the split form paid for its constants twice over on arm64.
+// AArch64 folds an immediate into a logical op only when it is a "bitmask
+// immediate" (a rotated run of ones, replicated), and ADD/SUB take a 12-bit
+// immediate and nothing wider — so is4Digits' 0x06060606 (an ADD operand) and
+// 0x33333333 (a CMP operand) each cost a MOVD plus three MOVKs, IN the loop and
+// again on the back edge, and parse4Digits then materialised 0x30303030 for its
+// own subtraction. Deciding on the SAME d = w - 0x30303030 the fold needs
+// removes one constant outright and trades the other two for one.
+//
+// The test is the classic packed-digit form: d = w - 0x30303030 wraps a byte
+// below '0' to >= 0xd0, so its own top bit flags it, and adding 0x76 to a byte
+// in 0x0a..0x7f carries into the top bit while a real digit (0..9) reaches only
+// 0x7f. It is EXACTLY is4Digits, not an approximation. A lane can only be
+// disturbed by a carry out of the lane below it, and a lane that carries has
+// already set its own flag (d >= 0x8a there), so the OR is nonzero either way;
+// the proof runs in both directions and TestTryParse4DigitsMatchesIs4Digits
+// checks it over every digit-adjacent byte combination plus random words.
+func tryParse4Digits(w uint32) (uint32, bool) {
+	d := w - 0x30303030
+	if (d|(d+0x76767676))&0x80808080 != 0 {
+		return 0, false
+	}
+	lo := d & 0x00FF00FF
+	hi := (d >> 8) & 0x00FF00FF
+	x := lo*10 + hi
+	return (x&0x0000FFFF)*100 + (x >> 16), true
 }
