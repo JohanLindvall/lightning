@@ -26,7 +26,7 @@ import (
 // is what let this comment go stale while claiming to be exhaustive. Every
 // caller treats such input as an error or a presize miss.
 func SkipValue(data []byte, i int) (int, error) {
-	if i >= len(data) {
+	if uint(i) >= uint(len(data)) {
 		return i, ErrTruncated
 	}
 	switch data[i] {
@@ -75,7 +75,7 @@ func SkipString(data []byte, i int) (int, error) {
 	i++
 	for {
 		e := indexCloseOrEscapeAt(data, i)
-		if e == len(data) {
+		if uint(e) >= uint(len(data)) {
 			return len(data), ErrTruncated
 		}
 		if data[e] == '"' {
@@ -108,7 +108,7 @@ func skipNumber(data []byte, i int) (int, error) {
 	if i < len(data) && data[i] == '-' {
 		i++
 	}
-	for i < len(data) {
+	for uint(i) < uint(len(data)) {
 		c := data[i]
 		if (c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-' {
 			i++
@@ -154,11 +154,11 @@ func skipObjectDepth(data []byte, i, depth int) (int, error) {
 	}
 	// data[i] == '{'
 	i++
-	for i < len(data) {
+	for uint(i) < uint(len(data)) {
 		// Jump to the next structural byte, skipping inert content (keys' inner
 		// chars, numbers, bools, whitespace) in one vectorized pass.
 		i += indexStructural(data[i:])
-		if i >= len(data) {
+		if uint(i) >= uint(len(data)) {
 			break
 		}
 		switch data[i] {
@@ -195,9 +195,9 @@ func skipArrayDepth(data []byte, i, depth int) (int, error) {
 	}
 	// data[i] == '['
 	i++
-	for i < len(data) {
+	for uint(i) < uint(len(data)) {
 		i += indexStructural(data[i:])
-		if i >= len(data) {
+		if uint(i) >= uint(len(data)) {
 			break
 		}
 		switch data[i] {
@@ -241,7 +241,7 @@ func skipArrayDepth(data []byte, i, depth int) (int, error) {
 // reject the next real token. SkipWS is not called inside strings, so control
 // bytes within string contents are unaffected.
 func SkipWS(data []byte, i int) int {
-	for i < len(data) && data[i] <= ' ' {
+	for uint(i) < uint(len(data)) && data[i] <= ' ' {
 		i++
 	}
 	return i
@@ -281,8 +281,13 @@ func SkipWSRun(data []byte, i int) int {
 		// compare instead of the five-op classify below. It is a *sufficient*
 		// condition — every byte is exactly 0x20 — so this only skips work; the
 		// exact SWAR still decides every other word, including the one that ends
-		// the run, so nothing about which input is accepted changes.
-		if w != sp {
+		// the run, so nothing about which input is accepted changes. Whether the
+		// shortcut pays is per architecture (skipWSSpaceShortcut): it trades
+		// three ALU operations for a second taken branch per space word, a win
+		// where instructions are the limit (arm64) and a loss where taken
+		// branches are (amd64); the constant folds, so each side compiles to
+		// exactly the loop it measured best.
+		if !skipWSSpaceShortcut || w != sp {
 			// A bit set per lane that is NOT whitespace — the complement of the
 			// whitespace mask, so the run-terminating exit needs no XOR to invert
 			// it, and the non-zero test in front of TrailingZeros64 *proves* the
@@ -318,7 +323,7 @@ func SkipWSRun(data []byte, i int) int {
 		}
 		i += 8
 	}
-	for i < len(data) && data[i] <= ' ' {
+	for uint(i) < uint(len(data)) && data[i] <= ' ' {
 		i++
 	}
 	return i
@@ -331,7 +336,7 @@ func SkipWSRun(data []byte, i int) int {
 // i unchanged; otherwise it is SkipWS. This mirrors the generator's
 // //lightning:compact decoders, which elide exactly these inter-token skips.
 func SkipWSCompact(data []byte, i int, compact bool) int {
-	for !compact && i < len(data) && data[i] <= ' ' {
+	for !compact && uint(i) < uint(len(data)) && data[i] <= ' ' {
 		i++
 	}
 	return i

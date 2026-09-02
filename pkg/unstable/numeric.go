@@ -30,6 +30,227 @@ var pow10exact = [...]float64{
 // always runs to the end of the token, the slow path no longer pays for the
 // fast-path parser's full rescan-then-reject before handing off to strconv.
 func scanFloat(data []byte, i int) (f float64, end int, fast, ok bool) {
+	// Straight-line fast path for the shape nearly every real-world float has:
+	// an optional '-', 1-7 integer digits, an optional '.' with 1-24 fraction
+	// digits, an optional exponent of 1-7 digits, at most 19 significant digits.
+	//
+	// The whole 32-byte window after the sign is loaded up front at FIXED
+	// offsets, and the fraction is aligned to a word boundary with funnel
+	// shifts by the integer-digit count, so every load issues at once and the
+	// digit masks and folds of the three fraction words proceed in parallel. A
+	// first version loaded each word at the offset the previous word's digit
+	// count produced; that turned the loop form's well-predicted control
+	// dependencies into a load-to-address DATA chain (load, mask, count, add,
+	// load, ... ~13 cycles a link), and a 17-digit fraction ran 18% slower
+	// than the loops it replaced despite executing fewer instructions. The
+	// loop form (scanFloatSlow) costs 289 instructions and 23 taken branches
+	// for an 8-byte float on Meteor Lake; this path is the arithmetic alone.
+	//
+	// Each digit run is measured with one SWAR mask (the lowest flagged lane
+	// is exact: borrows and carries only travel upward, and every lane below
+	// the first non-digit is a digit) and folded with one fixed 8-digit fold
+	// after shifting the run into the top lanes, the vacated low lanes reading
+	// as leading zeros. Significance follows scanFloatSlow to the digit —
+	// leading fraction zeros do not count against the 19-digit budget when the
+	// integer part is zero — so golang_source's 0.000698…-shaped weights stay
+	// here. Anything unrecognised (a '+', 8+ integer digits, 25+ fraction
+	// digits, more than 19 significant digits, an 8+ digit exponent, a
+	// malformed continuation, or a token within 48 bytes of the end of the
+	// buffer, the window the unchecked loads need) is handed whole to
+	// scanFloatSlow, whose results this path reproduces bit for bit —
+	// TestScanFloatFastMatchesSlow pins that over generated tokens.
+	if uint(i)+48 <= uint(len(data)) {
+		const (
+			hi   = swarHi
+			zero = swarZero
+			six  = swarSix
+			nib  = swarNib
+			one  = swarOne
+		)
+		start := i
+		neg := data[i] == '-'
+		if neg {
+			i++
+		}
+		w0 := load64(data, i)
+		w1 := load64(data, i+8)
+		w2 := load64(data, i+16)
+		w3 := load64(data, i+24)
+		d0 := w0 ^ zero
+		k := bits.TrailingZeros64(((d0+six)|d0)&nib) >> 3 // integer digits, 8 = all
+		if uint(k-1) < 7 {                                // 1..7 (k == 0 wraps)
+			mant := parse8Digits(d0 << (uint(8-k) * 8 & 63))
+			p := k // offset just past the digits consumed so far
+			exp := 0
+			if byte(w0>>(uint(k)*8&63)) == '.' {
+				// The fraction starts at lane k+1: funnel the window down by
+				// that many lanes so it begins each word. k is 1..7, so the
+				// shift pairs are 8..56 and 48..0 — no shift reaches 64.
+				sh := uint(k) * 8 & 63
+				f0 := (w0>>8)>>sh | w1<<(56-sh)
+				f1 := (w1>>8)>>sh | w2<<(56-sh)
+				f2 := (w2>>8)>>sh | w3<<(56-sh)
+				fd0 := f0 ^ zero
+				m0 := ((fd0 + six) | fd0) & nib
+				var kf int
+				var fv uint64
+				if m0 != 0 { // 1-7 fraction digits, or none
+					kf = bits.TrailingZeros64(m0) >> 3
+					if kf == 0 {
+						return scanFloatSlow(data, start) // "1." and "1.x": the slow path decides
+					}
+					fv = parse8Digits(fd0 << (uint(8-kf) * 8 & 63))
+				} else {
+					fd1 := f1 ^ zero
+					m1 := ((fd1 + six) | fd1) & nib
+					if m1 != 0 { // 8-15
+						r := bits.TrailingZeros64(m1) >> 3
+						kf = 8 + r
+						// (x<<8)<<((7-r)*8) lands r digits in the top lanes and, for
+						// r == 0, shifts the word out entirely — no 64-bit shift.
+						fv = parse8Digits(fd0)*pow10u64[r] + parse8Digits((fd1<<8)<<(uint(7-r)*8&63))
+					} else {
+						fd2 := f2 ^ zero
+						m2 := ((fd2 + six) | fd2) & nib
+						if m2 == 0 {
+							return scanFloatSlow(data, start) // 25+ fraction digits
+						}
+						r := bits.TrailingZeros64(m2) >> 3 // 16-23
+						kf = 16 + r
+						fv = (parse8Digits(fd0)*1e8+parse8Digits(fd1))*pow10u64[r] + parse8Digits((fd2<<8)<<(uint(7-r)*8&63))
+					}
+				}
+				// Significant digits: the integer digits plus the fraction digits,
+				// less the fraction's leading zeros when the integer part is zero
+				// (the slow path skips those without counting them). Only the first
+				// word's zeros are discounted, which can only send a number with 9+
+				// leading zeros to the slow path early, never admit one wrongly; lz
+				// is clamped to the run because a non-digit lane above it can read
+				// as zero.
+				sig := k + kf
+				if mant == 0 {
+					lz := bits.TrailingZeros64((fd0+one)&hi) >> 3
+					if lz > kf {
+						lz = kf
+					}
+					sig -= lz
+				}
+				if sig > 19 {
+					return scanFloatSlow(data, start) // past the budget: strconv decides
+				}
+				mant = mant*pow10u64[kf] + fv // mant != 0 implies kf <= 18 here
+				p = k + 1 + kf
+				exp = -kf
+			}
+			// The byte after the digits: an exponent of 1-7 digits is folded the
+			// same way; a digit cannot follow a measured run, so only a '.', 'e' or
+			// 'E' can still make the token malformed ("1.2.3", "1e2e3"), and those
+			// go to the slow path, which measures and rejects the whole run.
+			switch c := data[i+p]; c {
+			case 'e', 'E':
+				q := i + p + 1
+				esign := 1
+				if c := data[q]; c == '+' || c == '-' {
+					if c == '-' {
+						esign = -1
+					}
+					q++
+				}
+				de := load64(data, q) ^ zero // q <= i+34: the window covers it
+				ke := bits.TrailingZeros64(((de+six)|de)&nib) >> 3
+				if uint(ke-1) >= 7 { // no digits ("1e", "1e+"), or 8+: the slow path decides
+					return scanFloatSlow(data, start)
+				}
+				exp += esign * int(parse8Digits(de<<(uint(8-ke)*8&63)))
+				q += ke
+				if c := data[q]; c == '.' || c == 'e' || c == 'E' {
+					return scanFloatSlow(data, start)
+				}
+				end = q
+			case '.':
+				return scanFloatSlow(data, start)
+			default:
+				end = i + p
+			}
+			if mant>>53 != 0 {
+				if v, ok := eiselLemire64(mant, exp, neg); ok {
+					return v, end, true, true
+				}
+				return 0, end, false, true // hand the exact token to strconv
+			}
+			f = float64(mant)
+			if exp < 0 {
+				if exp < -22 {
+					if v, ok := eiselLemire64(mant, exp, neg); ok {
+						return v, end, true, true
+					}
+					return 0, end, false, true
+				}
+				f /= pow10exact[-exp]
+			} else if exp > 0 {
+				if exp > 22 {
+					if v, ok := eiselLemire64(mant, exp, neg); ok {
+						return v, end, true, true
+					}
+					return 0, end, false, true
+				}
+				f *= pow10exact[exp]
+			}
+			if neg {
+				f = -f
+			}
+			return f, end, true, true
+		}
+		i = start
+	}
+	return scanFloatSlow(data, i)
+}
+
+// The SWAR digit constants. d = w ^ swarZero turns a digit lane into its value
+// (0x30..0x39 differ from '0' only in the low nibble) and leaves every other
+// byte with a nonzero high nibble or a low nibble above 9, so
+// ((d + swarSix) | d) & swarNib flags exactly the non-digit lanes: adding 6
+// pushes 0x0a..0x0f into the high nibble and a digit reaches at most 0x0f. The
+// XOR is lane-independent, so the mask is exact in every lane; the add can
+// carry only out of a lane at 0xfa or above, which is itself flagged, so the
+// lowest flagged lane and the all-digits verdict are exact regardless. Every
+// constant here is an AArch64 bitmask immediate, which the earlier
+// subtract-and-bias form (0x30 in a SUB, 0x76 in an ADD) was not: those cost a
+// MOVD and three MOVKs each per call, and the compiler also distributed the
+// fold's multiply over the subtraction, materialising a further two-instruction
+// constant on the fraction path. swarOne flags the digit lanes that are not
+// zero.
+const (
+	swarLo   = ^uint64(0) / 255 // 0x0101...01
+	swarHi   = swarLo << 7      // 0x8080...80
+	swarZero = swarLo * '0'
+	swarSix  = swarLo * 0x06
+	swarNib  = swarLo * 0xf0
+	swarOne  = swarLo * 0x7f
+)
+
+// pow10u64 holds 10^0 .. 10^19 as integers, the scale that shifts an integer
+// part past a measured run of fraction digits in scanFloat's fast path. It is
+// indexed by a fraction length of up to 24, but a nonzero integer part is only
+// ever scaled within the 19-digit budget; the entries past 10^19 are reached
+// only with a zero multiplicand and hold zero.
+var pow10u64 = [25]uint64{
+	1, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19,
+}
+
+// parse8Digits folds eight digit lanes (each already reduced by '0', lane 0 the
+// most significant digit) into their value — simdjson's parse_eight_digits_
+// unrolled. Lanes shifted in as zero read as leading '0' digits, which is how
+// scanFloat folds a run shorter than eight with the same three multiplies.
+func parse8Digits(d uint64) uint64 {
+	d = d*10 + d>>8
+	d = (d&0x000000FF000000FF)*(100+(1000000<<32)) + ((d>>16)&0x000000FF000000FF)*(1+(10000<<32))
+	return d >> 32
+}
+
+// scanFloatSlow is the general loop form of scanFloat (see there): it handles
+// every token shape and is the oracle the fast path is pinned against.
+func scanFloatSlow(data []byte, i int) (f float64, end int, fast, ok bool) {
 	n := len(data)
 	neg := false
 	if i < n {
@@ -340,10 +561,15 @@ func parse4Digits(w uint32) uint32 {
 // the proof runs in both directions and TestTryParse4DigitsMatchesIs4Digits
 // checks it over every digit-adjacent byte combination plus random words.
 func tryParse4Digits(w uint32) (uint32, bool) {
-	d := w - 0x30303030
-	if (d|(d+0x76767676))&0x80808080 != 0 {
+	// The test runs in a 64-bit register so its constants are AArch64 bitmask
+	// immediates (a 32-bit splat is not one to the Go compiler); the four upper
+	// lanes read 0x30 after the XOR and so flag, which the uint32 truncation
+	// discards. See swarSix for the mask.
+	d64 := uint64(w) ^ swarZero
+	if uint32(((d64+swarSix)|d64)&swarNib) != 0 {
 		return 0, false
 	}
+	d := uint32(d64)
 	lo := d & 0x00FF00FF
 	hi := (d >> 8) & 0x00FF00FF
 	x := lo*10 + hi

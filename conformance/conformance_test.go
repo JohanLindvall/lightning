@@ -1371,19 +1371,27 @@ func TestEmbeddedUnmarshalerDivergesFromStdlib(t *testing.T) {
 		t.Errorf("got %+v, want RawMessage={\"z\":1} B=8", r)
 	}
 
-	// Control: json.Number has no UnmarshalJSON, so nothing is promoted and the
-	// two agree — the divergence is the promoted method, not the foreign embed.
+	// Control: through Go 1.26 json.Number has no unmarshaler of its own, so
+	// nothing is promoted and the two agree — the divergence is the promoted
+	// method, not the foreign embed. Go 1.27's json/v2-backed encoding/json gives
+	// json.Number an UnmarshalJSONFrom, which promotes exactly like time.Time's
+	// method above; on that toolchain the stdlib hands the whole document to the
+	// embed and the case is a third instance of the divergence instead.
 	ndoc := []byte(`{"Number":12,"c":9}`)
-	var nstd embedNumberStd
-	if err := json.Unmarshal(ndoc, &nstd); err != nil {
-		t.Fatalf("stdlib: %v", err)
-	}
 	var n EmbedNumber
 	if err := n.UnmarshalJSON(ndoc); err != nil {
 		t.Fatalf("lightning: %v", err)
 	}
+	if n.Number != "12" || n.C != 9 {
+		t.Errorf("lightning %+v, want Number=12 C=9", n)
+	}
+	var nstd embedNumberStd
+	if err := json.Unmarshal(ndoc, &nstd); err != nil {
+		t.Logf("encoding/json rejects the document (%v): json.Number carries a promoted unmarshaler on this toolchain, so the embed diverges like time.Time", err)
+		return
+	}
 	if n != EmbedNumber(nstd) {
-		t.Errorf("lightning %+v, stdlib %+v: embedding a type without UnmarshalJSON must agree", n, nstd)
+		t.Errorf("lightning %+v, stdlib %+v: embedding a type without an unmarshaler must agree", n, nstd)
 	}
 }
 

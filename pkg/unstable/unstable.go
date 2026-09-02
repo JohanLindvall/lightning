@@ -61,9 +61,6 @@ func ExpectNull(data []byte, i int) (int, error) {
 }
 
 func unsafeStr(b []byte) string {
-	if len(b) == 0 {
-		return ""
-	}
 	return unsafe.String(unsafe.SliceData(b), len(b))
 }
 

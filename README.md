@@ -236,8 +236,10 @@ Two limits on that:
   *silently*, capturing the entire document into the embed and leaving the
   sibling fields zero. lightning's answer is usually the wanted one, but it is a
   real divergence: don't embed such a type in a schema that has to decode the
-  same way under both. An embedded `json.Number` is unaffected — it carries no
-  `UnmarshalJSON`, so nothing is promoted and the two agree.
+  same way under both. An embedded `json.Number` is unaffected through Go 1.26
+  — it carries no `UnmarshalJSON`, so nothing is promoted and the two agree;
+  Go 1.27's json/v2-backed `encoding/json` gives it an unmarshaler, and from
+  there it diverges the same way `time.Time` does.
 
 ## Differences from `encoding/json`
 
@@ -330,12 +332,14 @@ are *silent*.
   `unstable.TestStringsPassInvalidUTF8Through`. (The *escape* direction —
   `EscapeString`/`EscapeStringInto`, which produce JSON — substitutes U+FFFD
   exactly as `encoding/json` does when marshaling.)
-- **A `time.Time` written with `\uXXXX` escapes decodes here and fails in
-  `encoding/json`.** lightning reads the JSON string's *value* and parses that;
-  `time.Time.UnmarshalJSON` parses the raw bytes between the quotes without
-  unescaping them ([go.dev/issue/47353](https://go.dev/issue/47353)), so
-  `"2021-01-01T00:00:00Z"` — legal JSON denoting a legal instant — errors
-  there and decodes to `2021-01-01 00:00:00 +0000 UTC` here. The divergence only
+- **A `time.Time` written with `\uXXXX` escapes decodes here and, through Go
+  1.26, fails in `encoding/json`.** lightning reads the JSON string's *value*
+  and parses that; `time.Time.UnmarshalJSON` used to parse the raw bytes between
+  the quotes without unescaping them
+  ([go.dev/issue/47353](https://go.dev/issue/47353)), so
+  `"2021-01-01T00:00:00Z"` — legal JSON denoting a legal instant — errored
+  there and decodes to `2021-01-01 00:00:00 +0000 UTC` here. Go 1.27's
+  json/v2-backed `encoding/json` unescapes first and agrees. The divergence only
   ever accepts *more*, and on an escape-free timestamp the two agree on both
   acceptance and instant. lightning's authority for the grammar is
   `time.Parse(time.RFC3339, …)`, which is also what the stdlib currently reduces

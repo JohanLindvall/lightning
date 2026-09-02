@@ -92,15 +92,22 @@ func TestReadTimeAcceptsEscapedTimestamps(t *testing.T) {
 				t.Errorf("ReadTimeLaxOrNull(%s) = %v; want it to inherit the leniency", tc.doc, err)
 			}
 
-			// The premise: the document is well-formed JSON, and the stdlib's
-			// time.Time still refuses it — not because the instant is wrong but
-			// because it never unescapes the string.
+			// The premise depends on the toolchain. Through Go 1.26 the stdlib's
+			// time.Time refused these — not because the instant is wrong but
+			// because it parsed the raw quoted bytes without unescaping them
+			// (go.dev/issue/47353); Go 1.27's json/v2-backed encoding/json
+			// unescapes first, closing the divergence. Either way the document is
+			// well-formed JSON, and wherever the stdlib does decode it, it must
+			// land on the same instant this reader does.
 			if !ejson.Valid(data) {
 				t.Fatalf("test bug: %s is not valid JSON", tc.doc)
 			}
 			var std time.Time
 			if err := ejson.Unmarshal(data, &std); err == nil {
-				t.Fatalf("premise broken: encoding/json now decodes %s as %v — the divergence has closed", tc.doc, std)
+				if !std.Equal(tc.want) {
+					t.Fatalf("encoding/json decodes %s as %v, want %v: the two now disagree on the instant itself", tc.doc, std, tc.want)
+				}
+				t.Logf("encoding/json also decodes %s: the escape divergence is closed on this toolchain", tc.doc)
 			}
 		})
 	}

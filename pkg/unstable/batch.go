@@ -69,7 +69,7 @@ func DecodeFloat64SliceArena(out *[]float64, data []byte, i int, a *Arena) (int,
 // on the once-per-slice presize path, not in the per-element loop, so the
 // non-arena entry point costs one predictable branch over the old form.
 func decodeFloat64Slice(out *[]float64, data []byte, i int, a *Arena) (int, error) {
-	if i >= len(data) {
+	if uint(i) >= uint(len(data)) {
 		return i, ErrTruncated
 	}
 	if data[i] == 'n' {
@@ -106,13 +106,13 @@ func decodeFloat64Slice(out *[]float64, data []byte, i int, a *Arena) (int, erro
 		// Inter-token whitespace, in the shape the generator inlines: 0-1 bytes
 		// resolve in one or two compares; only a real indentation run reaches the
 		// SWAR SkipWSRun (which the compiler inlines here too — no call).
-		if i < len(data) && data[i] <= ' ' {
+		if uint(i) < uint(len(data)) && data[i] <= ' ' {
 			i++
-			if i < len(data) && data[i] <= ' ' {
+			if uint(i) < uint(len(data)) && data[i] <= ' ' {
 				i = SkipWSRun(data, i+1)
 			}
 		}
-		if i >= len(data) {
+		if uint(i) >= uint(len(data)) {
 			*out = s
 			return i, ErrTruncated
 		}
@@ -154,13 +154,13 @@ func decodeFloat64Slice(out *[]float64, data []byte, i int, a *Arena) (int, erro
 		// Inter-token whitespace, in the shape the generator inlines: 0-1 bytes
 		// resolve in one or two compares; only a real indentation run reaches the
 		// SWAR SkipWSRun (which the compiler inlines here too — no call).
-		if i < len(data) && data[i] <= ' ' {
+		if uint(i) < uint(len(data)) && data[i] <= ' ' {
 			i++
-			if i < len(data) && data[i] <= ' ' {
+			if uint(i) < uint(len(data)) && data[i] <= ' ' {
 				i = SkipWSRun(data, i+1)
 			}
 		}
-		if i >= len(data) {
+		if uint(i) >= uint(len(data)) {
 			*out = s
 			return i, ErrTruncated
 		}
@@ -195,7 +195,7 @@ func DecodeIntSliceArena[T intKind](out *[]T, data []byte, i int, a *Arena) (int
 // decodeIntSlice is the shared body; a nil arena presizes with make, exactly
 // as before the arena existed (see decodeFloat64Slice).
 func decodeIntSlice[T intKind](out *[]T, data []byte, i int, a *Arena) (int, error) {
-	if i >= len(data) {
+	if uint(i) >= uint(len(data)) {
 		return i, ErrTruncated
 	}
 	if data[i] == 'n' {
@@ -232,13 +232,13 @@ func decodeIntSlice[T intKind](out *[]T, data []byte, i int, a *Arena) (int, err
 		// Inter-token whitespace, in the shape the generator inlines: 0-1 bytes
 		// resolve in one or two compares; only a real indentation run reaches the
 		// SWAR SkipWSRun (which the compiler inlines here too — no call).
-		if i < len(data) && data[i] <= ' ' {
+		if uint(i) < uint(len(data)) && data[i] <= ' ' {
 			i++
-			if i < len(data) && data[i] <= ' ' {
+			if uint(i) < uint(len(data)) && data[i] <= ' ' {
 				i = SkipWSRun(data, i+1)
 			}
 		}
-		if i >= len(data) {
+		if uint(i) >= uint(len(data)) {
 			*out = s
 			return i, ErrTruncated
 		}
@@ -262,7 +262,7 @@ func decodeIntSlice[T intKind](out *[]T, data []byte, i int, a *Arena) (int, err
 			if data[i] == '-' {
 				neg = true
 				i++
-				if i >= len(data) {
+				if uint(i) >= uint(len(data)) {
 					*out = s
 					return i, ErrBadNumber
 				}
@@ -271,6 +271,14 @@ func decodeIntSlice[T intKind](out *[]T, data []byte, i int, a *Arena) (int, err
 				*out = s
 				return i, ErrBadNumber
 			}
+			// Four digits per SWAR step, then a byte tail — deliberately NOT the
+			// word-at-a-time digitRun the single-value readers use. The corpus's
+			// array integers are 1-4 digits (marine_ik 130k of them, mesh's index
+			// arrays), and back to back: a byte loop advances under a predicted
+			// branch, so the next element's load issues ahead, while a word count
+			// puts that address on a load→mask→count data chain. Measured on a
+			// Neoverse N2: digitRun here was mesh +1.1% with fewer instructions,
+			// and two guarded hybrids were worse still (CLAUDE.md, 2026-09-02).
 			for i+4 <= len(data) {
 				v, ok := tryParse4Digits(binary.LittleEndian.Uint32(data[i : i+4]))
 				if !ok {
@@ -279,7 +287,7 @@ func decodeIntSlice[T intKind](out *[]T, data []byte, i int, a *Arena) (int, err
 				n = n*10000 + int64(v)
 				i += 4
 			}
-			for i < len(data) {
+			for uint(i) < uint(len(data)) {
 				d := data[i] - '0'
 				if d > 9 {
 					break
@@ -288,7 +296,7 @@ func decodeIntSlice[T intKind](out *[]T, data []byte, i int, a *Arena) (int, err
 				i++
 			}
 			if i < len(data) && (data[i] == '.' || data[i] == 'e' || data[i] == 'E') {
-				for i < len(data) {
+				for uint(i) < uint(len(data)) {
 					c := data[i]
 					if (c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-' {
 						i++
@@ -305,13 +313,13 @@ func decodeIntSlice[T intKind](out *[]T, data []byte, i int, a *Arena) (int, err
 		// Inter-token whitespace, in the shape the generator inlines: 0-1 bytes
 		// resolve in one or two compares; only a real indentation run reaches the
 		// SWAR SkipWSRun (which the compiler inlines here too — no call).
-		if i < len(data) && data[i] <= ' ' {
+		if uint(i) < uint(len(data)) && data[i] <= ' ' {
 			i++
-			if i < len(data) && data[i] <= ' ' {
+			if uint(i) < uint(len(data)) && data[i] <= ' ' {
 				i = SkipWSRun(data, i+1)
 			}
 		}
-		if i >= len(data) {
+		if uint(i) >= uint(len(data)) {
 			*out = s
 			return i, ErrTruncated
 		}
@@ -342,7 +350,7 @@ func DecodeUintSliceArena[T uintKind](out *[]T, data []byte, i int, a *Arena) (i
 // decodeUintSlice is the shared body; a nil arena presizes with make, exactly
 // as before the arena existed (see decodeFloat64Slice).
 func decodeUintSlice[T uintKind](out *[]T, data []byte, i int, a *Arena) (int, error) {
-	if i >= len(data) {
+	if uint(i) >= uint(len(data)) {
 		return i, ErrTruncated
 	}
 	if data[i] == 'n' {
@@ -379,13 +387,13 @@ func decodeUintSlice[T uintKind](out *[]T, data []byte, i int, a *Arena) (int, e
 		// Inter-token whitespace, in the shape the generator inlines: 0-1 bytes
 		// resolve in one or two compares; only a real indentation run reaches the
 		// SWAR SkipWSRun (which the compiler inlines here too — no call).
-		if i < len(data) && data[i] <= ' ' {
+		if uint(i) < uint(len(data)) && data[i] <= ' ' {
 			i++
-			if i < len(data) && data[i] <= ' ' {
+			if uint(i) < uint(len(data)) && data[i] <= ' ' {
 				i = SkipWSRun(data, i+1)
 			}
 		}
-		if i >= len(data) {
+		if uint(i) >= uint(len(data)) {
 			*out = s
 			return i, ErrTruncated
 		}
@@ -417,7 +425,7 @@ func decodeUintSlice[T uintKind](out *[]T, data []byte, i int, a *Arena) (int, e
 				n = n*10000 + uint64(v)
 				i += 4
 			}
-			for i < len(data) {
+			for uint(i) < uint(len(data)) {
 				d := data[i] - '0'
 				if d > 9 {
 					break
@@ -426,7 +434,7 @@ func decodeUintSlice[T uintKind](out *[]T, data []byte, i int, a *Arena) (int, e
 				i++
 			}
 			if i < len(data) && (data[i] == '.' || data[i] == 'e' || data[i] == 'E') {
-				for i < len(data) {
+				for uint(i) < uint(len(data)) {
 					c := data[i]
 					if (c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-' {
 						i++
@@ -440,13 +448,13 @@ func decodeUintSlice[T uintKind](out *[]T, data []byte, i int, a *Arena) (int, e
 		// Inter-token whitespace, in the shape the generator inlines: 0-1 bytes
 		// resolve in one or two compares; only a real indentation run reaches the
 		// SWAR SkipWSRun (which the compiler inlines here too — no call).
-		if i < len(data) && data[i] <= ' ' {
+		if uint(i) < uint(len(data)) && data[i] <= ' ' {
 			i++
-			if i < len(data) && data[i] <= ' ' {
+			if uint(i) < uint(len(data)) && data[i] <= ' ' {
 				i = SkipWSRun(data, i+1)
 			}
 		}
-		if i >= len(data) {
+		if uint(i) >= uint(len(data)) {
 			*out = s
 			return i, ErrTruncated
 		}
@@ -470,7 +478,7 @@ func decodeUintSlice[T uintKind](out *[]T, data []byte, i int, a *Arena) (int, e
 // per-point call for coordinate rings ([][2]float64, [][3]float64), where the
 // generated form paid an extra call frame per coordinate.
 func DecodeFloat64Array(out []float64, data []byte, i int) (int, error) {
-	if i >= len(data) {
+	if uint(i) >= uint(len(data)) {
 		return i, ErrTruncated
 	}
 	if data[i] == 'n' {
@@ -486,13 +494,13 @@ func DecodeFloat64Array(out []float64, data []byte, i int) (int, error) {
 		// Inter-token whitespace, in the shape the generator inlines: 0-1 bytes
 		// resolve in one or two compares; only a real indentation run reaches the
 		// SWAR SkipWSRun (which the compiler inlines here too — no call).
-		if i < len(data) && data[i] <= ' ' {
+		if uint(i) < uint(len(data)) && data[i] <= ' ' {
 			i++
-			if i < len(data) && data[i] <= ' ' {
+			if uint(i) < uint(len(data)) && data[i] <= ' ' {
 				i = SkipWSRun(data, i+1)
 			}
 		}
-		if i >= len(data) {
+		if uint(i) >= uint(len(data)) {
 			return i, ErrTruncated
 		}
 		if data[i] == ']' {
@@ -534,13 +542,13 @@ func DecodeFloat64Array(out []float64, data []byte, i int) (int, error) {
 		// Inter-token whitespace, in the shape the generator inlines: 0-1 bytes
 		// resolve in one or two compares; only a real indentation run reaches the
 		// SWAR SkipWSRun (which the compiler inlines here too — no call).
-		if i < len(data) && data[i] <= ' ' {
+		if uint(i) < uint(len(data)) && data[i] <= ' ' {
 			i++
-			if i < len(data) && data[i] <= ' ' {
+			if uint(i) < uint(len(data)) && data[i] <= ' ' {
 				i = SkipWSRun(data, i+1)
 			}
 		}
-		if i >= len(data) {
+		if uint(i) >= uint(len(data)) {
 			return i, ErrTruncated
 		}
 		if data[i] == ']' {
@@ -556,7 +564,7 @@ func DecodeFloat64Array(out []float64, data []byte, i int) (int, error) {
 // DecodeIntArray is DecodeFloat64Array for the integer kinds; the element
 // parse mirrors ReadInt64OrNull (inlined, as in DecodeIntSlice).
 func DecodeIntArray[T intKind](out []T, data []byte, i int) (int, error) {
-	if i >= len(data) {
+	if uint(i) >= uint(len(data)) {
 		return i, ErrTruncated
 	}
 	if data[i] == 'n' {
@@ -572,13 +580,13 @@ func DecodeIntArray[T intKind](out []T, data []byte, i int) (int, error) {
 		// Inter-token whitespace, in the shape the generator inlines: 0-1 bytes
 		// resolve in one or two compares; only a real indentation run reaches the
 		// SWAR SkipWSRun (which the compiler inlines here too — no call).
-		if i < len(data) && data[i] <= ' ' {
+		if uint(i) < uint(len(data)) && data[i] <= ' ' {
 			i++
-			if i < len(data) && data[i] <= ' ' {
+			if uint(i) < uint(len(data)) && data[i] <= ' ' {
 				i = SkipWSRun(data, i+1)
 			}
 		}
-		if i >= len(data) {
+		if uint(i) >= uint(len(data)) {
 			return i, ErrTruncated
 		}
 		if data[i] == ']' {
@@ -599,7 +607,7 @@ func DecodeIntArray[T intKind](out []T, data []byte, i int) (int, error) {
 				if data[i] == '-' {
 					neg = true
 					i++
-					if i >= len(data) {
+					if uint(i) >= uint(len(data)) {
 						return i, ErrBadNumber
 					}
 				}
@@ -615,7 +623,7 @@ func DecodeIntArray[T intKind](out []T, data []byte, i int) (int, error) {
 					n = n*10000 + int64(v)
 					i += 4
 				}
-				for i < len(data) {
+				for uint(i) < uint(len(data)) {
 					d := data[i] - '0'
 					if d > 9 {
 						break
@@ -624,7 +632,7 @@ func DecodeIntArray[T intKind](out []T, data []byte, i int) (int, error) {
 					i++
 				}
 				if i < len(data) && (data[i] == '.' || data[i] == 'e' || data[i] == 'E') {
-					for i < len(data) {
+					for uint(i) < uint(len(data)) {
 						c := data[i]
 						if (c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-' {
 							i++
@@ -649,13 +657,13 @@ func DecodeIntArray[T intKind](out []T, data []byte, i int) (int, error) {
 		// Inter-token whitespace, in the shape the generator inlines: 0-1 bytes
 		// resolve in one or two compares; only a real indentation run reaches the
 		// SWAR SkipWSRun (which the compiler inlines here too — no call).
-		if i < len(data) && data[i] <= ' ' {
+		if uint(i) < uint(len(data)) && data[i] <= ' ' {
 			i++
-			if i < len(data) && data[i] <= ' ' {
+			if uint(i) < uint(len(data)) && data[i] <= ' ' {
 				i = SkipWSRun(data, i+1)
 			}
 		}
-		if i >= len(data) {
+		if uint(i) >= uint(len(data)) {
 			return i, ErrTruncated
 		}
 		if data[i] == ']' {
@@ -671,7 +679,7 @@ func DecodeIntArray[T intKind](out []T, data []byte, i int) (int, error) {
 // DecodeUintArray is DecodeIntArray for the unsigned kinds; the element parse
 // mirrors ReadUint64OrNull (inlined, as in DecodeUintSlice).
 func DecodeUintArray[T uintKind](out []T, data []byte, i int) (int, error) {
-	if i >= len(data) {
+	if uint(i) >= uint(len(data)) {
 		return i, ErrTruncated
 	}
 	if data[i] == 'n' {
@@ -687,13 +695,13 @@ func DecodeUintArray[T uintKind](out []T, data []byte, i int) (int, error) {
 		// Inter-token whitespace, in the shape the generator inlines: 0-1 bytes
 		// resolve in one or two compares; only a real indentation run reaches the
 		// SWAR SkipWSRun (which the compiler inlines here too — no call).
-		if i < len(data) && data[i] <= ' ' {
+		if uint(i) < uint(len(data)) && data[i] <= ' ' {
 			i++
-			if i < len(data) && data[i] <= ' ' {
+			if uint(i) < uint(len(data)) && data[i] <= ' ' {
 				i = SkipWSRun(data, i+1)
 			}
 		}
-		if i >= len(data) {
+		if uint(i) >= uint(len(data)) {
 			return i, ErrTruncated
 		}
 		if data[i] == ']' {
@@ -722,7 +730,7 @@ func DecodeUintArray[T uintKind](out []T, data []byte, i int) (int, error) {
 					n = n*10000 + uint64(v)
 					i += 4
 				}
-				for i < len(data) {
+				for uint(i) < uint(len(data)) {
 					d := data[i] - '0'
 					if d > 9 {
 						break
@@ -731,7 +739,7 @@ func DecodeUintArray[T uintKind](out []T, data []byte, i int) (int, error) {
 					i++
 				}
 				if i < len(data) && (data[i] == '.' || data[i] == 'e' || data[i] == 'E') {
-					for i < len(data) {
+					for uint(i) < uint(len(data)) {
 						c := data[i]
 						if (c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-' {
 							i++
@@ -753,13 +761,13 @@ func DecodeUintArray[T uintKind](out []T, data []byte, i int) (int, error) {
 		// Inter-token whitespace, in the shape the generator inlines: 0-1 bytes
 		// resolve in one or two compares; only a real indentation run reaches the
 		// SWAR SkipWSRun (which the compiler inlines here too — no call).
-		if i < len(data) && data[i] <= ' ' {
+		if uint(i) < uint(len(data)) && data[i] <= ' ' {
 			i++
-			if i < len(data) && data[i] <= ' ' {
+			if uint(i) < uint(len(data)) && data[i] <= ' ' {
 				i = SkipWSRun(data, i+1)
 			}
 		}
-		if i >= len(data) {
+		if uint(i) >= uint(len(data)) {
 			return i, ErrTruncated
 		}
 		if data[i] == ']' {
@@ -803,7 +811,7 @@ func DecodeByteSliceArena(out *[]byte, data []byte, i int, a *Arena) (int, error
 
 // decodeByteSlice is the shared body (see decodeFloat64Slice for the pattern).
 func decodeByteSlice(out *[]byte, data []byte, i int, a *Arena) (int, error) {
-	if i >= len(data) {
+	if uint(i) >= uint(len(data)) {
 		return i, ErrTruncated
 	}
 	if data[i] != '"' {

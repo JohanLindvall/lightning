@@ -124,6 +124,61 @@ byte-identical when adding cold paths; push new logic out-of-line.
   inside the noise floor; geomean −1.1%, no regressions. Note `numbers` had gone
   **+2.2%** on the scanner work two commits earlier and this more than takes it
   back — a reminder that a case flat on one axis can be sensitive on another.
+- **The float scan is straight-line SWAR over a fixed 32-byte window
+  (`scanFloat` in `numeric.go`, 2026-09-02; the loop form it fronts is kept
+  verbatim as `scanFloatSlow`, both the fallback and the differential oracle).**
+  Hardware counters on Meteor Lake put the old loop form at **289 instructions
+  and 23 taken branches per 8-byte float** (`0.270354`) and 457 per 15-digit
+  canada coordinate — six small digit loops (integer, leading zeros, 4-digit
+  fold, scalar tail, exponent, trailing check), each paying its rotation jump
+  and back edge, for ~70 instructions of arithmetic. The fast path handles an
+  optional `-`, 1-7 integer digits, 1-24 fraction digits, an exponent of 1-7
+  digits and at most 19 significant digits, and hands anything else (a `+`,
+  8+ integer digits, 25+ fraction digits, a malformed continuation, or a token
+  within 48 bytes of the buffer end) whole to `scanFloatSlow`. Three design
+  points, each measured. **(1) Measure a digit run with one mask, fold it with
+  one fixed 8-digit fold.** `d = w - 0x30…`; `(d | (d + 0x76…)) & 0x80…` flags
+  the non-digit lanes and the lowest flagged lane is exact (borrows and carries
+  only travel upward and every lane below the first non-digit is a digit), so
+  `TrailingZeros64 >> 3` is the run length; shifting the run into the top lanes
+  lets simdjson's `parse8Digits` (three multiplies) fold it, the vacated low
+  lanes reading as leading zeros. **(2) Load the whole window at fixed offsets
+  and align the fraction with funnel shifts.** The first version loaded each
+  word at the offset the previous word's digit count produced, and that turned
+  the loop form's well-predicted *control* dependencies into a load-to-address
+  *data* chain (load, mask, count, add, load … ~13 cycles a link): a 17-digit
+  fraction executed 7% fewer instructions and ran **+18% slower** (IPC 5.8 →
+  4.6), which is exactly what made mesh_pretty — 20k of its 32k floats are
+  Python-repr 17-19-digit fractions — regress while compact mesh improved.
+  Loading `w0..w3` at `i, i+8, i+16, i+24` and computing `f_j = (w_j>>8)>>8k |
+  w_{j+1}<<(56-8k)` from the integer count alone lets all three fraction masks
+  and folds run in parallel; the same shape then went **mesh_pretty −3.6%**.
+  The loads are `load64` (`load_le.go`, an unchecked `unsafe` read on
+  amd64/arm64 behind the one up-front `uint(i)+48 <= uint(len(data))` test,
+  `encoding/binary` elsewhere) because a checked `data[i:i+8]` costs five
+  instructions of slice arithmetic per load. **(3) Significance follows the slow
+  path to the digit**: leading fraction zeros do not count against the
+  19-digit budget when the integer part is zero (only the first word's zeros are
+  discounted, which can only send a 9+-leading-zero number to the slow path
+  early, never admit one wrongly), so golang_source's `0.000698…`-shaped weights
+  stay fast; the Clinger/Eisel-Lemire tail is the slow path's. The exponent is
+  folded inline too: without it, an exponent-bearing shape did the fast-path
+  work and then restarted in the slow path (float-array-slow **+31%**,
+  mesh_pretty's `e-05` values), with it those are +3.9% and −3.6%. Interleaved
+  A/B (n=8, `-ldflags=-funcalign=64`, pinned Meteor Lake P-core): **numbers
+  −23.7%, canada_geometry −16.1%, canada −15.2%, float-array −13.7%, mesh
+  −12.4%, marine_ik −11.9%, large-json −7.9%, mesh_pretty −3.6%, golang_source
+  −3.3%, synthea −1.3%**; cloudflare/twitter/citm flat; float-array-slow +3.9%
+  (a 20-number synthetic of 16-digit-plus-exponent tokens, the one shape where
+  the fast path's work is all EL setup). Locked by `TestScanFloatFastMatchesSlow`
+  — 20k generated tokens with fraction lengths at every word boundary, every
+  sign/exponent/trailing-byte shape, at eight distances from the buffer end so
+  the checked fallback is exercised — comparing all four results bit for bit,
+  plus `TestParse8Digits` and the standing `TestParseFloatMatchesStrconv` fuzz.
+  **This supersedes the "variable-length SWAR fraction fold" rejection below**:
+  that experiment measured a count-then-shift step *inside the loop*, against
+  `is4Digits`' fixed step; the win here comes from deleting the loops, which no
+  per-step comparison could see.
 - **Batched scalar-array readers** (`batch.go`: `DecodeFloat64Slice`, the generic
   `DecodeIntSlice`/`DecodeUintSlice`, and the fixed-size `DecodeFloat64Array`/
   `DecodeIntArray`/`DecodeUintArray`). The generated per-element loop paid a non-inlinable reader
@@ -886,6 +941,21 @@ byte-identical when adding cold paths; push new logic out-of-line.
   formulation that moves it to a logical op or removes it — and check the
   disassembly, since the Go source looks identical either way. The same trap is
   what `tryParse4Digits` fixes in the digit folds.
+  **The all-spaces shortcut is per architecture (`skipWSSpaceShortcut`,
+  `ws_amd64.go`/`ws_other.go`, 2026-09-02).** On Meteor Lake the shortcut's
+  `w != sp` test costs a *second taken branch* per space word — the compiler
+  lays the classify out inline, so a space word takes `je` over it and then the
+  `jmp` back edge — and citm's taken-branch profile put those two jumps at 25%
+  of its hottest decoder's taken branches. With the shortcut compiled out the
+  loop is one conditional back edge per word: **citm_catalog −3.7%, instruments
+  −2.4%, twitter_status −1.1%**, nothing worse (n=6, funcalign=64). The N2
+  measurement above (+16% at indent 24 without the shortcut) is not wrong, it
+  is the other side of the same trade on an issue-bound core, so the constant
+  keeps arm64's loop byte-identical and gives amd64 the one it measured best;
+  `SkipWSRun` still inlines (cost 63). An inner `for w == sp` loop (one taken
+  branch per word *with* the shortcut) was also built and lost everywhere
+  (+1…+5%): the compiler's rotation of the nested loop added a jump per outer
+  iteration and a `goto`-shaped tail.
 - **Slice reuse replaces, and the reset is guarded.** Every slice decoder — the
   generated `sliceDecoder` loop and `batch.go`'s three readers — used to start from
   `*out`, so decoding into a **non-nil** slice *appended* to it. `[1,2]` decoded
@@ -1196,6 +1266,15 @@ byte-identical when adding cold paths; push new logic out-of-line.
   drops 45 → **25** — headroom for the many decoders that inline it — and
   nothing that inlined before stopped inlining. Sub-noise alone; landed as a
   rider on the any-path work above.
+- **`unsafeStr` has no empty-slice guard** (2026-09-02). It used to return `""`
+  for `len(b) == 0` before `unsafe.String`, and that compare was a *taken*
+  branch on every object key — cloudflare's taken-branch profile showed it at
+  one per member, 8% of the decoder's taken branches — for a result
+  `unsafe.String(ptr, 0)` produces correctly anyway (a nil pointer with length
+  zero is permitted). Removing it: **cloudflare −2.2%, cloudflare-nocopy −2.4%**
+  (n=6, funcalign=64; −3.5%/−2.5%/citm −3.2% at default alignment). An empty
+  nocopy string now carries a pointer into the input, which changes nothing a
+  caller can observe under the nocopy contract.
 - **Escaped-string decode, second pass** (on top of the four-part entry above;
   both changes in `string.go`, twitterescaped **−8.4%** and gsoc_2018 **−2.3%**
   interleaved). **(1)** `decodeEscaped`'s `\uXXXX` branch hand-encodes BMP runes
@@ -1292,6 +1371,89 @@ byte-identical when adding cold paths; push new logic out-of-line.
   presizes by `[]Foo`'s rules — previously silently skipped), and
   `batchArrayFn` routes uint kinds to the new `DecodeUintArray` (a `[N]uint32`
   field used to keep the generated loop).
+
+- **Every cursor bound is tested unsigned, in the generated decoders and the
+  runtime alike** (`uint(i) < uint(len(data))`, 2026-09-02, Neoverse N2). The
+  cursor is an `int` that has passed through reader results, so the compiler
+  cannot prove it non-negative, and after a signed `i < len(data)` the
+  `data[i]` behind it kept its own bounds check — on arm64 a second,
+  never-taken `BLS` to `panicBounds` per probe (the compare's flags are
+  reused, so one instruction, where amd64 pays a compare and a jump; the
+  Meteor Lake pass sized those at ~3% of cloudflare's uops and left them).
+  The unsigned form proves `0 <= i < len(data)` in one test and is identical
+  for every `i >= 0`, which is every value the decoders hold; only a negative
+  cursor, which no caller can produce, would now read "truncated" instead of
+  panicking. Applied to the generator's probe and structural-test templates
+  (`skipWS`, `readKey`, `genStructBody`, the slice/array/map decoders) and
+  the same 94 sites in `read.go`/`batch.go`/`skip.go`/`count.go`/`string.go`/
+  `any.go`; the whole main cloudflare decoder went 1640 → 1624 static
+  instructions with 28 → 19 `panicBounds` sites, and per decode (counters,
+  noise-free): cloudflare −4.2%, cloudflare-nocopy −3.1%, twitter −3.1%,
+  mesh −3.1%, gsoc −3.5%, marine_ik −2.6%, large-json −2.4%, citm −2.3%,
+  golang_source −2.4%, canada −2.0%, instruments −2.0%, numbers −1.6%,
+  float-array −1.6%, synthea −0.7%; branches −6…−13%. Time (generator half
+  alone, n=8): citm −2.67%, twitter −1.70%, cloudflare-nocopy −1.57%,
+  cloudflare −1.27%, cloudflare-compact −1.22%, golang_source −1.22%,
+  instruments −0.91%, all p≤0.05; both halves over the corpus (n=6) geomean
+  −1.24%, mesh −4.0%, marine_ik −3.0%, golang_source −3.0%, float-array
+  −2.7%, instruments −2.5%, citm −2.2%, canada −2.0%, nothing outside noise
+  the other way. Inline costs rose by two per pair (`SkipWS` 16 → 18,
+  `SkipWSRun` 67 → 69, `skipNumber` 74 → 76; `DecodeValue` 77 unchanged) —
+  still under 80, and that budget is now the constraint on any further
+  edit to those three. This corrects the standing "bounds checks are free"
+  entry in the rejected list for an issue-bound core: the *stub* is free, the
+  branch that reaches it is a dispatch slot, and there were seven per member.
+- **The SWAR digit test is XOR-based, with bitmask-immediate constants
+  only** (`swarZero`/`swarSix`/`swarNib` in `numeric.go`, 2026-09-02):
+  `d = w ^ 0x30…`, `m = ((d + 0x06…) | d) & 0xf0…`. A digit lane differs
+  from `'0'` only in its low nibble, so the XOR leaves 0..9 and gives every
+  other byte a nonzero high nibble or a low nibble of 0xa..0xf, which +6
+  pushes into the high nibble; the XOR is lane-independent, so the mask is
+  exact in every lane, and the add can carry only out of a lane at 0xfa or
+  above, which is flagged itself — so the lowest flagged lane and the
+  all-digits verdict are exact, the two properties every user needs. The
+  form it replaces, `d = w − 0x30…`, `(d | (d + 0x76…)) & 0x80…`, was right
+  but paid for its spelling: 0x76 is not an AArch64 bitmask immediate (a
+  `MOVD` and three `MOVK`s per `scanFloat` call), and the compiler
+  distributed `parse8Digits`' first multiply over the subtraction —
+  `(f − zero)·10` became `f·10 + (−10·zero)`, a further two-instruction
+  constant (`0x1e1e…1e20`) on the fraction path, visible in the annotated
+  canada profile. `tryParse4Digits` does its test in a 64-bit register for
+  the same reason: a 32-bit splat is never a bitmask immediate to the Go
+  compiler (it holds the constant sign-extended and checks the 64-bit
+  value), which is why its old `0x80808080` was materialised for a `TSTW`.
+  Instructions per decode: numbers −3.8%, mesh −2.7%, mesh_pretty −2.5%,
+  canada −2.0%, float-array −1.9%, float-array-slow −1.9%, canada_geometry
+  −1.4%, marine_ik −1.1%, citm −1.0%, golang_source −1.0%. Locked by the
+  unchanged `TestTryParse4DigitsMatchesIs4Digits` (every digit-adjacent byte
+  combination plus 2M random words) and `TestScanFloatFastMatchesSlow`.
+- **Long integers fold a word at a time in the single-value readers**
+  (`digitRun` in `digitrun.go`; `ReadInt64OrNull`/`ReadUint64OrNull`,
+  2026-09-02). The digit run is measured with the XOR mask, a full word is
+  folded with `parse8Digits` and the final partial word after shifting its
+  digits into the top lanes — the `scanFloat` fast path's step, in a loop —
+  and every product is modulo 2^64, so the value is bit for bit the `n*10+d`
+  chain's, wrap included, and stays so after truncation to any narrower
+  kind (reduction modulo 2^k commutes with + and ×). It replaces the
+  four-digit-SWAR-then-byte-loop pair, which cost a 10-digit golang_source
+  position two folds, two bytes and a failing third attempt: instructions
+  golang_source −5.5%, citm −3.5%, marine_ik −1.5%, twitter −1.1%; time
+  (n=8, the unguarded form) golang_source −5.19%, twitter −1.77%, citm
+  −1.41%. Not inlinable (cost 177), so it is a leaf call from the two
+  readers, which is cheap on the register ABI. **Deliberately NOT applied to
+  the batch integer loops** (`decodeIntSlice`/`decodeUintSlice`/
+  `DecodeIntArray`/`DecodeUintArray`), whose elements are 1–4 digits in the
+  corpus (marine_ik 130k of them, mesh's index arrays): there it measured
+  mesh **+1.09% (p=0.000)** and marine_ik flat with fewer instructions,
+  because a byte loop advances its index under a predicted branch and the
+  next element's load issues ahead, while the word count puts that address
+  on a load→mask→count chain; and two guarded hybrids (fold only past a
+  digit at `i+4`, then at `i+7`) were worse still, +2…+3.5% instructions on
+  marine_ik, apparently an inliner size cliff in those generic functions.
+  `TestDigitRunWordBoundary` pins the shape the batch parity tests never
+  reach — a run ending exactly on a word boundary with input behind it, so
+  the next word's run length is zero (the first version folded eight lanes
+  of whatever followed; the shift must be Go's, not masked `&63`).
 
 ## The inline trick — let the generator write hot bodies inline
 
@@ -1642,6 +1804,12 @@ no regressions.)
   *checks* are free, bounds *arithmetic* is not, and the way to tell them apart is
   to read the disassembly for `SUB`/`AND`/`NEG` around the load rather than to
   count `panicBounds` labels.
+  **And narrowed again (2026-09-02, Neoverse N2): the checks are free on a
+  core with dispatch to spare, not on an issue-bound one.** The never-taken
+  branch to each stub is a dispatch slot, there were seven per object member,
+  and testing the cursor unsigned removed them for 2-4% of instructions and
+  1-3% of time on the object cases — see the unsigned-bound entry in the
+  performance architecture.
 - **Whitespace run-length memoization (`wsGuess`)** — the tempting fix for
   SkipWSRun's ~24% flat share on citm-shaped indentation: remember the last
   run's length g per call site and verify a repeat with two compares
@@ -1712,6 +1880,43 @@ no regressions.)
   needs a *new* idea, not a rearrangement, and should size it with `perf stat`
   instructions-per-op first, which costs a minute and would have ended each of
   these three in one measurement.
+- **Restructuring the amd64 string scanner's found path — three shapes, all
+  rejected (2026-09-02).** The taken-branch profile made it look free: a block-0
+  hit takes `JNZ sse_found` and then `RET`, two taken branches per call, once
+  per key and once per string value. Making the hit fall through to the return
+  (E3) executed 42 fewer instructions and 38 fewer taken branches per cloudflare
+  decode and ran **cloudflare-nocopy +7.7%, cloudflare-compact +7.4%** — still
+  +5% with both binaries linked at 64-byte function alignment, still +5% with
+  the found code reached by a `JMP` instead of falling through, still +5% with
+  block 1's `LEA` split back into two `ADD`s. The extra cycles are back-end
+  bound with an identical instruction stream and no load blocks, machine clears
+  or mispredicts, and the mechanism was never identified; the standing
+  layout is a local optimum by a margin no reasoning predicted. An AVX2 32-byte
+  first block (one compare covers a 31-byte string with no data-dependent 16/32
+  branch, one `VZEROUPPER` per call) did remove update_center's top mispredict
+  source (−1.8%) but cost **cloudflare-compact +8.4%, nocopy +4.4%, cloudflare
+  +3.2%** — the old "don't make it pure AVX2" note holds on this
+  microarchitecture too. Leave the scanner's short-string path alone unless a
+  change can be shown to win on cloudflare-compact, which is the most sensitive
+  case in the corpus to anything in it.
+- **Outlining `SkipWSRun` for code size.** synthea_fhir takes 93k L1i misses
+  per decode (fetch latency 11% of its cycles) across 177 generated decoders,
+  and the four inlined `SkipWSRun` bodies per object loop are what falls out of
+  citm's uop cache (the DSB-miss samples land on skip.go's word loop). A
+  `//go:noinline` shrank the generated text 21-22% (synthea 135 → 107 KB) and
+  measured **citm +3.8%, mesh_pretty +6.2%, golang_source +2.7%, canada +1.5%,
+  cloudflare +4.6%** (the last on compact input that never calls it — pure
+  layout), synthea flat. The icache problem is the schema's size; the call per
+  whitespace run costs more than the misses.
+- **The word-at-a-time integer fold.** The float path's mask-count-fold step
+  applied to `ReadInt64OrNull`/`ReadUint64OrNull` and the four batch integer
+  loops: a 1-4 digit int went **119 → 137 instructions**, golang_source
+  **+3.4%**, cloudflare +1.4%, twitter −1.5%, everything else flat. Short digit
+  runs have no loop overhead to amortize an 8-lane fold against; the 4-digit
+  `tryParse4Digits` step already fails in one compare for them. Reverted.
+- **Skipping a clean string inside `SkipValue` without the `SkipString` frame**,
+  re-measured on Meteor Lake: flat on every case (geomean −0.3%), the same
+  verdict as the M2 and N2 entries above. Three microarchitectures now agree.
 - **No-corpus determinations (quantified, don't build without a workload):**
   `[]float32`/`[]bool` batch readers — zero bench-corpus fields of those types
   (if a real workload appears, the `DecodeFloat64Slice` pattern ports
@@ -1774,6 +1979,9 @@ no regressions.)
   mask+`TrailingZeros` is dearer than `is4Digits`, and the variable shift + `pow10`
   table load beats the fixed-width `parse4Digits` whose multipliers are
   compile-time immediates. Fixed widths win *because* they're fixed.
+  **Superseded 2026-09-02** by the straight-line `scanFloat` fast path (see the
+  performance architecture): the count-and-shift step is what wins once it
+  replaces the loops rather than sitting inside one.
 - **Vectorizing `SkipWS` as a standalone function**: regresses — the SWAR/SIMD
   setup isn't amortized on the common 0–1 byte runs. It pays off *only* via the
   inline trick above (inline fast path for short runs; `SkipWSRun` SWAR for ≥2-byte
@@ -1958,6 +2166,44 @@ no regressions.)
   all within noise). The Go compiler already dead-stores the zero and elides the
   `(*out)[len(*out)-1]` bounds check, so the two forms compile to the same code.
   Reverted — it only added an `isByValueLeaf` branch to the generator for no gain.
+
+- **A Go SWAR probe in front of the SVE2 string scanner (Neoverse N2,
+  2026-09-02)** — the one experiment of that pass built for latency rather
+  than instruction count. The case looked strong: a scanner call is ~26
+  executed instructions of which ~13 are ABI0 marshaling, its arguments and
+  result cross the stack on the dependency chain the decoder waits on, and
+  the asm takes 24% of cloudflare's cycles for ~14% of its instructions. An
+  eight-byte has-byte word (`w ^ 0x22…`, `w ^ 0x5c…`, the has-zero trick,
+  `TrailingZeros64`) before the call resolves a key or value of up to seven
+  bytes in registers; two words cover fifteen. Built three ways. **(1)**
+  In the generated key read and the four string readers and `SkipString`,
+  returning `(index, hit)`: instructions cloudflare +12.2%,
+  cloudflare-compact +19.8%, string_unicode +12%, twitter +6.8%,
+  payload_large +7.2%, citm +2.2%, golang_source +1.6%; single-run cycles
+  apache −7.8%, compact −4.3%, golang −3.7%, instruments −3.5%, random
+  −2.8%, citm −2.3% against cloudflare +2.4%, gsoc +1.8%, payload_large
+  +1.7%, twitter +1.4%. A miss costs ~20 instructions on top of the call it
+  then makes anyway, and the compiler materialised the bool and re-tested
+  it (six instructions) and re-checked the slice bounds behind the guard.
+  **(2)** Sized from the schema — one word when at least half of a struct's
+  key names are ≤ 7 bytes, two when ≤ 15, none otherwise, keys only, with
+  an unchecked load behind the guard and a single-int result (`i+8` means
+  "scan on from here"): random −5.1%, apache −5.6%, marine_ik −3.3%,
+  payload_large −2.3%, instruments −1.7%, golang −1.65% cycles — and
+  **cloudflare +12.7% instructions, +14.7% cycles**, twitter +2.5%,
+  string_unicode +3.8%. cloudflare's 45 field names are mostly short, so
+  the rule armed the probe, but 35 of the 48 keys in its *document* are
+  long unknown keys that miss both words. **(3)** A 16-byte helper is not
+  inlinable (cost 88 as a two-trip loop, 119 unrolled, against 80), so only
+  a single word can inline (66), and two calls of it cost ~40 instructions
+  on a miss. Per hit it saves 2–7 cycles (not the 15+ the two store-forward
+  hops promised: the OoO window was already hiding most of them), per miss
+  5–8 plus a data-dependent branch. It is a bet on the document's key
+  lengths, which no schema rule can know — the same class as the rejected
+  object-loop fusion — and the corpus that likes it (random, apache,
+  marine_ik: 95–100% of keys ≤ 7 bytes) is exactly the corpus that was
+  already fast. Don't re-attempt without a way to make the miss free; the
+  scanner's own block-0 branch already encodes the same length information.
 
 ## Conventions
 
@@ -2200,6 +2446,200 @@ build, which is the only reason it was caught.
   the runtime's own `IndexByte`/`Count`; what has *not* been tried is not counting
   at all for arrays whose elements are this small, in the spirit of the
   `[][N]scalar` presize-skip. Needs a cheap way to know the element is small.
+
+## Meteor Lake hardware-counter pass (2026-09-02)
+
+The first session driven by PMU counters rather than sampling profiles, on an
+Intel Core Ultra 9 185H (Meteor Lake, Redwood Cove P-cores 0-11, E-cores
+12-21; `perf` 7.0 with `perf_event_paranoid=-1`). What moved is recorded in
+the entries above (the `scanFloat` fast path, the per-arch `SkipWSRun`
+shortcut, `unsafeStr`); cumulative over all 30 cases against the session's
+starting commit, n=5 at default link flags: **numbers −23.9%, float-array
+−17.0%, canada_geometry −16.3%, canada −15.6%, marine_ik −14.1%, mesh −12.9%,
+large-json −6.8%**, mesh_pretty −3.6%, payload_medium −3.0%, citm −2.7%,
+instruments −2.3%, golang_source −2.3%, twitter −2.1%, string_unicode −2.0%,
+random −1.7%; float-array-slow +7.6% and payload_small +1.1% (two synthetic
+sub-microsecond cases); geomean **−4.5%**. The method is the part worth keeping.
+
+- **Per-op counters by differencing.** A benchmark binary run under `perf stat`
+  at N and at 3N fixed iterations, subtracted, gives per-decode cycles,
+  instructions, uops, taken branches, DSB/MITE uops, L1i misses and the
+  top-down slots with process startup and Go's warm-up iteration cancelled out.
+  Instructions and taken branches per op are noise-free where cycles are not;
+  they decided every keep/revert here.
+- **Where the corpus was bound.** Every object-heavy case sits at IPC 4.3-5.1
+  with branch-miss rates of 0.02-0.15%, 20-32% front-end bound: on cloudflare a
+  taken branch every 2.2 cycles and 268 cycles/op of DSB→MITE switch penalty;
+  on citm 17% of uops from legacy decode and a taken branch every 2.5 cycles.
+  The float-heavy cases were front-end bound too, and the taken-branch samples
+  put 23 of the 30 taken branches per float inside `scanFloat`'s loops — the
+  observation that produced the session's main win. gsoc_2018, update_center
+  and twitter lose 9-13% of slots to bad speculation, mostly in the string
+  scanner's data-dependent block-0/block-1 branch and in `bytes.IndexByte`,
+  which is intrinsic to varying string lengths (see the AVX2 rejection).
+- **Fewer taken branches is not automatically faster here.** Three
+  instruction-identical re-layouts of the string scanner each cost 5-8% on
+  cloudflare-compact with the loss in the *back end*; an inner all-spaces loop
+  with one taken branch per word lost to the two-branch form it replaced. Treat
+  a taken-branch reduction as a hypothesis to measure, and measure it on
+  cloudflare-compact first.
+- **Branchless can be slower than well-predicted loops.** A digit loop advances
+  its index by a constant under a predicted branch, so its loads issue
+  speculatively in parallel; a SWAR count feeding the next load's address
+  serializes them. The fix is to load at fixed offsets and shift, not to go
+  back to loops — the `scanFloat` entry has the numbers.
+- **Layout noise is ±2% and is controlled, not averaged away.** Padding one
+  assembly function by 32 unreachable bytes moved cloudflare-compact +2.1%
+  (p=0.016). Every A/B here linked both sides with `-ldflags=-funcalign=64`,
+  which removes the cross-function shift a code-size change causes (Go aligns
+  functions to 32 bytes, so any size change re-aligns everything after it to a
+  different 64-byte window); it does not remove intra-function effects, which
+  is what the scanner experiments were left with.
+- **Left on the table, sized:** the generated object loop's four inline
+  whitespace probes each jump over their body on compact input (four taken
+  branches per member; the layout is the compiler's indegree heuristic and no
+  source shape changes it without a call in the body); the two `jbe panicBounds`
+  compares per probe that an unproven `i >= 0` costs (~3% of cloudflare's uops,
+  removable only by unsigned indexing in the generator's templates — done in
+  the N2 pass below, unmeasured on Meteor Lake); the batch
+  float loop's ~50 instructions per element around the ~200 in `scanFloat`;
+  and a 64-KiB-chunk scratch arena for gsoc-shaped escaped strings (the
+  correction in the string-arena rejection above still stands, unmeasured here).
+
+## Neoverse N2 hardware-counter pass (2026-09-02)
+
+The N2 counterpart of the Meteor Lake pass above, on the same Azure
+Cobalt-class VM as the 2026-08 sessions (2 cores, 3.44 GHz, `perf` 6.17,
+`perf_event_paranoid=1`). Three changes landed, one experiment was rejected,
+and the Meteor Lake commit was validated here first. Cumulative over the 30
+cases against the session's starting commit (interleaved ABBA, n=8, both
+sides linked `-funcalign=64`, pinned): **golang_source −6.7%, numbers −6.7%, mesh −5.5%, marine_ik −5.0%,
+float-array −4.3%, canada −3.8%, citm_catalog −3.5%, mesh_pretty −3.4%,
+payload_large −3.4%, float-array-slow −3.2%, twitter_status −3.2%,
+instruments −2.7%, cloudflare −2.4%, cloudflare-nocopy −2.3%,
+canada_geometry −2.2%, github_events −2.0%, random −1.9%,
+cloudflare-compact −1.8%, pretty −1.8%, twitterescaped −1.7%, payload_small
+−1.1%, payload_medium −0.7%, skip-heavy −0.5%** (all p≤0.002);
+apache_builds, gsoc_2018, large-json, synthea_fhir, time-array and
+update_center flat (p≥0.11); string_unicode **+0.3% (p=0.037)**, the one
+detectable regression. Geomean **−2.4%**. The method transferred from
+Meteor Lake unchanged; the findings are this core's, and the two that
+mattered most were in the disassembly, not the source.
+
+- **What the guest exposes, and how the counters were read.** Thirteen PMU
+  events reach a Hyper-V guest: `cpu_cycles inst_retired op_retired
+  br_retired br_mis_pred_retired stall_frontend stall_backend inst_spec
+  op_spec br_pred br_mis_pred l1d_cache l1d_cache_refill` (the sysfs list
+  under `armv8_pmuv3_0/events`; everything else in the N2's tables is
+  accepted and counts zero). Six programmable counters beside the cycle
+  counter, so seven events per run count at 100% and two runs cover the lot.
+  Per-op figures are by differencing — the cell at N and at 3N fixed
+  iterations (`-test.benchtime=Nx`) under `perf stat`, `(c3N − cN)/2N` — which
+  cancels process startup and Go's calibration ramp; instructions and
+  branches per decode are then repeatable to four digits on every case whose
+  heap is small, and to ±1.5% on the allocation-heavy ones (large-json,
+  synthea, gsoc), where the GC's own work is counted too. Decide keep/revert
+  on instructions first and time second, as on Meteor Lake; the difference
+  here is what the counters said the corpus is bound by.
+- **Where the corpus sits on this core.** 24 of the 30 cases run at IPC
+  3.6–4.6 with branch-miss rates under 0.5% and front-end stalls under 6%,
+  branches 18–33% of instructions: issue-bound, so executed instructions are
+  the currency and a never-taken branch is not free (it is a dispatch slot).
+  The exceptions are gsoc_2018 (IPC 2.4, 0.84% misses, 75k L1D refills per
+  decode: allocation), synthea_fhir (IPC 2.8, 10.9% front-end stall: the
+  177-decoder i-cache problem already recorded), github_events, update_center
+  and twitter_status (IPC 3.0–3.2, 0.4–0.9% misses, 7–8% front-end). Back-end
+  stalls of 17–30% on the cloudflare family with zero L1D refills are the
+  dependency chain through the cursor — each key read's scanner call passes
+  its arguments and result through the stack — not cache misses. The
+  per-case table:
+
+  | case | cycles/op | inst/op | IPC | branch share | miss rate | FE stall | BE stall | L1D refills/op |
+  |---|---|---|---|---|---|---|---|---|
+  | mesh | 3.75M | 17.11M | 4.56 | 24% | 0.12% | 3.8% | 9.9% | 12.8k |
+  | numbers | 545.1k | 2.47M | 4.54 | 18% | 0.01% | 0.9% | 8.4% | 1614 |
+  | float-array | 1297 | 5644 | 4.35 | 23% | 0.05% | 1.5% | 7.9% | 4 |
+  | time-array | 2913 | 12.3k | 4.21 | 22% | 0.35% | 2.5% | 11.7% | 10 |
+  | canada | 9.19M | 37.04M | 4.03 | 20% | 0.23% | 3.2% | 15.0% | 33.9k |
+  | payload_small | 621 | 2478 | 3.99 | 30% | 0.00% | 0.1% | 30.2% | 0 |
+  | cloudflare-nocopy | 3137 | 12.4k | 3.96 | 29% | 0.00% | 1.2% | 24.9% | 0 |
+  | mesh_pretty | 5.82M | 22.90M | 3.94 | 24% | 0.45% | 5.2% | 14.6% | 15.1k |
+  | cloudflare | 3762 | 14.7k | 3.91 | 28% | 0.05% | 2.0% | 17.7% | 5 |
+  | payload_medium | 5181 | 19.9k | 3.85 | 29% | 0.00% | 0.8% | 16.3% | 1 |
+  | citm_catalog | 3.57M | 13.70M | 3.84 | 28% | 0.15% | 3.6% | 14.9% | 22.4k |
+  | canada_geometry | 1.24M | 4.70M | 3.79 | 21% | 0.45% | 5.3% | 12.3% | 7428 |
+  | marine_ik | 18.68M | 70.63M | 3.78 | 24% | 0.36% | 5.7% | 12.4% | 71.4k |
+  | string_unicode | 6677 | 25.2k | 3.77 | 27% | 0.02% | 0.9% | 20.0% | 10 |
+  | golang_source | 8.36M | 31.49M | 3.77 | 25% | 0.21% | 4.9% | 15.6% | 42.2k |
+  | instruments | 653.4k | 2.45M | 3.76 | 29% | 0.14% | 4.4% | 18.6% | 2853 |
+  | pretty | 4072 | 15.2k | 3.72 | 30% | -0.00% | 1.5% | 28.5% | 0 |
+  | float-array-slow | 2148 | 7987 | 3.72 | 18% | 0.44% | 2.2% | 15.4% | 4 |
+  | cloudflare-compact | 3034 | 11.2k | 3.70 | 27% | 0.00% | 0.9% | 28.4% | 0 |
+  | apache_builds | 316.3k | 1.16M | 3.67 | 26% | 0.19% | 3.2% | 25.2% | 959 |
+  | random | 2.17M | 7.85M | 3.62 | 26% | 0.30% | 4.7% | 14.8% | 7189 |
+  | payload_large | 103.0k | 366.1k | 3.56 | 26% | 0.30% | 5.3% | 14.0% | 628 |
+  | twitterescaped | 2.45M | 8.54M | 3.49 | 25% | 0.48% | 8.4% | 14.2% | 19.1k |
+  | large-json | 40.58M | 133.15M | 3.28 | 24% | 0.31% | 4.6% | 18.4% | 195.7k |
+  | skip-heavy | 1647 | 5358 | 3.25 | 33% | -0.00% | 0.1% | 23.1% | 0 |
+  | twitter_status | 1.68M | 5.33M | 3.17 | 27% | 0.42% | 7.3% | 17.8% | 12.3k |
+  | update_center | 2.27M | 7.01M | 3.10 | 24% | 0.87% | 6.6% | 13.6% | 17.2k |
+  | github_events | 186.1k | 550.4k | 2.96 | 25% | 0.40% | 8.3% | 18.2% | 1314 |
+  | synthea_fhir | 7.95M | 21.95M | 2.76 | 25% | 0.56% | 10.9% | 21.8% | 69.9k |
+  | gsoc_2018 | 5.40M | 13.25M | 2.45 | 25% | 0.84% | 8.2% | 25.9% | 74.7k |
+
+- **The Meteor Lake commit holds on N2, by instruction count first.** The
+  `scanFloat` fast path and the `unsafeStr` guard, measured only on Meteor
+  Lake when they landed: instructions per decode canada −33.8%,
+  canada_geometry −31.5%, numbers −27.6%, float-array-slow −22.8%,
+  float-array −21.6%, large-json −15.1%, mesh −13.6%, mesh_pretty −12.0%,
+  marine_ik −10.2%, golang_source −4.5%, the object cases −0.0…−0.5%;
+  instruments +0.8%, apache +0.5%, twitterescaped +0.5% and synthea +0.3% are
+  the floats whose shape does the fast path's work and then falls through to
+  `scanFloatSlow`. Geomean −7.2% instructions, −3.7% cycles; time (single
+  runs) canada −19.5%, numbers −19.0%, canada_geometry −18.7%, mesh −11.2%,
+  float-array −10.9%, large-json −7.9%, marine_ik −7.8%, golang_source −5.4%.
+  On this box the per-arch `SkipWSRun` shortcut is the arm64 side, unchanged.
+- **The profile named the buckets, the disassembly named the waste.**
+  Sampled by cycles, the generated object loops are the largest bucket on
+  the object cases (cloudflare 37%, citm 47%, twitter 30%, golang_source
+  32%), the SVE2 string scanner second (10–24%), and on canada 48% is
+  `scanFloat` with 22% in `eiselLemire64` (108k of its 111k numbers carry
+  16–17 significant digits, so nearly every one takes the 128-bit path; that
+  routine is ~60 instructions of table load, two multiplies and checks, and
+  has no fat). Reading the compiled member loop then showed what the source
+  does not: every `if i < len(data) && data[i] …` probe carried a second
+  branch, every SWAR digit test rebuilt a constant, and the integer readers
+  spent a failing four-digit attempt on every short number. All three are
+  recorded as entries above; their sizes here were: unsigned tests −2…−4%
+  instructions on the object and batch cases; the XOR digit mask −1…−4% on
+  the number cases; the word fold −5.5% on golang_source and −3.5% on citm.
+- **Not every instruction removal is a cycle removal, and the counters say
+  which.** The word fold applied to the batch integer loops (marine_ik's and
+  mesh's 1–4-digit ints) removed instructions and branches and cost
+  mesh +1.1% (p=0.000, n=8): a byte loop advances its index under a
+  predicted branch, so the next element's load issues speculatively, while
+  a SWAR count puts that address on a load→mask→count data chain of ~12
+  cycles — the Meteor Lake "branchless can be slower" lesson in its arm64
+  form. Two attempts to steer short runs to the byte loop with a guard made
+  those loops *worse* (+2…+3.5% instructions on marine_ik) — the generic
+  batch functions are near an inliner size cliff where their helpers stop
+  inlining — so the fold lives in the single-value readers only, where the
+  member loop around each call breaks the chain, and the batch loops keep
+  their four-digit fold and byte tail byte for byte.
+- **Rejected: a Go SWAR probe in front of the string scanner** — the one
+  idea this session built for latency rather than instruction count, and the
+  numbers are in the rejected list. It won 2–6% where a document's keys are
+  short and lost 15% where they are not, and no schema rule can know which a
+  document will be.
+
+**Left on the table, sized:** the ~13 instructions of ABI0 marshaling per
+scanner call plus its two store-to-load hops remain the floor under every
+key and string read (`<ABIInternal>` is still refused outside the runtime on
+Go 1.27); `eiselLemire64` at ~60 instructions is the price of canada's
+17-digit coordinates and has nothing removable; the batch float loop's
+per-element overhead is ~35 instructions around `scanFloat`'s ~196, of which
+the unsigned tests took three; and synthea's front-end stall (10.9%) and
+gsoc's allocation profile are what they were.
 
 ## Session 2026-08 fixes worth knowing (correctness/API)
 
@@ -2850,3 +3290,22 @@ self-inflicted, which is what made the merge a composition problem instead of a 
 hunt. Note also that agent worktrees branch from *origin/main*, not local `main`, so
 parallel fixes see none of the merges that happened while they ran — check the
 branch parent before assuming a report's baseline matches the tree.
+
+### Toolchain drift: three divergence pins broke on Go 1.27 (2026-09-02)
+
+Go 1.27's `encoding/json` is backed by json/v2, and three tests that pinned a
+stdlib divergence failed on a clean checkout before any change here:
+`TestReadTimeAcceptsEscapedTimestamps` (the stdlib now unescapes a `time.Time`
+string, go.dev/issue/47353 is closed), `TestGenerate/invalid_json_tag_names`
+(v2 reserves only quotes, backslash and backtick in a tag name and *ignores* a
+field whose name holds one rather than keying it by the Go name; `a\nb` is now
+a valid name), and `TestEmbeddedUnmarshalerDivergesFromStdlib` (`json.Number`
+now carries `UnmarshalJSONFrom`, so an embedded one is promoted like
+`time.Time` and the "no unmarshaler" control is no longer a control). Each is
+now toolchain-adaptive: where the stdlib still diverges it must keep doing so,
+where it has converged it must agree with lightning on the value, and the
+generator's tag warning describes both behaviours. The generator's rule stays
+the v1 set, which is the wider one — every name it flags diverges on at least
+one supported toolchain. Read a fresh failure in one of these three as the
+stdlib moving again, not as a decoder bug.
+

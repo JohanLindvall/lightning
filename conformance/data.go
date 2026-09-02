@@ -492,10 +492,12 @@ type EmbedRaw struct {
 	B int `json:"b"`
 }
 
-// EmbedNumber is the control: json.Number is a defined string type with NO
-// UnmarshalJSON of its own, so nothing is promoted and both decoders treat the
-// embed as a named field. It is what keeps the divergence above attributable to
-// the promoted method rather than to embedding a foreign type as such.
+// EmbedNumber is the control: through Go 1.26 json.Number is a defined string
+// type with NO UnmarshalJSON of its own, so nothing is promoted and both
+// decoders treat the embed as a named field. It is what keeps the divergence
+// above attributable to the promoted method rather than to embedding a foreign
+// type as such. (Go 1.27's json/v2-backed encoding/json gives json.Number an
+// unmarshaler, and the test adapts: there the embed diverges like time.Time.)
 type EmbedNumber struct {
 	json.Number
 	C int `json:"c"`

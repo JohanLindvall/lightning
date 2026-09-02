@@ -115,7 +115,7 @@ func decodeStringEscaped(data []byte, start, i int) (string, int, error) {
 // per-byte append.
 func decodeEscaped(buf, data []byte, start, i int, quoted bool) (string, int, error) {
 	buf = append(buf, data[start:i]...)
-	for i < len(data) {
+	for uint(i) < uint(len(data)) {
 		if quoted {
 			// Bulk-copy the literal run up to the next escape (or the closing
 			// quote) in one vectorized pass — but only when there is a run. Densely
@@ -125,7 +125,7 @@ func decodeEscaped(buf, data []byte, start, i int, quoted bool) (string, int, er
 			c := data[i]
 			if c != '\\' && c != '"' {
 				e := indexCloseOrEscapeAt(data, i)
-				if e == len(data) {
+				if uint(e) >= uint(len(data)) {
 					break // unterminated string
 				}
 				buf = append(buf, data[i:e]...)
@@ -151,7 +151,7 @@ func decodeEscaped(buf, data []byte, start, i int, quoted bool) (string, int, er
 			}
 			i = j + 1 // step over the backslash
 		}
-		if i >= len(data) {
+		if uint(i) >= uint(len(data)) {
 			return "", i, ErrTruncated
 		}
 		// One table load dispatches the eight single-byte escapes; a Go switch
@@ -283,7 +283,7 @@ func readUnicodeEscape(data []byte, i int) (rune, int, error) {
 // is freshly allocated and not retained by Unwrap, so values decoded out of it
 // may safely alias it (the "nocopy" option).
 func Unwrap(data []byte, i int) ([]byte, int, error) {
-	if i >= len(data) {
+	if uint(i) >= uint(len(data)) {
 		return nil, i, ErrTruncated
 	}
 	if data[i] == 'n' {

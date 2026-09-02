@@ -20,6 +20,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -340,9 +341,7 @@ func main() {
 	fmt.Printf("field keys: lightning=%d,%d,%d stdlib=%d,%d,%d\n", v2.Q, v2.BS, v2.NL, s2.Q, s2.BS, s2.NL)
 }
 `,
-		want: `tag keys:   lightning=1,2,3 stdlib=0,0,0
-field keys: lightning=0,0,0 stdlib=1,2,3
-`,
+		want:       tagProbeWant(),
 		wantWarn:   []string{"field Q", "field BS", "field NL", "encoding/json"},
 		wantNoWarn: []string{"field OK", "field Alt", "field Sp"},
 	},
@@ -1197,6 +1196,33 @@ func main() {
 `,
 		want: "equal\n",
 	},
+}
+
+// tagProbeStd mirrors invalid_json_tag_names' Root for the three names whose
+// treatment by encoding/json depends on the toolchain, so the probe's stdlib
+// columns are computed by the encoding/json the test runs against rather than
+// pinned to one version: through Go 1.26 an invalid name made the stdlib
+// discard the whole tag and key the field by its Go name; the json/v2-backed
+// decoder of Go 1.27 ignores a field whose name holds a quote or backslash
+// (neither key matches it) and accepts the newline name as written. The
+// lightning columns are fixed — it matches every name as written — and the
+// divergence itself is still required: if the stdlib ever matched all three
+// tag names too, the want string says so and the case fails.
+type tagProbeStd struct {
+	Q  int `json:"a\"b"` //nolint:staticcheck // deliberately a name encoding/json's tag rule rejects
+	BS int `json:"a\\b"` //nolint:staticcheck // deliberately a name encoding/json's tag rule rejects
+	NL int `json:"a\nb"`
+}
+
+func tagProbeWant() string {
+	var s, s2 tagProbeStd
+	_ = json.Unmarshal([]byte("{\"a\\\"b\":1,\"a\\\\b\":2,\"a\\nb\":3}"), &s)
+	_ = json.Unmarshal([]byte("{\"Q\":1,\"BS\":2,\"NL\":3}"), &s2)
+	if s.Q == 1 && s.BS == 2 && s.NL == 3 {
+		return "premise broken: encoding/json now matches every invalid tag name as written; the divergence has closed\n"
+	}
+	return fmt.Sprintf("tag keys:   lightning=1,2,3 stdlib=%d,%d,%d\nfield keys: lightning=0,0,0 stdlib=%d,%d,%d\n",
+		s.Q, s.BS, s.NL, s2.Q, s2.BS, s2.NL)
 }
 
 func TestGenerate(t *testing.T) {
