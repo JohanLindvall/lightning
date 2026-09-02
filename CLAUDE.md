@@ -1660,7 +1660,12 @@ byte-identical when adding cold paths; push new logic out-of-line.
   found the 48-byte-restart bug and the stale-register bug of the lazy
   class) and `TestParseIntRunDirect` (which found the two capacity forms
   that stopped early), padded to 80 bytes for the 64-byte lookahead;
-  `make sveasm-check` covers the two `WORD`s. Tried and rejected on the
+  `make sveasm-check` covers its twenty `WORD`s — sixteen `CMHI`, two
+  `UDOT`, two `MUL`. **The first push failed CI on exactly those**: Go
+  1.27 (this box) spells `VCMHI` and `VMUL`, Go 1.25 (the module's `go`
+  directive, which CI installs with `GOTOOLCHAIN=local`) does not, and
+  `go vet` on the single package passed locally under 1.25 only because
+  the build cache served it — see the assembler-floor convention below. Tried and rejected on the
   way, with counters: a 32-byte stride (+2.2 cycles an element — each
   extra transition is exposed chain, not just its instructions), a 56-byte
   one (−0.1, inside the noise, less slack), making the fold fall through
@@ -2479,6 +2484,19 @@ no regressions.)
   there) and read ~flat. Implemented as a per-case source duplicate, **not** a
   generator twin (a `-inplace-twin` flag emitting a second `UnmarshalJSONInPlace`
   method was prototyped and dropped in favour of the simpler duplicate).
+- **The module's `go` directive is the assembler floor, and the build cache
+  hides it.** CI installs the toolchain from `go.mod` (1.25) with
+  `GOTOOLCHAIN=local`, so a mnemonic a newer local toolchain accepts may not
+  exist there: Go 1.25's arm64 assembler has no `VCMHI`, `VMUL`, `VCMHS`,
+  `VUMULL` or `VSHRN` (all present by 1.27), which cost the integer-array
+  kernel's first push its CI run. Before pushing assembly, run
+  `GOTOOLCHAIN=go1.25.0 go build -a ./... && GOTOOLCHAIN=go1.25.0 go vet ./...`
+  — the `-a` matters, and so does `./...`: a `go vet` of the single package
+  under 1.25 passed on this box while CI failed, because vet of a package
+  nobody imports never assembles it and the cache served the rest. A missing
+  mnemonic becomes a `WORD` with its mnemonic comment (the `sveasm`
+  mechanism is not SVE-specific), on its own line outside any macro, since a
+  macro line cannot carry the comment.
 - **After touching any SVE instruction in `simd_arm64.s`, run `make sveasm`.**
   Those instructions are `WORD` constants (the Go assembler has no SVE mnemonics),
   and the mnemonic in the trailing comment — not the hex — is the source of truth:
