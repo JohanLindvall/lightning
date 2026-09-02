@@ -16,15 +16,16 @@ DATA irConst<>+32(SB)/8, $0x0102040810204080
 DATA irConst<>+40(SB)/8, $0x0102040810204080
 GLOBL irConst<>(SB), RODATA|NOPTR, $48
 
-// CLASS3 classifies the four chunks c0..c3 with the compare cmp against the
-// splat s and folds the result to the 16-byte form two ADDP steps short of
-// the block's 64-bit mask, in t0 — skipfast_arm64.s's CLASS3, with the
-// compare as a parameter. Clobbers t1..t3.
-#define CLASS3(cmp, s, c0, c1, c2, c3, t0, t1, t2, t3) \
-	cmp   s, c0, t0        \
-	cmp   s, c1, t1        \
-	cmp   s, c2, t2        \
-	cmp   s, c3, t3        \
+// The assembler floor is the module's go directive — CI assembles with Go
+// 1.25 — and its arm64 assembler has no CMHI or MUL (vector) mnemonic, nor
+// UDOT; those are WORDs, each on its own line with the mnemonic sveasm
+// derives the encoding from (a macro line cannot carry that comment), which
+// is why the compares below sit between the macros rather than inside them.
+
+// CASCADE folds the four class compares in t0..t3 (0x00/0xFF per lane) to
+// the 16-byte form two ADDP steps short of the block's 64-bit mask, in t0 —
+// the bit-weight/ADDP cascade of skipfast_arm64.s. Clobbers t1..t3.
+#define CASCADE(t0, t1, t2, t3) \
 	VAND  V10.B16, t0, t0  \
 	VAND  V10.B16, t1, t1  \
 	VAND  V10.B16, t2, t2  \
@@ -33,59 +34,64 @@ GLOBL irConst<>(SB), RODATA|NOPTR, $48
 	VADDP t3, t2, t2       \
 	VADDP t2, t0, t0
 
-// PREP classifies the 64-byte block at address a: its bytes minus '0' land
-// in d0..d3 (the fold's TBL source) and two masks, bit-reversed so lane j
-// is bit 63-j, in rD (not a digit: c-'0' > 9) and rC (a comma). The digit
-// class is compared negated because the walk wants its complement. Each
-// class is the bit-weight/ADDP-cascade movemask of skipfast_arm64.s, and
+// CLASS3 is CASCADE with the compare of the four chunks c0..c3 against the
+// splat s in front, for a compare the assembler can spell (VCMEQ).
+#define CLASS3(cmp, s, c0, c1, c2, c3, t0, t1, t2, t3) \
+	cmp   s, c0, t0        \
+	cmp   s, c1, t1        \
+	cmp   s, c2, t2        \
+	cmp   s, c3, t3        \
+	CASCADE(t0, t1, t2, t3)
+
+// PREP1 and PREP2, with the four not-digit compares between them, classify
+// the 64-byte block at address a: its bytes minus '0' land in d0..d3 (the
+// fold's TBL source) and two masks, bit-reversed so lane j is bit 63-j, in
+// rD (not a digit: c-'0' > 9, the CMHI WORDs against the 9 splat V5, into
+// V12..V15) and rC (a comma). The digit class is compared negated because
+// the walk wants its complement. Each class is the cascade movemask, and
 // the reversal costs nothing on the way: the weights run {128,...,1}
 // within each eight-lane half, so the cascade packs each half reversed,
 // and a VREV64 of the packed bytes then reverses the halves and chunks
 // (lane 16k+8h+l lands at bit 63-(16k+8h+l)). The two classes share their
 // final ADDP, so one VREV64 and one VMOV pair serve both. Clobbers V0-V3,
 // V12-V19.
-#define PREP(a, d0, d1, d2, d3, rD, rC) \
-	VLD1  (a), [V0.B16, V1.B16, V2.B16, V3.B16]                            \
-	VSUB  V4.B16, V0.B16, d0                                                \
-	VSUB  V4.B16, V1.B16, d1                                                \
-	VSUB  V4.B16, V2.B16, d2                                                \
-	VSUB  V4.B16, V3.B16, d3                                                \
-	CLASS3(VCMHI, V5.B16, d0, d1, d2, d3, V12.B16, V13.B16, V14.B16, V15.B16)                    \
-	CLASS3(VCMEQ, V6.B16, V0.B16, V1.B16, V2.B16, V3.B16, V16.B16, V17.B16, V18.B16, V19.B16)     \
-	VADDP  V12.B16, V16.B16, V16.B16                                        \
-	VREV64 V16.B16, V16.B16                                                 \
-	VMOV   V16.D[1], rD                                                     \
+#define PREP1(a, d0, d1, d2, d3) \
+	VLD1  (a), [V0.B16, V1.B16, V2.B16, V3.B16] \
+	VSUB  V4.B16, V0.B16, d0                    \
+	VSUB  V4.B16, V1.B16, d1                    \
+	VSUB  V4.B16, V2.B16, d2                    \
+	VSUB  V4.B16, V3.B16, d3
+
+#define PREP2(rD, rC) \
+	CASCADE(V12.B16, V13.B16, V14.B16, V15.B16)                                              \
+	CLASS3(VCMEQ, V6.B16, V0.B16, V1.B16, V2.B16, V3.B16, V16.B16, V17.B16, V18.B16, V19.B16) \
+	VADDP  V12.B16, V16.B16, V16.B16                                                          \
+	VREV64 V16.B16, V16.B16                                                                   \
+	VMOV   V16.D[1], rD                                                                       \
 	VMOV   V16.D[0], rC
 
-// WSCLASS is the third mask, not whitespace (c > 0x20), for the block at
-// R11, in R9 with R19 set to say it is there. It is computed only when the
-// walk first needs it — a compact array never does, and its 13 vector ops
-// a block were the largest removable item once the walk was issue-bound —
-// from a reload of the block, which is cheaper than keeping its bytes in
-// registers across the next block's PREP. Clobbers V12-V19.
-#define WSCLASS \
-	VLD1   (R11), [V12.B16, V13.B16, V14.B16, V15.B16]                                             \
-	CLASS3(VCMHI, V7.B16, V12.B16, V13.B16, V14.B16, V15.B16, V16.B16, V17.B16, V18.B16, V19.B16) \
-	VADDP  V16.B16, V16.B16, V16.B16                                        \
-	VREV64 V16.B16, V16.B16                                                 \
-	VMOV   V16.D[0], R9                                                     \
-	MOVD   $1, R19
+// WSPACK finishes the third mask, not whitespace (c > 0x20), from its four
+// compares in t0..t3 (CMHI WORDs against the 0x20 splat V7), into rW; v is
+// t0's bare register name, for the lane move.
+#define WSPACK(t0, t1, t2, t3, v, rW) \
+	CASCADE(t0, t1, t2, t3) \
+	VADDP  t0, t0, t0       \
+	VREV64 t0, t0           \
+	VMOV   v.D[0], rW
 
-// FOLD1 and FOLD2, with the UDOT between them, turn the L digits at block
-// offset s (R6 = s, R12 = L; the block's bytes minus '0' in V20..V23) into
-// an int64 stored at the out cursor R3, which they advance. The TBL control
-// is intRunShuffleNEON[s*8+L]: the digits of the eight-digit zero-padded
-// number laid out three, three and two to a word (0x80 elsewhere, which a
-// four-register TBL reads as zero, any index >= 64 being out of range), so
-// one UDOT with byte weights 100,10,1 / 100,10,1 / 10,1 makes the three
-// groups, and a word multiply by 10^5, 10^2, 1 with an across-vector add
-// makes the value — a byte dot product cannot weight a fourth digit
-// (1000 does not fit a byte), which is why the groups are three and not
-// four, and why the control is sixteen bytes rather than eight. The UDOT is
-// a WORD because the Go assembler has no mnemonic for it, and sits outside
-// the macros because a macro line cannot carry the comment sveasm derives
-// the encoding from; it accumulates, so the value register is zeroed first.
-// Clobbers R16, V29-V31.
+// FOLD1 and FOLD2, with the UDOT and MUL between them, turn the L digits at
+// block offset s (R6 = s, R12 = L; the block's bytes minus '0' in V20..V23)
+// into an int64 stored at the out cursor R3, which they advance. The TBL
+// control is intRunShuffleNEON[s*8+L]: the digits of the eight-digit
+// zero-padded number laid out three, three and two to a word (0x80
+// elsewhere, which a four-register TBL reads as zero, any index >= 64 being
+// out of range), so one UDOT with byte weights 100,10,1 / 100,10,1 / 10,1
+// makes the three groups, and a word multiply by 10^5, 10^2, 1 with an
+// across-vector add makes the value — a byte dot product cannot weight a
+// fourth digit (1000 does not fit a byte), which is why the groups are
+// three and not four, and why the control is sixteen bytes rather than
+// eight. UDOT accumulates, so the value register is zeroed first. Clobbers
+// R16, V29-V31.
 #define FOLD1 \
 	ADD    R6<<3, R12, R16                                        \
 	ADD    R16<<4, R10, R16                                       \
@@ -94,8 +100,7 @@ GLOBL irConst<>(SB), RODATA|NOPTR, $48
 	VMOVI  $0, V31.B16
 
 #define FOLD2 \
-	VMUL    V9.S4, V31.S4, V31.S4 \
-	VUADDLV V31.S4, V31           \
+	VUADDLV V31.S4, V31 \
 	FMOVD.P F31, 8(R3)
 
 // func parseIntRunNEON(data []byte, i int, out []int64) (n, p, closed int)
@@ -133,7 +138,7 @@ GLOBL irConst<>(SB), RODATA|NOPTR, $48
 // one element to the next. The digit and whitespace classes are compared
 // negated (CMHI against 9 and 0x20), so the complement the counts want
 // costs nothing, and the whitespace class is computed only for a block
-// whose walk meets a non-digit — on demand the first time (see WSCLASS),
+// whose walk meets a non-digit — on demand the first time (see wsCompute),
 // pipelined with the rest once a block has needed it. The out-capacity
 // test is per block, not per element. A block stores at most 25 values
 // (elements start at least two lanes apart, so at most 24 start in its
@@ -156,10 +161,10 @@ GLOBL irConst<>(SB), RODATA|NOPTR, $48
 // whether it has been computed, R22 whether the previous block needed it),
 // R10 the shuffle table, R11 the block's address, R13 the lane limit,
 // R23-R25 the next block's masks, R26 its address, R27 whether there is
-// one, R12/R14-R17 temporaries. V20-V23 the block minus '0' and V24-V27
-// the next block's, V4-V7 splats, V8-V10 constants, V0-V3/V12-V19 the
-// temporaries of PREP and WSCLASS, V29 the capacity test's, V29-V31 the
-// fold's.
+// one, R12/R14-R17 temporaries (R17 also names wsCompute's return site).
+// V20-V23 the block minus '0' and V24-V27 the next block's, V4-V7 splats,
+// V8-V10 constants, V0-V3/V12-V19 the temporaries of the classification,
+// V29 the capacity test's, V29-V31 the fold's.
 TEXT ·parseIntRunNEON(SB), NOSPLIT, $0-80
 	MOVD  data_base+0(FP), R0
 	MOVD  data_len+8(FP), R1
@@ -188,7 +193,12 @@ block:
 	CMP   R1, R2
 	BGT   done // fewer than 64 bytes from s: the scalar loop takes it from here
 	ADD   R0, R2, R11
-	PREP(R11, V20.B16, V21.B16, V22.B16, V23.B16, R7, R8)
+	PREP1(R11, V20.B16, V21.B16, V22.B16, V23.B16)
+	WORD  $0x6e25368c // cmhi v12.16b, v20.16b, v5.16b
+	WORD  $0x6e2536ad // cmhi v13.16b, v21.16b, v5.16b
+	WORD  $0x6e2536ce // cmhi v14.16b, v22.16b, v5.16b
+	WORD  $0x6e2536ef // cmhi v15.16b, v23.16b, v5.16b
+	PREP2(R7, R8)
 	MOVD  R19, R22
 	MOVD  ZR, R9
 	MOVD  ZR, R19
@@ -205,13 +215,19 @@ blockAt:
 	CMP   R1, R12
 	BGT   noNext
 	ADD   $48, R11, R26
-	PREP(R26, V24.B16, V25.B16, V26.B16, V27.B16, R23, R24)
+	PREP1(R26, V24.B16, V25.B16, V26.B16, V27.B16)
+	WORD  $0x6e25370c // cmhi v12.16b, v24.16b, v5.16b
+	WORD  $0x6e25372d // cmhi v13.16b, v25.16b, v5.16b
+	WORD  $0x6e25374e // cmhi v14.16b, v26.16b, v5.16b
+	WORD  $0x6e25376f // cmhi v15.16b, v27.16b, v5.16b
+	PREP2(R23, R24)
 	MOVD  ZR, R25
 	CBZ   R22, haveNextNoWS
-	CLASS3(VCMHI, V7.B16, V0.B16, V1.B16, V2.B16, V3.B16, V12.B16, V13.B16, V14.B16, V15.B16) // c > 0x20
-	VADDP  V12.B16, V12.B16, V12.B16
-	VREV64 V12.B16, V12.B16
-	VMOV   V12.D[0], R25
+	WORD  $0x6e27340c // cmhi v12.16b, v0.16b, v7.16b
+	WORD  $0x6e27342d // cmhi v13.16b, v1.16b, v7.16b
+	WORD  $0x6e27344e // cmhi v14.16b, v2.16b, v7.16b
+	WORD  $0x6e27346f // cmhi v15.16b, v3.16b, v7.16b
+	WSPACK(V12.B16, V13.B16, V14.B16, V15.B16, V12, R25)
 
 haveNextNoWS:
 	MOVD  $1, R27
@@ -260,6 +276,7 @@ digits:
 fold:
 	FOLD1
 	WORD  $0x6e8897bf // udot v31.4s, v29.16b, v8.16b
+	WORD  $0x4ea99fff // mul v31.4s, v31.4s, v9.4s
 	FOLD2
 	ADD   $1, R14, R6       // b = just past the comma
 	CMP   R13, R6
@@ -286,8 +303,8 @@ fold:
 
 wsZero:
 	CBNZ  R19, straddle
-	WSCLASS
-	B     elemWS
+	MOVD  $1, R17
+	B     wsCompute
 
 wsComma:
 	// No comma right after the digits: whitespace before it, or none in
@@ -297,7 +314,8 @@ wsComma:
 	// from e reaches c; then the fold proceeds with e moved to c.
 	CBZ   R16, noComma
 	CBNZ  R19, wsCommaAt
-	WSCLASS
+	MOVD  $2, R17
+	B     wsCompute
 
 wsCommaAt:
 	CLZ   R16, R15          // c - e
@@ -307,6 +325,27 @@ wsCommaAt:
 	BLO   done              // something other than whitespace before the comma
 	ADD   R15, R14, R14
 	B     fold
+
+wsCompute:
+	// The whitespace class, not whitespace (c > 0x20), for the block at
+	// R11, in R9 with R19 set to say it is there. It is computed only when
+	// the walk first needs it — a compact array never does, and its 13
+	// vector ops a block were the largest removable item once the walk was
+	// issue-bound — from a reload of the block, which is cheaper than
+	// keeping its bytes in registers across the next block's PREP; R17
+	// says which of the three sites asked.
+	VLD1  (R11), [V12.B16, V13.B16, V14.B16, V15.B16]
+	WORD  $0x6e273590 // cmhi v16.16b, v12.16b, v7.16b
+	WORD  $0x6e2735b1 // cmhi v17.16b, v13.16b, v7.16b
+	WORD  $0x6e2735d2 // cmhi v18.16b, v14.16b, v7.16b
+	WORD  $0x6e2735f3 // cmhi v19.16b, v15.16b, v7.16b
+	WSPACK(V16.B16, V17.B16, V18.B16, V19.B16, V16, R9)
+	MOVD  $1, R19
+	CMP   $1, R17
+	BEQ   elemWS
+	CMP   $2, R17
+	BEQ   wsCommaAt
+	B     noCommaAt
 
 capacity:
 	// Fewer than 25 slots: the block's exact bound is its commas in lanes
@@ -339,7 +378,8 @@ noComma:
 	// No comma left in the block: the element can only be the array's
 	// last, terminated by ']' (after optional whitespace) in this block.
 	CBNZ  R19, noCommaAt
-	WSCLASS
+	MOVD  $3, R17
+	B     wsCompute
 
 noCommaAt:
 	LSL   R14, R9, R16      // not-whitespace << e
@@ -356,6 +396,7 @@ foldClose:
 	// return with p at the ']' and closed set.
 	FOLD1
 	WORD  $0x6e8897bf // udot v31.4s, v29.16b, v8.16b
+	WORD  $0x4ea99fff // mul v31.4s, v31.4s, v9.4s
 	FOLD2
 	ADD   R15, R2, R2
 	SUB   R20, R3, R16
