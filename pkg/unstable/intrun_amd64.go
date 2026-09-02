@@ -44,3 +44,8 @@ func init() {
 		}
 	}
 }
+
+// intRunMinSlots is the spare capacity below which the batch loops do not
+// call parseIntRun: on amd64 every array, the kernel's per-call cost being
+// one 16-byte block.
+const intRunMinSlots = 1

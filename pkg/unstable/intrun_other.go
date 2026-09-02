@@ -1,4 +1,4 @@
-//go:build !amd64
+//go:build !amd64 && !arm64
 
 package unstable
 
@@ -9,3 +9,6 @@ var useIntRun = false
 func parseIntRun(data []byte, i int, out []int64) (n, p, closed int) {
 	return 0, i, 0
 }
+
+// intRunMinSlots is unused where there is no kernel.
+const intRunMinSlots = 1

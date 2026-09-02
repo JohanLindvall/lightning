@@ -231,7 +231,7 @@ func decodeIntSlice[T intKind](out *[]T, data []byte, i int, a *Arena) (int, err
 	// an array it cannot help costs one call; tmp receives its values for
 	// the element kinds it cannot write directly (narrower than 8 bytes).
 	run := true
-	var tmp [16]int64
+	var tmp [32]int64
 	i++
 	for first := true; ; first = false {
 		// Inter-token whitespace, in the shape the generator inlines: 0-1 bytes
@@ -261,8 +261,13 @@ func decodeIntSlice[T intKind](out *[]T, data []byte, i int, a *Arena) (int, err
 		// handle — a sign, null, a fraction, 9+ digits — which the scalar
 		// code below then reads exactly as it always has. One unproductive
 		// call turns it off for the rest of the array, so an array of long
-		// ids or decimals pays for it once.
-		if useIntRun && run && data[i]-'0' <= 9 {
+		// ids or decimals pays for it once. The spare capacity is also the
+		// array's remaining length when the target was presized from its
+		// comma count, which is what intRunMinSlots gates on: a kernel with
+		// a per-call cost of its own (arm64's classifies a 64-byte block)
+		// is not worth calling for the two-element arrays of a schema like
+		// twitter_status's indices.
+		if useIntRun && run && data[i]-'0' <= 9 && cap(s)-len(s) >= intRunMinSlots {
 			var n, p, closed int
 			if unsafe.Sizeof(T(0)) == 8 {
 				dst := unsafe.Slice((*int64)(unsafe.Pointer(unsafe.SliceData(s))), cap(s))[len(s):]
@@ -432,7 +437,7 @@ func decodeUintSlice[T uintKind](out *[]T, data []byte, i int, a *Arena) (int, e
 	// an array it cannot help costs one call; tmp receives its values for
 	// the element kinds it cannot write directly (narrower than 8 bytes).
 	run := true
-	var tmp [16]int64
+	var tmp [32]int64
 	i++
 	for first := true; ; first = false {
 		// Inter-token whitespace, in the shape the generator inlines: 0-1 bytes
@@ -456,7 +461,7 @@ func decodeUintSlice[T uintKind](out *[]T, data []byte, i int, a *Arena) (int, e
 			return i, ErrInvalidJSON // trailing comma
 		}
 		// The SIMD run kernel, as in decodeIntSlice.
-		if useIntRun && run && data[i]-'0' <= 9 {
+		if useIntRun && run && data[i]-'0' <= 9 && cap(s)-len(s) >= intRunMinSlots {
 			var n, p, closed int
 			if unsafe.Sizeof(T(0)) == 8 {
 				dst := unsafe.Slice((*int64)(unsafe.Pointer(unsafe.SliceData(s))), cap(s))[len(s):]

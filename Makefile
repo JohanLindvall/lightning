@@ -82,7 +82,7 @@ fmt-check:
 # fails if the two ever drift apart. Needs an aarch64 assembler: binutils on an
 # arm64 host, or binutils-aarch64-linux-gnu (the cross-assembler) on any host —
 # the tool prefers the cross one so the check also runs on amd64.
-SVEASM_FILES = pkg/unstable/simd_arm64.s
+SVEASM_FILES = pkg/unstable/simd_arm64.s pkg/unstable/intrun_arm64.s
 
 sveasm:
 	go run ./internal/sveasm -w $(SVEASM_FILES)

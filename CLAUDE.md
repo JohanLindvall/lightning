@@ -1569,6 +1569,104 @@ byte-identical when adding cold paths; push new logic out-of-line.
   `closed`, and every shuffle-table row) and the standing
   `BenchmarkDecodeIntSliceRun`. The fixed-array readers (`DecodeIntArray`)
   do not use it (no corpus case has a `[N]int` field).
+- **The arm64 twin of the integer-array kernel** (`parseIntRunNEON` in
+  `intrun_arm64.s`, `useIntRun` = `cpu.ARM64.HasASIMDDP`; 2026-09-02,
+  Neoverse N2). Same contract and call sites as `parseIntRunSSE`, and the
+  same parity tests; the shape is different, and every difference came from
+  a counter. The direct port — a 16-byte block, `SHRN`-narrowed nibble
+  masks in place of `PMOVMSKB`, a `TBL` + three `UMULL`/`ADDP` levels in
+  place of `PSHUFB` + `PMADDUBSW` — ran **13.6 cycles and 40 instructions
+  an element** on the 4000-element micro against the scalar loop's 20, and
+  `BenchmarkParseIntRunShapes` said why: two elements a block cost 16.7
+  cycles each when every block straddled and 10.9 when none did, because
+  the next block's address depended on where the walk left the previous one
+  and the whole load, compare, narrow, `VMOV` prologue sat on that chain.
+  Five changes, each measured by instructions and cycles per element on
+  `BenchmarkDecodeIntSliceRun/kernel-only` (in order 13.6 → 9.3 → 8.1 →
+  7.5 → 7.2 → 6.9 cycles; 40 → 30 → 31 → 26 → 25 → 26 instructions):
+  **(1) A 64-byte block walked at a fixed 48-byte stride.** Elements
+  starting in the first 48 lanes are consumed, one starting at lane 48 or
+  beyond is deferred to the next block, which is entered at lane b−48 with
+  the commas before it dropped (the consumed element's tail can reach past
+  lane 48 — the first version restarted at s+48 and re-read that tail as a
+  new element), and only an element longer than the 16 lanes of slack
+  restarts a block at its own start. Masks are the 64-lane bit-weight/ADDP
+  cascade of `skipfast_arm64.s` (two classes share their last ADDP and one
+  VMOV pair); the fold is a four-register `TBL` over the block, so the
+  shuffle table is indexed by lane 0-63. Bit-REVERSED masks (lane j at bit
+  63−j) make every run length one `LSL` to the run's start plus one `CLZ`,
+  and the not-digit and not-whitespace classes are compared negated (`CMHI`
+  against 9 and 0x20) so the complements the counts want cost nothing; the
+  reversal itself is free — weights {128,…,1} within each eight-lane half
+  and a `VREV64` of the packed bytes. **(2) Software-pipelined
+  classification.** Even with the address dependence gone, backend stalls
+  were 2.3 of 9.3 cycles and each extra block transition cost ~25 cycles:
+  the walk executes at dispatch rate, so when the front end reaches the
+  next prologue nothing older is pending for its ~25-cycle chain to overlap
+  with, and the next block's first elements queue behind it. Classifying
+  block k+1 into a second register set at the top of block k's walk (a
+  discarded prefetch on the rare straddle) took stalls to 0.35 cycles.
+  **(3) The comma test is one bit.** The element's end is "is lane e a
+  comma" — `LSL` the comma mask by e, `TBZ` bit 63 — with the whitespace-
+  before-comma and no-comma cases out of line, and the mask is never
+  consumed (shifting to each element's end excludes the commas before it),
+  so nothing but b carries from one element to the next; with the
+  digits-to-block-end branch folded into the 9+-digit exit (`CLZ` of zero
+  is 64), that is −5 instructions an element. **(4) The whitespace class
+  is computed only for blocks that need it**: on demand from a reload of
+  the block the first time a walk meets a non-digit, then pipelined with
+  the rest as long as the previous block needed it — a compact array never
+  pays its 13 vector ops a block (−0.7 cycles an element), and a `, `-
+  separated one pays the on-demand chain only on its first block (the
+  purely lazy form put that chain on the critical path of every block and
+  cost the `, ` micro +33%). **(5) A `UDOT` fold**: `TBL` lays the digits
+  out three, three and two to a word (16-byte controls, 8 KiB table), one
+  byte dot product makes the groups, a word multiply by 10^5, 10^2, 1 and
+  `UADDLV` make the value. **`UDOT` accumulates**: the first version fed it
+  the shuffled bytes as both source and accumulator and every value came
+  back with the packed digit bytes added (5 → 1285 = 5·257); the zeroed
+  accumulator costs a `VMOVI` and still wins 5% over `UMULL`+`UADDLP`,
+  which is what gates the kernel on DotProd (ARMv8.2, mandatory from 8.4:
+  every Neoverse, Graviton and Apple M core; a Cortex-A72 keeps the scalar
+  loop). Capacity is checked per block, not per element: 25 slots free
+  (the most a block can store: elements start two lanes apart) run
+  unchecked on one compare; below that, the exact bound is the block's
+  commas at or after b and below lane 48 plus one, counted with `CNT`,
+  which an exactly presized target always meets; only a target too small
+  for the block walks under a lane limit (⌈m/2⌉ elements start in m lanes)
+  and fills what fits, as amd64 does. The nil-based empty `out` a full
+  slice hands in caught the first form of that test (an end-minus-25-slots
+  pointer wraps at address 0). Micro, N2: **compact −66% (23.4 → 8.0 µs
+  per 4000 elements, 20 → 6.9 cycles an element at 26 instructions and
+  IPC 3.8), `, `-separated −58% (25.9 → 10.9 µs)**; branch mispredicts
+  0.02 an element throughout — the walk was never mispredict-bound, and
+  removing branches (E5/E9 in the session) moved nothing. Corpus
+  (interleaved ABBA, n=6, pinned, both sides `-funcalign=64`):
+  **mesh −11.3%, mesh_pretty −12.3%, marine_ik −5.9%** (all p=0.000; mesh's
+  and mesh_pretty's five arrays average 7400 elements, marine_ik's ten
+  thousand average eleven), numbers/canada/random/golang_source/instruments/
+  citm/twitter flat and cloudflare −0.4% (layout); geomean over the eleven
+  −2.7%. The first run had **twitter_status +1.0% and citm +0.5%** (p=0.000):
+  twitter's integer arrays are its two-element `indices` pairs, and a
+  64-byte classification is pure overhead for those — the break-even
+  against the scalar loop is four elements (presized targets, N2: three
+  elements 49 ns scalar / 53 kernel, four 56.5 / 57, six 76 / 70, twelve
+  128 / 95), so the batch loops now gate the call on
+  `cap(s)-len(s) >= intRunMinSlots` (4 on arm64, 1 on amd64, where the
+  per-call cost is one 16-byte block): a presized target's spare capacity
+  is the array's remaining length, so short arrays pay no call at all.
+  Re-measured, twitter and citm are flat (p=0.29, 0.98) and the three wins
+  unchanged. Locked by the unchanged `TestIntRunMatchesScalar` (which
+  found the 48-byte-restart bug and the stale-register bug of the lazy
+  class) and `TestParseIntRunDirect` (which found the two capacity forms
+  that stopped early), padded to 80 bytes for the 64-byte lookahead;
+  `make sveasm-check` covers the two `WORD`s. Tried and rejected on the
+  way, with counters: a 32-byte stride (+2.2 cycles an element — each
+  extra transition is exposed chain, not just its instructions), a 56-byte
+  one (−0.1, inside the noise, less slack), making the fold fall through
+  from the comma test (one taken branch an element instead of two: flat),
+  and a 1-register `TBL` in place of the 4-register one (−0.4 cycles; not
+  available, the fold needs the whole block).
 - **The batch integer loops load their four-digit chunk unchecked and enter
   the chunk loop only past four digits** (`load32` in `load_le.go`, the same
   `unsafe` read as `load64` behind the loop's own `uint(i)+4 <= len` test;
@@ -2767,6 +2865,9 @@ Go 1.27); `eiselLemire64` at ~60 instructions is the price of canada's
 per-element overhead is ~35 instructions around `scanFloat`'s ~196, of which
 the unsigned tests took three; and synthea's front-end stall (10.9%) and
 gsoc's allocation profile are what they were.
+(The integer-array kernel's arm64 twin landed the same day in a later
+session — see its entry in the performance architecture — taking mesh
+−11.3%, mesh_pretty −12.3% and marine_ik −5.9% on this box.)
 
 ## Zen 4 hardware-counter pass (2026-09-02)
 

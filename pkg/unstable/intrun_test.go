@@ -19,8 +19,8 @@ import (
 // separators shift the offsets), signs, nulls, decimals, exponents, long ids,
 // every whitespace shape (none, one space, a tab, a newline-and-indent run
 // longer than a block), trailing commas, missing commas, garbage bytes, a
-// truncated array, arrays that end within 16 bytes of the buffer, and a
-// reused target whose capacity fills mid-run.
+// truncated array, arrays that end within a block of the buffer's end, and
+// a reused target whose capacity fills mid-run.
 func TestIntRunMatchesScalar(t *testing.T) {
 	if !useIntRun {
 		t.Skip("no SIMD integer-run kernel on this machine")
@@ -84,8 +84,8 @@ func TestIntRunMatchesScalar(t *testing.T) {
 	}
 	for _, in := range inputs {
 		// The array at a random offset in a buffer with random padding after
-		// it, so the kernel's 16-byte lookahead limit falls at every distance
-		// from the array's end.
+		// it, so the kernel's lookahead limit (16 bytes on amd64, 64 on arm64)
+		// falls at every distance from the array's end.
 		lead := strings.Repeat(" ", rng.Intn(5))
 		var trail string
 		if rng.Intn(3) > 0 {
@@ -180,7 +180,7 @@ func TestParseIntRunDirect(t *testing.T) {
 	if !useIntRun {
 		t.Skip("no SIMD integer-run kernel on this machine")
 	}
-	pad := strings.Repeat(" ", 32)
+	pad := strings.Repeat(" ", 80) // past either kernel's lookahead (16 bytes amd64, 64 arm64)
 	cases := []struct {
 		in     string
 		i      int
@@ -199,7 +199,7 @@ func TestParseIntRunDirect(t *testing.T) {
 		{"1,2.5,3]" + pad, 0, 16, []int64{1}, 2, 0},                // and at a decimal
 		{"1,2,3,4,5,6,7,8,9]" + pad, 0, 3, []int64{1, 2, 3}, 6, 0}, // out full
 		{"7]" + pad, 0, 16, []int64{7}, 1, 1},
-		{"1,2", 0, 16, nil, 0, 0}, // fewer than 16 bytes: nothing
+		{"1,2", 0, 16, nil, 0, 0}, // fewer than a block: nothing
 		{"0000,0001,0010]" + pad, 0, 16, []int64{0, 1, 10}, 14, 1},
 		{"   5,6]" + pad, 0, 16, []int64{5, 6}, 6, 1},
 	}
@@ -242,7 +242,7 @@ func pow10i(n int) int {
 }
 
 // intRunArray is a JSON array of n four-digit-or-shorter integers with sep
-// between them, padded so the kernel's lookahead never runs out.
+// between them, padded so neither kernel's lookahead runs out.
 func intRunArray(n int, sep string) []byte {
 	var b strings.Builder
 	b.WriteByte('[')
@@ -253,7 +253,7 @@ func intRunArray(n int, sep string) []byte {
 		b.WriteString(strconv.Itoa((i * 7919) % 10000))
 	}
 	b.WriteString("]")
-	b.WriteString(strings.Repeat(" ", 32))
+	b.WriteString(strings.Repeat(" ", 80))
 	return []byte(b.String())
 }
 
@@ -294,6 +294,31 @@ func BenchmarkDecodeIntSliceRun(b *testing.B) {
 			b.SetBytes(int64(len(data)))
 			for i := 0; i < b.N; i++ {
 				if n, _, _ := parseIntRun(data, 1, out); n < 3999 {
+					b.Fatal(n)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkParseIntRunShapes is the kernel alone over arrays of one element
+// length each, 4000 elements a run: the instrument that shaped the arm64
+// kernel (CLAUDE.md, 2026-09-02). Two elements a block that never straddled
+// a 16-byte block against two that always did exposed the block-to-block
+// address chain, and the per-element counts under perf stat then said what
+// the walk was bound by after each change. The scalar loop is not run here;
+// DecodeIntSliceRun has that comparison.
+func BenchmarkParseIntRunShapes(b *testing.B) {
+	if !useIntRun {
+		b.Skip("no SIMD integer-run kernel on this machine")
+	}
+	for _, elem := range []string{"1,", "12,", "123,", "1234,", "123456,", "1234567,", "1234, "} {
+		data := []byte(strings.Repeat(elem, 3999) + elem[:len(elem)-1] + "]" + strings.Repeat(" ", 80))
+		out := make([]int64, 4000)
+		b.Run(strconv.Quote(elem), func(b *testing.B) {
+			b.SetBytes(int64(len(data)))
+			for i := 0; i < b.N; i++ {
+				if n, _, _ := parseIntRun(data, 0, out); n != 4000 {
 					b.Fatal(n)
 				}
 			}
