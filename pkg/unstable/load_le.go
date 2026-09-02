@@ -14,3 +14,12 @@ import "unsafe"
 func load64(data []byte, i int) uint64 {
 	return *(*uint64)(unsafe.Add(unsafe.Pointer(unsafe.SliceData(data)), i))
 }
+
+// load32 is load64's four-byte form: the bytes at data[i:i+4] as a
+// little-endian word, unchecked, for a caller that has already proven
+// i+4 <= len(data). The checked data[i:i+4] a SWAR digit step would otherwise
+// spell costs a capacity compare and a length compare per attempt, and the
+// batch integer loops make one attempt per element.
+func load32(data []byte, i int) uint32 {
+	return *(*uint32)(unsafe.Add(unsafe.Pointer(unsafe.SliceData(data)), i))
+}

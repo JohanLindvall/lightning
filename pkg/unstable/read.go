@@ -149,13 +149,27 @@ func ReadInt64OrNull(data []byte, i int) (int64, int, error) {
 		return 0, i, ErrBadNumber
 	}
 	var n int64
-	// The digit run, a word at a time (digitRun): this reader is called per
-	// member from a decoder loop, so the address chain its count creates is
-	// broken by the key read that follows; the batch array loops keep their
-	// byte-loop tail for the opposite reason (see decodeIntSlice).
-	v, end := digitRun(data, i)
-	n = int64(v)
-	i = end
+	// The digit run, per architecture (readerWordFold): a word at a time
+	// through digitRun where an issue-bound core wants the fewest
+	// instructions, and a byte at a time where the cursor's data chain is
+	// what the next member waits on — there the loop's exit branch is
+	// predicted, so the cursor costs nothing, and a four-digit SWAR step in
+	// front of it measured MORE instructions on every int-bearing case
+	// (its failing attempt on the 1-3 digit ints that dominate).
+	if readerWordFold {
+		v, end := digitRun(data, i)
+		n = int64(v)
+		i = end
+	} else {
+		for uint(i) < uint(len(data)) {
+			d := data[i] - '0'
+			if d > 9 {
+				break
+			}
+			n = n*10 + int64(d)
+			i++
+		}
+	}
 	if i < len(data) && (data[i] == '.' || data[i] == 'e' || data[i] == 'E') {
 		for uint(i) < uint(len(data)) {
 			c := data[i]
@@ -185,13 +199,27 @@ func ReadUint64OrNull(data []byte, i int) (uint64, int, error) {
 		return 0, i, ErrBadNumber
 	}
 	var n uint64
-	// The digit run, a word at a time (digitRun): this reader is called per
-	// member from a decoder loop, so the address chain its count creates is
-	// broken by the key read that follows; the batch array loops keep their
-	// byte-loop tail for the opposite reason (see decodeIntSlice).
-	v, end := digitRun(data, i)
-	n = uint64(v)
-	i = end
+	// The digit run, per architecture (readerWordFold): a word at a time
+	// through digitRun where an issue-bound core wants the fewest
+	// instructions, and a byte at a time where the cursor's data chain is
+	// what the next member waits on — there the loop's exit branch is
+	// predicted, so the cursor costs nothing, and a four-digit SWAR step in
+	// front of it measured MORE instructions on every int-bearing case
+	// (its failing attempt on the 1-3 digit ints that dominate).
+	if readerWordFold {
+		v, end := digitRun(data, i)
+		n = uint64(v)
+		i = end
+	} else {
+		for uint(i) < uint(len(data)) {
+			d := data[i] - '0'
+			if d > 9 {
+				break
+			}
+			n = n*10 + uint64(d)
+			i++
+		}
+	}
 	if i < len(data) && (data[i] == '.' || data[i] == 'e' || data[i] == 'E') {
 		for uint(i) < uint(len(data)) {
 			c := data[i]

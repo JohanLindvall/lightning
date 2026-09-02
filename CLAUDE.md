@@ -1427,9 +1427,23 @@ byte-identical when adding cold paths; push new logic out-of-line.
   −1.4%, marine_ik −1.1%, citm −1.0%, golang_source −1.0%. Locked by the
   unchanged `TestTryParse4DigitsMatchesIs4Digits` (every digit-adjacent byte
   combination plus 2M random words) and `TestScanFloatFastMatchesSlow`.
-- **Long integers fold a word at a time in the single-value readers**
-  (`digitRun` in `digitrun.go`; `ReadInt64OrNull`/`ReadUint64OrNull`,
-  2026-09-02). The digit run is measured with the XOR mask, a full word is
+- **Long integers fold a word at a time in the single-value readers — on
+  every architecture but amd64** (`digitRun` in `digitrun.go`, selected by
+  the `readerWordFold` constant in `digits_other.go`/`digits_amd64.go`;
+  `ReadInt64OrNull`/`ReadUint64OrNull`, 2026-09-02). **amd64 keeps a plain
+  byte loop instead (Zen 4, same day):** the word fold puts the cursor on a
+  load → mask → count → add data chain of ~14 cycles, and in an object
+  decoder the next member's key scan waits on exactly that cursor, where the
+  byte loop's exit branch is predicted and its cursor is free — measured
+  against digitRun by counters, golang_source −4.5% cycles with +4%
+  instructions (the tell that it is the chain, not the work), instruments
+  −5%, update_center −3%, payload_large −3%, citm/twitter flat; and the
+  four-digit SWAR step the pre-N2 readers had in front of their byte loop
+  cost 0.5–4.8% MORE instructions than the byte loop alone on every
+  int-bearing case (instruments −4.8%, payload_large −2.4%, golang_source
+  −2.0% without it: its failing attempt on the 1–3 digit ints that
+  dominate), so amd64 has neither. The N2 numbers below are the arm64
+  side of the same trade. The digit run is measured with the XOR mask, a full word is
   folded with `parse8Digits` and the final partial word after shifting its
   digits into the top lanes — the `scanFloat` fast path's step, in a loop —
   and every product is modulo 2^64, so the value is bit for bit the `n*10+d`
@@ -1454,6 +1468,119 @@ byte-identical when adding cold paths; push new logic out-of-line.
   reach — a run ending exactly on a word boundary with input behind it, so
   the next word's run length is zero (the first version folded eight lanes
   of whatever followed; the shift must be Go's, not masked `&63`).
+- **The float fast path, second pass (Zen 4, 2026-09-02): one dependent
+  offset for the fraction words, the exponent from one word, Eisel-Lemire
+  inline, the power-of-ten entry by pointer.** Four changes to `scanFloat`,
+  found with the four-shape micro `BenchmarkScanFloatShapes` (per twenty
+  tokens, funcalign=64, median-of-5; "slow" is float-array-slow's shape,
+  which the straight-line path had made 6% SLOWER than the loop form it
+  replaced — the fast path executed 17% fewer instructions and still lost,
+  and the dispatch counters said why: retire stalls ≈ 0 (the ROB is not
+  full) but ~300 scheduler-full cycles per 20 tokens and 33% of dispatch
+  slots lost to the back end, i.e. ALU-port saturation plus chain latency,
+  so both instructions and chain length are the currency). **(1)** The
+  three fraction words are loaded at `i+k+1`, ONE offset that depends on the
+  integer count, instead of at fixed offsets and funnel-shifted into place:
+  three cycles behind the count instead of two, and ~20 instructions fewer
+  — six variable shifts, their `mov %r,%cl`, and the spills the register
+  pressure forced. This is NOT the chained-load version the original entry
+  rejected (each word at the offset the previous word's count produced, +18%
+  on 17-digit fractions); all three loads issue together. Alone: canada
+  shape −13% instructions / −12% cycles, array −14%/−11%, mesh −9%/−7%,
+  slow −5%/−4%. **(2)** The exponent is folded from one `load64` at the
+  token's end position — sign, digits and terminator are all within its
+  eight lanes, reached by register shifts — instead of three dependent
+  loads (marker byte, sign byte, digit word); the fast shape is now 1–5
+  exponent digits (6–7 go to the slow path, as 8+ already did). Also the
+  empty third fraction word of a 17-significant-digit token (`r == 0`) no
+  longer costs a fold of nothing and a multiply by one, and the three-word
+  fold is reassociated so its scalings run in parallel. **(3)**
+  Eisel-Lemire is written out inside the fast path at a single site (the
+  Clinger test is one `mant>>53 == 0 && uint(exp+22) <= 44`) instead of
+  called from three: the call was a frame plus a spill of the live state
+  per number on the shapes that take it, which is nearly every number in a
+  coordinate document. `eiselLemire64` stays as `scanFloatSlow`'s and the
+  tests' reference; `TestScanFloatFastMatchesSlow` holds the copy to it bit
+  for bit. **(4)** `pow := &detailedPowersOfTen[...]`, by pointer: the
+  `[2]uint64` copy went through the stack as one 16-byte store read back by
+  two 8-byte loads, which fails store-to-load forwarding — it was the
+  `ls_bad_status2.stli_other` event seen once or twice per float on every
+  float-heavy case (canada 346k per decode), and taking the entry by pointer
+  removed ~20 of the 60 per twenty tokens. Micro, all four together against
+  the 2026-09-02 tree: **canada −14%, slow −15%, array −10%, mesh −7%**
+  cycles. Corpus instructions per decode (exact, by differencing): canada
+  −10.4%, float-array-slow −13.0%, mesh_pretty −8.3%, numbers −8.1%,
+  float-array −7.8%, canada_geometry −6.7%, large-json −4.4%; time
+  (interleaved, n=12) float-array-slow −12.6%, canada −8.4%, mesh −7.1%,
+  mesh_pretty −5.2%, canada_geometry −4.3%, numbers −2.7% — the Zen 4
+  section below has the full table. Not measured on Meteor Lake or N2,
+  whose entries above were written against the funnel form.
+- **Arrays of short integers are parsed by a SIMD kernel** (`parseIntRunSSE`
+  in `intrun_amd64.s`, `useIntRun` = AVX && BMI2; called from
+  `decodeIntSlice`/`decodeUintSlice` whenever an element starts with a
+  digit; 2026-09-02, Zen 4). The kernel walks 16-byte blocks: four VEX.128
+  compares classify digits, commas, `]` and whitespace (`<= 0x20`, SkipWS's
+  rule) into bitmasks, and each `ws* digits{1..8} ws* ,` group becomes one
+  `PSHUFB` (an 8-byte control from a 128-entry table indexed `s*8+L`, which
+  right-aligns the L digits at block offset s into the low lane with zeros
+  in front) and the three fixed folds `PMADDUBSW` (10,1) → `PMADDWD` (100,1)
+  → `PACKUSDW` → `PMADDWD` (10000,1), then one int64 store. It writes
+  straight into the slice's spare capacity for the 8-byte kinds (through a
+  16-entry scratch and a converting append for narrower ones), also takes
+  the array's `]`-terminated last element (`closed`), and hands back at the
+  first element it does not handle — a sign, `null`, a fraction or
+  exponent, 9+ digits, a missing comma, an element straddling a block it
+  cannot move past, fewer than 16 bytes left, a full output — at a position
+  that is exactly the scalar loop's loop-top state, so every value and every
+  error still comes from the scalar code. One unproductive call turns it off
+  for the rest of the array. **Three things it had to learn on this core,
+  each worth more than the algorithm** (kernel-only micro, 4000 four-digit
+  elements): the first version ran **38 cycles an element, slower than the
+  scalar loop's 21, with a third of the instructions** — *(1)* it branched
+  on the flags of `SHR r32, CL`; a variable-count shift's flags are only
+  conditionally written, and reading them costs a decoder-fed sequence
+  (`de_src_op_disp.decoder` counted seven ops per element, `ex_no_retire.
+  not_complete` +12 cycles per element). `SHRX` plus an explicit `TEST`, or
+  `SHR CL` plus `TEST`, are both 15 cycles an element; Go-compiled code never
+  reads a shift's flags, which is why the float path's CL shifts show 0.2
+  decoder ops per 20 tokens and were not the source of the v3 gain below.
+  *(2)* Deriving each element's end from its digit count put the cursor on a
+  shift → count → add → shift → count chain of ~7 cycles; the comma positions
+  are known from the block mask independently, so the element loop now
+  walks commas with `BLSR`/`TZCNT` (a 2-cycle chain) and validates the digit
+  run against that comma: 12 cycles an element. *(3)* Skipping the
+  whitespace arithmetic when the byte at the cursor is a digit (one `BT`)
+  and the 8-byte table with a single `LEA` index: **9.3 cycles an element,
+  42 instructions** (12.5 for `, `-separated input). Legacy SSE encodings
+  measured the same as VEX once (1) was fixed; VEX is kept for the clean
+  three-operand form. Corpus: instructions per decode mesh −13.9%,
+  mesh_pretty −15.0%, marine_ik −9.0%; wall time (interleaved, n=12)
+  **mesh −7.2% (p=0.000), mesh_pretty −6.0% (p=0.000), marine_ik −2.8%
+  (p=0.003)**, citm/random/numbers/twitter flat. marine_ik's 10k arrays
+  average eleven elements, so its win is bounded by the ~45-instruction call
+  overhead; mesh's four long arrays get the full effect. Locked by
+  `TestIntRunMatchesScalar` — 4000 generated arrays (every digit count at
+  every block offset, signs, nulls, decimals, exponents, long ids, every
+  whitespace shape including indent runs longer than a block, trailing and
+  doubled commas, garbage, truncation, arrays ending inside the last 16
+  bytes) times nine target kinds including reused slices whose capacity
+  fills mid-run, decoded with the flag on and off and compared on values,
+  end and error identity — plus `TestParseIntRunDirect` (the stop positions,
+  `closed`, and every shuffle-table row) and the standing
+  `BenchmarkDecodeIntSliceRun`. The fixed-array readers (`DecodeIntArray`)
+  do not use it (no corpus case has a `[N]int` field).
+- **The batch integer loops load their four-digit chunk unchecked and enter
+  the chunk loop only past four digits** (`load32` in `load_le.go`, the same
+  `unsafe` read as `load64` behind the loop's own `uint(i)+4 <= len` test;
+  `decodeIntSlice`/`decodeUintSlice`/`DecodeIntArray`/`DecodeUintArray`,
+  2026-09-02). The checked `data[i:i+4]` cost a capacity compare and a
+  length compare per attempt, and the `for` around the four-digit step made
+  the register allocator spill and reload the slice header around it (three
+  stores and six loads per element, visible in the disassembly). Now the
+  common 1–4 digit element runs straight-line — one chunk attempt, then the
+  byte tail — and only a 5+-digit element (ids, timestamps) enters the loop.
+  Instructions per decode mesh −3.8%, marine_ik −1.9%; cycles (counters,
+  side core) mesh −6%, marine_ik −4.5%.
 
 ## The inline trick — let the generator write hot bodies inline
 
@@ -2640,6 +2767,118 @@ Go 1.27); `eiselLemire64` at ~60 instructions is the price of canada's
 per-element overhead is ~35 instructions around `scanFloat`'s ~196, of which
 the unsigned tests took three; and synthea's front-end stall (10.9%) and
 gsoc's allocation profile are what they were.
+
+## Zen 4 hardware-counter pass (2026-09-02)
+
+The amd64 counterpart of the Meteor Lake and N2 passes, on the local Ryzen
+7 8840HS (Zen 4, AVX-512, `perf` 7.0 at `perf_event_paranoid=2`, which
+allows `:u` counting of one's own process but not IBS). Everything landed
+is recorded in the entries above — the float fast path's second pass, the
+per-architecture integer readers, the batch integer loops' unchecked chunk
+load — and this section is the map of how it was found and what the core
+turned out to be bound by. Exact instructions per decode against the
+session's starting commit (geomean over 30 cases **−3.3%**): float-array-slow
+−13.0%, canada −10.4%, mesh −8.5%, mesh_pretty −8.3%, numbers −8.1%,
+float-array −7.8%, marine_ik −7.1%, canada_geometry −6.7%, instruments
+−6.7%, payload_small −6.4%, large-json −4.4%, payload_large −2.7%, random
+−2.2%; citm_catalog **+1.2%** and golang_source +0.8% (the byte-loop
+readers trade instructions for the cursor chain, and their wall-clock
+verdict is the interleaved A/B below); every other case within ±0.6%.
+Wall time (interleaved ABBA, n=12 per side, pinned, both sides
+`-funcalign=64`, benchstat): **float-array-slow −12.6% (p=0.000), canada
+−8.4% (p=0.003), payload_small −7.6% (p=0.004), instruments −7.2%
+(p=0.000), mesh −7.1% (p=0.014), mesh_pretty −5.2% (p=0.039),
+canada_geometry −4.3% (p=0.017), numbers −2.7% (p=0.039)**; marine_ik
+−3.7% (p=0.052), float-array −3.7% and large-json −3.4% (p=0.089),
+payload_large −2.3% (p=0.060), random −2.3% (p=0.068) are the right sign
+inside this laptop's ±4–9% per-case noise; citm_catalog, golang_source,
+the cloudflare family, twitter, gsoc, synthea, update_center flat; the one
+wrong-signed number is string_unicode +2.9% (p=0.080, −0.2% instructions,
+the layout-sensitive case). Geomean over 30 **−2.6%**. The float-array-slow
+regression the Meteor Lake pass recorded (+3.9%, +7.6% cumulative) is
+closed: the fast path is now faster than the loop form on that shape too.
+With the integer-array kernel (below) added, the whole session against its
+starting commit (same protocol, n=12): **float-array-slow −12.6%,
+mesh_pretty −11.0%, mesh −10.7%, marine_ik −9.2%, payload_small −8.3%,
+instruments −8.1%, canada −6.6%, float-array −5.3%, payload_large −4.8%,
+numbers −3.1%, canada_geometry −2.3%** (all p ≤ 0.04), large-json −4.7% and
+github_events −4.5% at p=0.078, everything else flat and nothing worse;
+geomean over 30 cases **−3.4%**.
+
+- **Per-op counters by differencing, as before; cycles need a median and an
+  idle machine.** `perf stat` at N and 3N fixed iterations gives
+  instructions and branches per decode to four digits; cycles drift ±5% on
+  the small cases and ±15% on the allocation-heavy ones (golang_source went
+  7.4M → 9.9M for one unchanged binary while a build ran on other cores),
+  so every keep/revert here was decided on instructions and confirmed on
+  wall time. Two traps: a `pkill -f` pattern that matches the shell running
+  the harness kills the harness; and a script edited while it runs is read
+  incrementally by bash. Layout: every micro binary is linked
+  `-funcalign=64` — adding a test file to the package moved an unchanged
+  fast path +15% on one shape without it.
+- **Where the corpus sits on this core.** Op cache delivers 99% of ops on
+  every case but synthea (82%) and twitter (89%); mispredicts are 0.0–0.5%;
+  IPC 4.3–5.0 on the object and number cases with 25–35% of dispatch slots
+  lost to back-end stalls, 8% to the front end. The dispatch-token counters
+  say which back-end resource: on the float micro `retire_token_stall` (ROB
+  full) is ~0 while the four `int_sch*_token_stall` events sum to ~300
+  cycles per 20 tokens — the schedulers fill with ops waiting on a chain,
+  which is the signature of a core that is both ALU-port-bound and
+  latency-bound at once. Removing instructions AND shortening the value
+  chain each paid, in proportion (the empty-third-word shortcut cut 21
+  instructions per token and bought 3.5 cycles, exactly 4 ALU ops per
+  cycle).
+- **The cursor data chain is the object cases' limiter, as on Meteor
+  Lake.** `digitRun` profiled at 12–15% flat on citm/golang_source, and the
+  byte loop that replaced it on amd64 executes MORE instructions yet runs
+  faster, because the object loop serializes through the cursor: key scan →
+  colon → value → comma → next key, ~60 cycles a member on cloudflare, and a
+  predicted branch keeps a byte loop's cursor off that chain where a SWAR
+  count puts ~14 cycles on it. The same reasoning is why the batch loops
+  keep their byte tail (N2 entry) and why (1) of the float pass was the
+  single-offset load and not a per-word chain.
+- **`ls_bad_status2.stli_other` is worth sampling.** It found the
+  `[2]uint64` table-entry copy in Eisel-Lemire (a 16-byte store read back
+  as two 8-byte loads, once per float). It did NOT find 4K aliasing: an
+  input page-offset sweep on cloudflare and float-array-slow moved the count
+  by nothing (77–125 and 31–51 per decode) and the cycles by ±5%, so the
+  stack stores of the ABI0 scanner calls are not falsely matching the input
+  loads on this core. The remaining ~1.5 per float in the batch loops are
+  unattributed (the samples smear with the cycle profile).
+- **What the profile said and what it was.** canada: `scanFloat` 48% +
+  `eiselLemire64` 27%, of which the removable part was the call, the funnel
+  and the table copy (−10% instructions), not the multiplies. cloudflare
+  (copying strings): 20% in `mallocgc`/`gcmarknewobject`/`slicebytetostring`,
+  which is the copy semantics and not the decoder — the nocopy twin is
+  2245 cycles to the copy's 3274 — while the whitespace probes on its
+  compact input, which looked like a third of the gap, are ~120 cycles
+  (5%) once the nocopy twin is the baseline (the compact twin is nocopy
+  too; compare like with like). mesh: `decodeIntSlice` 25% at ~100
+  instructions per 1–4 digit int, ~25 of them spills, bounds arithmetic
+  and constants the source does not show.
+
+- **The integer-array kernel, and what it taught about this core** (its
+  own entry above). Built in the same session on the user's request: the
+  first working version was *slower* than the loop it replaced despite a
+  third of the instructions, and the counters located the cause each time —
+  `de_src_op_disp.decoder` for the flags-after-variable-shift sequence,
+  `ex_no_retire.not_complete` for the cursor chain. A `GOAMD64=v3` build was
+  measured along the way: canada −11.5%, mesh −2.7%, golang_source flat,
+  citm +3.0%, cloudflare +2.3% — a lever only for a user who can set it,
+  and not from the shifts: replacing the float fast path's five CL shifts
+  with table multiplies (`x * (1 << 8n)`) was built and measured **canada
+  +17%, slow +10%, array +10%** (the load and multiply are 8 cycles on the
+  value chain where the shift is one), and a dependent-chain micro puts
+  `BSF`+`CMOV` at just one cycle more than `TZCNT`. Whatever v3 buys canada
+  is spread over its whole instruction selection.
+
+**Left on the table, sized:** the batch loops' remaining spills (two per
+element) are the register allocator's around `append` and resisted two
+source shapes; the kernel's per-call overhead (~45 instructions of ABI0
+marshaling and constant loads) is what bounds marine_ik's eleven-element
+arrays, and a `[N]int` fixed-array variant is unwritten for want of a
+corpus case; and the object loop's key scan still crosses the stack twice
+per call (`<ABIInternal>` refused, as on the other two cores).
 
 ## Session 2026-08 fixes worth knowing (correctness/API)
 

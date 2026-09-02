@@ -32,17 +32,22 @@ var pow10exact = [...]float64{
 func scanFloat(data []byte, i int) (f float64, end int, fast, ok bool) {
 	// Straight-line fast path for the shape nearly every real-world float has:
 	// an optional '-', 1-7 integer digits, an optional '.' with 1-24 fraction
-	// digits, an optional exponent of 1-7 digits, at most 19 significant digits.
+	// digits, an optional exponent of 1-5 digits, at most 19 significant digits.
 	//
-	// The whole 32-byte window after the sign is loaded up front at FIXED
-	// offsets, and the fraction is aligned to a word boundary with funnel
-	// shifts by the integer-digit count, so every load issues at once and the
-	// digit masks and folds of the three fraction words proceed in parallel. A
-	// first version loaded each word at the offset the previous word's digit
-	// count produced; that turned the loop form's well-predicted control
-	// dependencies into a load-to-address DATA chain (load, mask, count, add,
-	// load, ... ~13 cycles a link), and a 17-digit fraction ran 18% slower
-	// than the loops it replaced despite executing fewer instructions. The
+	// The integer word is loaded at the token, and the three fraction words at
+	// the offset its digit count gives — ONE data-dependent offset, with the
+	// three loads and then their masks and folds all in parallel. Two other
+	// shapes were measured and lost: loading each word at the offset the
+	// previous word's count produced (a load, mask, count, add, load chain of
+	// ~13 cycles a link: a 17-digit fraction ran 18% slower than the loops
+	// despite fewer instructions), and loading the whole window at fixed
+	// offsets and aligning the fraction with funnel shifts by the integer
+	// count (the 2026-09-02 form) — which keeps the loads independent but
+	// costs six variable shifts, their CL moves and the spills the register
+	// pressure forces, ~20 instructions a token that an ALU-bound core (Zen
+	// 4, IPC 4-5 on these tokens) pays in full for a two-cycle shorter chain:
+	// this form measured canada-shaped tokens -13% instructions and -12%
+	// cycles against it, mesh_pretty's -9%/-7%, float-array's -14%/-11%. The
 	// loop form (scanFloatSlow) costs 289 instructions and 23 taken branches
 	// for an 8-byte float on Meteor Lake; this path is the arithmetic alone.
 	//
@@ -54,7 +59,7 @@ func scanFloat(data []byte, i int) (f float64, end int, fast, ok bool) {
 	// leading fraction zeros do not count against the 19-digit budget when the
 	// integer part is zero — so golang_source's 0.000698…-shaped weights stay
 	// here. Anything unrecognised (a '+', 8+ integer digits, 25+ fraction
-	// digits, more than 19 significant digits, an 8+ digit exponent, a
+	// digits, more than 19 significant digits, a 6+ digit exponent, a
 	// malformed continuation, or a token within 48 bytes of the end of the
 	// buffer, the window the unchecked loads need) is handed whole to
 	// scanFloatSlow, whose results this path reproduces bit for bit —
@@ -73,23 +78,27 @@ func scanFloat(data []byte, i int) (f float64, end int, fast, ok bool) {
 			i++
 		}
 		w0 := load64(data, i)
-		w1 := load64(data, i+8)
-		w2 := load64(data, i+16)
-		w3 := load64(data, i+24)
 		d0 := w0 ^ zero
-		k := bits.TrailingZeros64(((d0+six)|d0)&nib) >> 3 // integer digits, 8 = all
-		if uint(k-1) < 7 {                                // 1..7 (k == 0 wraps)
+		m0i := ((d0 + six) | d0) & nib
+		if m0i == 0 {
+			return scanFloatSlow(data, start) // 8+ integer digits
+		}
+		k := bits.TrailingZeros64(m0i) >> 3 // integer digits, 0..7; the test above proves m0i != 0, so no zero guard
+		if k != 0 {
 			mant := parse8Digits(d0 << (uint(8-k) * 8 & 63))
 			p := k // offset just past the digits consumed so far
 			exp := 0
 			if byte(w0>>(uint(k)*8&63)) == '.' {
-				// The fraction starts at lane k+1: funnel the window down by
-				// that many lanes so it begins each word. k is 1..7, so the
-				// shift pairs are 8..56 and 48..0 — no shift reaches 64.
-				sh := uint(k) * 8 & 63
-				f0 := (w0>>8)>>sh | w1<<(56-sh)
-				f1 := (w1>>8)>>sh | w2<<(56-sh)
-				f2 := (w2>>8)>>sh | w3<<(56-sh)
+				// The fraction starts at lane k+1: load its three words there
+				// (k <= 7 keeps the last one inside the 48-byte window). This
+				// puts the loads three cycles behind the integer count instead
+				// of the funnel shifts' two, and on an ALU-bound core the ~20
+				// instructions the funnel cost (six shifts, their CL moves and
+				// the spills they forced) are worth more than the cycle.
+				q := i + k + 1
+				f0 := load64(data, q)
+				f1 := load64(data, q+8)
+				f2 := load64(data, q+16)
 				fd0 := f0 ^ zero
 				m0 := ((fd0 + six) | fd0) & nib
 				var kf int
@@ -106,9 +115,13 @@ func scanFloat(data []byte, i int) (f float64, end int, fast, ok bool) {
 					if m1 != 0 { // 8-15
 						r := bits.TrailingZeros64(m1) >> 3
 						kf = 8 + r
-						// (x<<8)<<((7-r)*8) lands r digits in the top lanes and, for
-						// r == 0, shifts the word out entirely — no 64-bit shift.
-						fv = parse8Digits(fd0)*pow10u64[r] + parse8Digits((fd1<<8)<<(uint(7-r)*8&63))
+						fv = parse8Digits(fd0)
+						if r != 0 {
+							// (x<<8)<<((7-r)*8) lands r digits in the top lanes; the
+							// r == 0 case above skips a fold of nothing and a
+							// multiply by one on the value chain.
+							fv = fv*pow10u64[r] + parse8Digits((fd1<<8)<<(uint(7-r)*8&63))
+						}
 					} else {
 						fd2 := f2 ^ zero
 						m2 := ((fd2 + six) | fd2) & nib
@@ -117,7 +130,15 @@ func scanFloat(data []byte, i int) (f float64, end int, fast, ok bool) {
 						}
 						r := bits.TrailingZeros64(m2) >> 3 // 16-23
 						kf = 16 + r
-						fv = (parse8Digits(fd0)*1e8+parse8Digits(fd1))*pow10u64[r] + parse8Digits((fd2<<8)<<(uint(7-r)*8&63))
+						// Reassociated so the three folds and their scalings run in
+						// parallel: two loads and adds instead of a fold-multiply-add-
+						// multiply-add chain, which is the value chain's long pole on a
+						// 17-digit token (see the r == 0 note above).
+						if r != 0 {
+							fv = parse8Digits(fd0)*pow10u64[8+r] + parse8Digits(fd1)*pow10u64[r] + parse8Digits((fd2<<8)<<(uint(7-r)*8&63))
+						} else {
+							fv = parse8Digits(fd0)*1e8 + parse8Digits(fd1)
+						}
 					}
 				}
 				// Significant digits: the integer digits plus the fraction digits,
@@ -142,64 +163,126 @@ func scanFloat(data []byte, i int) (f float64, end int, fast, ok bool) {
 				p = k + 1 + kf
 				exp = -kf
 			}
-			// The byte after the digits: an exponent of 1-7 digits is folded the
-			// same way; a digit cannot follow a measured run, so only a '.', 'e' or
-			// 'E' can still make the token malformed ("1.2.3", "1e2e3"), and those
-			// go to the slow path, which measures and rejects the whole run.
-			switch c := data[i+p]; c {
+			// The byte after the digits, and the seven behind it, in one word
+			// (p <= 32, so the load stays inside the 48-byte window). A digit
+			// cannot follow a measured run, so only a '.', 'e' or 'E' can still
+			// make the token malformed ("1.2.3", "1e2e3"), and those go to the
+			// slow path, which measures and rejects the whole run. An exponent
+			// is folded from this same word: its sign, its digits and the byte
+			// that ends it are all within the eight lanes, reached by register
+			// shifts rather than the three dependent loads (marker, sign, digit
+			// word) that used to sit on the value chain — the exponent feeds
+			// the Eisel-Lemire table lookup, and on a 17-digit token with an
+			// exponent that lookup was what the whole chain waited for.
+			ew := load64(data, i+p)
+			switch c := byte(ew); c {
 			case 'e', 'E':
 				q := i + p + 1
-				esign := 1
-				if c := data[q]; c == '+' || c == '-' {
-					if c == '-' {
-						esign = -1
-					}
+				ew >>= 8
+				eneg := false
+				if c := byte(ew); c == '+' || c == '-' {
+					eneg = c == '-'
+					ew >>= 8
 					q++
 				}
-				de := load64(data, q) ^ zero // q <= i+34: the window covers it
+				// The lanes shifted in above read as zero bytes, which the mask
+				// flags as non-digits, so ke never exceeds the visible lanes;
+				// 1-5 digits is the fast shape (a longer exponent is far outside
+				// the powers-of-ten table anyway), and "1e", "1e+" have none.
+				de := ew ^ zero
 				ke := bits.TrailingZeros64(((de+six)|de)&nib) >> 3
-				if uint(ke-1) >= 7 { // no digits ("1e", "1e+"), or 8+: the slow path decides
+				if uint(ke-1) >= 5 {
 					return scanFloatSlow(data, start)
 				}
-				exp += esign * int(parse8Digits(de<<(uint(8-ke)*8&63)))
-				q += ke
-				if c := data[q]; c == '.' || c == 'e' || c == 'E' {
+				eval := int(parse8Digits(de << (uint(8-ke) * 8 & 63)))
+				if eneg {
+					exp -= eval
+				} else {
+					exp += eval
+				}
+				if c := byte(ew >> (uint(ke) * 8 & 63)); c == '.' || c == 'e' || c == 'E' {
 					return scanFloatSlow(data, start)
 				}
-				end = q
+				end = q + ke
 			case '.':
 				return scanFloatSlow(data, start)
 			default:
 				end = i + p
 			}
-			if mant>>53 != 0 {
-				if v, ok := eiselLemire64(mant, exp, neg); ok {
-					return v, end, true, true
+			if mant>>53 == 0 && uint(exp+22) <= 44 {
+				// Clinger: an exact mantissa and a power of ten that is exact in
+				// a float64, one multiply or divide.
+				f = float64(mant)
+				if exp < 0 {
+					f /= pow10exact[-exp]
+				} else if exp > 0 {
+					f *= pow10exact[exp]
 				}
+				if neg {
+					f = -f
+				}
+				return f, end, true, true
+			}
+			// Eisel-Lemire, written out here rather than called: eiselLemire64
+			// is past the inliner's budget, and the call cost a spill of the
+			// live state and a frame per number on the shapes that take it —
+			// which is nearly every number in a coordinate-heavy document
+			// (canada: 108k of 111k). The body is eiselLemire64's, line for
+			// line, with its two returns spelled as this function's; that
+			// function stays as scanFloatSlow's and the tests' reference, and
+			// TestScanFloatFastMatchesSlow holds the copy to it bit for bit.
+			if mant == 0 {
+				if neg {
+					return math.Float64frombits(0x8000000000000000), end, true, true // -0
+				}
+				return 0, end, true, true
+			}
+			if exp < detailedPowersOfTenMinExp10 || detailedPowersOfTenMaxExp10 < exp {
 				return 0, end, false, true // hand the exact token to strconv
 			}
-			f = float64(mant)
-			if exp < 0 {
-				if exp < -22 {
-					if v, ok := eiselLemire64(mant, exp, neg); ok {
-						return v, end, true, true
-					}
+			man := mant
+			clz := bits.LeadingZeros64(man)
+			man <<= uint(clz)
+			const float64ExponentBias = 1023
+			retExp2 := uint64(217706*exp>>16+64+float64ExponentBias) - uint64(clz)
+			// By pointer, not by value: copying the [2]uint64 entry went through
+			// the stack as one 16-byte store read back by two 8-byte loads,
+			// which cannot store-forward and stalled the value chain once per
+			// number (ls_bad_status2.stli_other, one to two per float on
+			// every float-heavy case).
+			pow := &detailedPowersOfTen[exp-detailedPowersOfTenMinExp10]
+			xHi, xLo := bits.Mul64(man, pow[1])
+			if xHi&0x1FF == 0x1FF && xLo+man < man {
+				yHi, yLo := bits.Mul64(man, pow[0])
+				mergedHi, mergedLo := xHi, xLo+yHi
+				if mergedLo < xLo {
+					mergedHi++
+				}
+				if mergedHi&0x1FF == 0x1FF && mergedLo+1 == 0 && yLo+man < man {
 					return 0, end, false, true
 				}
-				f /= pow10exact[-exp]
-			} else if exp > 0 {
-				if exp > 22 {
-					if v, ok := eiselLemire64(mant, exp, neg); ok {
-						return v, end, true, true
-					}
-					return 0, end, false, true
-				}
-				f *= pow10exact[exp]
+				xHi, xLo = mergedHi, mergedLo
 			}
+			msb := xHi >> 63
+			retMantissa := xHi >> (msb + 9)
+			retExp2 -= 1 ^ msb
+			if xLo == 0 && xHi&0x1FF == 0 && retMantissa&3 == 1 {
+				return 0, end, false, true
+			}
+			retMantissa += retMantissa & 1
+			retMantissa >>= 1
+			if retMantissa>>53 > 0 {
+				retMantissa >>= 1
+				retExp2++
+			}
+			if retExp2-1 >= 0x7FF-1 {
+				return 0, end, false, true
+			}
+			retBits := retExp2<<52 | retMantissa&0x000FFFFFFFFFFFFF
 			if neg {
-				f = -f
+				retBits |= 0x8000000000000000
 			}
-			return f, end, true, true
+			return math.Float64frombits(retBits), end, true, true
 		}
 		i = start
 	}
@@ -441,7 +524,7 @@ func eiselLemire64(man uint64, exp10 int, neg bool) (float64, bool) {
 	// 217706/2^16 approximates log2(10); this estimates the binary exponent.
 	retExp2 := uint64(217706*exp10>>16+64+float64ExponentBias) - uint64(clz)
 
-	pow := detailedPowersOfTen[exp10-detailedPowersOfTenMinExp10]
+	pow := &detailedPowersOfTen[exp10-detailedPowersOfTenMinExp10] // by pointer: see scanFloat
 	xHi, xLo := bits.Mul64(man, pow[1])
 	// If the high product is within 1/512 of a halfway point, refine with the low
 	// half of the 128-bit power of ten.

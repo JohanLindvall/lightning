@@ -9,3 +9,8 @@ import "encoding/binary"
 func load64(data []byte, i int) uint64 {
 	return binary.LittleEndian.Uint64(data[i : i+8])
 }
+
+// load32 is the checked form of load_le.go's four-byte read.
+func load32(data []byte, i int) uint32 {
+	return binary.LittleEndian.Uint32(data[i : i+4])
+}

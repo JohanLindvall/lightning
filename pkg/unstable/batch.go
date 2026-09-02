@@ -2,8 +2,8 @@ package unstable
 
 import (
 	"encoding/base64"
-	"encoding/binary"
 	"strconv"
+	"unsafe"
 )
 
 // Batched scalar-array readers: each decodes a whole JSON array of numbers in
@@ -227,6 +227,11 @@ func decodeIntSlice[T intKind](out *[]T, data []byte, i int, a *Arena) (int, err
 			}
 		}
 	}
+	// The SIMD run kernel's state: run is cleared by an unproductive call, so
+	// an array it cannot help costs one call; tmp receives its values for
+	// the element kinds it cannot write directly (narrower than 8 bytes).
+	run := true
+	var tmp [16]int64
 	i++
 	for first := true; ; first = false {
 		// Inter-token whitespace, in the shape the generator inlines: 0-1 bytes
@@ -248,6 +253,36 @@ func decodeIntSlice[T intKind](out *[]T, data []byte, i int, a *Arena) (int, err
 				return i + 1, nil
 			}
 			return i, ErrInvalidJSON // trailing comma
+		}
+		// An element that starts with a digit is where the SIMD run kernel
+		// takes over (useIntRun): it writes every following short element
+		// straight into the slice's spare capacity (or a scratch, for the
+		// narrower kinds) and hands back at the first element it does not
+		// handle — a sign, null, a fraction, 9+ digits — which the scalar
+		// code below then reads exactly as it always has. One unproductive
+		// call turns it off for the rest of the array, so an array of long
+		// ids or decimals pays for it once.
+		if useIntRun && run && data[i]-'0' <= 9 {
+			var n, p, closed int
+			if unsafe.Sizeof(T(0)) == 8 {
+				dst := unsafe.Slice((*int64)(unsafe.Pointer(unsafe.SliceData(s))), cap(s))[len(s):]
+				n, p, closed = parseIntRun(data, i, dst)
+				s = s[:len(s)+n]
+			} else {
+				n, p, closed = parseIntRun(data, i, tmp[:])
+				for _, v := range tmp[:n] {
+					s = append(s, T(v))
+				}
+			}
+			if n > 0 {
+				i = p
+				if closed != 0 {
+					*out = s
+					return i + 1, nil
+				}
+				continue
+			}
+			run = false
 		}
 		var n int64
 		if data[i] == 'n' {
@@ -279,13 +314,24 @@ func decodeIntSlice[T intKind](out *[]T, data []byte, i int, a *Arena) (int, err
 			// puts that address on a load→mask→count data chain. Measured on a
 			// Neoverse N2: digitRun here was mesh +1.1% with fewer instructions,
 			// and two guarded hybrids were worse still (CLAUDE.md, 2026-09-02).
-			for i+4 <= len(data) {
-				v, ok := tryParse4Digits(binary.LittleEndian.Uint32(data[i : i+4]))
-				if !ok {
-					break
+			if uint(i)+4 <= uint(len(data)) {
+				if v, ok := tryParse4Digits(load32(data, i)); ok { // in bounds: the test above
+					n = int64(v)
+					i += 4
+					// 5+ digits (ids, timestamps): keep folding four at a time. A
+					// separate loop, entered only then, so the common 1-4 digit
+					// element runs straight-line: the slice header the loop forced
+					// the register allocator to spill and reload around it (three
+					// stores and six loads per element) now moves only on this path.
+					for uint(i)+4 <= uint(len(data)) {
+						v, ok := tryParse4Digits(load32(data, i))
+						if !ok {
+							break
+						}
+						n = n*10000 + int64(v)
+						i += 4
+					}
 				}
-				n = n*10000 + int64(v)
-				i += 4
 			}
 			for uint(i) < uint(len(data)) {
 				d := data[i] - '0'
@@ -382,6 +428,11 @@ func decodeUintSlice[T uintKind](out *[]T, data []byte, i int, a *Arena) (int, e
 			}
 		}
 	}
+	// The SIMD run kernel's state: run is cleared by an unproductive call, so
+	// an array it cannot help costs one call; tmp receives its values for
+	// the element kinds it cannot write directly (narrower than 8 bytes).
+	run := true
+	var tmp [16]int64
 	i++
 	for first := true; ; first = false {
 		// Inter-token whitespace, in the shape the generator inlines: 0-1 bytes
@@ -404,6 +455,29 @@ func decodeUintSlice[T uintKind](out *[]T, data []byte, i int, a *Arena) (int, e
 			}
 			return i, ErrInvalidJSON // trailing comma
 		}
+		// The SIMD run kernel, as in decodeIntSlice.
+		if useIntRun && run && data[i]-'0' <= 9 {
+			var n, p, closed int
+			if unsafe.Sizeof(T(0)) == 8 {
+				dst := unsafe.Slice((*int64)(unsafe.Pointer(unsafe.SliceData(s))), cap(s))[len(s):]
+				n, p, closed = parseIntRun(data, i, dst)
+				s = s[:len(s)+n]
+			} else {
+				n, p, closed = parseIntRun(data, i, tmp[:])
+				for _, v := range tmp[:n] {
+					s = append(s, T(v))
+				}
+			}
+			if n > 0 {
+				i = p
+				if closed != 0 {
+					*out = s
+					return i + 1, nil
+				}
+				continue
+			}
+			run = false
+		}
 		var n uint64
 		if data[i] == 'n' {
 			end, err := ExpectNull(data, i)
@@ -417,13 +491,24 @@ func decodeUintSlice[T uintKind](out *[]T, data []byte, i int, a *Arena) (int, e
 				*out = s
 				return i, ErrBadNumber
 			}
-			for i+4 <= len(data) {
-				v, ok := tryParse4Digits(binary.LittleEndian.Uint32(data[i : i+4]))
-				if !ok {
-					break
+			if uint(i)+4 <= uint(len(data)) {
+				if v, ok := tryParse4Digits(load32(data, i)); ok { // in bounds: the test above
+					n = uint64(v)
+					i += 4
+					// 5+ digits (ids, timestamps): keep folding four at a time. A
+					// separate loop, entered only then, so the common 1-4 digit
+					// element runs straight-line: the slice header the loop forced
+					// the register allocator to spill and reload around it (three
+					// stores and six loads per element) now moves only on this path.
+					for uint(i)+4 <= uint(len(data)) {
+						v, ok := tryParse4Digits(load32(data, i))
+						if !ok {
+							break
+						}
+						n = n*10000 + uint64(v)
+						i += 4
+					}
 				}
-				n = n*10000 + uint64(v)
-				i += 4
 			}
 			for uint(i) < uint(len(data)) {
 				d := data[i] - '0'
@@ -615,13 +700,24 @@ func DecodeIntArray[T intKind](out []T, data []byte, i int) (int, error) {
 					return i, ErrBadNumber
 				}
 				var n int64
-				for i+4 <= len(data) {
-					v, ok := tryParse4Digits(binary.LittleEndian.Uint32(data[i : i+4]))
-					if !ok {
-						break
+				if uint(i)+4 <= uint(len(data)) {
+					if v, ok := tryParse4Digits(load32(data, i)); ok { // in bounds: the test above
+						n = int64(v)
+						i += 4
+						// 5+ digits (ids, timestamps): keep folding four at a time. A
+						// separate loop, entered only then, so the common 1-4 digit
+						// element runs straight-line: the slice header the loop forced
+						// the register allocator to spill and reload around it (three
+						// stores and six loads per element) now moves only on this path.
+						for uint(i)+4 <= uint(len(data)) {
+							v, ok := tryParse4Digits(load32(data, i))
+							if !ok {
+								break
+							}
+							n = n*10000 + int64(v)
+							i += 4
+						}
 					}
-					n = n*10000 + int64(v)
-					i += 4
 				}
 				for uint(i) < uint(len(data)) {
 					d := data[i] - '0'
@@ -722,13 +818,24 @@ func DecodeUintArray[T uintKind](out []T, data []byte, i int) (int, error) {
 					return i, ErrBadNumber
 				}
 				var n uint64
-				for i+4 <= len(data) {
-					v, ok := tryParse4Digits(binary.LittleEndian.Uint32(data[i : i+4]))
-					if !ok {
-						break
+				if uint(i)+4 <= uint(len(data)) {
+					if v, ok := tryParse4Digits(load32(data, i)); ok { // in bounds: the test above
+						n = uint64(v)
+						i += 4
+						// 5+ digits (ids, timestamps): keep folding four at a time. A
+						// separate loop, entered only then, so the common 1-4 digit
+						// element runs straight-line: the slice header the loop forced
+						// the register allocator to spill and reload around it (three
+						// stores and six loads per element) now moves only on this path.
+						for uint(i)+4 <= uint(len(data)) {
+							v, ok := tryParse4Digits(load32(data, i))
+							if !ok {
+								break
+							}
+							n = n*10000 + uint64(v)
+							i += 4
+						}
 					}
-					n = n*10000 + uint64(v)
-					i += 4
 				}
 				for uint(i) < uint(len(data)) {
 					d := data[i] - '0'
