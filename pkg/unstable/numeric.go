@@ -63,7 +63,8 @@ func scanFloat(data []byte, i int) (f float64, end int, fast, ok bool) {
 		const (
 			hi   = swarHi
 			zero = swarZero
-			bias = swarBias
+			six  = swarSix
+			nib  = swarNib
 			one  = swarOne
 		)
 		start := i
@@ -75,8 +76,8 @@ func scanFloat(data []byte, i int) (f float64, end int, fast, ok bool) {
 		w1 := load64(data, i+8)
 		w2 := load64(data, i+16)
 		w3 := load64(data, i+24)
-		d0 := w0 - zero
-		k := bits.TrailingZeros64((d0|(d0+bias))&hi) >> 3 // integer digits, 8 = all
+		d0 := w0 ^ zero
+		k := bits.TrailingZeros64(((d0+six)|d0)&nib) >> 3 // integer digits, 8 = all
 		if uint(k-1) < 7 {                                // 1..7 (k == 0 wraps)
 			mant := parse8Digits(d0 << (uint(8-k) * 8 & 63))
 			p := k // offset just past the digits consumed so far
@@ -89,8 +90,8 @@ func scanFloat(data []byte, i int) (f float64, end int, fast, ok bool) {
 				f0 := (w0>>8)>>sh | w1<<(56-sh)
 				f1 := (w1>>8)>>sh | w2<<(56-sh)
 				f2 := (w2>>8)>>sh | w3<<(56-sh)
-				fd0 := f0 - zero
-				m0 := (fd0 | (fd0 + bias)) & hi
+				fd0 := f0 ^ zero
+				m0 := ((fd0 + six) | fd0) & nib
 				var kf int
 				var fv uint64
 				if m0 != 0 { // 1-7 fraction digits, or none
@@ -100,8 +101,8 @@ func scanFloat(data []byte, i int) (f float64, end int, fast, ok bool) {
 					}
 					fv = parse8Digits(fd0 << (uint(8-kf) * 8 & 63))
 				} else {
-					fd1 := f1 - zero
-					m1 := (fd1 | (fd1 + bias)) & hi
+					fd1 := f1 ^ zero
+					m1 := ((fd1 + six) | fd1) & nib
 					if m1 != 0 { // 8-15
 						r := bits.TrailingZeros64(m1) >> 3
 						kf = 8 + r
@@ -109,8 +110,8 @@ func scanFloat(data []byte, i int) (f float64, end int, fast, ok bool) {
 						// r == 0, shifts the word out entirely — no 64-bit shift.
 						fv = parse8Digits(fd0)*pow10u64[r] + parse8Digits((fd1<<8)<<(uint(7-r)*8&63))
 					} else {
-						fd2 := f2 - zero
-						m2 := (fd2 | (fd2 + bias)) & hi
+						fd2 := f2 ^ zero
+						m2 := ((fd2 + six) | fd2) & nib
 						if m2 == 0 {
 							return scanFloatSlow(data, start) // 25+ fraction digits
 						}
@@ -155,8 +156,8 @@ func scanFloat(data []byte, i int) (f float64, end int, fast, ok bool) {
 					}
 					q++
 				}
-				de := load64(data, q) - zero // q <= i+34: the window covers it
-				ke := bits.TrailingZeros64((de|(de+bias))&hi) >> 3
+				de := load64(data, q) ^ zero // q <= i+34: the window covers it
+				ke := bits.TrailingZeros64(((de+six)|de)&nib) >> 3
 				if uint(ke-1) >= 7 { // no digits ("1e", "1e+"), or 8+: the slow path decides
 					return scanFloatSlow(data, start)
 				}
@@ -205,16 +206,26 @@ func scanFloat(data []byte, i int) (f float64, end int, fast, ok bool) {
 	return scanFloatSlow(data, i)
 }
 
-// The SWAR digit constants: swarZero subtracts '0' from every lane, swarBias
-// then carries any lane above 9 (0x0a..0x7f) into its top bit while a digit
-// (0..9) reaches at most 0x7f, and a byte below '0' wrapped past 0x80 by the
-// subtraction, so (d | (d + swarBias)) & swarHi flags exactly the non-digit
-// lanes; swarOne likewise flags the digit lanes that are not zero.
+// The SWAR digit constants. d = w ^ swarZero turns a digit lane into its value
+// (0x30..0x39 differ from '0' only in the low nibble) and leaves every other
+// byte with a nonzero high nibble or a low nibble above 9, so
+// ((d + swarSix) | d) & swarNib flags exactly the non-digit lanes: adding 6
+// pushes 0x0a..0x0f into the high nibble and a digit reaches at most 0x0f. The
+// XOR is lane-independent, so the mask is exact in every lane; the add can
+// carry only out of a lane at 0xfa or above, which is itself flagged, so the
+// lowest flagged lane and the all-digits verdict are exact regardless. Every
+// constant here is an AArch64 bitmask immediate, which the earlier
+// subtract-and-bias form (0x30 in a SUB, 0x76 in an ADD) was not: those cost a
+// MOVD and three MOVKs each per call, and the compiler also distributed the
+// fold's multiply over the subtraction, materialising a further two-instruction
+// constant on the fraction path. swarOne flags the digit lanes that are not
+// zero.
 const (
 	swarLo   = ^uint64(0) / 255 // 0x0101...01
 	swarHi   = swarLo << 7      // 0x8080...80
 	swarZero = swarLo * '0'
-	swarBias = swarLo * 0x76
+	swarSix  = swarLo * 0x06
+	swarNib  = swarLo * 0xf0
 	swarOne  = swarLo * 0x7f
 )
 
@@ -550,10 +561,15 @@ func parse4Digits(w uint32) uint32 {
 // the proof runs in both directions and TestTryParse4DigitsMatchesIs4Digits
 // checks it over every digit-adjacent byte combination plus random words.
 func tryParse4Digits(w uint32) (uint32, bool) {
-	d := w - 0x30303030
-	if (d|(d+0x76767676))&0x80808080 != 0 {
+	// The test runs in a 64-bit register so its constants are AArch64 bitmask
+	// immediates (a 32-bit splat is not one to the Go compiler); the four upper
+	// lanes read 0x30 after the XOR and so flag, which the uint32 truncation
+	// discards. See swarSix for the mask.
+	d64 := uint64(w) ^ swarZero
+	if uint32(((d64+swarSix)|d64)&swarNib) != 0 {
 		return 0, false
 	}
+	d := uint32(d64)
 	lo := d & 0x00FF00FF
 	hi := (d >> 8) & 0x00FF00FF
 	x := lo*10 + hi

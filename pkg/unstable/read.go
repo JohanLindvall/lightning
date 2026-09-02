@@ -1,7 +1,6 @@
 package unstable
 
 import (
-	"encoding/binary"
 	"strconv"
 	"time"
 )
@@ -10,12 +9,12 @@ import (
 // allocating. Keys are assumed not to contain backslash escapes; if they do,
 // the slow path is taken.
 func ReadKey(data []byte, i int) (string, int, error) {
-	if i >= len(data) || data[i] != '"' {
+	if uint(i) >= uint(len(data)) || data[i] != '"' {
 		return "", i, ErrInvalidJSON
 	}
 	i++
 	e := indexCloseOrEscapeAt(data, i)
-	if e == len(data) {
+	if uint(e) >= uint(len(data)) {
 		return "", len(data), ErrTruncated
 	}
 	if data[e] == '\\' {
@@ -41,7 +40,7 @@ func ReadKey(data []byte, i int) (string, int, error) {
 // \uXXXX decoder normalizes: an unpaired surrogate escape becomes U+FFFD,
 // matching encoding/json, since there is no other way to encode it.
 func ReadStringOrNull(data []byte, i int) (string, int, error) {
-	if i >= len(data) {
+	if uint(i) >= uint(len(data)) {
 		return "", i, ErrTruncated
 	}
 	if data[i] == 'n' {
@@ -53,7 +52,7 @@ func ReadStringOrNull(data []byte, i int) (string, int, error) {
 	}
 	i++
 	e := indexCloseOrEscapeAt(data, i)
-	if e == len(data) {
+	if uint(e) >= uint(len(data)) {
 		return "", len(data), ErrTruncated
 	}
 	if data[e] == '\\' {
@@ -68,7 +67,7 @@ func ReadStringOrNull(data []byte, i int) (string, int, error) {
 // containing escapes still allocate, since they cannot be represented as a
 // slice of the input.
 func ReadStringNoCopyOrNull(data []byte, i int) (string, int, error) {
-	if i >= len(data) {
+	if uint(i) >= uint(len(data)) {
 		return "", i, ErrTruncated
 	}
 	if data[i] == 'n' {
@@ -80,7 +79,7 @@ func ReadStringNoCopyOrNull(data []byte, i int) (string, int, error) {
 	}
 	i++
 	e := indexCloseOrEscapeAt(data, i)
-	if e == len(data) {
+	if uint(e) >= uint(len(data)) {
 		return "", len(data), ErrTruncated
 	}
 	if data[e] == '\\' {
@@ -101,7 +100,7 @@ func ReadStringNoCopyOrNull(data []byte, i int) (string, int, error) {
 // for callers that own the buffer and discard it after decoding. Escape-free strings
 // alias the input unchanged, exactly like the nocopy reader.
 func ReadStringDestructiveOrNull(data []byte, i int) (string, int, error) {
-	if i >= len(data) {
+	if uint(i) >= uint(len(data)) {
 		return "", i, ErrTruncated
 	}
 	if data[i] == 'n' {
@@ -113,7 +112,7 @@ func ReadStringDestructiveOrNull(data []byte, i int) (string, int, error) {
 	}
 	i++
 	e := indexCloseOrEscapeAt(data, i)
-	if e == len(data) {
+	if uint(e) >= uint(len(data)) {
 		return "", len(data), ErrTruncated
 	}
 	if data[e] == '\\' {
@@ -131,7 +130,7 @@ func ReadStringDestructiveOrNull(data []byte, i int) (string, int, error) {
 // ReadInt64OrNull reads a JSON integer (or null) at data[i]. Fractional and
 // exponent parts are tolerated and truncated toward zero.
 func ReadInt64OrNull(data []byte, i int) (int64, int, error) {
-	if i >= len(data) {
+	if uint(i) >= uint(len(data)) {
 		return 0, i, ErrTruncated
 	}
 	if data[i] == 'n' {
@@ -142,7 +141,7 @@ func ReadInt64OrNull(data []byte, i int) (int64, int, error) {
 	if data[i] == '-' {
 		neg = true
 		i++
-		if i >= len(data) {
+		if uint(i) >= uint(len(data)) {
 			return 0, i, ErrBadNumber
 		}
 	}
@@ -150,27 +149,15 @@ func ReadInt64OrNull(data []byte, i int) (int64, int, error) {
 		return 0, i, ErrBadNumber
 	}
 	var n int64
-	// Fold four digits per SWAR chunk for long integers (database/timestamp IDs
-	// run 9-18 digits), then a scalar tail for the last 1-3. n*10000+v matches the
-	// scalar n*10+d chain bit for bit, including the wrap past 2^63 on overflow.
-	for i+4 <= len(data) {
-		v, ok := tryParse4Digits(binary.LittleEndian.Uint32(data[i : i+4]))
-		if !ok {
-			break
-		}
-		n = n*10000 + int64(v)
-		i += 4
-	}
-	for i < len(data) {
-		d := data[i] - '0'
-		if d > 9 {
-			break
-		}
-		n = n*10 + int64(d)
-		i++
-	}
+	// The digit run, a word at a time (digitRun): this reader is called per
+	// member from a decoder loop, so the address chain its count creates is
+	// broken by the key read that follows; the batch array loops keep their
+	// byte-loop tail for the opposite reason (see decodeIntSlice).
+	v, end := digitRun(data, i)
+	n = int64(v)
+	i = end
 	if i < len(data) && (data[i] == '.' || data[i] == 'e' || data[i] == 'E') {
-		for i < len(data) {
+		for uint(i) < uint(len(data)) {
 			c := data[i]
 			if (c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-' {
 				i++
@@ -187,7 +174,7 @@ func ReadInt64OrNull(data []byte, i int) (int64, int, error) {
 
 // ReadUint64OrNull reads a JSON unsigned integer (or null) at data[i].
 func ReadUint64OrNull(data []byte, i int) (uint64, int, error) {
-	if i >= len(data) {
+	if uint(i) >= uint(len(data)) {
 		return 0, i, ErrTruncated
 	}
 	if data[i] == 'n' {
@@ -198,26 +185,15 @@ func ReadUint64OrNull(data []byte, i int) (uint64, int, error) {
 		return 0, i, ErrBadNumber
 	}
 	var n uint64
-	// Fold four digits per SWAR chunk (see ReadInt64OrNull); the scalar tail picks
-	// up the last 1-3 digits.
-	for i+4 <= len(data) {
-		v, ok := tryParse4Digits(binary.LittleEndian.Uint32(data[i : i+4]))
-		if !ok {
-			break
-		}
-		n = n*10000 + uint64(v)
-		i += 4
-	}
-	for i < len(data) {
-		d := data[i] - '0'
-		if d > 9 {
-			break
-		}
-		n = n*10 + uint64(d)
-		i++
-	}
+	// The digit run, a word at a time (digitRun): this reader is called per
+	// member from a decoder loop, so the address chain its count creates is
+	// broken by the key read that follows; the batch array loops keep their
+	// byte-loop tail for the opposite reason (see decodeIntSlice).
+	v, end := digitRun(data, i)
+	n = uint64(v)
+	i = end
 	if i < len(data) && (data[i] == '.' || data[i] == 'e' || data[i] == 'E') {
-		for i < len(data) {
+		for uint(i) < uint(len(data)) {
 			c := data[i]
 			if (c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-' {
 				i++
@@ -281,7 +257,7 @@ func scanNumberToken(data []byte, i int) (int, error) {
 // whose magnitude overflows float64 ("1e309") is rejected though its digits are
 // well-formed.
 func ReadNumberOrNull(data []byte, i int) (string, int, error) {
-	if i >= len(data) {
+	if uint(i) >= uint(len(data)) {
 		return "", i, ErrTruncated
 	}
 	if data[i] == 'n' {
@@ -299,7 +275,7 @@ func ReadNumberOrNull(data []byte, i int) (string, int, error) {
 // data instead of copying it, so the caller must keep data unchanged while the
 // result is in use.
 func ReadNumberNoCopyOrNull(data []byte, i int) (string, int, error) {
-	if i >= len(data) {
+	if uint(i) >= uint(len(data)) {
 		return "", i, ErrTruncated
 	}
 	if data[i] == 'n' {
@@ -315,7 +291,7 @@ func ReadNumberNoCopyOrNull(data []byte, i int) (string, int, error) {
 
 // ReadFloat64OrNull reads a JSON number (or null) at data[i] as a float64.
 func ReadFloat64OrNull(data []byte, i int) (float64, int, error) {
-	if i >= len(data) {
+	if uint(i) >= uint(len(data)) {
 		return 0, i, ErrTruncated
 	}
 	if data[i] == 'n' {
@@ -345,7 +321,7 @@ func ReadFloat64OrNull(data []byte, i int) (float64, int, error) {
 // ExpectNull) rather than byte at a time; a partial literal returns i, as
 // before.
 func ReadBoolOrNull(data []byte, i int) (bool, int, error) {
-	if i >= len(data) {
+	if uint(i) >= uint(len(data)) {
 		return false, i, ErrTruncated
 	}
 	switch data[i] {
@@ -390,7 +366,7 @@ func ReadBoolOrNull(data []byte, i int) (bool, int, error) {
 // neither its result nor its error (the stdlib copies into ParseError; locked by
 // TestReadTimeErrorRetainsNoAlias) — so this allocates only the time.Time.
 func ReadTimeOrNull(data []byte, i int) (time.Time, int, error) {
-	if i >= len(data) {
+	if uint(i) >= uint(len(data)) {
 		return time.Time{}, i, ErrTruncated
 	}
 	if data[i] == 'n' {
@@ -418,7 +394,7 @@ func ReadTimeOrNull(data []byte, i int) (time.Time, int, error) {
 // normalized to UTC. Anything it cannot interpret returns ErrBadTime, which the
 // "lax" decode path turns into a skipped value and an unset field.
 func ReadTimeLaxOrNull(data []byte, i int) (time.Time, int, error) {
-	if i >= len(data) {
+	if uint(i) >= uint(len(data)) {
 		return time.Time{}, i, ErrTruncated
 	}
 	switch data[i] {

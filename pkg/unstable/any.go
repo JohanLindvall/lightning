@@ -33,7 +33,7 @@ func DecodeValueCompact(data []byte, i int) (any, int, error) {
 // stack (see MaxDepth). Only container entry pays for the bound — one compare per
 // '{' or '[', nothing on the scalar paths.
 func decodeValue(data []byte, i int, compact bool, depth int) (any, int, error) {
-	if i >= len(data) {
+	if uint(i) >= uint(len(data)) {
 		return nil, i, ErrTruncated
 	}
 	switch data[i] {
@@ -99,7 +99,7 @@ func decodeAnyObject(data []byte, i int, compact bool, depth int) (any, int, err
 	// decoders).
 	for first := true; ; first = false {
 		i = SkipWSCompact(data, i, compact)
-		if i >= len(data) {
+		if uint(i) >= uint(len(data)) {
 			return nil, i, ErrTruncated
 		}
 		if data[i] == '}' {
@@ -137,7 +137,7 @@ func decodeAnyObject(data []byte, i int, compact bool, depth int) (any, int, err
 			key, ni = akey, aend
 		}
 		i = SkipWSCompact(data, ni, compact)
-		if i >= len(data) || data[i] != ':' {
+		if uint(i) >= uint(len(data)) || data[i] != ':' {
 			return nil, i, ErrExpectColon
 		}
 		i = SkipWSCompact(data, i+1, compact)
@@ -147,7 +147,7 @@ func decodeAnyObject(data []byte, i int, compact bool, depth int) (any, int, err
 		}
 		m[key] = val
 		i = SkipWSCompact(data, end, compact)
-		if i >= len(data) {
+		if uint(i) >= uint(len(data)) {
 			return nil, i, ErrTruncated
 		}
 		if data[i] == '}' {
@@ -171,7 +171,7 @@ func decodeAnyArray(data []byte, i int, compact bool, depth int) (any, int, erro
 	// decodeAnyObject.
 	for first := true; ; first = false {
 		i = SkipWSCompact(data, i, compact)
-		if i >= len(data) {
+		if uint(i) >= uint(len(data)) {
 			return nil, i, ErrTruncated
 		}
 		if data[i] == ']' {
@@ -194,7 +194,7 @@ func decodeAnyArray(data []byte, i int, compact bool, depth int) (any, int, erro
 		}
 		a = append(a, val)
 		i = SkipWSCompact(data, end, compact)
-		if i >= len(data) {
+		if uint(i) >= uint(len(data)) {
 			return nil, i, ErrTruncated
 		}
 		if data[i] == ']' {

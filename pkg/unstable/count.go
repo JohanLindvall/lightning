@@ -23,12 +23,12 @@ const countSampleCap = 64
 // instead of one byte at a time. This is what makes presizing slices of arrays,
 // objects, or strings cheap.
 func CountArrayElements(data []byte, i int) int {
-	if i >= len(data) || data[i] != '[' {
+	if uint(i) >= uint(len(data)) || data[i] != '[' {
 		return 0
 	}
 	open := i
 	i = SkipWS(data, i+1)
-	if i >= len(data) || data[i] == ']' {
+	if uint(i) >= uint(len(data)) || data[i] == ']' {
 		return 0
 	}
 	n := 1
@@ -38,7 +38,7 @@ func CountArrayElements(data []byte, i int) int {
 			return 0
 		}
 		i = SkipWS(data, end)
-		if i >= len(data) {
+		if uint(i) >= uint(len(data)) {
 			return 0
 		}
 		switch data[i] {
@@ -47,7 +47,7 @@ func CountArrayElements(data []byte, i int) int {
 		case ',':
 			n++
 			i = SkipWS(data, i+1)
-			if i >= len(data) {
+			if uint(i) >= uint(len(data)) {
 				return 0
 			}
 			if n == countSampleCap {
@@ -156,7 +156,7 @@ var openBraceByte = []byte{'{'}
 // unexpected input only over- or under-allocates, never misdecodes. Returns 0 for
 // an empty array.
 func CountArrayObjects(data []byte, i int) int {
-	if i >= len(data) {
+	if uint(i) >= uint(len(data)) {
 		return 0
 	}
 	rb := bytes.IndexByte(data[i+1:], ']')
