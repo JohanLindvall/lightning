@@ -378,11 +378,12 @@ func ReadBoolOrNull(data []byte, i int) (bool, int, error) {
 //
 // The parity stops at the JSON string layer, and only in the lenient direction:
 // this reads the string *value* (escapes decoded) and parses that, where
-// time.Time.UnmarshalJSON parses the raw bytes between the quotes without
-// unescaping them (a known stdlib quirk, go.dev/issue/47353). So a timestamp
-// written with any \uXXXX escape — legal JSON denoting a legal instant, such
-// as "2021-01-01T00:00:00\u005A" — decodes here and is rejected by the stdlib.
-// TestReadTimeAcceptsEscapedTimestamps pins both halves of that.
+// time.Time.UnmarshalJSON through Go 1.26 parsed the raw bytes between the
+// quotes without unescaping them (go.dev/issue/47353). So a timestamp written
+// with any \uXXXX escape — legal JSON denoting a legal instant, such as
+// "2021-01-01T00:00:00\u005A" — decodes here and was rejected by that stdlib;
+// Go 1.27's json/v2-backed encoding/json unescapes first and agrees.
+// TestReadTimeAcceptsEscapedTimestamps pins both halves on either toolchain.
 // ReadTimeLaxOrNull inherits the same leniency by construction.
 //
 // The intermediate string aliases data — safe because time.Parse retains it in

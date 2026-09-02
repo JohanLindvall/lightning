@@ -2651,12 +2651,16 @@ func (g *gen) warnTagOptions(opts []string, field string) {
 }
 
 // invalidTagRune returns the first rune of a json tag name that encoding/json's
-// isValidTag rejects. That function allows letters, digits and the punctuation
-// set below; a name containing anything else (a quote, a backslash, a control
-// byte) makes encoding/json discard the WHOLE tag and key the field by its Go
-// field name instead. The set is copied from encoding/json's encode.go — note it
-// includes '|', so lightning's pipe-separated alternate names are valid there
-// too, which is what lets each name be checked on its own.
+// isValidTag (the rule through Go 1.26) rejects. That function allows letters,
+// digits and the punctuation set below; a name containing anything else (a
+// quote, a backslash, a control byte) made encoding/json discard the WHOLE tag
+// and key the field by its Go field name instead. Go 1.27's json/v2-backed
+// decoder reserves only quotes, backslash and backtick and ignores such a field
+// rather than renaming it, so this rule is the wider of the two: every name it
+// flags diverges on at least one supported toolchain. The set is copied from
+// encoding/json's encode.go — note it includes '|', so lightning's
+// pipe-separated alternate names are valid there too, which is what lets each
+// name be checked on its own.
 func invalidTagRune(name string) (rune, bool) {
 	for _, c := range name {
 		switch {
@@ -2686,7 +2690,7 @@ func invalidTagRune(name string) (rune, bool) {
 func (g *gen) warnTagNames(names []string, field string) {
 	for _, n := range names {
 		if c, bad := invalidTagRune(n); bad {
-			g.warnf("json tag name %q on %s contains %q, which encoding/json's tag validation rejects: this generator matches the name as written, while encoding/json ignores the whole tag and matches the Go field name instead", n, field, c)
+			g.warnf("json tag name %q on %s contains %q, which encoding/json's tag validation rejects: this generator matches the name as written, while encoding/json does not (through Go 1.26 it keys the field by its Go name instead; from Go 1.27 it ignores the field, or accepts the name, by json/v2's rules)", n, field, c)
 		}
 	}
 }

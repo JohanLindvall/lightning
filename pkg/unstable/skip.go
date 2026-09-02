@@ -281,8 +281,13 @@ func SkipWSRun(data []byte, i int) int {
 		// compare instead of the five-op classify below. It is a *sufficient*
 		// condition — every byte is exactly 0x20 — so this only skips work; the
 		// exact SWAR still decides every other word, including the one that ends
-		// the run, so nothing about which input is accepted changes.
-		if w != sp {
+		// the run, so nothing about which input is accepted changes. Whether the
+		// shortcut pays is per architecture (skipWSSpaceShortcut): it trades
+		// three ALU operations for a second taken branch per space word, a win
+		// where instructions are the limit (arm64) and a loss where taken
+		// branches are (amd64); the constant folds, so each side compiles to
+		// exactly the loop it measured best.
+		if !skipWSSpaceShortcut || w != sp {
 			// A bit set per lane that is NOT whitespace — the complement of the
 			// whitespace mask, so the run-terminating exit needs no XOR to invert
 			// it, and the non-zero test in front of TrailingZeros64 *proves* the
