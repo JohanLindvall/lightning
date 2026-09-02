@@ -222,8 +222,10 @@ func TestParseIntRunDirect(t *testing.T) {
 			in := strings.Repeat(" ", b) + num + "," + pad
 			out := make([]int64, 4)
 			n, p, _ := parseIntRun([]byte(in), 0, out)
-			var want int64
-			fmt.Sscan(num, &want)
+			want, err := strconv.ParseInt(num, 10, 64)
+			if err != nil {
+				t.Fatal(err)
+			}
 			if n != 1 || out[0] != want || p != b+l+1 {
 				t.Errorf("b=%d l=%d %q: n=%d v=%d p=%d, want 1 %d %d", b, l, in[:b+l+1], n, out[0], p, want, b+l+1)
 			}
