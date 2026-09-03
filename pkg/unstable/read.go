@@ -170,7 +170,7 @@ func ReadInt64OrNull(data []byte, i int) (int64, int, error) {
 			i++
 		}
 	}
-	if i < len(data) && (data[i] == '.' || data[i] == 'e' || data[i] == 'E') {
+	if uint(i) < uint(len(data)) && (data[i] == '.' || data[i] == 'e' || data[i] == 'E') {
 		for uint(i) < uint(len(data)) {
 			c := data[i]
 			if (c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-' {
@@ -220,7 +220,7 @@ func ReadUint64OrNull(data []byte, i int) (uint64, int, error) {
 			i++
 		}
 	}
-	if i < len(data) && (data[i] == '.' || data[i] == 'e' || data[i] == 'E') {
+	if uint(i) < uint(len(data)) && (data[i] == '.' || data[i] == 'e' || data[i] == 'E') {
 		for uint(i) < uint(len(data)) {
 			c := data[i]
 			if (c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-' {

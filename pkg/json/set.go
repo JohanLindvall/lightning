@@ -64,17 +64,17 @@ func setSpan(in, rawVal []byte, keys []string) (start, end int, insert []byte, m
 	i := unstable.SkipWS(in, 0)
 	for level := 0; level < len(keys); level++ {
 		j := unstable.SkipWS(in, i)
-		if j >= len(in) || in[j] != '{' {
+		if uint(j) >= uint(len(in)) || in[j] != '{' {
 			// The path still needs to descend but there is no object here: replace
 			// this value with the remaining keys built as nested objects.
 			return i, skipValueOrEnd(in, i), nil, keys[level:], false, true
 		}
 		afterBrace := j + 1
 		p := unstable.SkipWS(in, afterBrace)
-		empty := p >= len(in) || in[p] == '}'
+		empty := uint(p) >= uint(len(in)) || in[p] == '}'
 		found, valStart, valEnd := false, 0, 0
 		lastValEnd := afterBrace // end of the last member's value, for appending
-		for p < len(in) && in[p] != '}' {
+		for uint(p) < uint(len(in)) && in[p] != '}' {
 			// The key read with its no-escape fast path inline, as in getMany
 			// (see get.go): unstable.ReadKey never inlines, but the common case —
 			// a quoted key with no backslash — is just an IndexCloseOrEscape scan
@@ -87,7 +87,7 @@ func setSpan(in, rawVal []byte, keys []string) (start, end int, insert []byte, m
 				break
 			}
 			ks := p + 1
-			if e := unstable.IndexCloseOrEscapeAt(in, ks); e < len(in) && in[e] == '"' {
+			if e := unstable.IndexCloseOrEscapeAt(in, ks); uint(e) < uint(len(in)) && in[e] == '"' {
 				k, np = unstable.UnsafeStr(in[ks:e]), e+1
 			} else {
 				var err error
@@ -96,7 +96,7 @@ func setSpan(in, rawVal []byte, keys []string) (start, end int, insert []byte, m
 				}
 			}
 			p = unstable.SkipWS(in, np)
-			if p >= len(in) || in[p] != ':' {
+			if uint(p) >= uint(len(in)) || in[p] != ':' {
 				break
 			}
 			p = unstable.SkipWS(in, p+1)
@@ -114,7 +114,7 @@ func setSpan(in, rawVal []byte, keys []string) (start, end int, insert []byte, m
 			ve := skipValueOrEnd(in, p)
 			lastValEnd = ve
 			p = unstable.SkipWS(in, ve)
-			if p < len(in) && in[p] == ',' {
+			if uint(p) < uint(len(in)) && in[p] == ',' {
 				p = unstable.SkipWS(in, p+1)
 				continue
 			}
@@ -200,7 +200,7 @@ func SetMany(in, out []byte, rawVal [][]byte, keys []string) []byte {
 		n = len(rawVal)
 	}
 	j := unstable.SkipWS(in, 0)
-	if j >= len(in) || in[j] != '{' {
+	if uint(j) >= uint(len(in)) || in[j] != '{' {
 		return setManyNonObject(in, out, rawVal, keys, n, j)
 	}
 	// The found flags live on the stack for the common small key set; only an
@@ -230,9 +230,9 @@ func SetMany(in, out []byte, rawVal [][]byte, keys []string) []byte {
 	}
 	afterBrace := j + 1
 	p := unstable.SkipWS(in, afterBrace)
-	empty := p >= len(in) || in[p] == '}'
+	empty := uint(p) >= uint(len(in)) || in[p] == '}'
 	lastValEnd := afterBrace // insertion point for new members: after the last value
-	for p < len(in) && in[p] != '}' {
+	for uint(p) < uint(len(in)) && in[p] != '}' {
 		// Key read with the no-escape fast path inline; see setSpan.
 		var k string
 		var np int
@@ -240,7 +240,7 @@ func SetMany(in, out []byte, rawVal [][]byte, keys []string) []byte {
 			break
 		}
 		ks := p + 1
-		if e := unstable.IndexCloseOrEscapeAt(in, ks); e < len(in) && in[e] == '"' {
+		if e := unstable.IndexCloseOrEscapeAt(in, ks); uint(e) < uint(len(in)) && in[e] == '"' {
 			k, np = unstable.UnsafeStr(in[ks:e]), e+1
 		} else {
 			var err error
@@ -249,7 +249,7 @@ func SetMany(in, out []byte, rawVal [][]byte, keys []string) []byte {
 			}
 		}
 		q := unstable.SkipWS(in, np)
-		if q >= len(in) || in[q] != ':' {
+		if uint(q) >= uint(len(in)) || in[q] != ':' {
 			break
 		}
 		q = unstable.SkipWS(in, q+1)
@@ -281,7 +281,7 @@ func SetMany(in, out []byte, rawVal [][]byte, keys []string) []byte {
 			return append(out, in[prev:]...)
 		}
 		p = unstable.SkipWS(in, ve)
-		if p < len(in) && in[p] == ',' {
+		if uint(p) < uint(len(in)) && in[p] == ',' {
 			p = unstable.SkipWS(in, p+1)
 			continue
 		}
@@ -385,7 +385,7 @@ func SetPaths(in, out []byte, rawVal [][]byte, paths [][]string) []byte {
 	for m := range idx {
 		idx[m] = m
 	}
-	if i >= len(in) || in[i] != '{' {
+	if uint(i) >= uint(len(in)) || in[i] != '{' {
 		// Non-object root: replace it with a fresh merged object of all paths.
 		out = append(out, in[:i]...)
 		out = appendMergedObject(out, paths, rawVal, idx, 0)
@@ -406,11 +406,11 @@ func SetPaths(in, out []byte, rawVal [][]byte, paths [][]string) []byte {
 func setObject(in, out []byte, i, depth int, active []int, paths [][]string, rawVal [][]byte) ([]byte, int) {
 	prev := i // next byte of in not yet copied into out
 	p := unstable.SkipWS(in, i+1)
-	empty := p >= len(in) || in[p] == '}'
+	empty := uint(p) >= uint(len(in)) || in[p] == '}'
 	lastValEnd := i + 1 // insertion point for created members: after the last value
 	matched := make([]bool, len(active))
 	nmatched := 0 // active paths matched so far, for the root all-matched early exit
-	for p < len(in) && in[p] != '}' {
+	for uint(p) < uint(len(in)) && in[p] != '}' {
 		// Key read with the no-escape fast path inline; see setSpan.
 		var k string
 		var np int
@@ -418,7 +418,7 @@ func setObject(in, out []byte, i, depth int, active []int, paths [][]string, raw
 			break
 		}
 		ks := p + 1
-		if e := unstable.IndexCloseOrEscapeAt(in, ks); e < len(in) && in[e] == '"' {
+		if e := unstable.IndexCloseOrEscapeAt(in, ks); uint(e) < uint(len(in)) && in[e] == '"' {
 			k, np = unstable.UnsafeStr(in[ks:e]), e+1
 		} else {
 			var err error
@@ -427,7 +427,7 @@ func setObject(in, out []byte, i, depth int, active []int, paths [][]string, raw
 			}
 		}
 		q := unstable.SkipWS(in, np)
-		if q >= len(in) || in[q] != ':' {
+		if uint(q) >= uint(len(in)) || in[q] != ':' {
 			break
 		}
 		q = unstable.SkipWS(in, q+1)
@@ -463,7 +463,7 @@ func setObject(in, out []byte, i, depth int, active []int, paths [][]string, raw
 			out = append(out, in[prev:vs]...) // copy through up to the old value...
 			out = append(out, rawVal[ending]...)
 			prev = ve
-		} else if len(recurse) > 0 && vs < len(in) && in[vs] == '{' {
+		} else if len(recurse) > 0 && uint(vs) < uint(len(in)) && in[vs] == '{' {
 			// Recursing into this object: the recursion walks it member by member
 			// and reports where it ends, so don't pre-skip the whole subtree here
 			// (that would scan every on-path container twice).
@@ -500,14 +500,14 @@ func setObject(in, out []byte, i, depth int, active []int, paths [][]string, raw
 		}
 
 		p = unstable.SkipWS(in, ve)
-		if p < len(in) && in[p] == ',' {
+		if uint(p) < uint(len(in)) && in[p] == ',' {
 			p = unstable.SkipWS(in, p+1)
 			continue
 		}
 		break
 	}
 	objEnd := p
-	if objEnd < len(in) && in[objEnd] == '}' {
+	if uint(objEnd) < uint(len(in)) && in[objEnd] == '}' {
 		objEnd++
 	} else {
 		objEnd = len(in) // malformed; best-effort

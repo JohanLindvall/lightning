@@ -346,7 +346,7 @@ func decodeIntSlice[T intKind](out *[]T, data []byte, i int, a *Arena) (int, err
 				n = n*10 + int64(d)
 				i++
 			}
-			if i < len(data) && (data[i] == '.' || data[i] == 'e' || data[i] == 'E') {
+			if uint(i) < uint(len(data)) && (data[i] == '.' || data[i] == 'e' || data[i] == 'E') {
 				for uint(i) < uint(len(data)) {
 					c := data[i]
 					if (c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-' {
@@ -523,7 +523,7 @@ func decodeUintSlice[T uintKind](out *[]T, data []byte, i int, a *Arena) (int, e
 				n = n*10 + uint64(d)
 				i++
 			}
-			if i < len(data) && (data[i] == '.' || data[i] == 'e' || data[i] == 'E') {
+			if uint(i) < uint(len(data)) && (data[i] == '.' || data[i] == 'e' || data[i] == 'E') {
 				for uint(i) < uint(len(data)) {
 					c := data[i]
 					if (c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-' {
@@ -732,7 +732,7 @@ func DecodeIntArray[T intKind](out []T, data []byte, i int) (int, error) {
 					n = n*10 + int64(d)
 					i++
 				}
-				if i < len(data) && (data[i] == '.' || data[i] == 'e' || data[i] == 'E') {
+				if uint(i) < uint(len(data)) && (data[i] == '.' || data[i] == 'e' || data[i] == 'E') {
 					for uint(i) < uint(len(data)) {
 						c := data[i]
 						if (c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-' {
@@ -850,7 +850,7 @@ func DecodeUintArray[T uintKind](out []T, data []byte, i int) (int, error) {
 					n = n*10 + uint64(d)
 					i++
 				}
-				if i < len(data) && (data[i] == '.' || data[i] == 'e' || data[i] == 'E') {
+				if uint(i) < uint(len(data)) && (data[i] == '.' || data[i] == 'e' || data[i] == 'E') {
 					for uint(i) < uint(len(data)) {
 						c := data[i]
 						if (c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-' {

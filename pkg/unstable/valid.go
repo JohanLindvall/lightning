@@ -54,7 +54,7 @@ func SkipValueStrict(data []byte, i int) (int, error) {
 	n := len(data)
 
 scanValue:
-	if i >= n {
+	if uint(i) >= uint(n) {
 		return i, ErrTruncated
 	}
 	switch data[i] {
@@ -67,7 +67,7 @@ scanValue:
 		i = SkipWS(data, i+1)
 		// An empty object is complete here. Handling it at the open brace is what
 		// lets scanKey reject a '}' outright as a trailing comma.
-		if i < n && data[i] == '}' {
+		if uint(i) < uint(n) && data[i] == '}' {
 			i++
 			depth--
 			goto scanAfter
@@ -82,7 +82,7 @@ scanValue:
 		i = SkipWS(data, i+1)
 		// As above: an empty array is complete, so a ']' after a comma is a
 		// trailing comma and falls through to scanValue's failure.
-		if i < n && data[i] == ']' {
+		if uint(i) < uint(n) && data[i] == ']' {
 			i++
 			depth--
 			goto scanAfter
@@ -134,7 +134,7 @@ scanAfter:
 		return i, nil
 	}
 	i = SkipWS(data, i)
-	if i >= n {
+	if uint(i) >= uint(n) {
 		return i, ErrTruncated
 	}
 	isObj = stack[(depth-1)/64]&(1<<((depth-1)%64)) != 0
@@ -166,7 +166,7 @@ scanKey:
 	// A member needs a quoted key and a colon. i is at the first non-space byte of
 	// the key, never at a '}' from an empty object (handled at the open brace), so
 	// a '}' here is the trailing comma of {"a":1,} and is rejected below.
-	if i >= n {
+	if uint(i) >= uint(n) {
 		return i, ErrTruncated
 	}
 	if data[i] != '"' {
@@ -176,7 +176,7 @@ scanKey:
 		return i, err
 	}
 	i = SkipWS(data, i)
-	if i >= n || data[i] != ':' {
+	if uint(i) >= uint(n) || data[i] != ':' {
 		return i, ErrExpectColon
 	}
 	i = SkipWS(data, i+1)
@@ -202,7 +202,7 @@ func strictString(data []byte, i int) (int, error) {
 	i++ // opening quote
 	for {
 		i = indexCloseOrEscapeAt(data, i)
-		if i >= len(data) {
+		if uint(i) >= uint(len(data)) {
 			return i, ErrTruncated // unterminated: ran out before a closing quote
 		}
 		if data[i] == '"' {
@@ -210,17 +210,18 @@ func strictString(data []byte, i int) (int, error) {
 		}
 		// data[i] == '\\'
 		i++
-		if i >= len(data) {
+		if uint(i) >= uint(len(data)) {
 			return i, ErrTruncated
 		}
 		switch data[i] {
 		case '"', '\\', '/', 'b', 'f', 'n', 'r', 't':
 			i++
 		case 'u':
-			if i+5 > len(data) {
+			hex := data[i+1:]
+			if len(hex) < 4 {
 				return i, ErrTruncated
 			}
-			for _, c := range data[i+1 : i+5] {
+			for _, c := range hex[:4] {
 				if !isHexDigit(c) {
 					return i, ErrBadUnicode
 				}

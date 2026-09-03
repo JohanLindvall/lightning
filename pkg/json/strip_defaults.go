@@ -222,7 +222,7 @@ func (s *stripper) emitFieldSnap(base, write, wsStart, keyStart, keyEnd, colonPo
 // the rest of this file gives.
 func compactValue(dst, src []byte) int {
 	n := 0
-	for i := 0; i < len(src); {
+	for i := 0; uint(i) < uint(len(src)); {
 		switch c := src[i]; {
 		case c <= ' ':
 			i++
@@ -354,13 +354,13 @@ func (s *stripper) handle(read, write, depth int) (int, int) {
 	compact := s.ws == AssumeCompact
 	preserve := s.ws == PreserveWhitespace
 	dataLen := len(in)
-	if !compact && read < len(in) && in[read] <= ' ' {
+	if !compact && uint(read) < uint(len(in)) && in[read] <= ' ' {
 		read++
-		if read < len(in) && in[read] <= ' ' {
+		if uint(read) < uint(len(in)) && in[read] <= ' ' {
 			read = unstable.SkipWSRun(in, read+1)
 		}
 	}
-	if read == dataLen {
+	if uint(read) >= uint(dataLen) {
 		return read, write
 	}
 	// eject copies the unconsumed remainder of input through verbatim, the
@@ -387,13 +387,13 @@ func (s *stripper) handle(read, write, depth int) (int, int) {
 		// a helper wrapping the two-compare fast path plus SkipWSRun costs more than
 		// the inliner's budget, so it would cost a call frame per container.)
 		peekObj := read
-		if !compact && peekObj < dataLen && in[peekObj] <= ' ' {
+		if !compact && uint(peekObj) < uint(dataLen) && in[peekObj] <= ' ' {
 			peekObj++
-			if peekObj < dataLen && in[peekObj] <= ' ' {
+			if uint(peekObj) < uint(dataLen) && in[peekObj] <= ' ' {
 				peekObj = unstable.SkipWSRun(in, peekObj+1)
 			}
 		}
-		if peekObj < dataLen && in[peekObj] == '}' {
+		if uint(peekObj) < uint(dataLen) && in[peekObj] == '}' {
 			return peekObj + 1, write
 		}
 		startWrite := write
@@ -414,13 +414,13 @@ func (s *stripper) handle(read, write, depth int) (int, int) {
 			// entirely still rewinds to localStartWrite, comma included.
 			postComma := write
 			wsStart := read
-			if !compact && read < len(in) && in[read] <= ' ' {
+			if !compact && uint(read) < uint(len(in)) && in[read] <= ' ' {
 				read++
-				if read < len(in) && in[read] <= ' ' {
+				if uint(read) < uint(len(in)) && in[read] <= ' ' {
 					read = unstable.SkipWSRun(in, read+1)
 				}
 			}
-			if read >= dataLen || in[read] != '"' {
+			if uint(read) >= uint(dataLen) || in[read] != '"' {
 				return eject()
 			}
 			keyStart := read
@@ -429,21 +429,21 @@ func (s *stripper) handle(read, write, depth int) (int, int) {
 			// truncated keys fall back to SkipString. Same trick on the value reads below.
 			ke := unstable.IndexCloseOrEscapeAt(in, read+1)
 			keyEnd := ke + 1
-			if ke >= dataLen || in[ke] != '"' {
+			if uint(ke) >= uint(dataLen) || in[ke] != '"' {
 				var err error
 				if keyEnd, err = unstable.SkipString(in, read); err != nil {
 					return eject()
 				}
 			}
 			read = keyEnd
-			if !compact && read < len(in) && in[read] <= ' ' {
+			if !compact && uint(read) < uint(len(in)) && in[read] <= ' ' {
 				read++
-				if read < len(in) && in[read] <= ' ' {
+				if uint(read) < uint(len(in)) && in[read] <= ' ' {
 					read = unstable.SkipWSRun(in, read+1)
 				}
 			}
 			colonPos := read
-			if read == dataLen || in[read] != ':' {
+			if uint(read) >= uint(dataLen) || in[read] != ':' {
 				// Missing ':' — copy the key, then eject.
 				write += copy(out[write:], in[keyStart:keyEnd])
 				return eject()
@@ -451,9 +451,9 @@ func (s *stripper) handle(read, write, depth int) (int, int) {
 			read++
 			tmpRead := read
 
-			if !compact && read < len(in) && in[read] <= ' ' {
+			if !compact && uint(read) < uint(len(in)) && in[read] <= ' ' {
 				read++
-				if read < len(in) && in[read] <= ' ' {
+				if uint(read) < uint(len(in)) && in[read] <= ' ' {
 					read = unstable.SkipWSRun(in, read+1)
 				}
 			}
@@ -468,12 +468,12 @@ func (s *stripper) handle(read, write, depth int) (int, int) {
 			// kept key), or the base offset in s.scratch of the snapshot of the
 			// member's original bytes (decided early, kept).
 			snapBase := snapNone
-			if read < dataLen {
+			if uint(read) < uint(dataLen) {
 				switch in[read] {
 				case '"':
 					ve := unstable.IndexCloseOrEscapeAt(in, read+1)
 					valEnd := ve + 1
-					if ve >= dataLen || in[ve] != '"' {
+					if uint(ve) >= uint(dataLen) || in[ve] != '"' {
 						var err error
 						if valEnd, err = unstable.SkipString(in, read); err != nil {
 							// Bad string: eject from the original position.
@@ -492,13 +492,13 @@ func (s *stripper) handle(read, write, depth int) (int, int) {
 						closeBrace = ']'
 					}
 					peek := read + 1
-					if !compact && peek < dataLen && in[peek] <= ' ' {
+					if !compact && uint(peek) < uint(dataLen) && in[peek] <= ' ' {
 						peek++
-						if peek < dataLen && in[peek] <= ' ' {
+						if uint(peek) < uint(dataLen) && in[peek] <= ' ' {
 							peek = unstable.SkipWSRun(in, peek+1)
 						}
 					}
-					if peek < dataLen && in[peek] == closeBrace {
+					if uint(peek) < uint(dataLen) && in[peek] == closeBrace {
 						read = peek + 1 // empty nested container — drop the member
 						break
 					}
@@ -586,13 +586,13 @@ func (s *stripper) handle(read, write, depth int) (int, int) {
 				written = true
 			}
 			wsBeforeDelim := read
-			if !compact && read < len(in) && in[read] <= ' ' {
+			if !compact && uint(read) < uint(len(in)) && in[read] <= ' ' {
 				read++
-				if read < len(in) && in[read] <= ' ' {
+				if uint(read) < uint(len(in)) && in[read] <= ' ' {
 					read = unstable.SkipWSRun(in, read+1)
 				}
 			}
-			if read == dataLen {
+			if uint(read) >= uint(dataLen) {
 				return eject()
 			}
 			switch in[read] {
@@ -621,13 +621,13 @@ func (s *stripper) handle(read, write, depth int) (int, int) {
 		// only as long as that route holds. Deciding emptiness here makes the two
 		// container cases agree by construction.
 		peekArr := read
-		if !compact && peekArr < dataLen && in[peekArr] <= ' ' {
+		if !compact && uint(peekArr) < uint(dataLen) && in[peekArr] <= ' ' {
 			peekArr++
-			if peekArr < dataLen && in[peekArr] <= ' ' {
+			if uint(peekArr) < uint(dataLen) && in[peekArr] <= ' ' {
 				peekArr = unstable.SkipWSRun(in, peekArr+1)
 			}
 		}
-		if peekArr < dataLen && in[peekArr] == ']' {
+		if uint(peekArr) < uint(dataLen) && in[peekArr] == ']' {
 			return peekArr + 1, write
 		}
 		startWrite := write
@@ -641,9 +641,9 @@ func (s *stripper) handle(read, write, depth int) (int, int) {
 				write++
 			}
 			wsStart := read
-			if !compact && read < len(in) && in[read] <= ' ' {
+			if !compact && uint(read) < uint(len(in)) && in[read] <= ' ' {
 				read++
-				if read < len(in) && in[read] <= ' ' {
+				if uint(read) < uint(len(in)) && in[read] <= ' ' {
 					read = unstable.SkipWSRun(in, read+1)
 				}
 			}
@@ -658,13 +658,13 @@ func (s *stripper) handle(read, write, depth int) (int, int) {
 				written = true
 			}
 			wsBeforeDelim := read
-			if !compact && read < len(in) && in[read] <= ' ' {
+			if !compact && uint(read) < uint(len(in)) && in[read] <= ' ' {
 				read++
-				if read < len(in) && in[read] <= ' ' {
+				if uint(read) < uint(len(in)) && in[read] <= ' ' {
 					read = unstable.SkipWSRun(in, read+1)
 				}
 			}
-			if read == dataLen {
+			if uint(read) >= uint(dataLen) {
 				return eject()
 			}
 			switch in[read] {
@@ -687,7 +687,7 @@ func (s *stripper) handle(read, write, depth int) (int, int) {
 	case '"':
 		se := unstable.IndexCloseOrEscapeAt(in, read+1)
 		send := se + 1
-		if se >= dataLen || in[se] != '"' {
+		if uint(se) >= uint(dataLen) || in[se] != '"' {
 			var err error
 			if send, err = unstable.SkipString(in, read); err != nil {
 				return eject()
@@ -721,7 +721,7 @@ var delimTable = func() (t [256]bool) {
 // findDelimiter returns the index of the first scalar-terminating byte at or
 // after offset (per delimTable), or len(input) if none remains.
 func findDelimiter(input []byte, offset int) int {
-	for end := len(input); offset < end; offset++ {
+	for end := len(input); uint(offset) < uint(end); offset++ {
 		if delimTable[input[offset]] {
 			break
 		}

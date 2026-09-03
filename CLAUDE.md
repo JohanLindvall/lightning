@@ -1403,6 +1403,71 @@ byte-identical when adding cold paths; push new logic out-of-line.
   edit to those three. This corrects the standing "bounds checks are free"
   entry in the rejected list for an issue-bound core: the *stub* is free, the
   branch that reaches it is a dispatch slot, and there were seven per member.
+- **The unsigned-bound audit, completed (2026-09-02, N2).** The question was
+  whether `uint(i) < uint(len(data))` was used wherever it removes a check,
+  and the compiler's own list (`go build -gcflags=-d=ssa/check_bce`, which
+  prints every `IsInBounds`/`IsSliceInBounds` it could not prove away) said
+  no: the generator's templates and the reader entry probes had it, but
+  **367 checks remained** across pkg/unstable (129) and pkg/json (238), and
+  90 cursor-versus-length compares were still written signed — all of the
+  toolkit walkers, and in the decode path the truncated-fraction probes of
+  the integer readers and batch loops (per number), `skipNumber`'s sign
+  probe, `decodeEscaped`'s literal-run scan and surrogate-pair test (per
+  escape), `DecodeAny`'s string fast path, `scanFloatSlow`'s eight `i < n`
+  bounds, the strict walk's, `skipContainerFast`'s scalar tail, and —
+  the one that matters most — **`SkipWSRun`'s word load**, which kept a
+  check per word AND is inlined into every batch loop and every generated
+  decoder, so the check recurred at each inline site. Now 254 remain, all
+  of them slice copies and lookups whose bounds come from scanner results
+  or table indexes. The conversions are three idioms, each proven with a
+  probe package under `check_bce` before use, because most spellings that
+  look equivalent are not:
+  **(1) A single-byte probe is the plain form**, `uint(i) < uint(len(x)) &&
+  x[i] == c`, and it holds through a loop-carried cursor (`for uint(j) <
+  uint(len(data)) && data[j] != '\\'`). **(2) Two bytes are two probes**:
+  `uint(i) < uint(n) && uint(i+1) < uint(n)`; `uint(i)+1 < uint(n)` keeps
+  both checks. **(3) A word load in a loop needs the induction shape.**
+  `for i+8 <= len(data)` with a checked `data[i:i+8]` keeps one check per
+  word, and neither `uint(i)+8 <= uint(len)` nor an unsigned test of `i` at
+  entry changes that; what works is the entry test `if uint(i) >
+  uint(len(data)) { return i }` PLUS the condition written `i <=
+  len(data)-8` — the same test in the shape the prove pass recognises as an
+  induction variable. `SkipWSRun` took that form: check-free, inline cost
+  69 → 78 (budget 80). The shrinking-slice form (`d := data[i:]; for len(d)
+  >= 8 { … d = d[8:] }`) is also check-free but costs 82, which would have
+  un-inlined the function from every decoder. **Two conversions were built
+  and reverted on the counters, and they are the same lesson.** The
+  reslice idiom for a multi-byte read (`if uint(i) >= uint(len) {…}; d :=
+  data[i:]; if len(d) < 4 {…}; d[0]…d[3]` — the only spelling that removes
+  the four checks of `readUnicodeEscape`) measured
+  `UnescapeString/unicode_escaped_dense` **+3.5% cycles at 3% fewer
+  instructions**; and the shrinking-slice loop in `EscapeStringInto`'s SWAR
+  gate measured `EscapeString/json_in_json` **+7.9%, path_with_backslash
+  +5.2%, control_bytes +5.0%** at the same instruction count. Both put a
+  reslice on the per-escape dependency chain of an escape-dense string,
+  where the checks they removed were off it — a bounds check is a
+  predicted branch, and on a latency-bound chain it is cheaper than one
+  dependent ALU op. `ExpectNull` and the `true`/`false` literal compares
+  were left alone for the same reason before measuring: the reslice form
+  has the same instruction count as the check it replaces.
+  Measured (interleaved ABBA, n=6, pinned, both sides `-funcalign=64`):
+  **citm_catalog −2.25%, instruments −1.64%, canada −1.17%, mesh_pretty
+  −0.99%, cloudflare-nocopy −0.99%, cloudflare −0.28%** (all p=0.000; the
+  `SkipWSRun` word check on pretty input, the fraction and sign probes per
+  number, the batch loops' inlined copies), synthea/gsoc/twitterescaped/
+  golang_source/twitter/numbers flat; geomean −0.56%, no regressions. Toolkit micros: **StripDefaultsPretty −8.2%, SetPaths −2.7%, Set/create_nested −2.4%,
+  Valid −1.7%, Set/append −1.4%, StripDefaults −1.3%, GetPretty −0.9%**,
+  the rest of the Set family −0.6…−1.1%, DecodeSmallSlices −1.3%,
+  `ScanFloatSlowShapes` array −4.9% / mesh −3.3% / canada −1.7% (its `slow`
+  shape +4.7% is four more mispredicts per op on 2.6% fewer instructions —
+  predictor aliasing on a fallback path), every EscapeString and
+  UnescapeString shape flat after the two reverts; geomean −0.5%. `GetManyWithSkip`'s
+  branch mispredicts swing from 4 to 7.5 to 11 per op across three
+  binaries that differ only elsewhere (base, converted, and converted with
+  `get.go` alone reverted) — layout, not the compare spelling — and the
+  converted `get.go` executes 0.7–1.4% fewer instructions on every Get
+  micro and wins four of five against the same-tree alternative, so it
+  stays.
 - **The SWAR digit test is XOR-based, with bitmask-immediate constants
   only** (`swarZero`/`swarSix`/`swarNib` in `numeric.go`, 2026-09-02):
   `d = w ^ 0x30…`, `m = ((d + 0x06…) | d) & 0xf0…`. A digit lane differs

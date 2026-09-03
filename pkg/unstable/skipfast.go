@@ -185,7 +185,7 @@ func skipContainerFast(data []byte, i int, open byte) (int, error) {
 	// inside-string / pending-escape state out of the block loop.
 	inStr := prevInString != 0
 	esc := prevEscaped != 0
-	for ; pos < len(data); pos++ {
+	for ; uint(pos) < uint(len(data)); pos++ {
 		c := data[pos]
 		if esc {
 			esc = false

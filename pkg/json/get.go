@@ -46,7 +46,7 @@ func getMany(data []byte, keys []string, out [][]byte, compact bool) ([][]byte, 
 		clear(out)
 	}
 	i := unstable.SkipWS(data, 0)
-	if i >= len(data) {
+	if uint(i) >= uint(len(data)) {
 		return out, unstable.ErrTruncated
 	}
 	if data[i] != '{' {
@@ -56,7 +56,7 @@ func getMany(data []byte, keys []string, out [][]byte, compact bool) ([][]byte, 
 	found := 0
 	for {
 		i = unstable.SkipWSCompact(data, i, compact)
-		if i >= len(data) {
+		if uint(i) >= uint(len(data)) {
 			return out, unstable.ErrTruncated
 		}
 		if data[i] == '}' {
@@ -71,11 +71,11 @@ func getMany(data []byte, keys []string, out [][]byte, compact bool) ([][]byte, 
 		// scan inlines into it, so the block is expanded at each site.
 		var key string
 		var ni int
-		if i >= len(data) || data[i] != '"' {
+		if uint(i) >= uint(len(data)) || data[i] != '"' {
 			return out, unstable.ErrInvalidJSON
 		}
 		ks := i + 1
-		if e := unstable.IndexCloseOrEscapeAt(data, ks); e < len(data) && data[e] == '"' {
+		if e := unstable.IndexCloseOrEscapeAt(data, ks); uint(e) < uint(len(data)) && data[e] == '"' {
 			key, ni = unstable.UnsafeStr(data[ks:e]), e+1
 		} else {
 			var err error
@@ -84,7 +84,7 @@ func getMany(data []byte, keys []string, out [][]byte, compact bool) ([][]byte, 
 			}
 		}
 		i = unstable.SkipWSCompact(data, ni, compact)
-		if i >= len(data) || data[i] != ':' {
+		if uint(i) >= uint(len(data)) || data[i] != ':' {
 			return out, unstable.ErrExpectColon
 		}
 		i = unstable.SkipWSCompact(data, i+1, compact)
@@ -111,7 +111,7 @@ func getMany(data []byte, keys []string, out [][]byte, compact bool) ([][]byte, 
 			return out, nil // every requested key found; skip the rest
 		}
 		i = unstable.SkipWSCompact(data, end, compact)
-		if i >= len(data) {
+		if uint(i) >= uint(len(data)) {
 			return out, unstable.ErrTruncated
 		}
 		switch data[i] {
@@ -169,7 +169,7 @@ func getPaths(data []byte, paths [][]string, out [][]byte, compact bool) ([][]by
 		clear(out)
 	}
 	i := unstable.SkipWS(data, 0)
-	if i >= len(data) {
+	if uint(i) >= uint(len(data)) {
 		return out, unstable.ErrTruncated
 	}
 	// One shared scratch holds the active-index set for every recursion level. The
@@ -248,7 +248,7 @@ func walkPaths(data []byte, i, depth int, active, free []int, paths [][]string, 
 	i++                // step over '{'
 	for {
 		i = unstable.SkipWSCompact(data, i, compact)
-		if i >= len(data) {
+		if uint(i) >= uint(len(data)) {
 			return i, unstable.ErrTruncated, true
 		}
 		if data[i] == '}' {
@@ -257,11 +257,11 @@ func walkPaths(data []byte, i, depth int, active, free []int, paths [][]string, 
 		// Key read with the no-escape fast path inline; see getMany.
 		var key string
 		var ni int
-		if i >= len(data) || data[i] != '"' {
+		if uint(i) >= uint(len(data)) || data[i] != '"' {
 			return i, unstable.ErrInvalidJSON, true
 		}
 		ks := i + 1
-		if e := unstable.IndexCloseOrEscapeAt(data, ks); e < len(data) && data[e] == '"' {
+		if e := unstable.IndexCloseOrEscapeAt(data, ks); uint(e) < uint(len(data)) && data[e] == '"' {
 			key, ni = unstable.UnsafeStr(data[ks:e]), e+1
 		} else {
 			var err error
@@ -270,7 +270,7 @@ func walkPaths(data []byte, i, depth int, active, free []int, paths [][]string, 
 			}
 		}
 		i = unstable.SkipWSCompact(data, ni, compact)
-		if i >= len(data) || data[i] != ':' {
+		if uint(i) >= uint(len(data)) || data[i] != ':' {
 			return i, unstable.ErrExpectColon, true
 		}
 		i = unstable.SkipWSCompact(data, i+1, compact)
@@ -294,7 +294,7 @@ func walkPaths(data []byte, i, depth int, active, free []int, paths [][]string, 
 		}
 
 		var end int
-		if len(recurse) > 0 && start < len(data) && data[start] == '{' {
+		if len(recurse) > 0 && uint(start) < uint(len(data)) && data[start] == '{' {
 			werr, fatal := error(nil), false
 			end, werr, fatal = walkPaths(data, start, depth+1, recurse, free[len(recurse):], paths, out, compact)
 			if werr != nil {
@@ -354,7 +354,7 @@ func walkPaths(data []byte, i, depth int, active, free []int, paths [][]string, 
 		}
 
 		i = unstable.SkipWSCompact(data, end, compact)
-		if i >= len(data) {
+		if uint(i) >= uint(len(data)) {
 			return i, unstable.ErrTruncated, true
 		}
 		switch data[i] {
@@ -486,7 +486,7 @@ func objectEach(data []byte, fn func(key string, value []byte) error, compact bo
 		}
 	}
 	i = unstable.SkipWSCompact(data, i, compact)
-	if i >= len(data) {
+	if uint(i) >= uint(len(data)) {
 		return unstable.ErrTruncated
 	}
 	if data[i] != '{' {
@@ -495,7 +495,7 @@ func objectEach(data []byte, fn func(key string, value []byte) error, compact bo
 	i++
 	for {
 		i = unstable.SkipWSCompact(data, i, compact)
-		if i >= len(data) {
+		if uint(i) >= uint(len(data)) {
 			return unstable.ErrTruncated
 		}
 		if data[i] == '}' {
@@ -504,11 +504,11 @@ func objectEach(data []byte, fn func(key string, value []byte) error, compact bo
 		// Key read with the no-escape fast path inline; see getMany.
 		var key string
 		var ni int
-		if i >= len(data) || data[i] != '"' {
+		if uint(i) >= uint(len(data)) || data[i] != '"' {
 			return unstable.ErrInvalidJSON
 		}
 		ks := i + 1
-		if e := unstable.IndexCloseOrEscapeAt(data, ks); e < len(data) && data[e] == '"' {
+		if e := unstable.IndexCloseOrEscapeAt(data, ks); uint(e) < uint(len(data)) && data[e] == '"' {
 			key, ni = unstable.UnsafeStr(data[ks:e]), e+1
 		} else {
 			var err error
@@ -517,7 +517,7 @@ func objectEach(data []byte, fn func(key string, value []byte) error, compact bo
 			}
 		}
 		i = unstable.SkipWSCompact(data, ni, compact)
-		if i >= len(data) || data[i] != ':' {
+		if uint(i) >= uint(len(data)) || data[i] != ':' {
 			return unstable.ErrExpectColon
 		}
 		i = unstable.SkipWSCompact(data, i+1, compact)
@@ -530,7 +530,7 @@ func objectEach(data []byte, fn func(key string, value []byte) error, compact bo
 			return err
 		}
 		i = unstable.SkipWSCompact(data, end, compact)
-		if i >= len(data) {
+		if uint(i) >= uint(len(data)) {
 			return unstable.ErrTruncated
 		}
 		switch data[i] {
@@ -580,7 +580,7 @@ func arrayEach(data []byte, fn func(value []byte) error, compact bool, keys ...s
 		}
 	}
 	i = unstable.SkipWSCompact(data, i, compact)
-	if i >= len(data) {
+	if uint(i) >= uint(len(data)) {
 		return unstable.ErrTruncated
 	}
 	if data[i] != '[' {
@@ -588,7 +588,7 @@ func arrayEach(data []byte, fn func(value []byte) error, compact bool, keys ...s
 	}
 	i++
 	i = unstable.SkipWSCompact(data, i, compact)
-	if i >= len(data) {
+	if uint(i) >= uint(len(data)) {
 		return unstable.ErrTruncated
 	}
 	if data[i] == ']' {
@@ -604,7 +604,7 @@ func arrayEach(data []byte, fn func(value []byte) error, compact bool, keys ...s
 			return err
 		}
 		i = unstable.SkipWSCompact(data, end, compact)
-		if i >= len(data) {
+		if uint(i) >= uint(len(data)) {
 			return unstable.ErrTruncated
 		}
 		switch data[i] {
@@ -612,7 +612,7 @@ func arrayEach(data []byte, fn func(value []byte) error, compact bool, keys ...s
 			return nil
 		case ',':
 			i = unstable.SkipWSCompact(data, i+1, compact)
-			if i >= len(data) {
+			if uint(i) >= uint(len(data)) {
 				return unstable.ErrTruncated
 			}
 		default:
@@ -629,7 +629,7 @@ func arrayEach(data []byte, fn func(value []byte) error, compact bool, keys ...s
 // skipped without allocating.
 func objectField(data []byte, i int, key string, compact bool) (int, error) {
 	i = unstable.SkipWSCompact(data, i, compact)
-	if i >= len(data) {
+	if uint(i) >= uint(len(data)) {
 		return i, unstable.ErrTruncated
 	}
 	if data[i] != '{' {
@@ -638,7 +638,7 @@ func objectField(data []byte, i int, key string, compact bool) (int, error) {
 	i++
 	for {
 		i = unstable.SkipWSCompact(data, i, compact)
-		if i >= len(data) {
+		if uint(i) >= uint(len(data)) {
 			return i, unstable.ErrTruncated
 		}
 		if data[i] == '}' {
@@ -647,11 +647,11 @@ func objectField(data []byte, i int, key string, compact bool) (int, error) {
 		// Key read with the no-escape fast path inline; see getMany.
 		var k string
 		var ni int
-		if i >= len(data) || data[i] != '"' {
+		if uint(i) >= uint(len(data)) || data[i] != '"' {
 			return i, unstable.ErrInvalidJSON
 		}
 		ks := i + 1
-		if e := unstable.IndexCloseOrEscapeAt(data, ks); e < len(data) && data[e] == '"' {
+		if e := unstable.IndexCloseOrEscapeAt(data, ks); uint(e) < uint(len(data)) && data[e] == '"' {
 			k, ni = unstable.UnsafeStr(data[ks:e]), e+1
 		} else {
 			var err error
@@ -660,7 +660,7 @@ func objectField(data []byte, i int, key string, compact bool) (int, error) {
 			}
 		}
 		i = unstable.SkipWSCompact(data, ni, compact)
-		if i >= len(data) || data[i] != ':' {
+		if uint(i) >= uint(len(data)) || data[i] != ':' {
 			return i, unstable.ErrExpectColon
 		}
 		i = unstable.SkipWSCompact(data, i+1, compact)
@@ -672,7 +672,7 @@ func objectField(data []byte, i int, key string, compact bool) (int, error) {
 			return end, err
 		}
 		i = unstable.SkipWSCompact(data, end, compact)
-		if i >= len(data) {
+		if uint(i) >= uint(len(data)) {
 			return i, unstable.ErrTruncated
 		}
 		switch data[i] {

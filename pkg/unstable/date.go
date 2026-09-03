@@ -80,12 +80,12 @@ func parseRFC3339(s string, allowSpace bool) (time.Time, bool) {
 		}
 		nsec *= pow10nano[fd]
 		// Any digits past the ninth are below nanosecond resolution; skip them.
-		for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		for uint(i) < uint(len(s)) && s[i] >= '0' && s[i] <= '9' {
 			i++
 		}
 	}
 
-	if i >= len(s) {
+	if uint(i) >= uint(len(s)) {
 		return time.Time{}, false
 	}
 	var loc *time.Location

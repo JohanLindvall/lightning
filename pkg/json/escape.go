@@ -30,7 +30,7 @@ const rfffd = "\xef\xbf\xbd"
 // straight to out, with neither a scratch buffer nor a rescan.
 func EscapeString(s []byte, out *strings.Builder) {
 	pos := unstable.IndexEscapeNonASCII(s)
-	if pos == len(s) {
+	if uint(pos) >= uint(len(s)) {
 		// Nothing to escape and pure ASCII (so trivially valid UTF-8): write the
 		// bytes straight to the builder, avoiding both the scratch buffer and the
 		// copy into it.
@@ -50,7 +50,7 @@ func EscapeString(s []byte, out *strings.Builder) {
 		// clean-prefix probe with the plain scanner, and the remainder — now
 		// UTF-8-cleared — takes the plain escape walk below.
 		pos += unstable.IndexEscape(s[pos:])
-		if pos == len(s) {
+		if uint(pos) >= uint(len(s)) {
 			out.Write(s)
 			return
 		}
@@ -109,6 +109,13 @@ func EscapeStringInto(s []byte, out []byte) []byte {
 				i += 8 + unstable.IndexEscapeNonASCII(s[i+8:])
 			}
 		} else {
+			// `for i+8 <= n` keeps a bounds check on every word's load (i's
+			// sign is unknown to the compiler); the shrinking-slice form that
+			// drops it (d := s[i:], for len(d) >= 8, see SkipWSRun) was measured
+			// and is WORSE here — json_in_json +7.9%, path_with_backslash +5.2%,
+			// control_bytes +5.0% at the same instruction count — because on
+			// escape-dense input the runs are short and the reslice puts each
+			// run's start on a longer dependency chain than the check it saves.
 			for i+8 <= n {
 				v := binary.LittleEndian.Uint64(s[i : i+8])
 				if m := unstable.SwarNeedsEscapeOrNonASCII(v); m != 0 {
@@ -121,7 +128,7 @@ func EscapeStringInto(s []byte, out []byte) []byte {
 			// as int8, non-ASCII bytes (0x80..0xFF) are negative and control
 			// bytes are below 0x20 — the same three tests per byte as
 			// escapeValidInto's walk.
-			for i < n && int8(s[i]) >= 0x20 && s[i] != '"' && s[i] != '\\' {
+			for uint(i) < uint(n) && int8(s[i]) >= 0x20 && s[i] != '"' && s[i] != '\\' {
 				i++
 			}
 		}
@@ -209,7 +216,7 @@ func escapeValidInto(s []byte, out []byte) []byte {
 				}
 				i += 8
 			}
-			for i < n && s[i] >= 0x20 && s[i] != '"' && s[i] != '\\' {
+			for uint(i) < uint(n) && s[i] >= 0x20 && s[i] != '"' && s[i] != '\\' {
 				i++
 			}
 		}
@@ -251,7 +258,7 @@ func escapeValidInto(s []byte, out []byte) []byte {
 // per-rune DecodeRune walk is off every hot path.
 func escapeInvalidInto(s []byte, out []byte) []byte {
 	run := 0
-	for i := 0; i < len(s); {
+	for i := 0; uint(i) < uint(len(s)); {
 		// ASCII advances on a byte compare; DecodeRune (a real call) runs only
 		// at non-ASCII positions. Escape bytes need no attention here — the
 		// escapeValidInto call on each run expands them.

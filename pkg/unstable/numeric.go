@@ -336,7 +336,7 @@ func parse8Digits(d uint64) uint64 {
 func scanFloatSlow(data []byte, i int) (f float64, end int, fast, ok bool) {
 	n := len(data)
 	neg := false
-	if i < n {
+	if uint(i) < uint(n) {
 		switch data[i] {
 		case '-':
 			neg = true
@@ -354,7 +354,7 @@ func scanFloatSlow(data []byte, i int) (f float64, end int, fast, ok bool) {
 	// (a byte below '0' underflows to a large value, so it also fails d > 9).
 	var mant uint64
 	digits, mdigits := 0, 0
-	for i < n {
+	for uint(i) < uint(n) {
 		d := data[i] - '0'
 		if d > 9 {
 			break
@@ -367,7 +367,7 @@ func scanFloatSlow(data []byte, i int) (f float64, end int, fast, ok bool) {
 		digits++
 	}
 	exp := 0
-	if i < n && data[i] == '.' {
+	if uint(i) < uint(n) && data[i] == '.' {
 		i++
 		// Leading fraction zeros (the "000" of 0.000698…) are not significant
 		// digits: they only shift the decimal exponent. Skip them here so they do
@@ -378,7 +378,7 @@ func scanFloatSlow(data []byte, i int) (f float64, end int, fast, ok bool) {
 		// significant digit has been seen yet (mant == 0); a zero between nonzero
 		// digits is significant and stays in the loops below.
 		if mant == 0 {
-			for i < n && data[i] == '0' {
+			for uint(i) < uint(n) && data[i] == '0' {
 				exp--
 				i++
 			}
@@ -400,7 +400,7 @@ func scanFloatSlow(data []byte, i int) (f float64, end int, fast, ok bool) {
 			exp -= 4
 			i += 4
 		}
-		for i < n {
+		for uint(i) < uint(n) {
 			d := data[i] - '0'
 			if d > 9 {
 				break
@@ -415,17 +415,17 @@ func scanFloatSlow(data []byte, i int) (f float64, end int, fast, ok bool) {
 		}
 	}
 	overflow := digits > mdigits // more digits than the uint64 mantissa holds
-	if i < n && (data[i] == 'e' || data[i] == 'E') {
+	if uint(i) < uint(n) && (data[i] == 'e' || data[i] == 'E') {
 		i++
 		esign := 1
-		if i < n && (data[i] == '+' || data[i] == '-') {
+		if uint(i) < uint(n) && (data[i] == '+' || data[i] == '-') {
 			if data[i] == '-' {
 				esign = -1
 			}
 			i++
 		}
 		ed, eval := 0, 0
-		for i < n {
+		for uint(i) < uint(n) {
 			d := data[i] - '0'
 			if d > 9 {
 				break
@@ -449,9 +449,9 @@ func scanFloatSlow(data []byte, i int) (f float64, end int, fast, ok bool) {
 	// malformed token such as "1.2.3" or "1e2e3"; consume the rest of the run (as
 	// skipNumber would) and reject, so the reported end and error match the slow
 	// path rather than silently accepting the leading "1.2".
-	if end < n {
+	if uint(end) < uint(n) {
 		if c := data[end]; c == '.' || c == 'e' || c == 'E' || (c >= '0' && c <= '9') {
-			for end < n {
+			for uint(end) < uint(n) {
 				c = data[end]
 				if (c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-' {
 					end++

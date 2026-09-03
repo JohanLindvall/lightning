@@ -47,7 +47,7 @@ func decodeValue(data []byte, i int, compact bool, depth int) (any, int, error) 
 		// string falls back to ReadStringOrNull, whose error identities and
 		// positions are unchanged (it re-checks data[i] == '"' and takes its
 		// existing escaped/truncated paths).
-		if e := indexCloseOrEscapeAt(data, i+1); e < len(data) && data[e] == '"' {
+		if e := indexCloseOrEscapeAt(data, i+1); uint(e) < uint(len(data)) && data[e] == '"' {
 			return string(data[i+1 : e]), e + 1, nil
 		}
 		s, end, err := ReadStringOrNull(data, i)
@@ -120,7 +120,7 @@ func decodeAnyObject(data []byte, i int, compact bool, depth int) (any, int, err
 		var key string
 		ni := -1
 		if data[i] == '"' {
-			if e := indexCloseOrEscapeAt(data, i+1); e < len(data) && data[e] == '"' {
+			if e := indexCloseOrEscapeAt(data, i+1); uint(e) < uint(len(data)) && data[e] == '"' {
 				key = string(data[i+1 : e])
 				ni = e + 1
 			}

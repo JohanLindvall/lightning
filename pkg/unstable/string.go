@@ -142,11 +142,11 @@ func decodeEscaped(buf, data []byte, start, i int, quoted bool) (string, int, er
 			i++ // step over the backslash
 		} else {
 			j := i
-			for j < len(data) && data[j] != '\\' {
+			for uint(j) < uint(len(data)) && data[j] != '\\' {
 				j++
 			}
 			buf = append(buf, data[i:j]...)
-			if j >= len(data) {
+			if uint(j) >= uint(len(data)) {
 				break
 			}
 			i = j + 1 // step over the backslash
@@ -169,7 +169,7 @@ func decodeEscaped(buf, data []byte, start, i int, quoted bool) (string, int, er
 			}
 			i = ni
 			if utf16.IsSurrogate(r) {
-				if i+1 < len(data) && data[i] == '\\' && data[i+1] == 'u' {
+				if uint(i) < uint(len(data)) && uint(i+1) < uint(len(data)) && data[i] == '\\' && data[i+1] == 'u' {
 					r2, ni2, err := readUnicodeEscape(data, i+2)
 					if err != nil {
 						return "", ni2, err
@@ -264,6 +264,13 @@ var hexNibble = func() [256]uint32 {
 // escape from decodeEscaped's loop, and as a call frame it was the loop's only
 // non-inlined step.
 func readUnicodeEscape(data []byte, i int) (rune, int, error) {
+	// The four reads each keep a bounds check (i's sign is unknown to the
+	// compiler, and no unsigned spelling of the i+4 test removes them). The
+	// form that does — prove i once, d := data[i:], test len(d) >= 4 — was
+	// measured and is WORSE: UnescapeString/unicode_escaped_dense +3.5%
+	// cycles at 3% fewer instructions (N2, 2026-09-02), because a dense
+	// escape string is one serial chain of escapes and the reslice adds a
+	// cycle to every link where the checks it removes were off the chain.
 	if i+4 > len(data) {
 		return 0, i, ErrTruncated
 	}

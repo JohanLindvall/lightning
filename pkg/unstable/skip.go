@@ -40,7 +40,7 @@ func SkipValue(data []byte, i int) (int, error) {
 	case '[':
 		if fastSkipAvail {
 			j := SkipWS(data, i+1)
-			if j < len(data) {
+			if uint(j) < uint(len(data)) {
 				switch data[j] {
 				case '{', '[', '"':
 					return skipContainerFast(data, i, '[')
@@ -105,7 +105,7 @@ func SkipString(data []byte, i int) (int, error) {
 // checked wrappers exist because the fast walkers make exactly this trade.
 func skipNumber(data []byte, i int) (int, error) {
 	start := i
-	if i < len(data) && data[i] == '-' {
+	if uint(i) < uint(len(data)) && data[i] == '-' {
 		i++
 	}
 	for uint(i) < uint(len(data)) {
@@ -263,18 +263,32 @@ func SkipWSRun(data []byte, i int) int {
 		sp  = lo * ' '         // 0x2020...20: a word of eight literal spaces
 		low = lo * 0x5f        // 0x5f...5f: 0x80 - (' ' + 1), the lane bias below
 	)
-	for i+8 <= len(data) {
-		// data[i:i+8], not data[i:]: the explicit end is what lets the compiler
-		// prove the load in bounds from the loop condition it already tested.
-		// Written data[i:] the word costs SIX more instructions per iteration —
-		// a second bounds compare, the len and cap subtractions with their
-		// negative clamp, and Uint64's own "at least 8 bytes" test — because the
-		// open-ended reslice is a value the prove pass then has to re-derive
-		// facts about. Measured 9-12% on citm-shaped indentation runs; this loop
-		// is issue-bound (citm decodes at IPC 3.6 with a 0.18% branch-miss rate),
-		// so instructions removed are cycles removed. The same spelling is
-		// already used by every other SWAR load here (read.go, batch.go,
-		// numeric.go) — this one was the exception.
+	// data[i:i+8], not data[i:]: the explicit end is what lets the compiler
+	// prove the load in bounds from the loop condition it already tested.
+	// Written data[i:] the word costs SIX more instructions per iteration —
+	// a second bounds compare, the len and cap subtractions with their
+	// negative clamp, and Uint64's own "at least 8 bytes" test — because the
+	// open-ended reslice is a value the prove pass then has to re-derive
+	// facts about. Measured 9-12% on citm-shaped indentation runs; this loop
+	// is issue-bound (citm decodes at IPC 3.6 with a 0.18% branch-miss rate),
+	// so instructions removed are cycles removed. The same spelling is
+	// already used by every other SWAR load here (read.go, batch.go,
+	// numeric.go) — this one was the exception. What the loop condition
+	// does not prove is i's sign, so the load still kept one bounds check
+	// per word — a compare and a never-taken branch, i.e. a dispatch slot,
+	// in the hottest loop pretty input has. The unsigned test at entry
+	// proves the sign once, and the condition written `i <= len(data)-8`
+	// (the same test, but the shape the prove pass recognises as an
+	// induction variable — `i+8 <= len(data)` keeps the check even with the
+	// entry proof) carries it through the loop: the load is check-free.
+	// Every unsigned spelling of the offset condition itself, and the
+	// shrinking-slice form `for len(d) >= 8`, were tried too; the latter
+	// also drops the check but costs 82 against the inliner's budget of 80,
+	// and this function must inline (see g.skipWS). Cost now 78.
+	if uint(i) > uint(len(data)) {
+		return i
+	}
+	for i <= len(data)-8 {
 		w := binary.LittleEndian.Uint64(data[i : i+8])
 		// Eight literal spaces is the overwhelmingly common word inside an
 		// indentation run, and equality against the splat answers it with one
