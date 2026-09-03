@@ -283,21 +283,45 @@ byte-identical when adding cold paths; push new logic out-of-line.
 - **`//lightning:arena` — chunked backings for small scalar slices**
   (`unstable.Arena` + `arenaCarve` in `pkg/unstable/arena.go`, the
   `Decode*SliceArena` reader twins in `batch.go`, `g.arena`/`arenaParam`/
-  `arenaArg` threading in `main.go`). Documents shaped like marine_ik hold tens
+  `arenaArg`/`arenaField` threading in `main.go`). Documents shaped like
+  marine_ik hold tens
   of thousands of 3–4-element `[]float64` fields; each decoded into its own
   exact-fit `make` backing, `DecodeFloat64Slice` was **95% of allocated
-  objects**. Under the directive, each `UnmarshalJSON` declares a local
-  `unstable.Arena` and threads `a *unstable.Arena` through every decoder of the
+  objects**. Under the directive, each `UnmarshalJSON` declares the arenas and
+  threads them through every decoder of the
   variant (uniformly — unlike depth's cycle gating, the directive itself is the
   gate; the batch slice readers are rerouted to `...Arena` twins that carve the
-  presized backing from 4 KiB chunks instead of one `make` per slice). Safety
-  is by construction: `arenaCarve` is constrained to **noscan element kinds**
-  (chunks are `[]byte`, which the GC doesn't scan — pointerful types must never
-  live there); the cursor bumps past the **full capacity**, so carves are
-  exclusive and a caller's later `append` can never clobber a neighbour (exact
-  scalar counts leave `len == cap`, so such an append reallocates to the heap
-  anyway); carve offsets stay 8-aligned; chunks are make-zeroed and regions
-  never reused, so `s[len:cap]` reads zeros exactly like a `make` backing; and
+  presized backing from 4 KiB chunks instead of one `make` per slice).
+
+  **The store is `github.com/JohanLindvall/arena`, not a hand-built one
+  (2026-09-03).** `unstable.Arena[T]` is a generic alias for that module's
+  `Arena[T]`, `arenaCarve` is its `Reserve` behind the `arenaMaxCarve`
+  threshold, and `NewArena[T]` fixes the chunk at `arenaChunkBytes` (the module
+  defaults to 64 KiB, which would widen the pinning granularity 16×). The
+  consequence that shapes the generated code is that **an arena is typed** —
+  its chunks are `[]T` — where the hand-built one was a `free []byte` bump
+  allocator serving every element kind at once. So a root storing several kinds
+  needs one arena per kind, and rather than widen every decoder by a parameter
+  per kind, the generator emits a **per-root struct** (`<prefix>Arenas`, fields
+  named after their element type, only for the kinds that root actually carves
+  for) and threads a pointer to it. `arenaParam` therefore stays a single
+  parameter and the memo keys are untouched; the only call sites that differ
+  are the batch readers, which take `&a.<field>` — see `arenaArgForExpr`. This
+  is sound because `g.prefix` is per-root, so no decoder is ever shared between
+  two roots and none can see another's struct.
+
+  Safety is now by construction in a stronger sense: the chunks are `[]T`, so
+  the GC scans them correctly for whatever `T` is and there is **no pointer
+  reinterpretation and no alignment arithmetic anywhere in the path** — the old
+  `arenaScalar` noscan constraint and the 8-byte carve rounding both existed
+  only because a `[]byte` chunk was being reinterpreted, and both are gone.
+  What still holds and still matters: `Reserve` caps the region at **exactly
+  n**, so carves are exclusive and a caller's later `append` can never clobber
+  a neighbour (exact scalar counts leave `len == cap`, so such an append
+  reallocates to the heap anyway); chunks are make-zeroed and regions are never
+  reused, so `s[len:cap]` reads zeros exactly like a `make` backing — which
+  depends on lightning never calling `Reset`, since the module's `Reserve`
+  documents that a reused chunk hands back what the previous batch left; and
   backings over `arenaMaxCarve` (512 B) fall back to a direct `make`, keeping
   both chunk waste and the pinning trade-off bounded to small slices. The
   trade-off — a surviving small slice pins its ~4 KiB chunk — is why it is a
@@ -305,8 +329,19 @@ byte-identical when adding cold paths; push new logic out-of-line.
   **marine_ik allocs/op −94.9% (29 356 → 1 504) and time −2.80% (p=0.001);
   mesh allocs/op −99.2% (3 618 → 30) and time −3.30% (p=0.000)**; B/op +0.2–0.4%
   (chunk-tail waste); numbers exactly flat (its one big array bypasses the
-  threshold by design). Non-arena schemas are **byte-identical** (dual-generator
-  diff over all 60 bench inputs) and the shared-body restructure of the batch
+  threshold by design). Moving to the module was measured separately and is
+  **free**: interleaved A/B (n=10, pinned Meteor Lake, `funcalign=64`)
+  **marine_ik and mesh both flat** (p=0.63, p=0.68), with allocs/op +10
+  (1 504 → 1 514) and +7 (30 → 37) and B/op +0.4–0.5% — the module tracks its
+  chunks in a `[][]T` that grows by append, where the `free []byte` form kept
+  none. The **non-arena** decode path is byte-for-byte unchanged: same case,
+  `BenchmarkLightning`, allocs/op and B/op identical at p=1.000 and time flat.
+  A carve micro says the typed form is 11% cheaper per carve (7.26 vs 8.16 ns)
+  and none of that reaches the wall clock — the usual over-prediction, recorded
+  in the calibration note below. Non-arena schemas are **byte-identical** (dual-generator
+  diff over all 30 bench schemas plus conformance: 30 of 31 files identical,
+  the one that differs being the only schema with `//lightning:arena` types)
+  and the shared-body restructure of the batch
   readers costs nothing (`Decode*Slice` became inlinable wrappers over a private
   body with a nil-arena parameter — regression A/B over marine_ik/mesh/numbers/
   float-array/canada/cloudflare/citm all flat, n=8). **Calibration lesson worth

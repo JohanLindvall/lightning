@@ -39,23 +39,25 @@ func TestArenaSliceParity(t *testing.T) {
 	for _, in := range inputs {
 		t.Run(in[:min(len(in), 24)], func(t *testing.T) {
 			var pf, af []float64
-			var arena Arena
+			// An arena is typed, so a document mixing element kinds threads one
+			// per kind — which is what the generated decoders declare.
+			af64, ai32, au16 := NewArena[float64](), NewArena[int32](), NewArena[uint16]()
 			pe, perr := DecodeFloat64Slice(&pf, []byte(in), 0)
-			ae, aerr := DecodeFloat64SliceArena(&af, []byte(in), 0, &arena)
+			ae, aerr := DecodeFloat64SliceArena(&af, []byte(in), 0, &af64)
 			if pe != ae || !errIs(perr, aerr) || !reflect.DeepEqual(pf, af) {
 				t.Errorf("float64 %q: plain (%v,%v,%v) arena (%v,%v,%v)", in, pf, pe, perr, af, ae, aerr)
 			}
 
 			var pi, ai []int32
 			pe, perr = DecodeIntSlice(&pi, []byte(in), 0)
-			ae, aerr = DecodeIntSliceArena(&ai, []byte(in), 0, &arena)
+			ae, aerr = DecodeIntSliceArena(&ai, []byte(in), 0, &ai32)
 			if pe != ae || !errIs(perr, aerr) || !reflect.DeepEqual(pi, ai) {
 				t.Errorf("int32 %q: plain (%v,%v,%v) arena (%v,%v,%v)", in, pi, pe, perr, ai, ae, aerr)
 			}
 
 			var pu, au []uint16
 			pe, perr = DecodeUintSlice(&pu, []byte(in), 0)
-			ae, aerr = DecodeUintSliceArena(&au, []byte(in), 0, &arena)
+			ae, aerr = DecodeUintSliceArena(&au, []byte(in), 0, &au16)
 			if pe != ae || !errIs(perr, aerr) || !reflect.DeepEqual(pu, au) {
 				t.Errorf("uint16 %q: plain (%v,%v,%v) arena (%v,%v,%v)", in, pu, pe, perr, au, ae, aerr)
 			}
@@ -74,9 +76,9 @@ func errIs(a, b error) bool {
 // in-capacity case only arises on a miscount; the append-beyond-cap path (a heap
 // reallocation) is the one exercised on well-formed input.
 func TestArenaCarveExclusive(t *testing.T) {
-	var arena Arena
+	arena := NewArena[float64]()
 	var slices [][]float64
-	for k := 0; k < 300; k++ { // ~300 × 32B ≈ 3 chunks: crosses chunk boundaries
+	for k := 0; k < 300; k++ { // 900 elements over 512-element chunks: crosses boundaries
 		in := fmt.Sprintf("[%d,%d,%d]", k, k+1, k+2)
 		var s []float64
 		if _, err := DecodeFloat64SliceArena(&s, []byte(in), 0, &arena); err != nil {
@@ -98,27 +100,33 @@ func TestArenaCarveExclusive(t *testing.T) {
 	}
 }
 
-// TestArenaCarveAlignmentAndKinds checks that carves of narrow element kinds
-// stay 8-aligned (the carve rounds its byte size up to a multiple of 8) and
-// decode correctly when interleaved, including a same-chunk mix of widths.
+// TestArenaCarveAlignmentAndKinds checks that carves of narrow element kinds are
+// correctly aligned for their type and decode correctly when interleaved.
+//
+// The invariant here is weaker than it used to need to be, and that is the point.
+// Carving out of a shared []byte chunk meant every carve had to be rounded up to
+// 8 bytes by hand, because a []uint16 view was a reinterpretation of bytes that
+// happened to be there. An arena is typed now — its chunks are []T — so an
+// element lands at a T-aligned offset by construction, and the alignment to
+// check is T's own, not a blanket 8.
 func TestArenaCarveAlignmentAndKinds(t *testing.T) {
-	var arena Arena
+	ai32, au16, af := NewArena[int32](), NewArena[uint16](), NewArena[float64]()
 	for k := 0; k < 100; k++ {
 		var i32 []int32
 		var u16 []uint16
 		var f []float64
-		if _, err := DecodeIntSliceArena(&i32, []byte(`[-1,2,-3,4,-5]`), 0, &arena); err != nil {
+		if _, err := DecodeIntSliceArena(&i32, []byte(`[-1,2,-3,4,-5]`), 0, &ai32); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := DecodeUintSliceArena(&u16, []byte(`[1,2,3]`), 0, &arena); err != nil {
+		if _, err := DecodeUintSliceArena(&u16, []byte(`[1,2,3]`), 0, &au16); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := DecodeFloat64SliceArena(&f, []byte(`[1.5]`), 0, &arena); err != nil {
+		if _, err := DecodeFloat64SliceArena(&f, []byte(`[1.5]`), 0, &af); err != nil {
 			t.Fatal(err)
 		}
-		if uintptr(unsafe.Pointer(unsafe.SliceData(i32)))%8 != 0 ||
-			uintptr(unsafe.Pointer(unsafe.SliceData(u16)))%8 != 0 ||
-			uintptr(unsafe.Pointer(unsafe.SliceData(f)))%8 != 0 {
+		if uintptr(unsafe.Pointer(unsafe.SliceData(i32)))%unsafe.Alignof(i32[0]) != 0 ||
+			uintptr(unsafe.Pointer(unsafe.SliceData(u16)))%unsafe.Alignof(u16[0]) != 0 ||
+			uintptr(unsafe.Pointer(unsafe.SliceData(f)))%unsafe.Alignof(f[0]) != 0 {
 			t.Fatalf("iteration %d: misaligned carve", k)
 		}
 		if !reflect.DeepEqual(i32, []int32{-1, 2, -3, 4, -5}) ||
@@ -131,15 +139,15 @@ func TestArenaCarveAlignmentAndKinds(t *testing.T) {
 
 // TestArenaThresholdBypass pins the direct-make fallback: a backing over
 // arenaMaxCarve bytes must not come from a chunk (it would burn most of one and
-// widen the pinning trade-off to large slices). White-box: the arena's free tail
-// must be unchanged by the big decode.
+// widen the pinning trade-off to large slices). White-box: the arena must record
+// nothing stored for the big decode, since it never reached it.
 func TestArenaThresholdBypass(t *testing.T) {
-	var arena Arena
+	arena := NewArena[float64]()
 	var small []float64
 	if _, err := DecodeFloat64SliceArena(&small, []byte(`[1,2]`), 0, &arena); err != nil {
 		t.Fatal(err)
 	}
-	freeBefore := len(arena.free)
+	storedBefore := arena.Size()
 	in := "[0"
 	for i := 1; i <= arenaMaxCarve/8; i++ { // one element over the threshold
 		in += fmt.Sprintf(",%d", i)
@@ -148,8 +156,8 @@ func TestArenaThresholdBypass(t *testing.T) {
 	if _, err := DecodeFloat64SliceArena(&big, []byte(in+"]"), 0, &arena); err != nil {
 		t.Fatal(err)
 	}
-	if len(arena.free) != freeBefore {
-		t.Fatalf("big carve consumed arena: free %d -> %d", freeBefore, len(arena.free))
+	if arena.Size() != storedBefore {
+		t.Fatalf("big carve consumed arena: stored %d -> %d", storedBefore, arena.Size())
 	}
 	if len(big) != arenaMaxCarve/8+1 || big[len(big)-1] != float64(arenaMaxCarve/8) {
 		t.Fatalf("big slice misdecoded: len %d", len(big))
@@ -163,7 +171,7 @@ func TestArenaThresholdBypass(t *testing.T) {
 	if _, err := DecodeFloat64SliceArena(&edge, []byte(in+"]"), 0, &arena); err != nil {
 		t.Fatal(err)
 	}
-	if len(arena.free) == freeBefore {
+	if arena.Size() == storedBefore {
 		t.Fatalf("threshold-sized carve did not come from the arena")
 	}
 }
@@ -173,13 +181,13 @@ func TestArenaThresholdBypass(t *testing.T) {
 // existing (arena-carved) backing without carving again, and must replace, not
 // append.
 func TestArenaReuseKeepsBacking(t *testing.T) {
-	var arena Arena
+	arena := NewArena[float64]()
 	var s []float64
 	if _, err := DecodeFloat64SliceArena(&s, []byte(`[1,2,3]`), 0, &arena); err != nil {
 		t.Fatal(err)
 	}
 	p0 := unsafe.SliceData(s)
-	freeBefore := len(arena.free)
+	storedBefore := arena.Size()
 	if _, err := DecodeFloat64SliceArena(&s, []byte(`[7,8]`), 0, &arena); err != nil {
 		t.Fatal(err)
 	}
@@ -189,8 +197,8 @@ func TestArenaReuseKeepsBacking(t *testing.T) {
 	if unsafe.SliceData(s) != p0 {
 		t.Fatalf("reuse reallocated the backing")
 	}
-	if len(arena.free) != freeBefore {
-		t.Fatalf("reuse carved again: free %d -> %d", freeBefore, len(arena.free))
+	if arena.Size() != storedBefore {
+		t.Fatalf("reuse carved again: stored %d -> %d", storedBefore, arena.Size())
 	}
 }
 
@@ -199,7 +207,7 @@ func TestArenaReuseKeepsBacking(t *testing.T) {
 // bit-identical results — a cheap fuzz for the carve/count interaction.
 func TestArenaRandomizedParity(t *testing.T) {
 	rng := rand.New(rand.NewSource(1))
-	var arena Arena
+	arena := NewArena[float64]()
 	for iter := 0; iter < 2000; iter++ {
 		n := rng.Intn(80)
 		in := "["
@@ -248,7 +256,7 @@ func BenchmarkDecodeSmallSlices(b *testing.B) {
 	})
 	b.Run("arena", func(b *testing.B) {
 		b.ReportAllocs()
-		var arena Arena
+		arena := NewArena[float64]()
 		for i := 0; i < b.N; i++ {
 			var s []float64
 			if _, err := DecodeFloat64SliceArena(&s, docs[i%len(docs)], 0, &arena); err != nil {

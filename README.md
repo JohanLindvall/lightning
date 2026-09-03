@@ -43,6 +43,10 @@ the module you generate into must depend on lightning:
 go get github.com/JohanLindvall/lightning
 ```
 
+That pulls in two small dependencies: `golang.org/x/sys` (CPU feature detection
+for the SIMD scanners) and `github.com/JohanLindvall/arena` (the chunk-backed
+store behind [`//lightning:arena`](#lightningarena)).
+
 `pkg/unstable` is the generator's runtime: it is exported only because the
 generated `*_unmarshal.go` files (which live in your module) have to call into it.
 As its name says, it is **not a stable API** — don't import it directly; use
@@ -633,6 +637,13 @@ neighbours, backings over 512 bytes are allocated individually as before, and
 reusing a target value still reuses its existing backings. Only slices of bare
 `float64`/int/uint kinds participate; other field types decode exactly as
 without the directive.
+
+The chunks come from [`github.com/JohanLindvall/arena`](https://github.com/JohanLindvall/arena),
+whose `Arena[T]` is typed — its chunks are `[]T` — so a schema storing several
+element kinds gets one arena per kind, held in a small struct the generator
+emits beside the method and threaded through that root's decoders. Being typed
+is what makes the backings ordinary `[]T` the collector scans correctly, with no
+pointer reinterpretation anywhere in the path.
 
 A schema may refer back to itself — a tree node, a comment thread, a FHIR
 extension — either directly or through a chain of types:

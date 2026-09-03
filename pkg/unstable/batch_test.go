@@ -568,7 +568,7 @@ func TestDecodeByteSliceErrorPublishesPartial(t *testing.T) {
 	}{
 		{"DecodeByteSlice", DecodeByteSlice},
 		{"DecodeByteSliceArena", func(o *[]byte, d []byte, i int) (int, error) {
-			var a Arena
+			a := NewArena[byte]()
 			return DecodeByteSliceArena(o, d, i, &a)
 		}},
 	} {

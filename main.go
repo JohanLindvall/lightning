@@ -341,6 +341,10 @@ func generateTo(inPath string, warn io.Writer) error {
 		g.nocopy = g.destructive || g.nocopyTypes[name]
 		g.arena = g.arenaTypes[name]
 		g.prefix = "lightning" + g.pathFrag + name
+		// Reset per root: the arena struct and its fields belong to this root
+		// alone, which is sound because g.prefix is per-root too, so no decoder
+		// is ever shared between two roots and none can see another's struct.
+		g.arenaElems, g.arenaStruct = nil, g.prefix+"Arenas"
 		methods = append(methods, g.genUnmarshal(name))
 	}
 	if len(g.errs) > 0 {
@@ -398,9 +402,21 @@ type gen struct {
 	// Working flags for the root type currently being generated, derived from the
 	// directive sets above.
 	compact     bool
-	destructive bool   // //lightning:destructive: unescape strings in place
-	nocopy      bool   // //lightning:nocopy root, or a destructive root (which aliases what it decodes)
-	arena       bool   // //lightning:arena: thread a per-decode unstable.Arena through the decoders
+	destructive bool // //lightning:destructive: unescape strings in place
+	nocopy      bool // //lightning:nocopy root, or a destructive root (which aliases what it decodes)
+	arena       bool // //lightning:arena: thread the per-decode arena struct through the decoders
+	// An arena is typed (unstable.Arena[T] is github.com/JohanLindvall/arena's
+	// Arena[T], whose chunks are []T), so a root storing several element kinds
+	// needs one arena per kind. Rather than widen every decoder's signature by one
+	// parameter per kind, the root gets a generated struct holding them and the
+	// decoders thread a pointer to it — so arenaParam stays a single parameter
+	// however many kinds a schema uses, and the memo keys stay as they were.
+	// arenaElems is that struct's fields, in first-use order, reset per root;
+	// arenaStruct is its name. Only a batched slice reader consumes one, so only
+	// batchSliceFn's element kinds ever appear here, and those are predeclared
+	// names — hence no import can be needed for a field's type.
+	arenaElems  []arenaElem
+	arenaStruct string
 	pathFrag    string // import path sanitized into an identifier fragment
 	prefix      string // current per-type prefix for generated function names
 
@@ -859,7 +875,7 @@ func (g *gen) csuf() string {
 // arena merely passes through carry it unused.
 func (g *gen) arenaParam() string {
 	if g.arena {
-		return ", a *unstable.Arena"
+		return ", a *" + g.arenaStruct
 	}
 	return ""
 }
@@ -869,6 +885,78 @@ func (g *gen) arenaArg() string {
 		return ", a"
 	}
 	return ""
+}
+
+// arenaElem is one element kind an //lightning:arena root carves backings for,
+// and the field of the root's arena struct that serves it.
+type arenaElem struct{ typ, field string }
+
+// arenaElemType normalizes an element type name to the type its arena is keyed
+// by, so that byte/uint8 and rune/int32 — each pair being one Go type under two
+// names — share a single arena instead of generating two fields of identical
+// type. batchSliceFn only ever matches predeclared names, so this sees no others.
+func arenaElemType(name string) string {
+	switch name {
+	case "byte":
+		return "uint8"
+	case "rune":
+		return "int32"
+	}
+	return name
+}
+
+// arenaField returns the arena-struct field serving elt's element kind, adding
+// it on first use. Fields are named after the type rather than numbered so the
+// emitted struct does not depend on the order fields happen to be generated in.
+func (g *gen) arenaField(elt ast.Expr) string {
+	typ := arenaElemType(g.typeStr(elt))
+	for _, e := range g.arenaElems {
+		if e.typ == typ {
+			return e.field
+		}
+	}
+	f := "a" + typ
+	g.arenaElems = append(g.arenaElems, arenaElem{typ, f})
+	return f
+}
+
+// arenaArgForExpr is arenaArg for a call site whose decoder may be a batched
+// slice reader. Those take the arena for their own element type — the reader is
+// generic in T and its arena parameter is *Arena[T] — where every generated
+// decoder takes the root's whole arena struct. Anything else gets the struct.
+func (g *gen) arenaArgForExpr(expr ast.Expr) string {
+	if !g.arena {
+		return ""
+	}
+	if t, ok := unparen(expr).(*ast.ArrayType); ok && t.Len == nil && batchSliceFn(t.Elt) != "" {
+		return ", &a." + g.arenaField(t.Elt)
+	}
+	return g.arenaArg()
+}
+
+// arenaTypeDecl emits the current root's arena struct and the statement its
+// UnmarshalJSON opens with. Both are empty unless the root carries
+// //lightning:arena, and the struct has a field only for the element kinds the
+// root actually carves for — so a schema with no batched slice field still
+// threads an (empty) struct, exactly as it used to thread an unused arena.
+//
+// NewArena rather than a zero value: the arena package defaults to 64 KiB
+// chunks, where lightning wants arenaChunkBytes (4 KiB) to keep the pinning
+// granularity and the waste on a small decode modest.
+func (g *gen) arenaTypeDecl() (typeDecl, stmt string) {
+	if !g.arena {
+		return "", ""
+	}
+	var fields, inits strings.Builder
+	for _, e := range g.arenaElems {
+		fmt.Fprintf(&fields, "\t%s unstable.Arena[%s]\n", e.field, e.typ)
+		if inits.Len() > 0 {
+			inits.WriteString(", ")
+		}
+		fmt.Fprintf(&inits, "%s: unstable.NewArena[%s]()", e.field, e.typ)
+	}
+	typeDecl = fmt.Sprintf("type %s struct {\n%s}\n\n", g.arenaStruct, fields.String())
+	return typeDecl, fmt.Sprintf("a := %s{%s}\n\t", g.arenaStruct, inits.String())
 }
 
 // genUnmarshal emits the UnmarshalJSON method for a named root type and makes sure
@@ -895,16 +983,27 @@ func (g *gen) genUnmarshal(name string) string {
 	// likewise seeds the decode's arena: the method declares it (arenaDecl) and every
 	// decoder threads the pointer down.
 	g.depthArg = "0"
-	var arenaDecl, rootArenaArg string
+	// At the root the arena struct is a local value, so calls take its address;
+	// inside a decoder body `a` is already the pointer, which is what arenaArg
+	// gives every other call site.
+	rootArenaArg := ""
 	if g.arena {
-		arenaDecl = "var a unstable.Arena\n\t"
 		rootArenaArg = ", &a"
 	}
 	switch {
 	case g.sliceTypes[name] != nil:
 		at := g.sliceTypes[name]
 		fn := g.sliceDecoder(at.Elt, name, nocopy, false, true)
-		call = fmt.Sprintf("%s((*[]%s)(v), data, i%s%s)", fn, g.typeStr(at.Elt), g.depthArgFor(fn), rootArenaArg)
+		// A named slice root of a batched element kind IS the batched reader, so
+		// it takes that kind's arena rather than the struct.
+		// A named slice root of a batched element kind IS the batched reader, so
+		// it takes that kind's arena, which arenaArgForExpr already spells as an
+		// address (&a.field) and so needs no adjustment for a value receiver.
+		rootSliceArena := rootArenaArg
+		if arg := g.arenaArgForExpr(at); g.arena && arg != g.arenaArg() {
+			rootSliceArena = arg
+		}
+		call = fmt.Sprintf("%s((*[]%s)(v), data, i%s%s)", fn, g.typeStr(at.Elt), g.depthArgFor(fn), rootSliceArena)
 		nullReset = "*v = nil\n\t\t"
 	case g.mapTypes[name] != nil:
 		mt := g.mapTypes[name]
@@ -915,11 +1014,14 @@ func (g *gen) genUnmarshal(name string) string {
 		fn := g.namedStruct(name)
 		call = fmt.Sprintf("%s(v, data, i%s%s)", fn, g.depthArgFor(fn), rootArenaArg)
 	}
+	// After the switch: generating the body is what registers which element kinds
+	// the root carves for, so the struct can only be spelled once that has run.
+	arenaType, arenaDecl := g.arenaTypeDecl()
 	// No doc comment (or any other comment) is emitted: generated files carry
 	// only the top-of-file "Code generated ... DO NOT EDIT." header. The nocopy /
 	// destructive / arena caveats the method's doc comment used to state live in
 	// the README's directive documentation instead.
-	return fmt.Sprintf(`func (v *%[1]s) UnmarshalJSON(data []byte) error {
+	return arenaType + fmt.Sprintf(`func (v *%[1]s) UnmarshalJSON(data []byte) error {
 	%[3]si := unstable.SkipWS(data, 0)
 	if uint(i) >= uint(len(data)) {
 		return unstable.ErrTruncated
@@ -1455,7 +1557,7 @@ func (g *gen) field(dest string, expr ast.Expr, hint string, nocopy, lax bool) s
 			}
 			return g.callDecoder(dest, g.arrayDecoder(t, hint, nocopy, lax))
 		}
-		return g.callDecoder(dest, g.sliceDecoder(t.Elt, hint, nocopy, lax, false))
+		return g.callDecoderArena(dest, g.sliceDecoder(t.Elt, hint, nocopy, lax, false), g.arenaArgForExpr(t))
 
 	case *ast.MapType:
 		fn := g.mapDecoder(t.Key, t.Value, hint, nocopy, lax)
@@ -1484,11 +1586,18 @@ func (g *gen) field(dest string, expr ast.Expr, hint string, nocopy, lax bool) s
 // recursion depth on when fn is one of the decoders that thread it, and the arena
 // when generating an //lightning:arena variant (whose decoders all take it).
 func (g *gen) callDecoder(dest, fn string) string {
+	return g.callDecoderArena(dest, fn, g.arenaArg())
+}
+
+// callDecoderArena is callDecoder for a call that passes something other than
+// the root's whole arena struct — a batched slice reader, which takes the arena
+// for its own element type. See arenaArgForExpr.
+func (g *gen) callDecoderArena(dest, fn, arenaArg string) string {
 	return fmt.Sprintf(`end, err := %s(&%s, data, i%s%s)
 if err != nil {
 	return end, err
 }
-i = end`, fn, dest, g.depthArgFor(fn), g.arenaArg())
+i = end`, fn, dest, g.depthArgFor(fn), arenaArg)
 }
 
 // unsupportedf records a generation error for a type the generator cannot decode
@@ -1555,7 +1664,7 @@ if err != nil {
 		return end, err
 	}
 %[6]s
-i = end`, g.typeStr(expr), fn, dest, g.depthArgFor(fn), g.arenaArg(), commit)
+i = end`, g.typeStr(expr), fn, dest, g.depthArgFor(fn), g.arenaArgForExpr(expr), commit)
 }
 
 // nullAssigns reports whether a JSON null decoded into a field of this type
