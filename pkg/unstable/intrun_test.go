@@ -312,10 +312,15 @@ func BenchmarkParseIntRunShapes(b *testing.B) {
 	if !useIntRun {
 		b.Skip("no SIMD integer-run kernel on this machine")
 	}
-	for _, elem := range []string{"1,", "12,", "123,", "1234,", "123456,", "1234567,", "1234, "} {
-		data := []byte(strings.Repeat(elem, 3999) + elem[:len(elem)-1] + "]" + strings.Repeat(" ", 80))
+	for _, sh := range []struct{ num, sep string }{
+		{"1", ","}, {"12", ","}, {"123", ","}, {"1234", ","}, {"123456", ","}, {"1234567", ","}, {"1234", ", "},
+	} {
+		// 4000 elements, the last one closed by ']' with no separator after
+		// it (a separator there would be a trailing comma, which the kernel
+		// rightly stops in front of).
+		data := []byte(strings.Repeat(sh.num+sh.sep, 3999) + sh.num + "]" + strings.Repeat(" ", 80))
 		out := make([]int64, 4000)
-		b.Run(strconv.Quote(elem), func(b *testing.B) {
+		b.Run(strconv.Quote(sh.num+sh.sep), func(b *testing.B) {
 			b.SetBytes(int64(len(data)))
 			for i := 0; i < b.N; i++ {
 				if n, _, _ := parseIntRun(data, 0, out); n != 4000 {
