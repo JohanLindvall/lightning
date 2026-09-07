@@ -14,8 +14,9 @@
 //     (several top-level keys in one pass), [GetPaths]/[GetPathsCompact] (several
 //     nested paths in one prefix-sharing pass), and [ObjectEach]/[ObjectEachCompact]
 //     and [ArrayEach]/[ArrayEachCompact] (iterate an object's members or an
-//     array's elements). Returned values alias the input, so the caller must keep
-//     it unchanged while they are in use.
+//     array's elements; a null in the container's place is an empty one).
+//     Returned values alias the input, so the caller must keep it unchanged
+//     while they are in use.
 //   - Edit — splice raw values into a document, creating any missing path:
 //     [Set], [SetMany], [SetPaths]. These write into a caller-provided buffer and
 //     allocate nothing when it is reused.

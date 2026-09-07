@@ -736,6 +736,12 @@ its surrounding quotes with escapes intact, an object or array spans the whole
   array reached by the path `keys` (the root array with no keys), same
   error-stops-iteration contract.
 
+Both walkers treat a JSON `null` in the container's place as a container with
+nothing in it — `fn` is not called and the call returns `nil` — which is what
+unmarshalling `null` into a map or a slice does (it leaves them `nil`) and what
+`{"metric":null}` or `"values":null` mean on the wire. Any other non-container
+value there, a misspelt literal included, is still `ErrExpectObject`/`ErrExpectArray`.
+
 ```go
 // Pull a few fields out of a log record in one pass, reusing a scratch slice.
 keys := []string{"ClientIP", "EdgeResponseStatus", "RayID"}
