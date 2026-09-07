@@ -36,9 +36,22 @@ func scannerCorpus() []string {
 // feedInChunks runs a whole document through the scanner in fixed-size pieces,
 // which is what a caller reading from a network does.
 func feedInChunks(t *testing.T, doc string, size int) (int, bool, error) {
+	return feedInChunksMode(t, doc, size, false)
+}
+
+// feedInChunksFast is the same through the block-scan balance.
+func feedInChunksFast(t *testing.T, doc string, size int) (int, bool, error) {
+	return feedInChunksMode(t, doc, size, true)
+}
+
+func feedInChunksMode(t *testing.T, doc string, size int, fast bool) (int, bool, error) {
 	t.Helper()
 	var s ValueScanner
-	s.Reset()
+	if fast {
+		s.ResetFast()
+	} else {
+		s.Reset()
+	}
 	pos := 0
 	for {
 		hi := pos + size
@@ -79,6 +92,63 @@ func TestValueScannerMatchesSkipValue(t *testing.T) {
 			if err != nil || !done || got != want {
 				t.Fatalf("chunk %d over %.40q: end=%d done=%v err=%v; SkipValue says %d",
 					size, doc, got, done, err, want)
+			}
+		}
+	}
+}
+
+// TestValueScannerFastMatchesSkipValue is ResetFast's contract: on a
+// WELL-FORMED value the block-scan balance ends exactly where SkipValue does,
+// at every chunk size, so a caller stepping past values gets the in-memory
+// walkers' answer. (What the mode changes is malformed input, which ResetFast
+// enumerates by pointing at skipfast.go.)
+//
+// The sizes either side of 64 are the point: the block scan is handed the
+// depth and nothing else, so a chunk boundary that falls inside a string — or
+// just after a backslash — is state it cannot carry, and the first version of
+// this got a 900-byte padding string wrong at exactly those splits while
+// passing at 1, 7 and "the whole value at once".
+func TestValueScannerFastMatchesSkipValue(t *testing.T) {
+	if !useSkipBlocks {
+		t.Skip("no block scan on this machine; ResetFast is the scalar balance")
+	}
+	for _, doc := range scannerCorpus() {
+		want, err := SkipValue([]byte(doc), 0)
+		if err != nil {
+			t.Fatalf("premise: SkipValue(%.40q) = %v", doc, err)
+		}
+		for _, size := range []int{1, 2, 3, 7, 16, 63, 64, 65, 100, 127, 128, 129, 200, 4096, len(doc), len(doc) + 1} {
+			if size <= 0 {
+				continue
+			}
+			got, done, err := feedInChunksFast(t, doc, size)
+			if err != nil || !done || got != want {
+				t.Fatalf("fast chunk %d over %.40q: end=%d done=%v err=%v; SkipValue says %d",
+					size, doc, got, done, err, want)
+			}
+		}
+	}
+}
+
+// TestValueScannerFastStraddlesStrings walks a chunk boundary across every
+// byte of a value whose strings hold quotes, backslashes and brackets, which
+// is every position the carried state can be wrong in.
+func TestValueScannerFastStraddlesStrings(t *testing.T) {
+	if !useSkipBlocks {
+		t.Skip("no block scan on this machine")
+	}
+	body := `{"a":"x]}\"y","b":["p\\","q\"r",{"c":"[[["}],"d":1}`
+	for _, pad := range []int{0, 1, 7, 31, 60, 61, 62, 63, 64, 65, 100} {
+		doc := `{"pad":"` + strings.Repeat("z", pad) + `","v":` + body + `},`
+		want, err := SkipValue([]byte(doc), 0)
+		if err != nil {
+			t.Fatalf("premise: SkipValue(%.40q) = %v", doc, err)
+		}
+		for size := 1; size <= len(doc)+1; size++ {
+			got, done, err := feedInChunksFast(t, doc, size)
+			if err != nil || !done || got != want {
+				t.Fatalf("fast chunk %d pad %d over %.60q: end=%d done=%v err=%v; want %d",
+					size, pad, doc, got, done, err, want)
 			}
 		}
 	}

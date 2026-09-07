@@ -9,14 +9,17 @@ package unstable
 // the start after every refill — a "refill and retry SkipValue from the value's
 // first byte" loop is O(n²) in the number of chunks a value arrives in.
 //
-// Semantics are the scalar skip path's, byte for byte: skipObject/skipArray's
-// typed bracket balance (a stray closer of the OTHER kind is stepped over, not
-// counted), SkipString's escape handling, skipNumber's accept set of
-// [0-9.eE+-] (it measures a number token, it does not validate one) and the
-// literal arms' exact match against "true"/"false"/"null". The same errors come
-// back: ErrBadNumber for a byte that starts no value, ErrInvalidJSON for a
-// misspelt literal, ErrMaxDepth past MaxDepth, and ErrTruncated for input that
-// ends inside a string or a container.
+// After [ValueScanner.Reset] the semantics are the scalar skip path's, byte for
+// byte: skipObject/skipArray's typed bracket balance (a stray closer of the
+// OTHER kind is stepped over, not counted), SkipString's escape handling,
+// skipNumber's accept set of [0-9.eE+-] (it measures a number token, it does
+// not validate one) and the literal arms' exact match against
+// "true"/"false"/"null". The same errors come back: ErrBadNumber for a byte
+// that starts no value, ErrInvalidJSON for a misspelt literal, ErrMaxDepth past
+// MaxDepth, and ErrTruncated for input that ends inside a string or a
+// container. After [ValueScanner.ResetFast] the containers are balanced by the
+// block scan instead, which is what a caller stepping past a value it will
+// never look at wants; that method says what changes.
 //
 // It is NOT the same code as SkipValue and does not always agree with it on
 // MALFORMED input — SkipValue may take the SIMD in-string-mask path, whose
@@ -28,7 +31,12 @@ type ValueScanner struct {
 	depth    int
 	inString bool
 	escaped  bool
-	lit      string // the bytes of a literal still to match
+	// fast selects the block-scan container balance; see ResetFast. isArray
+	// is the kind of the container it is balancing, which that scan needs and
+	// the scalar one keeps per level in kinds instead.
+	fast    bool
+	isArray bool
+	lit     string // the bytes of a literal still to match
 	// kinds[d/64] bit d%64 is set when the container opened at depth d+1 is an
 	// object, clear when it is an array — the type stack skipObject and
 	// skipArray keep as their recursion. Never cleared: every bit is written
@@ -51,6 +59,27 @@ const (
 // stack, which is written before it is read.
 func (s *ValueScanner) Reset() {
 	s.state, s.depth, s.inString, s.escaped, s.lit = scanValueStart, 0, false, false, ""
+	s.fast = false
+}
+
+// ResetFast prepares the scanner for a value that is being STEPPED OVER rather
+// than read, and balances its containers with the in-string-mask block scan
+// (skipfast.go) instead of the structural walk — 0.25 instructions a byte
+// against 3.5, because a 64-byte block of string bodies, numbers and
+// whitespace costs one pass rather than a call per structural byte.
+//
+// That is the scan the in-memory walkers already use for a member they were
+// not asked for, so a caller skipping past values gets the same answer they
+// do; what it costs is the same path's divergences on MALFORMED input, which
+// skipfast.go's header enumerates (an unbalanced bracket of the other kind,
+// nesting past MaxDepth, a stray backslash outside a string). The scan the
+// value's own reader would do is unaffected: this is only for bytes nobody
+// will look at. Where the block scan has no assembly (useSkipBlocks false —
+// an amd64 without AVX2, and the architectures with neither) the scalar
+// balance runs and nothing changes, exactly as SkipValue itself falls back.
+func (s *ValueScanner) ResetFast() {
+	s.Reset()
+	s.fast = useSkipBlocks
 }
 
 // Feed advances the scan over the next chunk of the document, which must
@@ -76,10 +105,10 @@ func (s *ValueScanner) Feed(chunk []byte, final bool) (n int, done bool, err err
 		case '"':
 			s.state = scanString
 		case '{':
-			s.state = scanContainer
+			s.state, s.isArray = scanContainer, false
 			s.push(true)
 		case '[':
-			s.state = scanContainer
+			s.state, s.isArray = scanContainer, true
 			s.push(false)
 		case 't':
 			s.state, s.lit = scanLiteral, "rue"
@@ -143,6 +172,9 @@ func (s *ValueScanner) Feed(chunk []byte, final bool) (n int, done bool, err err
 		return end, false, nil
 
 	case scanContainer:
+		if s.fast {
+			return s.containerFast(chunk, i, final)
+		}
 		return s.container(chunk, i, final)
 	}
 	return i, true, nil // scanDone: the caller fed past the end
@@ -197,6 +229,101 @@ func (s *ValueScanner) container(chunk []byte, i int, final bool) (int, bool, er
 		return i, false, ErrTruncated
 	}
 	return i, false, nil
+}
+
+// containerFast is container's block-scan form: skipContainerFast's balance,
+// resumed at each chunk boundary. See ResetFast for what selects it and what
+// it costs.
+//
+// The block scan is handed only the depth — it starts each call outside a
+// string with no escape pending, which is all skipContainerFast ever needs
+// because it runs once over a whole value. A chunk that BEGINS inside a string
+// therefore has to be walked out of it first, which stringBody does with the
+// same vectorized scan the scalar path uses; a boundary lands inside a string
+// once in a while and the walk is over by the string's closing quote. The two
+// bits that survive a boundary are the scanner's own inString and escaped,
+// which the block scan's two masks reduce to exactly.
+//
+// The ragged end — fewer than 64 bytes, and whatever is left when the input
+// ends — is skipContainerFast's tail loop written out again rather than
+// shared. That function IS the tail, and nothing else, for every container
+// under 64 bytes, which is every unknown-field skip a generated decoder does;
+// a call there to save fifteen duplicated lines of byte loop would be paid by
+// all of them.
+func (s *ValueScanner) containerFast(chunk []byte, i int, final bool) (int, bool, error) {
+	pos := i
+	if s.escaped {
+		// A backslash ended the previous chunk, so this byte is inert. Outside
+		// a string that is meaningless JSON and reachable only on malformed
+		// input, where the block scan's bit math — which cannot tell where the
+		// backslash was — does the same thing.
+		if pos >= len(chunk) {
+			if final {
+				return pos, false, ErrTruncated
+			}
+			return pos, false, nil
+		}
+		s.escaped = false
+		pos++
+	}
+	if s.inString {
+		end, closed := s.stringBody(chunk, pos)
+		if !closed {
+			if final {
+				return end, false, ErrTruncated
+			}
+			return end, false, nil
+		}
+		s.inString = false
+		pos = end
+	}
+	if useSkipBlocks && pos+64 <= len(chunk) {
+		end, d, pe, pis := skipBlocks(chunk, pos, s.depth, s.isArray)
+		if end >= 0 {
+			s.state = scanDone
+			return end, true, nil
+		}
+		pos += (len(chunk) - pos) &^ 63
+		s.depth, s.inString, s.escaped = d, pis != 0, pe != 0
+	}
+	open, close := byte('{'), byte('}')
+	if s.isArray {
+		open, close = '[', ']'
+	}
+	inStr, esc := s.inString, s.escaped
+	for ; uint(pos) < uint(len(chunk)); pos++ {
+		c := chunk[pos]
+		if esc {
+			esc = false
+			continue
+		}
+		if inStr {
+			switch c {
+			case '\\':
+				esc = true
+			case '"':
+				inStr = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inStr = true
+		case open:
+			s.depth++
+		case close:
+			s.depth--
+			if s.depth == 0 {
+				s.state = scanDone
+				return pos + 1, true, nil
+			}
+		}
+	}
+	s.inString, s.escaped = inStr, esc
+	if final {
+		return pos, false, ErrTruncated
+	}
+	return pos, false, nil
 }
 
 // stringBody advances past the body of the string whose opening quote is
