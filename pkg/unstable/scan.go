@@ -242,8 +242,3 @@ func (s *ValueScanner) isObject() bool {
 	d := s.depth - 1
 	return s.kinds[d/64]&(1<<(uint(d)%64)) != 0
 }
-
-// isNumberByte is skipNumber's accept set.
-func isNumberByte(c byte) bool {
-	return (c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-'
-}

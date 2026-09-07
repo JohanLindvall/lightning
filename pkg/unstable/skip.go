@@ -110,21 +110,18 @@ func SkipString(data []byte, i int) (int, error) {
 // call, a frame and a switch each, which is a third of the walk. Every other
 // leading byte must still go to SkipValue — SkipNumber does not replace it,
 // and the two agree only where the caller has established that the value is a
-// number. Re-check `go build -gcflags=-m` after any edit here: at cost 78 of
-// the budget's 80 this function has two units of headroom, and losing the
-// inlining silently gives every one of those callers its call back.
+// number. Re-check `go build -gcflags=-m` after any edit here: losing the
+// inlining silently gives every one of those callers its call back. Moving the
+// accept set behind isNumberByte left it at cost 35 on the architectures that
+// take the table and 59 on amd64, where it had been 78 of the budget's 80.
+//
+// There is no step for a leading '-' in front of the loop. There was one, and
+// it never did anything: the loop's own accept set contains '-', so the step
+// only re-recognised a byte the first iteration would have taken anyway.
 func SkipNumber(data []byte, i int) (int, error) {
 	start := i
-	if uint(i) < uint(len(data)) && data[i] == '-' {
+	for uint(i) < uint(len(data)) && isNumberByte(data[i]) {
 		i++
-	}
-	for uint(i) < uint(len(data)) {
-		c := data[i]
-		if (c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-' {
-			i++
-			continue
-		}
-		break
 	}
 	if i == start {
 		return i, ErrBadNumber
