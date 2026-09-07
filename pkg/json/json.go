@@ -14,8 +14,10 @@
 //     (several top-level keys in one pass), [GetPaths]/[GetPathsCompact] (several
 //     nested paths in one prefix-sharing pass), and [ObjectEach]/[ObjectEachCompact]
 //     and [ArrayEach]/[ArrayEachCompact] (iterate an object's members or an
-//     array's elements). Returned values alias the input, so the caller must keep
-//     it unchanged while they are in use.
+//     array's elements; [ArrayEachIndex]/[ArrayEachIndexCompact] hand the
+//     element's index along, and a callback returning [ErrStop] ends any walk
+//     early without an error). Returned values alias the input, so the caller
+//     must keep it unchanged while they are in use.
 //   - Edit — splice raw values into a document, creating any missing path:
 //     [Set], [SetMany], [SetPaths]. These write into a caller-provided buffer and
 //     allocate nothing when it is reused.
@@ -51,7 +53,11 @@
 // package is not a stable API and should not be imported directly.
 package json
 
-import "github.com/JohanLindvall/lightning/pkg/unstable"
+import (
+	"errors"
+
+	"github.com/JohanLindvall/lightning/pkg/unstable"
+)
 
 // Errors reported by this package. They are re-exported from pkg/unstable so that
 // callers of the stable API can match them with errors.Is without importing the
@@ -88,6 +94,15 @@ var (
 	// parse (neither RFC 3339 nor a Unix timestamp).
 	ErrBadTime = unstable.ErrBadTime
 )
+
+// ErrStop ends a walk early without making it a failure: when the callback
+// of [ObjectEach], [ArrayEach] or [ArrayEachIndex] (or a Compact form)
+// returns it, the walker stops and returns nil. Any other error the callback
+// returns stops the walk too and is returned as it is — so a caller who wants
+// the first element that matches no longer invents a private sentinel and
+// filters it back out of the result. It is compared with errors.Is, so a
+// wrapped ErrStop stops as well.
+var ErrStop = errors.New("json: stop iteration")
 
 // MaxDepth is how deeply nested a document may be before DecodeAny, Valid,
 // StripDefaults and the generated decoders for recursive schemas give up

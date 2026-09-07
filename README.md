@@ -735,6 +735,27 @@ its surrounding quotes with escapes intact, an object or array spans the whole
   — the array counterpart of `ObjectEach`: calls `fn` for every element of the
   array reached by the path `keys` (the root array with no keys), same
   error-stops-iteration contract.
+- `ArrayEachIndex(data []byte, fn func(index int, value []byte) error, keys ...string) error`
+  — `ArrayEach` with the element's position handed along, `0` for the first.
+  A fixed-shape array — the `[timestamp, value]` pair of a time series, a
+  `[key, value]` tuple — reads by position without the caller keeping a
+  counter in the closure.
+
+A callback that returns `ErrStop` ends any of these walks early **without**
+making it a failure: the walker returns `nil`. Any other error stops the walk
+too and is returned as it is. So "the first element that matches" no longer
+means inventing a private sentinel and filtering it back out of the result:
+
+```go
+var first []byte
+err := json.ArrayEach(data, func(v []byte) error {
+    if matches(v) {
+        first = v
+        return json.ErrStop
+    }
+    return nil
+})
+```
 
 ```go
 // Pull a few fields out of a log record in one pass, reusing a scratch slice.
@@ -744,7 +765,8 @@ vals, err := json.GetMany(data, keys, scratch[:0])
 ```
 
 Each function has a **compact counterpart** — `GetCompact`, `LookupCompact`,
-`GetManyCompact`, `GetPathsCompact`, `ObjectEachCompact`, `ArrayEachCompact` —
+`GetManyCompact`, `GetPathsCompact`, `ObjectEachCompact`, `ArrayEachCompact`,
+`ArrayEachIndexCompact` —
 with the identical signature and result. Like the
 [`//lightning:compact`](#lightningcompact) directive, they assume the input has
 no whitespace *between* tokens (the form `encoding/json`'s `Marshal` and most
@@ -852,7 +874,9 @@ Errors returned by these helpers are the package's exported sentinels —
 `ErrKeyNotFound`, `ErrInvalidJSON`, `ErrTruncated`, `ErrExpectObject`,
 `ErrExpectArray`, `ErrExpectColon`, `ErrMaxDepth`, `ErrBadNumber`,
 `ErrBadEscape`, `ErrBadUnicode`, `ErrBadTime` — so callers can match them with
-`errors.Is` without importing the internal `pkg/unstable` package.
+`errors.Is` without importing the internal `pkg/unstable` package. `ErrStop` is
+the one that is not a failure: returned from a walker's callback, it ends the
+walk with a `nil` result.
 
 ## String escaping and unescaping
 
@@ -1227,7 +1251,7 @@ Representative numbers for a 1.8 KB Cloudflare log (Go 1.26, amd64):
 |---|---|
 | [`main.go`](main.go) | the generator (`package main`) |
 | [`pkg/unstable`](pkg/unstable) | the (unstable, do-not-import) runtime the generated decoders call into |
-| [`pkg/json`](pkg/json) | small public API over the scanner (`Get`/`Lookup`/`GetMany`/`GetPaths`/`ObjectEach`/`ArrayEach`, `Valid`, `DecodeAny`, `Escape`/`UnescapeString`, `ParseFloat`, `StripDefaults`, `Set`/`SetMany`/`SetPaths` and their `…Checked` forms) |
+| [`pkg/json`](pkg/json) | small public API over the scanner (`Get`/`Lookup`/`GetMany`/`GetPaths`/`ObjectEach`/`ArrayEach`/`ArrayEachIndex`, `Valid`, `DecodeAny`, `Escape`/`UnescapeString`, `ParseFloat`, `StripDefaults`, `Set`/`SetMany`/`SetPaths` and their `…Checked` forms) |
 | [`bench/`](bench) | benchmark module: hand-written `data.go` + `input.json` per case, plus the generated decoders, harness, and results |
 
 Generated files (`*_unmarshal.go`, `bench/*/bench_test.go`, `bench/*/ej/`, and
