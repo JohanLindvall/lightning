@@ -14,7 +14,9 @@
 //     (several top-level keys in one pass), [GetPaths]/[GetPathsCompact] (several
 //     nested paths in one prefix-sharing pass), and [ObjectEach]/[ObjectEachCompact]
 //     and [ArrayEach]/[ArrayEachCompact] (iterate an object's members or an
-//     array's elements; a null in the container's place is an empty one).
+//     array's elements; [ArrayEachIndex]/[ArrayEachIndexCompact] hand the
+//     element's index along, a callback returning [ErrStop] ends any walk early
+//     without an error, and a null in the container's place is an empty one).
 //     Returned values alias the input, so the caller must keep it unchanged
 //     while they are in use. [KindOf] says what a returned value is; [String]
 //     and [Bool] turn a returned scalar token into its Go value; [ParseFloat]
@@ -59,6 +61,7 @@ package json
 
 import (
 	"bytes"
+	"errors"
 
 	"github.com/JohanLindvall/lightning/pkg/unstable"
 )
@@ -98,6 +101,15 @@ var (
 	// parse (neither RFC 3339 nor a Unix timestamp).
 	ErrBadTime = unstable.ErrBadTime
 )
+
+// ErrStop ends a walk early without making it a failure: when the callback
+// of [ObjectEach], [ArrayEach] or [ArrayEachIndex] (or a Compact form)
+// returns it, the walker stops and returns nil. Any other error the callback
+// returns stops the walk too and is returned as it is — so a caller who wants
+// the first element that matches no longer invents a private sentinel and
+// filters it back out of the result. It is compared with errors.Is, so a
+// wrapped ErrStop stops as well.
+var ErrStop = errors.New("json: stop iteration")
 
 // MaxDepth is how deeply nested a document may be before DecodeAny, Valid,
 // StripDefaults and the generated decoders for recursive schemas give up

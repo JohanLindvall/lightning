@@ -1,6 +1,10 @@
 package json
 
-import "github.com/JohanLindvall/lightning/pkg/unstable"
+import (
+	"errors"
+
+	"github.com/JohanLindvall/lightning/pkg/unstable"
+)
 
 // GetMany looks up several top-level members of the JSON object in data at once,
 // in a single pass over the object, and returns their raw value bytes in the
@@ -463,8 +467,8 @@ func get(data []byte, compact bool, keys ...string) ([]byte, int, error) {
 // null in the object's place is an object with no members: fn is not called
 // and ObjectEach returns nil, as unmarshalling null into a map leaves it nil
 // rather than failing. If fn returns a non-nil error, iteration stops and that
-// error is returned. Non-target members along the path are skipped without
-// allocating.
+// error is returned — unless it is [ErrStop], which ends the walk with a nil
+// result. Non-target members along the path are skipped without allocating.
 func ObjectEach(data []byte, fn func(key string, value []byte) error, keys ...string) error {
 	return objectEach(data, fn, false, keys...)
 }
@@ -537,6 +541,9 @@ func objectEach(data []byte, fn func(key string, value []byte) error, compact bo
 			return err
 		}
 		if err := fn(key, data[start:end]); err != nil {
+			if errors.Is(err, ErrStop) {
+				return nil
+			}
 			return err
 		}
 		i = unstable.SkipWSCompact(data, end, compact)
@@ -567,8 +574,9 @@ func objectEach(data []byte, fn func(key string, value []byte) error, compact bo
 // null in the array's place is an array with no elements: fn is not called
 // and ArrayEach returns nil, as unmarshalling null into a slice leaves it nil
 // rather than failing. If fn returns a non-nil error, iteration stops and that
-// error is returned. Non-target members along the path are skipped without
-// allocating.
+// error is returned — unless it is [ErrStop], which ends the walk with a nil
+// result. Non-target members along the path are skipped without allocating.
+// [ArrayEachIndex] is the same walk with the element's index handed to fn.
 func ArrayEach(data []byte, fn func(value []byte) error, keys ...string) error {
 	return arrayEach(data, fn, false, keys...)
 }
@@ -618,6 +626,82 @@ func arrayEach(data []byte, fn func(value []byte) error, compact bool, keys ...s
 			return err
 		}
 		if err := fn(data[start:end]); err != nil {
+			if errors.Is(err, ErrStop) {
+				return nil
+			}
+			return err
+		}
+		i = unstable.SkipWSCompact(data, end, compact)
+		if uint(i) >= uint(len(data)) {
+			return unstable.ErrTruncated
+		}
+		switch data[i] {
+		case ']':
+			return nil
+		case ',':
+			i = unstable.SkipWSCompact(data, i+1, compact)
+			if uint(i) >= uint(len(data)) {
+				return unstable.ErrTruncated
+			}
+		default:
+			return unstable.ErrInvalidJSON
+		}
+	}
+}
+
+// ArrayEachIndex is ArrayEach with the element's position handed to fn as
+// well: index is 0 for the first element and counts up. A fixed-shape array —
+// the [timestamp, value] pair of a time series, a [key, value] tuple — reads
+// by position without the caller keeping a counter in the closure, and a
+// walk that wants the n-th element returns [ErrStop] from it.
+func ArrayEachIndex(data []byte, fn func(index int, value []byte) error, keys ...string) error {
+	return arrayEachIndex(data, fn, false, keys...)
+}
+
+// ArrayEachIndexCompact is ArrayEachIndex for compact JSON, with
+// ArrayEachCompact's contract.
+func ArrayEachIndexCompact(data []byte, fn func(index int, value []byte) error, keys ...string) error {
+	return arrayEachIndex(data, fn, true, keys...)
+}
+
+// arrayEachIndex is arrayEach with a counter. It is written out rather than
+// shared — ArrayEach wrapping it in a closure would add a second indirect
+// call to every element of the hot walker — and the two are held to the same
+// spans by TestArrayEachIndexMatchesArrayEach.
+func arrayEachIndex(data []byte, fn func(index int, value []byte) error, compact bool, keys ...string) error {
+	i := unstable.SkipWS(data, 0)
+	for _, key := range keys {
+		var err error
+		i, err = objectField(data, i, key, compact)
+		if err != nil {
+			return err
+		}
+	}
+	i = unstable.SkipWSCompact(data, i, compact)
+	if uint(i) >= uint(len(data)) {
+		return unstable.ErrTruncated
+	}
+	if data[i] != '[' {
+		return unstable.ErrExpectArray
+	}
+	i++
+	i = unstable.SkipWSCompact(data, i, compact)
+	if uint(i) >= uint(len(data)) {
+		return unstable.ErrTruncated
+	}
+	if data[i] == ']' {
+		return nil
+	}
+	for n := 0; ; n++ {
+		start := i
+		end, err := unstable.SkipValue(data, i)
+		if err != nil {
+			return err
+		}
+		if err := fn(n, data[start:end]); err != nil {
+			if errors.Is(err, ErrStop) {
+				return nil
+			}
 			return err
 		}
 		i = unstable.SkipWSCompact(data, end, compact)
