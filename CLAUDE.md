@@ -1893,6 +1893,120 @@ byte-identical when adding cold paths; push new logic out-of-line.
   −14.8%, nothing slower. The literals are matched with the constant-string
   compare `SkipValue`'s arms already use, and what follows them is measured
   with `SkipWS` — see the whitespace note in the conventions.
+- **`SkipNumber`'s accept set is a table on every architecture but amd64**
+  (`isNumberByte` in `numbyte_table.go`/`numbyte_cmp.go`, 2026-09-07,
+  Neoverse N2). The loop's per-byte test was the six comparisons the accept
+  set `[0-9.eE+-]` spells out, and the byte that ENDS a token runs all six
+  before it can be rejected — so a one-digit token pays about as much leaving
+  the loop as being in it. One load from a `[256]bool` answers instead. The
+  saving is **flat at 17 instructions per token**, not per digit: the slope
+  through token lengths 1, 3 and 10 is eight instructions a digit either way,
+  and what the table removes is the terminator's comparison ladder plus the
+  redundant leading-`-` step. So the shorter the token the larger the win —
+  the opposite of what a SWAR fold offers, which is why the two suit different
+  cores. The dependent load looks like it should hurt and does not: the loop's branch is
+  predicted, so each iteration's load of `data[i]` issues without waiting for
+  the previous iteration's table load and only the branch waits, which is what
+  makes this an issue-count win on a core with no dispatch to spare. Measured
+  over a 200-element array walk, per token shape, cycles / instructions: one
+  digit **−18% / −26%**, three digits −9% / −21%, ten digits −5% / −12%,
+  `1.5` −12% / −24%, `1.5e-7` **−24% / −30%**,
+  `0.000698752666567719` −8% / −9%; five- and nineteen-digit tokens were timed
+  but not counted, at −8% and −5%. **No shape is slower** —
+  which is the point, and what separates it from the word peel in the rejected
+  list. End to end (interleaved ABBA, n=6, pinned, `-funcalign=64`): decoder
+  corpus **cloudflare −2.7%, cloudflare-nocopy −2.5%, cloudflare-compact
+  −2.5%** (their unknown-field skips are 35 of 48 keys), time-array −0.3%,
+  the other eleven cases flat and none worse; toolkit ArrayEachScalars −1.1%,
+  ArrayEachSeries −3.2%, ObjectEachRecord −3.9%. On Zen 4 the same table
+  measured +9% and +13% on ten- and three-digit tokens, which is why it is a
+  build tag: amd64 keeps the comparisons. Two structural bonuses came free.
+  The redundant step for a leading `-` in front of the loop is gone (the
+  loop's own set contains `-`), and `SkipNumber`'s inline cost fell from 78 of
+  the budget's 80 to **35** on the table architectures and 59 on amd64, so the
+  function whose doc comment warned of "two units of headroom" now has forty.
+  Locked by `TestIsNumberByteMatchesComparisons` (all 256 bytes, both
+  spellings, so an arm64 run checks the table against the accept set) and
+  `TestSkipNumberSpan` (the span and the error against the pre-change byte
+  loop, every offset of every shape).
+- **A bounds check is not just a predicted branch — it can cost a whole stack
+  frame** (`KindOf`, `ParseInt`, `ParseUint`, 2026-09-07, N2). The standing
+  entry on this says the `panicBounds` stubs are cold and free, and the later
+  N2 amendment says the never-taken branch to one is still a dispatch slot.
+  There is a third case, and it is the largest of the three: `panicBounds` is
+  a CALL, so a function that keeps even one bounds check is **not a leaf**,
+  and Go gives it a prologue, an epilogue and a stack-growth check it would
+  otherwise skip entirely. `KindOf` carried three (`string(raw[i:i+4])` behind
+  a `len(raw)-i >= 4` guard the prove pass cannot connect to `i+4 <=
+  len(raw)`) and `ParseInt`/`ParseUint` one each (`b[i]` under a loop-carried
+  cursor). Writing the guards in the unsigned idiom — `uint(i+4) <=
+  uint(len(raw))`, `uint(i) < uint(len(b))` — removed every one and made all
+  three **frameless**: `KindOf` 132 → 92 static instructions, `ParseInt` 324 →
+  272. Per call: KindOf/number 43 → 35 instructions and 7.7 → 5.9 cycles,
+  KindOf/null 61 → 50 and 10.8 → 8.4, ParseInt/3digit 84 → 73 and 14.9 → 13.0,
+  ParseUint/3digit 79 → 68 and 13.7 → 11.7. Interleaved A/B at both link
+  alignments: **KindOf −15.7…−23.4% on every arm, ParseInt −6.7…−25.2%,
+  ParseUint −6.8…−16.6%**. The way to find these is
+  `go build -gcflags=-d=ssa/check_bce`, then check whether the function still
+  has a `morestack` in its disassembly — a small leaf that does is one bounds
+  check away from being free.
+- **`ParseInt`'s short arm indexes instead of reslicing.** `for _, c := range
+  b[i:]` lowers to the bounds compare, the cap subtraction, the negative-length
+  clamp on the base pointer and the len subtraction — the same seven-instruction
+  reslice the `IndexCloseOrEscapeAt` entry records — on the path taken by every
+  token of one to three digits, which is the common one. `for uint(i) <
+  uint(len(b))` with `b[i]` has none of it, and `uint64(b[i]) - '0'` drops the
+  byte truncation the `uint64(c - '0')` form forced. Worth 4 instructions of
+  the 84 a three-digit parse cost, before the frame above went too.
+- **The short-string readers branch where they decide, and gate on one
+  compare** (`json.String`, `unstable.UnescapeString`/`UnescapeStringInto`/
+  `UnescapeStringCopy`). Two shapes, both mechanical. Setting a `clean` flag in
+  a switch and testing it below costs the `CSET` that materialises it and the
+  branch that reads it, on the path every clean short string takes; each arm
+  returning where it decides removes both. And the length gate was `uint(n-4) <
+  29` with an `else if n < 4` behind it — two tests a long input pays before
+  reaching its scan — where `uint(n) < 33` with the short arm inside the switch
+  is one. Together: `String` short −7.8%, medium −6.2%.
+- **The word tests reach `UnescapeString` and `UnescapeStringInto` too, and the
+  corpus is why** (2026-09-07). The `NoBackslash4/8/16` windows landed in
+  `String` and `UnescapeStringCopy` and skipped their two siblings, which still
+  paid `bytes.IndexByte` — a call, 1.9 ns whatever the length — to decide that a
+  seven-byte body has no escape. With the windows: **`UnescapeString`
+  short_clean −28.8%, unicode_heavy −29.6%; `UnescapeStringInto` short_clean
+  −29.1%, unicode_heavy −28.9%** (68 → 53 instructions on the first). The cost
+  is **+3 instructions on a body over 32 bytes** — the gate and its branch —
+  which is +5.2% on a 44-byte one and +5.6% on a 52-byte one, both of them
+  ~19-cycle operations where three instructions really are 5%. That is a bet on
+  body length, and the repo's own corpus settles it rather than taste:
+  **95.8% of the 628 685 strings in `bench/*/input.json` are 32 bytes or
+  shorter**, and every case except `string_unicode` (46.7%, the deliberately
+  long-text one) is above 77% — citm 99.7%, large-json 100%, golang_source
+  95.8%, twitter 90.9%, cloudflare 96.7%. Nine of eleven benchmark shapes are
+  longer than the windows reach, so the shape set says the opposite of what the
+  documents do; the documents win. **`UnescapeStringScan` is the other half of
+  it**: `String` runs the windows on the quoted token, and because they cover
+  every byte a false answer there is CONCLUSIVE, so calling `UnescapeString`
+  (which runs the identical test on the body) cost 24 instructions of pure
+  duplication on every escaped short token. `UnescapeString` spells the scan out
+  rather than calling that entry, since the call was ten instructions on every
+  long body — the same trade `ParseInt` makes against `ParseUint`. Locked by
+  `TestUnescapeFindsEveryEscape`, the sibling of
+  `TestStringFindsEveryEscape`: an escape walked across every position of every
+  body length to 40, held to encoding/json, with capacity stopping at the body.
+  Sabotage-verified — a window four bytes short fails both.
+- **`ErrStop` is compared before `errors.Is` is called** (the three walkers).
+  `errors.Is` opens with that same comparison, so the fast path duplicates no
+  logic and removes only the call — which is the whole cost when the callback
+  returns the sentinel directly, as every caller of an early-exit walk does.
+  `BenchmarkErrStop` **−21.2% (funcalign=64) / −23.8% (default alignment)**,
+  16.7 → 13.2 ns for a walk that stops at the first element.
+- **The array walkers' number predicate is `uint(c)-'-' <= 12`, not
+  `uint(c-'-')`.** With `c` a byte the subtraction wraps at eight bits, so the
+  compiler must truncate before the unsigned compare — a `UBFX` per element.
+  Widening first is the same predicate (`c` below `-` underflows to a huge
+  `uint`, which fails the bound) and costs nothing. One instruction per element
+  of every array walk, and the same shape appears in any `uint(x-k) <= n` range
+  test written over a byte.
 
 - **The streaming reader assembles values with the SIMD skip and only falls back
   to the resumable scanner for values that dwarf the buffer** (`pkg/json/
@@ -2698,6 +2812,23 @@ no regressions.)
   the load's 4-cycle latency sits on the loop's exit branch where a compare
   does not (int10 +9%, int3 +13%). What DID pay is not touching `skipNumber` at
   all but removing the call around it; see the walker entry above.
+
+  **Both halves are amd64's answer, and arm64's is the opposite on the table
+  (2026-09-07, N2).** The table that costs +9%/+13% on Zen 4 measured −5…−24%
+  cycles on EVERY token shape on a Neoverse N2 and is now what that
+  architecture compiles — see the `isNumberByte` entry in the performance
+  architecture, and note the mechanism the Zen 4 reading gets right for its own
+  core and wrong for the other: the exit branch waits on the table load, but the
+  NEXT iteration's load of `data[i]` does not, so on a core that is issue-bound
+  rather than dispatch-rich the loads pipeline under a predicted branch and only
+  the instruction count is left. The **word peel** re-measured on N2 in the same
+  pass, on top of the table, and stayed rejected for the reason this entry
+  gives: eight digits folded in one word is −38% cycles at ten digits and −53%
+  at nineteen, but +20% at three digits, +18% on `1.5` and +21% at one digit,
+  with a break-even at eight digits and no signal to dispatch on. The committed
+  walker benchmarks are all ten-digit timestamps, so the peel would have looked
+  excellent on exactly the shapes the suite happens to hold; that is the trap,
+  not the evidence.
 - **The same inline dispatch in `objectEach`, `getMany` and `objectField`
   (2026-09-07).** In `objectEach` the number arm measured ObjectEachRecord
   −2.1% and ObjectEachRecordCompact −6.9% against **ObjectEachPretty +4.8%**
@@ -2735,6 +2866,25 @@ no regressions.)
   default-alignment build of the optimized tree against the default-alignment
   build of the BASELINE tree showed +19%, which is a comparison of two
   different lottery draws, not of the code.
+
+  **Reconfirmed 2026-09-07 on a Neoverse N2**, on a change that removes
+  instructions from `arrayEachIndex` and adds none: `-funcalign=64` reported
+  ArrayEachIndexShapes/scalars **+3.1%** and /strings **+1.6%**, the default
+  alignment **−3.6%** and **−2.0%**, and the counters said scalars executed
+  **7.2% fewer** instructions and strings executed *exactly the same number*.
+  So the lottery is not a property of one experiment or one core. When a
+  change touches this function, get the instruction count first; it is the only
+  number that means anything.
+- **Guarding the walkers' key-descent loop so the keyless call pays no spills
+  (2026-09-07).** `arrayEach`/`arrayEachIndex`/`objectEach` spill five
+  registers in front of the `for _, key := range keys` loop because
+  `objectField` might be called from it, and the overwhelmingly common call
+  passes no keys at all — so wrapping the loop in `if len(keys) != 0` should
+  sink those stores into the branch. It does almost nothing: ArrayEachSeries
+  (64 nested keyless walks per op, the shape that pays this prologue most)
+  went 43541 → 43410 instructions, **−0.3%**, and every other case was flat.
+  The register allocator had already placed them about as well as the guard
+  would. Reverted; the source stays as it was.
 
 ## Conventions
 
@@ -4086,3 +4236,77 @@ Three lessons that generalise:
   walk of an escape across every position of every length caught it. Any test
   for a fast path of this kind has to be exhaustive over the dimension the
   bound is in.
+
+## Session 2026-09-07 (second pass): the same toolkit readers, on a Neoverse N2
+
+The six merged PRs and every optimization on top of them were measured on
+Zen 4. This pass re-measured them on the arm64 box the library also targets,
+kept what that core says, and left the amd64 side exactly as it was. Nothing
+here changes the generated decoders' code; the decoder corpus moves only where
+`SkipValue`'s number arm reaches it. Each change has its own entry above; this
+is the map and the settled numbers.
+
+**Result** (interleaved ABBA, n=6-8, pinned N2, benchstat, each figure taken
+from at least two link alignments or from hardware counters — see the
+alignment note below):
+
+| what | change |
+|---|---|
+| `ParseInt` 1 digit / not-an-int / 3 digits | −25.1% / −23.2% / −18.0% |
+| `ParseInt` 5 / 10 / 16 / 19 / 20-digit-overflow | −11.3% / −9.1% / −9.1% / −6.9% / −10.5% |
+| `ParseUint` 3 / 10 / 13 / 20 digits | −16.7% / −9.6% / −9.5% / −6.9% |
+| `KindOf`, every arm | −18.5…−23.4% |
+| `UnescapeString` / `…Into` short_clean, unicode_heavy | −28.9…−29.6% |
+| `ErrStop` (a walk that stops at the first element) | −21.2% |
+| `String` short / medium | −7.8% / −6.1% |
+| `ArrayEachStrings` | −5.6% |
+| `ObjectEachRecord` / Compact / Nested | −2.7…−4.0% / −1.1…−2.5% / −1.5…−2.2% |
+| `ArrayEachSeries` / `ArrayEachRecords` / `ArrayEachScalars` | −0.7…−3.0% / −1.1…−1.5% / −0.9…−1.1% |
+| `StripDefaultsPretty` / `StripDefaults` / Compact | −1.9% / −1.0% / −0.5% |
+| **decoder corpus** cloudflare / -nocopy / -compact | **−2.7% / −2.5% / −2.5%** |
+| decoder corpus, the other eleven cases | flat, none worse |
+
+The costs, all of them the one trade this pass took deliberately:
+`UnescapeString` and `…Into` on a body longer than the word tests reach —
+url_clean +5.7% / +5.3%, sentence_clean +5.2% / +4.7%, everything else
++0.2…+1.5%. That is +3 instructions on a ~19-cycle operation, against −15 on
+every body of 32 bytes or fewer, and **95.8% of the 628 685 strings in
+`bench/*/input.json` are 32 bytes or fewer**. The benchmark shapes say the
+opposite of the documents because nine of their eleven are long; the documents
+decided it.
+
+- **Two of the four wins were not algorithms — they were a bounds check each.**
+  `KindOf`, `ParseInt` and `ParseUint` call nothing, and all three had a stack
+  frame anyway, because `runtime.panicBounds` is a CALL and one surviving
+  bounds check is enough to make a leaf non-leaf. Writing the guards unsigned
+  removed the checks and the frames together, for a fifth to a quarter of each
+  function. This is the third amendment to the "bounds checks are free" entry
+  and the largest: the stub is free, the branch that reaches it is a dispatch
+  slot, and a check in a small leaf is a whole prologue. `go build
+  -gcflags=-d=ssa/check_bce` finds them; `morestack` in the disassembly says
+  whether removing them bought a frame.
+- **`-funcalign=64` was the outlier, not the tiebreaker, and the mechanism is
+  measurable.** `KindOf` measured **+120%** at funcalign=64 and **−21%** at the
+  default 32, on 35 instructions either way (down from 43). Counters said why:
+  at 64 it takes **0.19 branch mispredicts per call** on a benchmark that does
+  the same thing every iteration, and at 16, 32 and 128 it takes zero and runs
+  5.9 cycles against the baseline's 7.7. One placement aliases in the predictor;
+  the other three agree. So the standing protocol — link both sides
+  `-funcalign=64` — removes the cross-function shift a code-size change causes
+  and can still land on a pathological placement. When a case moves several per
+  cent in one direction at funcalign=64 and the other at the default, **get a
+  third alignment and the mispredict counter** before believing either.
+- **The lottery can live in the BASELINE.** `ArrayEachIndexShapes/scalars` read
+  +3.1% at funcalign=64, −3.5% at the default and +3.1% at 128, which looks
+  like a regression at two votes out of three. Counters: the optimized binary
+  is 5842 and 5841 cycles at the two alignments — stable — and the baseline is
+  5670 and 6048, a 6.6% swing. The change executes **7.2% fewer instructions**
+  and the honest verdict is flat. Do not conclude from a majority of alignments
+  when the disagreement could be on either side; count instructions, then find
+  out which binary is the unstable one.
+- **A polluted benchmark looks exactly like a finding.** A run of this A/B
+  that overlapped with a `go build` on the other core reported KindOf +115%,
+  `StringShapes/long` −28% and half the suite scrambled. The interleaving and
+  the pinning do not rescue a busy box, which the null-guard entry already
+  warns about; the tell was that the *unchanged* shapes moved too. Check
+  `uptime` before and after any A/B that matters.
