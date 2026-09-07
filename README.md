@@ -927,6 +927,18 @@ The [`pkg/json`](pkg/json) package also exposes the scanner's float parser:
   `strconv` (verified by a differential fuzz test). `b` must be exactly one number
   with no surrounding whitespace; trailing bytes or an empty input return an
   error. Nothing is retained or copied.
+- `ParseInt(b []byte) (int64, error)` and `ParseUint(b []byte) (uint64, error)`
+  — the integer counterparts, for the value `Get` or `ObjectEach` hands back
+  when it is an integer, or for a quoted 64-bit integer once its quotes are
+  stripped (ClickHouse quotes every `Int64`/`UInt64` so it survives
+  JavaScript's 53-bit numbers; without these the only way to read such a cell
+  was to allocate a string for `strconv.ParseInt`). Same grammar as
+  `ParseFloat` where it applies — an optional sign, `+` included, leading zeros
+  accepted — and strictly an integer: a fraction or an exponent (`1.0`, `1e3`),
+  an empty input, stray bytes and a magnitude outside the type are all
+  `ErrBadNumber`, never a truncated value. `ParseUint` takes a `+` and refuses
+  a `-`. Held to `strconv.ParseInt`/`ParseUint` over a generated corpus, the
+  `+` on `ParseUint` being the one documented difference.
 
 ## Stripping default fields
 
@@ -1227,7 +1239,7 @@ Representative numbers for a 1.8 KB Cloudflare log (Go 1.26, amd64):
 |---|---|
 | [`main.go`](main.go) | the generator (`package main`) |
 | [`pkg/unstable`](pkg/unstable) | the (unstable, do-not-import) runtime the generated decoders call into |
-| [`pkg/json`](pkg/json) | small public API over the scanner (`Get`/`Lookup`/`GetMany`/`GetPaths`/`ObjectEach`/`ArrayEach`, `Valid`, `DecodeAny`, `Escape`/`UnescapeString`, `ParseFloat`, `StripDefaults`, `Set`/`SetMany`/`SetPaths` and their `…Checked` forms) |
+| [`pkg/json`](pkg/json) | small public API over the scanner (`Get`/`Lookup`/`GetMany`/`GetPaths`/`ObjectEach`/`ArrayEach`, `Valid`, `DecodeAny`, `Escape`/`UnescapeString`, `ParseFloat`/`ParseInt`/`ParseUint`, `StripDefaults`, `Set`/`SetMany`/`SetPaths` and their `…Checked` forms) |
 | [`bench/`](bench) | benchmark module: hand-written `data.go` + `input.json` per case, plus the generated decoders, harness, and results |
 
 Generated files (`*_unmarshal.go`, `bench/*/bench_test.go`, `bench/*/ej/`, and

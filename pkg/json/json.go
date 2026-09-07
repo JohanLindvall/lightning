@@ -26,7 +26,8 @@
 //     does when marshaling; unescaping passes it through, see each function);
 //     [DecodeAny] decodes a whole document into the generic
 //     nil/bool/float64/string/[]any/map[string]any representation; [ParseFloat]
-//     parses a single JSON number.
+//     parses a single JSON number, [ParseInt] and [ParseUint] a single JSON
+//     integer.
 //   - Check — [Valid] reports whether a document is one well-formed JSON value,
 //     without allocating or building the decoded value. It accepts exactly what
 //     [DecodeAny] accepts — that equivalence is the one this package fuzz-tests —
