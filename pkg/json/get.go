@@ -541,7 +541,7 @@ func objectEach(data []byte, fn func(key string, value []byte) error, compact bo
 			return err
 		}
 		if err := fn(key, data[start:end]); err != nil {
-			if errors.Is(err, ErrStop) {
+			if err == ErrStop || errors.Is(err, ErrStop) {
 				return nil
 			}
 			return err
@@ -633,10 +633,16 @@ func arrayEach(data []byte, fn func(value []byte) error, compact bool, keys ...s
 		// routes it to the same scanner. TestArrayEachDispatchMatchesSkipValue
 		// pins the direction that would be one — a predicate that claimed a
 		// quote, a brace or a literal.
+		//
+		// It is uint(c)-'-', not uint(c-'-'): with c a byte the inner form
+		// wraps at eight bits, so the compiler must truncate before the
+		// unsigned compare and that is an instruction per element. Widening
+		// first is the same predicate, since a byte below '-' underflows to a
+		// huge uint and fails the bound.
 		var end int
 		var err error
 		switch c := data[i]; {
-		case uint(c-'-') <= 12:
+		case uint(c)-'-' <= 12:
 			end, err = unstable.SkipNumber(data, i)
 		case c == '"':
 			end, err = unstable.SkipString(data, i)
@@ -647,7 +653,7 @@ func arrayEach(data []byte, fn func(value []byte) error, compact bool, keys ...s
 			return err
 		}
 		if err := fn(data[start:end]); err != nil {
-			if errors.Is(err, ErrStop) {
+			if err == ErrStop || errors.Is(err, ErrStop) {
 				return nil
 			}
 			return err
@@ -730,7 +736,7 @@ func arrayEachIndex(data []byte, fn func(index int, value []byte) error, compact
 		var end int
 		var err error
 		switch c := data[i]; {
-		case uint(c-'-') <= 12:
+		case uint(c)-'-' <= 12:
 			end, err = unstable.SkipNumber(data, i)
 		case c == '"':
 			end, err = unstable.SkipString(data, i)
@@ -741,7 +747,7 @@ func arrayEachIndex(data []byte, fn func(index int, value []byte) error, compact
 			return err
 		}
 		if err := fn(n, data[start:end]); err != nil {
-			if errors.Is(err, ErrStop) {
+			if err == ErrStop || errors.Is(err, ErrStop) {
 				return nil
 			}
 			return err
