@@ -809,6 +809,73 @@ faster; whitespace surrounding the whole document is still tolerated. Feed one
 input that does contain inter-token whitespace and it may return an error, so use
 them only for sources guaranteed compact.
 
+## Streaming
+
+Every function above takes a complete `[]byte`, so a large answer read over the
+network is buffered whole — `io.ReadAll` and then `ArrayEach` — before the
+first byte is scanned. A `Reader` walks the document **as it arrives**, through
+a bounded buffer:
+
+```go
+r := json.NewReader(resp.Body)
+err := r.ArrayEach(func(series []byte) error {
+    // series is one element of the matrix, complete, in the reader's buffer
+    return json.ArrayEach(series, handlePoint, "values")
+}, "data", "result")
+```
+
+- `NewReader(r io.Reader, opts ...ReaderOption) *Reader` — options are
+  `WithBufferSize(n)` (the initial buffer, 64 KiB) and `WithMaxElement(n)` (the
+  point at which one value is `ErrElementTooLarge` rather than a bigger
+  allocation, 64 MiB).
+- `(*Reader).ArrayEach(fn, keys...)` and `(*Reader).ObjectEach(fn, keys...)` —
+  the two walkers, with the in-memory contract: the same path descent, the same
+  sentinels, `ErrStop` from the callback to end a walk early, and a `null`
+  where the container would be walked as an empty one.
+- `(*Reader).Get(keys...)` — read until the value at the path is complete and
+  return it.
+- `(*Reader).Elements(keys...)` — `ArrayEach` as a range-over-func iterator,
+  yielding `(value, nil)` per element and at most one `(nil, err)`.
+- `(*Reader).Reset(io.Reader)` — start another document on the same reader, and
+  the same buffer. A client making the same query repeatedly pays for the
+  buffer once.
+- `(*Reader).Consumed()` and `(*Reader).Buffered()` — how many bytes were read
+  from the source, and the ones read past the end of the document; together
+  they let the caller hand the rest of the stream on.
+
+**The one contract difference — a value is valid only until the callback
+returns.** The in-memory walkers hand back a window onto the caller's own
+`data`, valid as long as that slice lives; the stream reader's window points
+into its buffer, and the next refill may move or overwrite it. A callback that
+keeps anything copies it: `UnescapeStringCopy` for a string body,
+`strings.Clone` for a key, `append([]byte(nil), v...)` for raw bytes. This is
+the one rule that a test, not the compiler, has to enforce for you.
+
+**What it bounds.** The buffer holds at most one complete value plus what has
+been read ahead of it. It grows only when a single value does not fit, and
+never past `WithMaxElement`. Values the walk does not want — the members before
+the one a key path names — are streamed past without ever being buffered whole,
+so a 100 MB sibling costs the read and nothing else.
+
+Measured on a 4 MB Prometheus-style matrix (200 series × 240 `[t,"v"]` points,
+Go 1.26, amd64), walking the series:
+
+| | ns/op | B/op | allocs/op |
+|---|--:|--:|--:|
+| `io.ReadAll` + `ArrayEach` | 256 000 | 2 293 536 | 25 |
+| `NewReader(...).ArrayEach` | 112 000 | 66 992 | 4 |
+| the same, reader reused (`Reset`) | 99 000 | 37 | 1 |
+
+Streaming is *faster* here as well as bounded: reading into one buffer costs
+less than growing a 4 MB one. On small documents it is the other way round —
+a walk of a 20 KB array costs about twice the in-memory one, because the
+per-value bookkeeping is no longer amortised over anything — so this is for
+documents that are large, not for all of them.
+
+**What does not stream.** `Set`, `SetMany`, `SetPaths`, `StripDefaults`,
+`Valid` and `DecodeAny` need the whole value by nature and stay `[]byte` APIs,
+as does a generated `UnmarshalJSON`.
+
 ## Decoding into `any`
 
 When a document's shape isn't known ahead of time — too variable to model, or
@@ -911,6 +978,8 @@ Errors returned by these helpers are the package's exported sentinels —
 so callers can match them with `errors.Is` without importing the internal
 `pkg/unstable` package. `ErrStop` is the one that is not a failure: returned
 from a walker's callback, it ends the walk with a `nil` result.
+[Streaming](#streaming) adds `ErrElementTooLarge`, and returns whatever the
+underlying `io.Reader` reported wrapped, so `errors.Is` reaches that too.
 
 ## String escaping and unescaping
 
@@ -1314,7 +1383,7 @@ Representative numbers for a 1.8 KB Cloudflare log (Go 1.26, amd64):
 |---|---|
 | [`main.go`](main.go) | the generator (`package main`) |
 | [`pkg/unstable`](pkg/unstable) | the (unstable, do-not-import) runtime the generated decoders call into |
-| [`pkg/json`](pkg/json) | small public API over the scanner (`Get`/`Lookup`/`GetMany`/`GetPaths`/`ObjectEach`/`ArrayEach`/`ArrayEachIndex`, `KindOf`, `String`/`Bool`, `Valid`, `DecodeAny`, `Escape`/`UnescapeString`/`UnescapeStringCopy`, `ParseFloat`/`ParseInt`/`ParseUint`, `StripDefaults`, `Set`/`SetMany`/`SetPaths` and their `…Checked` forms) |
+| [`pkg/json`](pkg/json) | small public API over the scanner (`Get`/`Lookup`/`GetMany`/`GetPaths`/`ObjectEach`/`ArrayEach`/`ArrayEachIndex`, `NewReader` for a stream, `KindOf`, `String`/`Bool`, `Valid`, `DecodeAny`, `Escape`/`UnescapeString`/`UnescapeStringCopy`, `ParseFloat`/`ParseInt`/`ParseUint`, `StripDefaults`, `Set`/`SetMany`/`SetPaths` and their `…Checked` forms) |
 | [`bench/`](bench) | benchmark module: hand-written `data.go` + `input.json` per case, plus the generated decoders, harness, and results |
 
 Generated files (`*_unmarshal.go`, `bench/*/bench_test.go`, `bench/*/ej/`, and

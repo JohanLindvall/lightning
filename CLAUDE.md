@@ -24,7 +24,8 @@ allocation-light `json.Unmarshaler` implementations.
 - `pkg/unstable` — the runtime scanning primitives the generated decoders call, plus
   the handful exported for the `pkg/json` toolkit (`SkipWS`/`SkipWSCompact`/`SkipValue`/
   `SkipNumber`/`SkipString`/`ReadKey`/`DecodeValue`/`UnescapeString`/`UnescapeStringCopy`/
-  `ParseFloat`/`ParseInt`/`ParseUint`, the `NoBackslash*` word tests, and the `Err*`
+  `ParseFloat`/`ParseInt`/`ParseUint`, the `NoBackslash*` word tests, `ValueScanner`
+  (the resumable skip `pkg/json`'s stream reader walks with) and the `Err*`
   sentinels). This is where almost all performance work happens. Split into topical
   files: `read.go` (the `Read*` readers), `batch.go` (the batched scalar-array
   readers), `skip.go`, `skipfast.go` (+ `skipfast_{amd64,arm64,noasm}`,
@@ -42,7 +43,8 @@ allocation-light `json.Unmarshaler` implementations.
   pkg/unstable). `EscapeString` lives in `escape.go`. The readers that turn a value a
   walker hands back into a Go value live beside them: `scalar.go` (`String`/`Bool`),
   `kind.go` (`KindOf` and the `Kind…` constants), `parseint.go` (`ParseInt`/`ParseUint`,
-  wrappers over pkg/unstable). **The `Kind` constants carry the `Kind` prefix**
+  wrappers over pkg/unstable); `stream.go` holds `Reader`, the two walkers over an
+  `io.Reader` through a bounded buffer. **The `Kind` constants carry the `Kind` prefix**
   (`KindString`, `KindNumber`, …) because `String` and `Bool` are functions in the same
   package; they were `String`/`Number`/… in the PR that added them and could not both
   land.
@@ -1891,6 +1893,41 @@ byte-identical when adding cold paths; push new logic out-of-line.
   −14.8%, nothing slower. The literals are matched with the constant-string
   compare `SkipValue`'s arms already use, and what follows them is measured
   with `SkipWS` — see the whitespace note in the conventions.
+
+- **The streaming reader assembles values with the SIMD skip and only falls back
+  to the resumable scanner for values that dwarf the buffer** (`pkg/json/
+  stream.go`'s `value`, `pkg/unstable/scan.go`'s `ValueScanner`, 2026-09-07).
+  A walk over a stream has to know when a value has arrived complete before it
+  can hand it to a callback, and the obvious loop — refill, re-run `SkipValue`
+  from the value's first byte — is O(n²) in the number of chunks the value
+  arrives in. The obvious fix, a resumable byte-state machine fed each chunk
+  once, is O(n) and **three times slower per byte**: it is the scalar skip's
+  shape (indexStructural per structural byte, an escape-aware string scan)
+  where `SkipValue` on a buffered value is `skipContainerFast`'s AVX-512 block
+  scan at 10 GB/s. Using the scanner for every value cost a 4 MB matrix
+  document 350 µs against `io.ReadAll` + `ArrayEach`'s 256 µs. So `value` does
+  both: it re-offers the value to `SkipValue` after each refill for a bounded
+  number of attempts (`valueRetries` = 4) and hands over to the scanner only
+  then, which keeps the fast path for every value that is a few refills wide
+  and keeps total re-scanning a small multiple of the value's size for one that
+  is not. Same document, same protocol: **112 µs**, and 99 µs with the reader
+  reused — 2.3-2.6× FASTER than reading it all in first, because growing a 4 MB
+  buffer costs more than filling a 64 KiB one repeatedly. The scanner still
+  earns its place twice over: it is what makes a member the key path skips cost
+  no buffer at all, and it is what stops a value larger than the buffer from
+  being quadratic (`TestStreamHugeElementIsLinear` is a 256 KB value through a
+  one-byte reader — it does not finish if that regresses).
+- **Four call frames per element is what a streaming walk costs if the fast
+  paths are not written out** (same commit). `arrayEach` over a stream reached
+  the buffer through `space` (whitespace), `value` (assemble) and
+  `afterElement` (separator), and on an array of small elements those frames
+  were a third of the walk: 42 µs against the in-memory walker's 14 µs for a
+  22 KB array. Writing the buffered case of each at the call site — SkipValue's
+  result accepted inline, the separator read as `r.buf[r.pos]` when it is
+  there, the byte after a comma likewise — took it to 29 µs, and the matrix
+  document from 564 to 112 µs. The remaining ~2× on small documents is the
+  per-`Reader` buffer allocation plus bookkeeping that has nothing to amortise
+  over; `Reset` is what a caller with many documents uses instead.
 
 ## The inline trick — let the generator write hot bodies inline
 
