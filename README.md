@@ -736,6 +736,20 @@ its surrounding quotes with escapes intact, an object or array spans the whole
   array reached by the path `keys` (the root array with no keys), same
   error-stops-iteration contract.
 
+A value those functions return is a raw token, and the scalar readers turn
+one into its Go value without the caller re-deriving the grammar:
+
+- `String(raw []byte) (string, error)` — decodes a string token (`"…"`, quotes
+  on, escapes intact) with `UnescapeString`'s contract: an escape-free token
+  yields a string that aliases `raw` (keep it unchanged while the result is in
+  use, or clone it when it outlives the input), an escaped one a fresh string.
+  Anything that is not a string token — a number, `null`, a container, an
+  unterminated string — is `ErrExpectString`; a bad escape inside the quotes is
+  `ErrBadEscape`/`ErrBadUnicode`.
+- `Bool(raw []byte) (bool, error)` — reads `true` or `false`; anything else,
+  `null` included, is `ErrExpectBool`.
+- A number is read with [`ParseFloat`](#number-parsing).
+
 ```go
 // Pull a few fields out of a log record in one pass, reusing a scratch slice.
 keys := []string{"ClientIP", "EdgeResponseStatus", "RayID"}
@@ -850,9 +864,10 @@ accept a trailing comma.)
 
 Errors returned by these helpers are the package's exported sentinels —
 `ErrKeyNotFound`, `ErrInvalidJSON`, `ErrTruncated`, `ErrExpectObject`,
-`ErrExpectArray`, `ErrExpectColon`, `ErrMaxDepth`, `ErrBadNumber`,
-`ErrBadEscape`, `ErrBadUnicode`, `ErrBadTime` — so callers can match them with
-`errors.Is` without importing the internal `pkg/unstable` package.
+`ErrExpectArray`, `ErrExpectString`, `ErrExpectBool`, `ErrExpectColon`,
+`ErrMaxDepth`, `ErrBadNumber`, `ErrBadEscape`, `ErrBadUnicode`, `ErrBadTime` —
+so callers can match them with `errors.Is` without importing the internal
+`pkg/unstable` package.
 
 ## String escaping and unescaping
 
@@ -1227,7 +1242,7 @@ Representative numbers for a 1.8 KB Cloudflare log (Go 1.26, amd64):
 |---|---|
 | [`main.go`](main.go) | the generator (`package main`) |
 | [`pkg/unstable`](pkg/unstable) | the (unstable, do-not-import) runtime the generated decoders call into |
-| [`pkg/json`](pkg/json) | small public API over the scanner (`Get`/`Lookup`/`GetMany`/`GetPaths`/`ObjectEach`/`ArrayEach`, `Valid`, `DecodeAny`, `Escape`/`UnescapeString`, `ParseFloat`, `StripDefaults`, `Set`/`SetMany`/`SetPaths` and their `…Checked` forms) |
+| [`pkg/json`](pkg/json) | small public API over the scanner (`Get`/`Lookup`/`GetMany`/`GetPaths`/`ObjectEach`/`ArrayEach`, `String`/`Bool`, `Valid`, `DecodeAny`, `Escape`/`UnescapeString`, `ParseFloat`, `StripDefaults`, `Set`/`SetMany`/`SetPaths` and their `…Checked` forms) |
 | [`bench/`](bench) | benchmark module: hand-written `data.go` + `input.json` per case, plus the generated decoders, harness, and results |
 
 Generated files (`*_unmarshal.go`, `bench/*/bench_test.go`, `bench/*/ej/`, and
