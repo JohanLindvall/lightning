@@ -40,7 +40,8 @@ func (k Kind) String() string {
 // and threw it away; without this every caller branched on raw[0] itself.
 //
 // Leading and trailing whitespace is tolerated, as [Get] tolerates it at a
-// document's root. A literal is matched whole — null, true and false with
+// document's root — and by the same rule, which counts every byte <= 0x20 (see
+// the literal cases below). A literal is matched whole — null, true and false with
 // nothing else around them — so a misspelling (nul, truex) is KindInvalid, while
 // a string, number, array or object is classified by its opening byte alone,
 // exactly as the scanner dispatches on it: KindOf says what a value IS, and
@@ -48,33 +49,54 @@ func (k Kind) String() string {
 // or '+' (the sign the rest of this library accepts).
 func KindOf(raw []byte) Kind {
 	i := unstable.SkipWS(raw, 0)
-	if i >= len(raw) {
+	if uint(i) >= uint(len(raw)) {
 		return KindInvalid
 	}
-	switch raw[i] {
-	case '"':
-		return KindString
-	case '{':
-		return KindObject
-	case '[':
-		return KindArray
-	case '-', '+', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
-		return KindNumber
-	case 'n', 't', 'f':
-		// A literal is the whole of what remains, whitespace aside.
-		end := len(raw)
-		for end > i && isWS(raw[end-1]) {
-			end--
-		}
-		switch string(raw[i:end]) {
-		case "null":
+	c := raw[i]
+	if k := kindOfByte[c]; k != kindLiteral {
+		return Kind(k)
+	}
+	// A literal must be the whole of what remains. The comparison is against a
+	// constant, which the compiler does as one word load and one compare, and
+	// what follows is measured with the same SkipWS that skipped what came
+	// before: this package's whitespace is every byte <= 0x20, the
+	// one-compare shortcut its decoder and Valid take, and a KindOf that
+	// tolerated a different set at the two ends of the same value would answer
+	// for a document neither of them would accept.
+	switch c {
+	case 'n':
+		if len(raw)-i >= 4 && string(raw[i:i+4]) == "null" && unstable.SkipWS(raw, i+4) == len(raw) {
 			return KindNull
-		case "true", "false":
+		}
+	case 't':
+		if len(raw)-i >= 4 && string(raw[i:i+4]) == "true" && unstable.SkipWS(raw, i+4) == len(raw) {
+			return KindBool
+		}
+	default:
+		if len(raw)-i >= 5 && string(raw[i:i+5]) == "false" && unstable.SkipWS(raw, i+5) == len(raw) {
 			return KindBool
 		}
 	}
 	return KindInvalid
 }
 
-// isWS is the JSON grammar's whitespace set.
-func isWS(c byte) bool { return c == ' ' || c == '\t' || c == '\n' || c == '\r' }
+// kindOfByte maps a value's opening byte to its kind — the dispatch the
+// scanner makes, as one load — with kindLiteral standing for the three bytes
+// a literal can start with, which need the rest of the token read before they
+// can be answered.
+const kindLiteral = 0xff
+
+var kindOfByte = [256]uint8{
+	'"': uint8(KindString),
+	'{': uint8(KindObject),
+	'[': uint8(KindArray),
+	'-': uint8(KindNumber), '+': uint8(KindNumber),
+	'0': uint8(KindNumber), '1': uint8(KindNumber), '2': uint8(KindNumber),
+	'3': uint8(KindNumber), '4': uint8(KindNumber), '5': uint8(KindNumber),
+	'6': uint8(KindNumber), '7': uint8(KindNumber), '8': uint8(KindNumber),
+	'9': uint8(KindNumber),
+	'n': kindLiteral, 't': kindLiteral, 'f': kindLiteral,
+	// Every other byte is left zero, which is KindInvalid: no JSON value
+	// begins with it. Written as a literal rather than built in an init
+	// function so the table is data, not startup work.
+}

@@ -87,3 +87,38 @@ func TestKindString(t *testing.T) {
 		}
 	}
 }
+
+// TestKindOfWhitespaceIsThePackagesOwn pins the rule KindOf tolerates at both
+// ends of a value: this package's whitespace is every byte <= 0x20, the
+// one-compare shortcut unstable.SkipWS takes and the decoder and Valid inherit
+// (CLAUDE.md's Valid entry records why it is deliberate). An earlier form
+// skipped leading bytes by that rule and trailing ones by the grammar's
+// four-byte set, so it called `null` followed by a NUL invalid while Valid and
+// DecodeAny accepted the same document.
+func TestKindOfWhitespaceIsThePackagesOwn(t *testing.T) {
+	for _, ws := range []string{" ", "\t", "\n", "\r", "\x00", "\x01", "\x1f", "\x20"} {
+		for _, c := range []struct {
+			val  string
+			want Kind
+		}{{"null", KindNull}, {"true", KindBool}, {"false", KindBool}, {"1", KindNumber}, {`"a"`, KindString}} {
+			for _, doc := range []string{ws + c.val, c.val + ws, ws + c.val + ws} {
+				got := KindOf([]byte(doc))
+				if got != c.want {
+					t.Errorf("KindOf(%q) = %v, want %v", doc, got, c.want)
+				}
+				// Whatever KindOf says of a document, Valid must agree that
+				// the document is one value: that is the property the two ends
+				// sharing a whitespace rule buys.
+				if !Valid([]byte(doc)) {
+					t.Errorf("Valid(%q) = false, but KindOf says %v", doc, got)
+				}
+			}
+		}
+	}
+	// A byte above the whitespace set still ends the literal.
+	for _, doc := range []string{"null!", "nullx", "true?", "false~", "null null"} {
+		if got := KindOf([]byte(doc)); got != KindInvalid {
+			t.Errorf("KindOf(%q) = %v, want invalid", doc, got)
+		}
+	}
+}
