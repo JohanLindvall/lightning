@@ -24,9 +24,11 @@
 //     allocate nothing when it is reused.
 //   - Transform — [StripDefaults] drops object members equal to a set of default
 //     values; [EscapeString]/[EscapeStringInto] and
-//     [UnescapeString]/[UnescapeStringInto] convert between a Go string and a JSON
-//     string body (escaping coerces ill-formed UTF-8 to U+FFFD as encoding/json
-//     does when marshaling; unescaping passes it through, see each function);
+//     [UnescapeString]/[UnescapeStringInto]/[UnescapeStringCopy] convert between
+//     a Go string and a JSON string body (escaping coerces ill-formed UTF-8 to
+//     U+FFFD as encoding/json does when marshaling; unescaping passes it
+//     through, see each function; the Copy form is for a result that outlives
+//     its input);
 //     [DecodeAny] decodes a whole document into the generic
 //     nil/bool/float64/string/[]any/map[string]any representation; [ParseFloat]
 //     parses a single JSON number, [ParseInt] and [ParseUint] a single JSON
@@ -55,7 +57,11 @@
 // package is not a stable API and should not be imported directly.
 package json
 
-import "github.com/JohanLindvall/lightning/pkg/unstable"
+import (
+	"bytes"
+
+	"github.com/JohanLindvall/lightning/pkg/unstable"
+)
 
 // Errors reported by this package. They are re-exported from pkg/unstable so that
 // callers of the stable API can match them with errors.Is without importing the
@@ -137,6 +143,27 @@ func UnescapeString(in []byte) (string, error) {
 // direction has no such form: EscapeStringInto's out must not overlap s.
 func UnescapeStringInto(in, out []byte) (string, error) {
 	return unstable.UnescapeStringInto(in, out)
+}
+
+// UnescapeStringCopy is UnescapeString for a result that OUTLIVES its input:
+// the returned string is always the caller's own, never a window onto in.
+//
+// The two other forms alias a buffer on their fast path — UnescapeString
+// aliases in when there are no escapes, UnescapeStringInto aliases out — which
+// is right for a value read and dropped inside one call and a hazard for one
+// that is kept: a label value or a cached row that aliases a response body
+// pins the whole body, a hundred megabytes for a pod name, for as long as
+// anything holds it. Until this function a caller in that position wrote
+// `string(in)` on the escape-free path itself and lost the library's escape
+// detection doing it. With no escapes this is one copy; with escapes it is
+// the same fresh allocation UnescapeString makes. Everything else is
+// UnescapeString's contract: the same decode, the same errors, invalid UTF-8
+// passed through.
+func UnescapeStringCopy(in []byte) (string, error) {
+	if bytes.IndexByte(in, '\\') < 0 {
+		return string(in), nil
+	}
+	return unstable.UnescapeString(in)
 }
 
 // ParseFloat parses the number in b as a float64. It takes the scanner's
