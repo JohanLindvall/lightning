@@ -43,13 +43,25 @@ retry:
 	if uint(nd-1) < 3 {
 		// Too short for a four-byte load to stay inside the token, and a
 		// chain of at most two multiplies is cheaper than a fold anyway.
+		//
+		// This walks an index rather than ranging over b[i:]. The reslice is
+		// the seven instructions IndexCloseOrEscapeAt's entry describes — a
+		// bounds compare, the cap and len subtractions and the negative-length
+		// clamp on the base pointer — on the arm every one-to-three-digit
+		// token takes, which is the common one. The unsigned loop condition is
+		// what leaves b[i] with no bounds check of its own, and that is worth
+		// more than the compares: runtime.panicBounds is a CALL, so one
+		// surviving check would give this whole leaf function a stack frame.
+		// uint64(b[i]) - '0' widens before subtracting for the same reason the
+		// walkers' number predicate does, to avoid a byte truncation.
 		var n uint64
-		for _, c := range b[i:] {
-			d := uint64(c - '0')
+		for uint(i) < uint(len(b)) {
+			d := uint64(b[i]) - '0'
 			if d > 9 {
 				return 0, ErrBadNumber
 			}
 			n = n*10 + d
+			i++
 		}
 		return n, nil
 	}
@@ -101,7 +113,7 @@ retry:
 	// token can still hold a small number. Skipping them is worth a pass only
 	// here, and it can only shorten, so the retry runs at most twice.
 	if nd > 0 {
-		for i < end && b[i] == '0' {
+		for uint(i) < uint(len(b)) && b[i] == '0' {
 			i++
 		}
 		if n := end - i; n != nd {
@@ -141,12 +153,13 @@ func ParseInt(b []byte) (int64, error) {
 retry:
 	if uint(nd-1) < 3 {
 		var n uint64
-		for _, c := range b[i:] {
-			d := uint64(c - '0')
+		for uint(i) < uint(len(b)) {
+			d := uint64(b[i]) - '0'
 			if d > 9 {
 				return 0, ErrBadNumber
 			}
 			n = n*10 + d
+			i++
 		}
 		return withSign(n, neg), nil
 	}
@@ -197,7 +210,7 @@ retry:
 		return withSign(n, neg), nil
 	}
 	if nd > 0 {
-		for i < end && b[i] == '0' {
+		for uint(i) < uint(len(b)) && b[i] == '0' {
 			i++
 		}
 		if n := end - i; n != nd {
