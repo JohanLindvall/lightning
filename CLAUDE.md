@@ -1925,6 +1925,19 @@ byte-identical when adding cold paths; push new logic out-of-line.
   loop's own set contains `-`), and `SkipNumber`'s inline cost fell from 78 of
   the budget's 80 to **35** on the table architectures and 59 on amd64, so the
   function whose doc comment warned of "two units of headroom" now has forty.
+  **The table's address is rematerialised INSIDE the loop and that is not
+  waste** — worth knowing, because the disassembly makes it look like two free
+  instructions. Go's arm64 backend treats a global's `ADRP`+`ADD` as
+  rematerialisable and re-emits it at every use, in `arrayEach`,
+  `arrayEachIndex` and `SkipValue` alike, and neither a local `&numberByte` nor
+  a global pointer to it changes that (the pointer form is worse: it adds a
+  load and a nil check). But the loop is eight instructions a byte either way —
+  `ADRP`+`ADD`+`MOVBU`+`TBNZ` is exactly what the comparisons' `MOVD`+`SUB`+
+  `CMP`+`BLS` costs — so there is nothing to recover. A digits-first hybrid
+  (arithmetic for `0-9`, the table only for the terminator) was built for this
+  and measured **+3.4 instructions an element**; the register copy the compiler
+  inserts to keep `c` alive for the second arm eats the saving.
+
   Locked by `TestIsNumberByteMatchesComparisons` (all 256 bytes, both
   spellings, so an arm64 run checks the table against the accept set) and
   `TestSkipNumberSpan` (the span and the error against the pre-change byte
@@ -2137,6 +2150,51 @@ byte-identical when adding cold paths; push new logic out-of-line.
   StreamShapes/scalars −32.7%, /strings −14.9%**, and the streaming member walk
   is now 1.23× the in-memory one where it was 2.46×, with the streaming
   scalar-array walk at parity.
+
+  **Third pass (2026-09-07, Neoverse N2): the helper that survived the second
+  pass was the flag it returned.** `atByte` — "the next byte is buffered and is
+  not whitespace" — was a `(byte, bool)` helper small enough to inline, in front
+  of `space`, `colon` and `afterElement`, at five sites. Inlining it is not the
+  same as writing it out: the caller has to MATERIALISE the bool with a `CSET`
+  and then test it, and take the byte back through a return that needs a
+  truncation, where the two tests written out branch on flags they already set.
+  Six to seven instructions a member, and the same shape `json.String` shed when
+  its arms learned to return where they decide. Instructions per decode
+  **strings −4.3%, scalars −3.2%, records −2.5%, StreamObjectEach −2.4%,
+  StreamDescent −1.4%**; time (interleaved ABBA, n=6–8, both alignments)
+  StreamShapes/scalars −2.4…−3.3%, StreamObjectEach −0.7…−1.5%,
+  strings/records −1.2% at funcalign=64 and flat at the default, nothing worse,
+  the in-memory controls flat. The helper is gone; its explanation sits above
+  `errMoreInput` because the five sites are what carry it now.
+
+  **What those benchmarks mostly measure is `NewReader`, not the walk.** With a
+  fresh Reader per iteration — which is how `StreamShapes` is written — the
+  streaming arms read 1.49× (scalars), 1.76× (strings) and 1.59× (records) of
+  their in-memory twins on this core. With `Reset` instead, so the buffer is
+  made once, the same walks are **1.15×, 1.22× and 1.09×**. The difference is
+  ~18 250 cycles per Reader, and `NewReader` alone measures **5.1 µs** at the
+  64 KiB default: 66 992 B/op, of which 65 536 is the buffer and 1 456 the
+  Reader, most of that the ValueScanner's 1 296-byte depth bitmap. Read a
+  fresh-Reader row as 22–31% setup before comparing it with anything.
+- **Tried on the streaming reader and rejected (2026-09-07, N2).** Three, each
+  measured rather than reasoned about. **(1) Hoisting the walk's cursor into
+  locals** — `data, pos` instead of `r.buf`, `r.pos`, `r.end` — on the theory
+  that the callback forces the receiver's fields to be reloaded through a
+  spilled pointer every element, which the disassembly does show. It is worth
+  **0.2% of instructions**: the compiler was already keeping what mattered, the
+  function grew 236 → 256 instructions, and the ±2–8% the benchmarks then
+  showed was layout. The batch readers' local slice header wins because
+  `append` writes through the pointer; here nothing does. **(2) A smaller
+  default buffer.** 32 KiB is Go's largest small-object size class, so it skips
+  the large-object allocation path, and on a fresh Reader it is worth
+  StreamShapes/records −12.5%, /strings −12.1%, /scalars −8.4%. It also costs
+  **StreamMatrix/stream_reused +4.7% and /stream +2.7%**, because that
+  document's elements are large enough that a 32 KiB buffer compacts and
+  refills where a 64 KiB one does not — and `fill` only GROWS the buffer when a
+  single value fills it, so frequent compaction never buys its way out. A bet
+  on document shape; 64 KiB stays. **(3)** Nothing in the digit loop: see the
+  number-byte entry's note that all three predicate spellings cost eight
+  instructions a byte on arm64.
 
 ## The inline trick — let the generator write hot bodies inline
 

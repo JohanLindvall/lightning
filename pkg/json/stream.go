@@ -86,21 +86,20 @@ const (
 // telling apart before it does.
 var errMoreInput = errors.New("json: value continues past the buffered bytes")
 
-// atByte is the shape every point of a walk takes on compact input: the next
-// byte is buffered and is not whitespace, so neither a refill nor a whitespace
-// run can be involved. It is a helper rather than two tests written out at
-// each site because it has to inline, and the functions it fronts — space,
-// peek, colon, afterElement — each carry a fill loop and cost two to three
-// times the inliner's budget. A member of an object passes through three of
-// them.
-func (r *Reader) atByte() (byte, bool) {
-	if uint(r.pos) < uint(r.end) {
-		if c := r.buf[r.pos]; c > ' ' {
-			return c, true
-		}
-	}
-	return 0, false
-}
+// The buffered-and-not-whitespace test — "uint(r.pos) < uint(r.end), and the
+// byte there is above a space" — is the shape every point of a walk takes on
+// compact input, and it is written out at each of its five sites rather than
+// called. It began as an atByte helper, small enough to inline, standing in
+// front of space, colon and afterElement, which each carry a fill loop and
+// cost two to three times the inliner's budget. Inlining it is not the same as
+// writing it out: a helper returning (byte, bool) makes the caller MATERIALISE
+// the bool with a CSET and then test it, and it hands the byte back through a
+// return that needs a truncation, where the tests written out branch on the
+// flags they already set. That is six to seven instructions a member,
+// measured — StreamShapes/strings -4.3% instructions, /scalars -3.2%,
+// /records -2.5%, StreamObjectEach -2.4% — and it is the same shape as the
+// flag json.String used to set before its arms learned to return where they
+// decide.
 
 // WithBufferSize sets the initial buffer, 64 KiB by default. It is a starting
 // point, not a limit: the buffer grows to fit one value, up to
@@ -235,14 +234,16 @@ func (r *Reader) ArrayEach(fn func(value []byte) error, keys ...string) error {
 		// element, which is once per element through a frame otherwise.
 		// Nothing is consumed before the fallback, so the two cannot disagree
 		// — and the loop's own top sets the hold, so the comma arm need not.
-		if c, ok := r.atByte(); ok {
-			if c == ']' {
-				r.pos++
-				return nil
-			}
-			if c == ',' && uint(r.pos+1) < uint(r.end) && r.buf[r.pos+1] > ' ' {
-				r.pos++
-				continue
+		if uint(r.pos) < uint(r.end) {
+			if c := r.buf[r.pos]; c > ' ' {
+				if c == ']' {
+					r.pos++
+					return nil
+				}
+				if c == ',' && uint(r.pos+1) < uint(r.end) && r.buf[r.pos+1] > ' ' {
+					r.pos++
+					continue
+				}
 			}
 		}
 		done, err2 := r.afterElement(']')
@@ -271,9 +272,12 @@ func (r *Reader) ObjectEach(fn func(key string, value []byte) error, keys ...str
 	}
 	r.pos++
 	for {
-		// space's fast path, written out; see atByte.
-		c, ok := r.atByte()
-		if !ok {
+		// space's fast path, written out; see the note above errMoreInput.
+		c := byte(0)
+		if uint(r.pos) < uint(r.end) {
+			c = r.buf[r.pos]
+		}
+		if c <= ' ' {
 			var err error
 			if c, err = r.space(); err != nil {
 				return err
@@ -363,14 +367,16 @@ func (r *Reader) ObjectEach(fn func(key string, value []byte) error, keys ...str
 		}
 		r.hold, r.pos = end, end
 		// afterElement's fast path, written out; see ArrayEach.
-		if c, ok := r.atByte(); ok {
-			if c == '}' {
-				r.pos++
-				return nil
-			}
-			if c == ',' && uint(r.pos+1) < uint(r.end) && r.buf[r.pos+1] > ' ' {
-				r.pos++
-				continue
+		if uint(r.pos) < uint(r.end) {
+			if c := r.buf[r.pos]; c > ' ' {
+				if c == '}' {
+					r.pos++
+					return nil
+				}
+				if c == ',' && uint(r.pos+1) < uint(r.end) && r.buf[r.pos+1] > ' ' {
+					r.pos++
+					continue
+				}
 			}
 		}
 		done, err := r.afterElement('}')
@@ -440,8 +446,11 @@ func (r *Reader) enter(keys []string) error {
 			// exactly as in the walkers: a descent reads a key and steps over
 			// a value per member, and the three frames around that are most of
 			// what it costs on a record whose members are buffered.
-			var ok bool
-			if c, ok = r.atByte(); !ok {
+			c = 0
+			if uint(r.pos) < uint(r.end) {
+				c = r.buf[r.pos]
+			}
+			if c <= ' ' {
 				if c, err = r.space(); err != nil {
 					return err
 				}
@@ -469,15 +478,17 @@ func (r *Reader) enter(keys []string) error {
 				return err
 			}
 			r.hold = r.pos
-			if c, ok := r.atByte(); ok {
-				if c == '}' {
-					r.pos++
-					return unstable.ErrKeyNotFound
-				}
-				if c == ',' && uint(r.pos+1) < uint(r.end) && r.buf[r.pos+1] > ' ' {
-					r.pos++
-					r.hold = r.pos
-					continue
+			if uint(r.pos) < uint(r.end) {
+				if c := r.buf[r.pos]; c > ' ' {
+					if c == '}' {
+						r.pos++
+						return unstable.ErrKeyNotFound
+					}
+					if c == ',' && uint(r.pos+1) < uint(r.end) && r.buf[r.pos+1] > ' ' {
+						r.pos++
+						r.hold = r.pos
+						continue
+					}
 				}
 			}
 			done, err := r.afterElement('}')
