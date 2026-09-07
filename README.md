@@ -875,6 +875,16 @@ just want to decode or encode it.
 Both return a string that aliases a buffer, so keep that buffer unchanged while
 the result is in use.
 
+- `UnescapeStringCopy(in []byte) (string, error)` — the same decode, for a
+  result that **outlives** its input: the returned string is always the
+  caller's own, never a window onto `in`. Aliasing is right for a value read
+  and dropped inside one call and a hazard for one that is kept — a label
+  value or a cached row that aliases a response body pins the whole body for
+  as long as anything holds it — and until this form a caller in that position
+  wrote `string(in)` on the escape-free path itself and lost the library's
+  escape detection doing it. One copy with no escapes; the same fresh
+  allocation `UnescapeString` makes with them.
+
 **Escaping** (raw value → escaped body, escaping `"`, `\`, and control bytes;
 `/` is left as-is and `\b`/`\f` are written in `\u00XX` form. Bytes that are not
 part of a well-formed UTF-8 sequence are replaced with U+FFFD, as `encoding/json`
@@ -1227,7 +1237,7 @@ Representative numbers for a 1.8 KB Cloudflare log (Go 1.26, amd64):
 |---|---|
 | [`main.go`](main.go) | the generator (`package main`) |
 | [`pkg/unstable`](pkg/unstable) | the (unstable, do-not-import) runtime the generated decoders call into |
-| [`pkg/json`](pkg/json) | small public API over the scanner (`Get`/`Lookup`/`GetMany`/`GetPaths`/`ObjectEach`/`ArrayEach`, `Valid`, `DecodeAny`, `Escape`/`UnescapeString`, `ParseFloat`, `StripDefaults`, `Set`/`SetMany`/`SetPaths` and their `…Checked` forms) |
+| [`pkg/json`](pkg/json) | small public API over the scanner (`Get`/`Lookup`/`GetMany`/`GetPaths`/`ObjectEach`/`ArrayEach`, `Valid`, `DecodeAny`, `Escape`/`UnescapeString`/`UnescapeStringCopy`, `ParseFloat`, `StripDefaults`, `Set`/`SetMany`/`SetPaths` and their `…Checked` forms) |
 | [`bench/`](bench) | benchmark module: hand-written `data.go` + `input.json` per case, plus the generated decoders, harness, and results |
 
 Generated files (`*_unmarshal.go`, `bench/*/bench_test.go`, `bench/*/ej/`, and
