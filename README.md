@@ -735,6 +735,16 @@ its surrounding quotes with escapes intact, an object or array spans the whole
   — the array counterpart of `ObjectEach`: calls `fn` for every element of the
   array reached by the path `keys` (the root array with no keys), same
   error-stops-iteration contract.
+- `KindOf(raw []byte) Kind` — says what a returned value (or a whole
+  document) is: `KindNull`, `KindBool`, `KindNumber`, `KindString`,
+  `KindArray` or `KindObject`, or `KindInvalid` for an empty input or a byte
+  no value starts with. The read
+  functions decide this while scanning and do not report it, so without it
+  every caller branched on `raw[0]` itself. A literal is matched whole (`nul`
+  and `truex` are `Invalid`); a string, number, array or object is classified
+  by its opening byte alone, as the scanner dispatches — `KindOf` says what a
+  value *is*, [`Valid`](#checking-validity) says whether it is well-formed.
+  Whitespace around the value is tolerated, as `Get` tolerates it at the root.
 
 A value those functions return is a raw token, and the scalar readers turn
 one into its Go value without the caller re-deriving the grammar:
@@ -1254,7 +1264,7 @@ Representative numbers for a 1.8 KB Cloudflare log (Go 1.26, amd64):
 |---|---|
 | [`main.go`](main.go) | the generator (`package main`) |
 | [`pkg/unstable`](pkg/unstable) | the (unstable, do-not-import) runtime the generated decoders call into |
-| [`pkg/json`](pkg/json) | small public API over the scanner (`Get`/`Lookup`/`GetMany`/`GetPaths`/`ObjectEach`/`ArrayEach`, `String`/`Bool`, `Valid`, `DecodeAny`, `Escape`/`UnescapeString`, `ParseFloat`/`ParseInt`/`ParseUint`, `StripDefaults`, `Set`/`SetMany`/`SetPaths` and their `…Checked` forms) |
+| [`pkg/json`](pkg/json) | small public API over the scanner (`Get`/`Lookup`/`GetMany`/`GetPaths`/`ObjectEach`/`ArrayEach`, `KindOf`, `String`/`Bool`, `Valid`, `DecodeAny`, `Escape`/`UnescapeString`, `ParseFloat`/`ParseInt`/`ParseUint`, `StripDefaults`, `Set`/`SetMany`/`SetPaths` and their `…Checked` forms) |
 | [`bench/`](bench) | benchmark module: hand-written `data.go` + `input.json` per case, plus the generated decoders, harness, and results |
 
 Generated files (`*_unmarshal.go`, `bench/*/bench_test.go`, `bench/*/ej/`, and
