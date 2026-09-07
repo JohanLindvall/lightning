@@ -151,3 +151,144 @@ func BenchmarkStreamSkipToKey(b *testing.B) {
 		}
 	}
 }
+
+// recordDoc is a flat record of the width an API response has: the shape a
+// member walk pays a key read and a separator for, once each per member.
+func recordDoc(members int) []byte {
+	var b bytes.Buffer
+	b.WriteByte('{')
+	for i := 0; i < members; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, `"field_number_%02d":"value-%02d"`, i, i)
+	}
+	b.WriteByte('}')
+	return b.Bytes()
+}
+
+// descentDoc is a record whose wanted key is last, with members that are
+// themselves small objects: every one of them is read and stepped over, and
+// every one of them is buffered — which is what separates this from
+// [BenchmarkStreamSkipToKey], whose single skipped sibling is far larger than
+// the buffer.
+func descentDoc(members int) []byte {
+	var b bytes.Buffer
+	b.WriteByte('{')
+	for i := 0; i < members; i++ {
+		fmt.Fprintf(&b, `"field_%02d":{"id":%d,"name":"value-%02d","tags":["a","b"]},`, i, i*7919, i)
+	}
+	b.WriteString(`"want":{"deep":[1,2,3]}}`)
+	return b.Bytes()
+}
+
+// largeElementDoc holds elements several times the buffer, which is the case
+// the resumable scanner exists for: each one has to be assembled across many
+// refills before its callback can see it.
+func largeElementDoc(elems, rows int) []byte {
+	var b bytes.Buffer
+	b.WriteByte('[')
+	for i := 0; i < elems; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, `{"id":%d,"rows":[`, i)
+		for j := 0; j < rows; j++ {
+			if j > 0 {
+				b.WriteByte(',')
+			}
+			fmt.Fprintf(&b, `{"t":%d,"v":"%d.%03d","tag":"host-%04d"}`, 1788087600+j, j, i, j)
+		}
+		b.WriteString(`]}`)
+	}
+	b.WriteByte(']')
+	return b.Bytes()
+}
+
+// BenchmarkStreamObjectEach is the member walk against the in-memory one over
+// the same record. The reader is reused, as a client making the same request
+// repeatedly does, so what is measured is the walk rather than the buffer —
+// [BenchmarkStreamMatrix] measures a reader per document as well.
+func BenchmarkStreamObjectEach(b *testing.B) {
+	doc := recordDoc(45)
+	fn := func(k string, v []byte) error { streamSink += len(k) + len(v); return nil }
+	b.Run("stream", func(b *testing.B) {
+		b.SetBytes(int64(len(doc)))
+		b.ReportAllocs()
+		r := NewReader(&chunkReader{})
+		for i := 0; i < b.N; i++ {
+			r.Reset(&chunkReader{data: doc, n: 32 << 10})
+			if err := r.ObjectEach(fn); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("inmemory", func(b *testing.B) {
+		b.SetBytes(int64(len(doc)))
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if err := ObjectEach(doc, fn); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+// BenchmarkStreamDescent is the path descent every Get and every keyed walk
+// begins with: the members before the wanted key are read and stepped over.
+func BenchmarkStreamDescent(b *testing.B) {
+	doc := descentDoc(60)
+	count := func(v []byte) error { streamSink += len(v); return nil }
+	b.Run("get", func(b *testing.B) {
+		b.SetBytes(int64(len(doc)))
+		b.ReportAllocs()
+		r := NewReader(&chunkReader{})
+		for i := 0; i < b.N; i++ {
+			r.Reset(&chunkReader{data: doc, n: 32 << 10})
+			v, err := r.Get("want", "deep")
+			if err != nil {
+				b.Fatal(err)
+			}
+			streamSink += len(v)
+		}
+	})
+	b.Run("arrayeach", func(b *testing.B) {
+		b.SetBytes(int64(len(doc)))
+		b.ReportAllocs()
+		r := NewReader(&chunkReader{})
+		for i := 0; i < b.N; i++ {
+			r.Reset(&chunkReader{data: doc, n: 32 << 10})
+			if err := r.ArrayEach(count, "want", "deep"); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("inmemory", func(b *testing.B) {
+		b.SetBytes(int64(len(doc)))
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if err := ArrayEach(doc, count, "want", "deep"); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+// BenchmarkStreamLargeElements walks elements far larger than the buffer, so
+// every one of them is assembled by the resumable scanner across refills. It
+// is the shape that says whether a value the walk DOES want is scanned once or
+// several times over.
+func BenchmarkStreamLargeElements(b *testing.B) {
+	doc := largeElementDoc(8, 3000)
+	b.Logf("element: %.0f KB, buffer: 64 KB", float64(len(doc))/8/1024)
+	b.SetBytes(int64(len(doc)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	r := NewReader(&chunkReader{})
+	for i := 0; i < b.N; i++ {
+		r.Reset(&chunkReader{data: doc, n: 32 << 10})
+		if err := r.ArrayEach(func(v []byte) error { streamSink += len(v); return nil }); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

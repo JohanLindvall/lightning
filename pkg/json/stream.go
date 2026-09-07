@@ -68,11 +68,39 @@ type readerConfig struct{ bufSize, maxElem int }
 const (
 	defaultReaderBuffer = 64 << 10
 	defaultMaxElement   = 64 << 20
-	// valueRetries is how many times a value that does not fit the buffered
-	// bytes is refilled and re-offered to SkipValue before the resumable
-	// scanner takes it; see value.
-	valueRetries = 4
+	// skipProbe bounds the bytes skip offers SkipValue before handing the
+	// value to the scanner. It is what keeps the probe's cost a property of
+	// the VALUE rather than of the buffer: without it a reader given a 4 MB
+	// buffer would scan 4 MB to find out that a 100 MB sibling does not fit.
+	// Above it a value is large enough that the probe is noise either way
+	// (the scan is ~0.23 instructions a byte against the scanner's ~3.5, so
+	// a wasted probe is ~7% of what the scanner then spends on the same
+	// bytes, and less the larger the value gets).
+	skipProbe = 4 << 10
 )
+
+// errMoreInput is not an error any caller sees: it is how a walker's inline
+// value scan says "the buffered bytes do not settle this", which sends the
+// value to valueMore exactly as a real error does — valueMore reads more and
+// reports whatever the scan then finds, and the two cases are not worth
+// telling apart before it does.
+var errMoreInput = errors.New("json: value continues past the buffered bytes")
+
+// atByte is the shape every point of a walk takes on compact input: the next
+// byte is buffered and is not whitespace, so neither a refill nor a whitespace
+// run can be involved. It is a helper rather than two tests written out at
+// each site because it has to inline, and the functions it fronts — space,
+// peek, colon, afterElement — each carry a fill loop and cost two to three
+// times the inliner's budget. A member of an object passes through three of
+// them.
+func (r *Reader) atByte() (byte, bool) {
+	if uint(r.pos) < uint(r.end) {
+		if c := r.buf[r.pos]; c > ' ' {
+			return c, true
+		}
+	}
+	return 0, false
+}
 
 // WithBufferSize sets the initial buffer, 64 KiB by default. It is a starting
 // point, not a limit: the buffer grows to fit one value, up to
@@ -160,23 +188,63 @@ func (r *Reader) ArrayEach(fn func(value []byte) error, keys ...string) error {
 	}
 	for {
 		r.hold = r.pos
-		// value's fast path, written out: the element is already buffered in
-		// full except where a refill landed in the middle of it, and the call
-		// and frame it saves are a tenth of this walk. See value for what the
-		// number test is about.
-		end, err := unstable.SkipValue(r.buf[:r.end], r.pos)
-		if err != nil || (end == r.end && r.rerr == nil && startsNumber(r.buf[r.pos])) {
-			if end, err = r.value(); err != nil {
+		// SkipValue's number and string arms, written out, which is what the
+		// in-memory walkers do (see arrayEach in get.go) and for the same
+		// reason: an element that is already buffered costs a call and a frame
+		// otherwise, and on an array of numbers that is a third of the walk.
+		// It has to be written out rather than reached through a helper —
+		// anything holding these three calls is far past the inline budget, so
+		// a helper would put back the frame it exists to remove. The dispatch
+		// agrees with SkipValue's byte for byte (every byte from '-' to '9'
+		// reaches its number arm), and it is uint(c)-'-' rather than
+		// uint(c-'-') so that no truncation is needed before the compare; see
+		// get.go for both.
+		//
+		// Only a number can be left undecided by the bytes the scan has seen:
+		// a token ending exactly where the buffered bytes do may continue in
+		// the next chunk. Every other kind is settled by a byte already read —
+		// a closing quote, the balanced bracket, the literal's last letter —
+		// so writing the arms out takes that test off them as well.
+		buf := r.buf[:r.end]
+		var end int
+		var err error
+		switch c := buf[r.pos]; {
+		case uint(c)-'-' <= 12:
+			if end, err = unstable.SkipNumber(buf, r.pos); err == nil && end == r.end && r.rerr == nil {
+				err = errMoreInput
+			}
+		case c == '"':
+			end, err = unstable.SkipString(buf, r.pos)
+		default:
+			end, err = unstable.SkipValue(buf, r.pos)
+		}
+		if err != nil {
+			if end, err = r.valueMore(); err != nil {
 				return err
 			}
 		}
 		if err := fn(r.buf[r.pos:end]); err != nil {
-			if errors.Is(err, ErrStop) {
+			if err == ErrStop || errors.Is(err, ErrStop) {
 				return nil
 			}
 			return err
 		}
 		r.hold, r.pos = end, end
+		// afterElement's fast path, written out: on compact input the
+		// separator is the very next byte and the one after it opens the next
+		// element, which is once per element through a frame otherwise.
+		// Nothing is consumed before the fallback, so the two cannot disagree
+		// — and the loop's own top sets the hold, so the comma arm need not.
+		if c, ok := r.atByte(); ok {
+			if c == ']' {
+				r.pos++
+				return nil
+			}
+			if c == ',' && uint(r.pos+1) < uint(r.end) && r.buf[r.pos+1] > ' ' {
+				r.pos++
+				continue
+			}
+		}
 		done, err2 := r.afterElement(']')
 		if done || err2 != nil {
 			return err2
@@ -203,9 +271,13 @@ func (r *Reader) ObjectEach(fn func(key string, value []byte) error, keys ...str
 	}
 	r.pos++
 	for {
-		c, err := r.space()
-		if err != nil {
-			return err
+		// space's fast path, written out; see atByte.
+		c, ok := r.atByte()
+		if !ok {
+			var err error
+			if c, err = r.space(); err != nil {
+				return err
+			}
 		}
 		if c == '}' {
 			r.pos++
@@ -221,32 +293,86 @@ func (r *Reader) ObjectEach(fn func(key string, value []byte) error, keys ...str
 			return unstable.ErrInvalidJSON
 		}
 		r.hold = r.pos
-		kend, err := r.value()
-		if err != nil {
-			return err
-		}
-		r.pos = kend
-		if err := r.colon(); err != nil {
-			return err
-		}
-		end, err := unstable.SkipValue(r.buf[:r.end], r.pos)
-		if err != nil || (end == r.end && r.rerr == nil && startsNumber(r.buf[r.pos])) {
-			if end, err = r.value(); err != nil {
+		// The no-escape key read, inline: get.go's readKey trick, which
+		// settles the key's end AND whether it holds an escape in one
+		// vectorized scan. Both of the calls it replaces are real — SkipString
+		// is past the inline budget, and String would test the same bytes a
+		// second time to reach the same verdict — and on a record they are two
+		// of the three frames per member the in-memory walker does not have.
+		// A key that straddles the buffered bytes, or holds an escape, takes
+		// the ordinary path.
+		kbuf := r.buf[:r.end]
+		clean := false
+		var kend int
+		var err error
+		if k := unstable.IndexCloseOrEscapeAt(kbuf, r.pos+1); uint(k) < uint(r.end) && kbuf[k] == '"' {
+			kend, clean = k+1, true
+		} else if kend, err = unstable.SkipString(kbuf, r.pos); err != nil {
+			if kend, err = r.valueMore(); err != nil {
 				return err
 			}
 		}
-		// pos and hold are read AFTER value, for the same reason.
-		key, _, err := unstable.ReadKey(r.buf[:r.end], r.hold)
+		klen := kend - r.pos
+		r.pos = kend
+		// colon's fast path: the colon and the value's first byte are the next
+		// two bytes on compact input. Nothing is consumed before the fallback,
+		// so the two cannot disagree.
+		if uint(r.pos+1) < uint(r.end) && r.buf[r.pos] == ':' && r.buf[r.pos+1] > ' ' {
+			r.pos++
+		} else if err := r.colon(); err != nil {
+			return err
+		}
+		// SkipValue's number and string arms, written out; see ArrayEach. The
+		// buffer is taken again here rather than reused: the key's own scan
+		// may have refilled, and a refill can compact.
+		buf := r.buf[:r.end]
+		var end int
+		switch c := buf[r.pos]; {
+		case uint(c)-'-' <= 12:
+			if end, err = unstable.SkipNumber(buf, r.pos); err == nil && end == r.end && r.rerr == nil {
+				err = errMoreInput
+			}
+		case c == '"':
+			end, err = unstable.SkipString(buf, r.pos)
+		default:
+			end, err = unstable.SkipValue(buf, r.pos)
+		}
 		if err != nil {
+			if end, err = r.valueMore(); err != nil {
+				return err
+			}
+		}
+		// The key is decoded AFTER the value, for the reason above, and from
+		// the hold rather than from the index the key scan returned — but its
+		// LENGTH survives a compaction, because compaction shifts hold and
+		// every index above it by the same amount. So hold+klen is the key's
+		// end whether or not the value's refills moved the bytes, and nothing
+		// has to be scanned again to find it. The scan above has already ruled
+		// out an escape in the common case, which leaves the body to alias.
+		var key string
+		if clean {
+			key = unstable.UnsafeStr(r.buf[r.hold+1 : r.hold+klen-1])
+		} else if key, err = String(r.buf[r.hold : r.hold+klen]); err != nil {
 			return err
 		}
 		if err := fn(key, r.buf[r.pos:end]); err != nil {
-			if errors.Is(err, ErrStop) {
+			if err == ErrStop || errors.Is(err, ErrStop) {
 				return nil
 			}
 			return err
 		}
 		r.hold, r.pos = end, end
+		// afterElement's fast path, written out; see ArrayEach.
+		if c, ok := r.atByte(); ok {
+			if c == '}' {
+				r.pos++
+				return nil
+			}
+			if c == ',' && uint(r.pos+1) < uint(r.end) && r.buf[r.pos+1] > ' ' {
+				r.pos++
+				continue
+			}
+		}
 		done, err := r.afterElement('}')
 		if done || err != nil {
 			return err
@@ -310,8 +436,15 @@ func (r *Reader) enter(keys []string) error {
 		}
 		r.pos++
 		for {
-			if c, err = r.space(); err != nil {
-				return err
+			// The fast paths of space, colon and afterElement, written out
+			// exactly as in the walkers: a descent reads a key and steps over
+			// a value per member, and the three frames around that are most of
+			// what it costs on a record whose members are buffered.
+			var ok bool
+			if c, ok = r.atByte(); !ok {
+				if c, err = r.space(); err != nil {
+					return err
+				}
 			}
 			if c == '}' {
 				return unstable.ErrKeyNotFound
@@ -324,7 +457,9 @@ func (r *Reader) enter(keys []string) error {
 			// The key has been compared, so it need not outlive the value.
 			match := k == key
 			r.hold = r.pos
-			if err := r.colon(); err != nil {
+			if uint(r.pos+1) < uint(r.end) && r.buf[r.pos] == ':' && r.buf[r.pos+1] > ' ' {
+				r.pos++
+			} else if err := r.colon(); err != nil {
 				return err
 			}
 			if match {
@@ -334,6 +469,17 @@ func (r *Reader) enter(keys []string) error {
 				return err
 			}
 			r.hold = r.pos
+			if c, ok := r.atByte(); ok {
+				if c == '}' {
+					r.pos++
+					return unstable.ErrKeyNotFound
+				}
+				if c == ',' && uint(r.pos+1) < uint(r.end) && r.buf[r.pos+1] > ' ' {
+					r.pos++
+					r.hold = r.pos
+					continue
+				}
+			}
 			done, err := r.afterElement('}')
 			if err != nil {
 				return err
@@ -399,14 +545,26 @@ func (r *Reader) colon() error {
 // the hold the caller set keeps it alive across the value's refills). The
 // returned string aliases the buffer unless the key holds an escape.
 func (r *Reader) key() (string, error) {
-	if r.pos >= r.end || r.buf[r.pos] != '"' {
+	if uint(r.pos) >= uint(r.end) || r.buf[r.pos] != '"' {
 		return "", unstable.ErrInvalidJSON
 	}
-	end, err := r.value()
-	if err != nil {
-		return "", err
+	// The no-escape key read, inline; see ObjectEach. A key on the way to a
+	// path is compared and dropped, so nothing here has to outlive the walk.
+	buf := r.buf[:r.end]
+	if k := unstable.IndexCloseOrEscapeAt(buf, r.pos+1); uint(k) < uint(r.end) && buf[k] == '"' {
+		s := unstable.UnsafeStr(buf[r.pos+1 : k])
+		r.pos = k + 1
+		return s, nil
 	}
-	k, _, err := unstable.ReadKey(r.buf[:end], r.pos)
+	// A key that straddles the buffered bytes, or holds an escape: SkipString
+	// settles the token without value's refill loop, and String decodes it.
+	end, err := unstable.SkipString(buf, r.pos)
+	if err != nil {
+		if end, err = r.valueMore(); err != nil {
+			return "", err
+		}
+	}
+	k, err := String(r.buf[r.pos:end])
 	if err != nil {
 		return "", err
 	}
@@ -496,43 +654,51 @@ func (r *Reader) readErr(err error) error {
 // value leaves the value at pos complete in the buffer and returns the index
 // just past it. pos is unchanged (fill may move both).
 //
-// The whole value is scanned by SkipValue when it is already buffered, which
-// is what keeps the streaming walk's answer identical to the in-memory one on
-// every document that fits; only a value that arrives across refills goes
-// through the resumable scanner, and then it is scanned once, not once per
-// refill.
+// A value that is already buffered is settled by SkipValue, which is what
+// keeps the streaming walk's answer identical to the in-memory one on every
+// document that fits; a value that is not goes to valueMore.
 func (r *Reader) value() (int, error) {
-	// A value that straddles the end of the buffered bytes is refilled and
-	// handed to SkipValue again a few times before the resumable scanner takes
-	// over: SkipValue is the SIMD skip, several times faster than the
-	// byte-state machine, so re-running it over a value of a few kilobytes
-	// costs less than scanning those kilobytes the slow way once. What the
-	// attempt limit buys is the guarantee the scanner exists for — total
-	// re-scanning stays a small multiple of the value's size instead of the
-	// O(n²) that "refill and retry from the first byte" is when a value
-	// arrives in many small chunks (a one-byte reader is the pathological
-	// case, and TestStreamHugeElementIsLinear is where it would hang).
-	for attempt := 0; ; attempt++ {
-		end, err := unstable.SkipValue(r.buf[:r.end], r.pos)
-		switch {
-		case err == nil && (end < r.end || r.rerr != nil || !startsNumber(r.buf[r.pos])):
-			// A number token that ends exactly where the buffered bytes do may
-			// still continue in the next chunk; every other kind is decided by
-			// a byte SkipValue has already seen.
-			return end, nil
-		case err != nil && r.rerr != nil:
-			// Nothing more can arrive to change the verdict, so this is the
-			// in-memory walkers' error for the same bytes.
-			return 0, r.wrap(err)
-		}
-		if attempt == valueRetries {
-			break
-		}
+	end, err := unstable.SkipValue(r.buf[:r.end], r.pos)
+	switch {
+	case err == nil && (end < r.end || r.rerr != nil || !startsNumber(r.buf[r.pos])):
+		// A number token that ends exactly where the buffered bytes do may
+		// still continue in the next chunk; every other kind is decided by a
+		// byte SkipValue has already seen.
+		return end, nil
+	case err != nil && r.rerr != nil:
+		// Nothing more can arrive to change the verdict, so this is the
+		// in-memory walkers' error for the same bytes.
+		return 0, r.wrap(err)
+	}
+	return r.valueMore()
+}
+
+// valueMore assembles a value whose buffered bytes have already been scanned
+// and did not settle it — which is what every walker's own inline scan has
+// just found out, and what value falls through to. It reads more and then
+// hands the value to the resumable scanner, which reaches the same end index
+// SkipValue would (ResetFast puts it on the same block scan) while scanning
+// each byte ONCE, however many refills the value arrives in.
+//
+// The refill comes first because repeating a scan that has just failed on
+// exactly these bytes can only fail again: it is the caller's scan, not an
+// independent one. What used to stand here instead was a bounded number of
+// refill-and-retry rounds before the scanner took over, on the reasoning that
+// SkipValue was several times faster per byte than the byte-state machine and
+// so worth re-running over a value of a few kilobytes. That reasoning ended
+// when the scanner got the block scan: a retry re-reads the whole value prefix
+// to learn what the previous one already knew, and dropping the rounds took a
+// document of 148 KB elements read through a 64 KiB buffer from 24.4M
+// instructions to 1.5M (-94%), while a matrix of 5.6 KB elements — where a
+// retry usually did succeed — is unchanged, because one scan of the value
+// replaces one scan of its prefix plus one of the whole.
+func (r *Reader) valueMore() (int, error) {
+	if r.rerr == nil {
 		if err := r.fill(); err != nil && !errors.Is(err, io.EOF) {
 			return 0, r.readErr(err)
 		}
 	}
-	r.sc.Reset()
+	r.sc.ResetFast()
 	scanned := r.pos
 	for {
 		final := r.rerr != nil
@@ -559,7 +725,41 @@ func (r *Reader) value() (int, error) {
 // has consumed are dropped at each refill, so a member the path does not want
 // costs the reads and nothing else.
 func (r *Reader) skip() error {
-	r.sc.Reset()
+	// The value a path steps over is usually buffered already — a record, not
+	// a megabyte — and then SkipValue settles it in one SIMD pass, where the
+	// resumable scanner walks it a structural byte at a time. The fast path is
+	// tried ONCE, on the bytes that have arrived, and never refills to make a
+	// value fit: that is what keeps a sibling larger than the buffer streaming
+	// past rather than growing it to ErrElementTooLarge.
+	//
+	// Only SkipValue's SUCCESS is taken. A failure means either malformed
+	// bytes or a value that continues in the next chunk, and the two are not
+	// distinguishable here, so the scanner re-reads the value from its first
+	// byte and reports what it finds — the errors this walk has always given.
+	// The one behaviour that moves is a value SkipValue accepts and the
+	// scanner does not (skipfast.go's divergence classes, all malformed):
+	// those are now stepped over, which is what the in-memory walkers do with
+	// a member they are not asked for.
+	//
+	// end < lim is the whole test for "settled": the scan stopped on a byte it
+	// had in front of it — a closing quote, the balancing bracket, the byte
+	// after a number — so nothing that arrives later can change the answer.
+	// A value that ends exactly at the last byte offered is left to the
+	// scanner, which is correct rather than fast and happens once in a buffer.
+	lim := r.end
+	if lim-r.pos > skipProbe {
+		lim = r.pos + skipProbe
+	}
+	if end, err := unstable.SkipValue(r.buf[:lim], r.pos); err == nil && end < lim {
+		r.pos, r.hold = end, end
+		return nil
+	}
+	// A value too large for the buffer is where the streaming skip earns its
+	// keep, and ResetFast is what makes it cost the read rather than several
+	// times the read: the same block scan the probe above just tried, resumed
+	// across refills. Its answer on a malformed value is that scan's; see
+	// ResetFast.
+	r.sc.ResetFast()
 	for {
 		final := r.rerr != nil
 		n, done, err := r.sc.Feed(r.buf[r.pos:r.end], final)
