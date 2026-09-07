@@ -811,6 +811,11 @@ func objectField(data []byte, i int, key string, compact bool) (int, error) {
 // — whitespace, a separator, a closing bracket, or the end of the input — so
 // that a null reached by key (followed by its object's '}') is one, and a
 // misspelling such as nullx is not.
+//
+// Whitespace here is this package's own, every byte <= 0x20, the rule SkipWS
+// takes and the decoder, Valid and KindOf inherit: written as the grammar's
+// four bytes instead, a null followed by a NUL would be an error where Valid
+// and encoding/json both read the document as a null.
 func isNullToken(data []byte, i int) bool {
 	if data[i] != 'n' {
 		return false
@@ -822,8 +827,8 @@ func isNullToken(data []byte, i int) bool {
 	if end == len(data) {
 		return true
 	}
-	switch data[end] {
-	case ' ', '\t', '\n', '\r', ',', '}', ']':
+	switch c := data[end]; {
+	case c <= ' ', c == ',', c == '}', c == ']':
 		return true
 	}
 	return false

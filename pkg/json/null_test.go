@@ -99,3 +99,29 @@ func TestANullMemberIsStillDelivered(t *testing.T) {
 		t.Fatalf("members = %q, want a=null delivered", got)
 	}
 }
+
+// TestNullContainerWhitespaceIsThePackagesOwn holds isNullToken's boundary set
+// to the rule the rest of the package uses — every byte <= 0x20 is whitespace
+// — so that a document Valid accepts as a null is an empty container here too,
+// whatever whitespace follows it.
+func TestNullContainerWhitespaceIsThePackagesOwn(t *testing.T) {
+	for _, ws := range []string{" ", "\t", "\n", "\r", "\x00", "\x01", "\x1f", "\x20"} {
+		doc := []byte("null" + ws)
+		if !Valid(doc) {
+			t.Fatalf("premise: Valid(%q) is false", doc)
+		}
+		called := false
+		if err := ObjectEach(doc, func(string, []byte) error { called = true; return nil }); err != nil || called {
+			t.Errorf("ObjectEach(%q) = %v, called=%v; want nil, false", doc, err, called)
+		}
+		if err := ArrayEach(doc, func([]byte) error { called = true; return nil }); err != nil || called {
+			t.Errorf("ArrayEach(%q) = %v, called=%v; want nil, false", doc, err, called)
+		}
+	}
+	// A byte above the whitespace set still makes it a misspelling.
+	for _, doc := range []string{"null!", "nullx", "null~"} {
+		if err := ObjectEach([]byte(doc), func(string, []byte) error { return nil }); err == nil {
+			t.Errorf("ObjectEach(%q) = nil, want an error", doc)
+		}
+	}
+}
