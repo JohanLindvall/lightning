@@ -459,9 +459,12 @@ func get(data []byte, compact bool, keys ...string) ([]byte, int, error) {
 //
 // With no keys ObjectEach iterates the document's root object; otherwise each
 // key descends one level and the value at the end of the path must itself be an
-// object (ErrExpectObject if not, ErrKeyNotFound if a key is missing). If fn
-// returns a non-nil error, iteration stops and that error is returned.
-// Non-target members along the path are skipped without allocating.
+// object (ErrExpectObject if not, ErrKeyNotFound if a key is missing). A JSON
+// null in the object's place is an object with no members: fn is not called
+// and ObjectEach returns nil, as unmarshalling null into a map leaves it nil
+// rather than failing. If fn returns a non-nil error, iteration stops and that
+// error is returned. Non-target members along the path are skipped without
+// allocating.
 func ObjectEach(data []byte, fn func(key string, value []byte) error, keys ...string) error {
 	return objectEach(data, fn, false, keys...)
 }
@@ -490,6 +493,13 @@ func objectEach(data []byte, fn func(key string, value []byte) error, compact bo
 		return unstable.ErrTruncated
 	}
 	if data[i] != '{' {
+		// A null where the object would be has no members: fn is never
+		// called and the walk succeeds, as unmarshalling null into a map
+		// leaves it nil rather than failing. Anything else that is not an
+		// object — a misspelt literal included — is still ErrExpectObject.
+		if isNullToken(data, i) {
+			return nil
+		}
 		return unstable.ErrExpectObject
 	}
 	i++
@@ -553,9 +563,12 @@ func objectEach(data []byte, fn func(key string, value []byte) error, compact bo
 //
 // With no keys ArrayEach iterates the document's root array; otherwise each
 // key descends one level and the value at the end of the path must itself be
-// an array (ErrExpectArray if not, ErrKeyNotFound if a key is missing). If fn
-// returns a non-nil error, iteration stops and that error is returned.
-// Non-target members along the path are skipped without allocating.
+// an array (ErrExpectArray if not, ErrKeyNotFound if a key is missing). A JSON
+// null in the array's place is an array with no elements: fn is not called
+// and ArrayEach returns nil, as unmarshalling null into a slice leaves it nil
+// rather than failing. If fn returns a non-nil error, iteration stops and that
+// error is returned. Non-target members along the path are skipped without
+// allocating.
 func ArrayEach(data []byte, fn func(value []byte) error, keys ...string) error {
 	return arrayEach(data, fn, false, keys...)
 }
@@ -584,6 +597,10 @@ func arrayEach(data []byte, fn func(value []byte) error, compact bool, keys ...s
 		return unstable.ErrTruncated
 	}
 	if data[i] != '[' {
+		// A null where the array would be has no elements: see objectEach.
+		if isNullToken(data, i) {
+			return nil
+		}
 		return unstable.ErrExpectArray
 	}
 	i++
@@ -684,4 +701,26 @@ func objectField(data []byte, i int, key string, compact bool) (int, error) {
 			return i, unstable.ErrInvalidJSON
 		}
 	}
+}
+
+// isNullToken reports the literal null at data[i], ending at a token boundary
+// — whitespace, a separator, a closing bracket, or the end of the input — so
+// that a null reached by key (followed by its object's '}') is one, and a
+// misspelling such as nullx is not.
+func isNullToken(data []byte, i int) bool {
+	if data[i] != 'n' {
+		return false
+	}
+	end, err := unstable.ExpectNull(data, i)
+	if err != nil {
+		return false
+	}
+	if end == len(data) {
+		return true
+	}
+	switch data[end] {
+	case ' ', '\t', '\n', '\r', ',', '}', ']':
+		return true
+	}
+	return false
 }
