@@ -15,6 +15,58 @@ import (
 // in unchanged while the result is in use; when escapes are present a new
 // string is allocated. It shares its slow path with the JSON scanner.
 func UnescapeString(in []byte) (string, error) {
+	// One compare admits every body the word tests can decide, so a body too
+	// long for them pays a single test rather than a pair: at 15 to 20 cycles
+	// for a short unescape, three instructions of gate are 4% of it. The tests
+	// answer 4 to 32 bytes without the bytes.IndexByte call, which is 1.9 ns
+	// whatever the length; see NoBackslash8. A longer body, and one with an
+	// escape, scans.
+	//
+	// That is a trade — 15 instructions off a short body, 3 onto a long one —
+	// and the corpus is what settles it rather than the benchmark shapes, nine
+	// of whose eleven are longer than the windows reach: 95.8% of the 628 685
+	// strings in bench/*/input.json are 32 bytes or shorter, and every case but
+	// string_unicode is above 77%.
+	if n := len(in); uint(n) < 33 {
+		switch {
+		case n < 4:
+			if n == 0 || (in[0] != '\\' && (n == 1 || (in[1] != '\\' && (n == 2 || in[2] != '\\')))) {
+				return unsafeStr(in), nil
+			}
+		case n <= 8:
+			if NoBackslash4(in) {
+				return unsafeStr(in), nil
+			}
+		case n <= 16:
+			if NoBackslash8(in) {
+				return unsafeStr(in), nil
+			}
+		default:
+			if NoBackslash8(in) && NoBackslash16(in) {
+				return unsafeStr(in), nil
+			}
+		}
+	}
+	// The scan is written out rather than calling UnescapeStringScan: the call
+	// is a frame on every body too long for the word tests, which measured ten
+	// instructions on a 128-byte one. Same reason ParseInt spells ParseUint's
+	// body rather than calling it.
+	k := bytes.IndexByte(in, '\\')
+	if k < 0 {
+		return unsafeStr(in), nil
+	}
+	s, _, err := decodeEscaped(make([]byte, 0, len(in)), in, 0, k, false)
+	return s, err
+}
+
+// UnescapeStringScan is UnescapeString without the short-body word tests, for a
+// caller that has already run them and been told no. Their windows cover every
+// byte of a body up to 32, so a false answer there is CONCLUSIVE — the body
+// really holds a backslash — and repeating the tests here would be pure waste:
+// pkg/json.String runs them on the quoted token, where a backslash in the token
+// is a backslash in the body, and its escaped path measured 24 instructions of
+// exactly that duplication before this existed.
+func UnescapeStringScan(in []byte) (string, error) {
 	k := bytes.IndexByte(in, '\\')
 	if k < 0 {
 		return unsafeStr(in), nil
@@ -40,6 +92,28 @@ func UnescapeString(in []byte) (string, error) {
 // caller must keep unchanged while the result is in use; when out aliases in,
 // in's original (escaped) bytes are overwritten.
 func UnescapeStringInto(in, out []byte) (string, error) {
+	// See UnescapeString: the escape-free answer for a short body costs two
+	// word loads instead of a call, and out stays untouched either way.
+	if n := len(in); uint(n) < 33 {
+		switch {
+		case n < 4:
+			if n == 0 || (in[0] != '\\' && (n == 1 || (in[1] != '\\' && (n == 2 || in[2] != '\\')))) {
+				return unsafeStr(in), nil
+			}
+		case n <= 8:
+			if NoBackslash4(in) {
+				return unsafeStr(in), nil
+			}
+		case n <= 16:
+			if NoBackslash8(in) {
+				return unsafeStr(in), nil
+			}
+		default:
+			if NoBackslash8(in) && NoBackslash16(in) {
+				return unsafeStr(in), nil
+			}
+		}
+	}
 	k := bytes.IndexByte(in, '\\')
 	if k < 0 {
 		return unsafeStr(in), nil
@@ -445,22 +519,24 @@ func UnescapeStringCopy(in []byte) (string, error) {
 	n := len(in)
 	// The word tests above, for the lengths they decide; longer input, and
 	// input with an escape, takes the vectorized scan.
-	if uint(n-4) < 29 {
-		var clean bool
+	if uint(n) < 33 {
 		switch {
+		case n < 4:
+			if n == 0 || (in[0] != '\\' && (n == 1 || (in[1] != '\\' && (n == 2 || in[2] != '\\')))) {
+				return string(in), nil
+			}
 		case n <= 8:
-			clean = NoBackslash4(in)
+			if NoBackslash4(in) {
+				return string(in), nil
+			}
 		case n <= 16:
-			clean = NoBackslash8(in)
+			if NoBackslash8(in) {
+				return string(in), nil
+			}
 		default:
-			clean = NoBackslash8(in) && NoBackslash16(in)
-		}
-		if clean {
-			return string(in), nil
-		}
-	} else if n < 4 {
-		if n == 0 || (in[0] != '\\' && (n == 1 || (in[1] != '\\' && (n == 2 || in[2] != '\\')))) {
-			return string(in), nil
+			if NoBackslash8(in) && NoBackslash16(in) {
+				return string(in), nil
+			}
 		}
 	}
 	k := bytes.IndexByte(in, '\\')

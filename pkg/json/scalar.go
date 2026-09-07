@@ -49,29 +49,43 @@ func String(raw []byte) (string, error) {
 	// makes the windows land inside the input. See unstable.NoBackslash8; the
 	// bounds there are what the windows COVER. A longer token, and any token
 	// with an escape, goes the ordinary way.
-	if uint(n-4) < 29 {
-		clean := false
+	//
+	// Two shapes here are deliberate. One length test admits every token the
+	// windows can decide, the degenerate lengths falling out of the switch's
+	// first arm, so a token too long for them pays one compare rather than a
+	// pair. And each arm returns where it decides rather than setting a flag
+	// the code below re-tests, which would cost the CSET that materialises the
+	// flag and the branch that reads it on the path every clean short string
+	// takes.
+	if uint(n) < 33 {
 		switch {
+		case n < 4:
+			// Two or three bytes: an empty or a one-byte body, below the
+			// shortest window.
+			if n == 2 {
+				return "", nil
+			}
+			if raw[1] != '\\' {
+				return unstable.UnsafeStr(raw[1:2]), nil
+			}
 		case n <= 8:
-			clean = unstable.NoBackslash4(raw)
+			if unstable.NoBackslash4(raw) {
+				return unstable.UnsafeStr(raw[1 : n-1]), nil
+			}
 		case n <= 16:
-			clean = unstable.NoBackslash8(raw)
+			if unstable.NoBackslash8(raw) {
+				return unstable.UnsafeStr(raw[1 : n-1]), nil
+			}
 		default:
-			clean = unstable.NoBackslash8(raw) && unstable.NoBackslash16(raw)
+			if unstable.NoBackslash8(raw) && unstable.NoBackslash16(raw) {
+				return unstable.UnsafeStr(raw[1 : n-1]), nil
+			}
 		}
-		if clean {
-			return unstable.UnsafeStr(raw[1 : n-1]), nil
-		}
-	} else if n < 4 {
-		// Two or three bytes: an empty or a one-byte body, below the shortest
-		// window. Tested after the gate, not before it, so that a token too
-		// long for any window pays two compares rather than three.
-		if n == 2 {
-			return "", nil
-		}
-		if raw[1] != '\\' {
-			return unstable.UnsafeStr(raw[1:2]), nil
-		}
+		// The windows covered every byte of the token, so falling out of the
+		// switch means it really does hold a backslash. UnescapeString would
+		// run the identical tests on the body and be told the same thing, so
+		// go straight to its scan.
+		return unstable.UnescapeStringScan(raw[1 : n-1])
 	}
 	return UnescapeString(raw[1 : n-1])
 }
