@@ -15,7 +15,8 @@
 //     nested paths in one prefix-sharing pass), and [ObjectEach]/[ObjectEachCompact]
 //     and [ArrayEach]/[ArrayEachCompact] (iterate an object's members or an
 //     array's elements). Returned values alias the input, so the caller must keep
-//     it unchanged while they are in use.
+//     it unchanged while they are in use; [KindOf] says what a returned value
+//     is.
 //   - Edit — splice raw values into a document, creating any missing path:
 //     [Set], [SetMany], [SetPaths]. These write into a caller-provided buffer and
 //     allocate nothing when it is reused.
