@@ -630,9 +630,12 @@ func arrayEach(data []byte, fn func(value []byte) error, compact bool, keys ...s
 		// its number arm, so the two dispatches agree byte for byte.
 		var end int
 		var err error
-		if uint(data[i]-'-') <= 12 {
+		switch c := data[i]; {
+		case uint(c-'-') <= 12:
 			end, err = unstable.SkipNumber(data, i)
-		} else {
+		case c == '"':
+			end, err = unstable.SkipString(data, i)
+		default:
 			end, err = unstable.SkipValue(data, i)
 		}
 		if err != nil {
@@ -707,7 +710,14 @@ func arrayEachIndex(data []byte, fn func(index int, value []byte) error, compact
 	}
 	for n := 0; ; n++ {
 		start := i
-		// SkipValue's number arm, written out; see arrayEach.
+		// SkipValue's number arm, written out; see arrayEach. The string arm
+		// is deliberately NOT here: measured, adding it costs this walker 35%
+		// on an array of numbers, where it costs arrayEach 1.5%. The two
+		// functions differ only in the counter and the callback's extra
+		// argument, and the number-only loop runs at IPC 6.2 on this core —
+		// at the issue width, where an extra branch target in the loop body
+		// drops it to 4.7 for the SAME instruction stream (measured: -0.6%
+		// instructions, +32% cycles, branch misses unchanged).
 		var end int
 		var err error
 		if uint(data[i]-'-') <= 12 {

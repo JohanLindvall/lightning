@@ -55,7 +55,37 @@ func walkSeries(n int) []byte {
 	return sb.Bytes()
 }
 
+func walkStringArray(n int) []byte {
+	var sb bytes.Buffer
+	sb.WriteByte('[')
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		fmt.Fprintf(&sb, `"entity-service-%05d"`, i)
+	}
+	sb.WriteByte(']')
+	return sb.Bytes()
+}
+
 var walkSink int
+
+func BenchmarkArrayEachStrings(b *testing.B) {
+	doc := walkStringArray(100)
+	b.SetBytes(int64(len(doc)))
+	b.ReportAllocs()
+	n := 0
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := ArrayEachCompact(doc, func(v []byte) error {
+			n += len(v)
+			return nil
+		}); err != nil {
+			b.Fatal(err)
+		}
+	}
+	walkSink = n
+}
 
 func BenchmarkObjectEachRecord(b *testing.B) {
 	doc := walkRecord
