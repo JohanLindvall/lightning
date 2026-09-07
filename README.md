@@ -1004,6 +1004,13 @@ The [`pkg/json`](pkg/json) package also exposes the scanner's float parser:
   a `-`. Held to `strconv.ParseInt`/`ParseUint` over a generated corpus, the
   `+` on `ParseUint` being the one documented difference.
 
+  Both fold the digits eight at a time rather than one multiply-add per digit,
+  which they can because they are handed the whole token: the digit count is
+  known before a byte is read, so the per-digit overflow test disappears (only
+  a 20-digit token needs a checked multiply) and the folds of the separate
+  words issue in parallel. A thirteen-digit timestamp costs 4.3 ns and a
+  nineteen-digit id 5.6 ns, against 9.7 and 13.4 for the digit loop.
+
 ## Stripping default fields
 
 The [`pkg/json`](pkg/json) package can also prune a JSON document in a single

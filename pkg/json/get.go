@@ -621,13 +621,18 @@ func arrayEach(data []byte, fn func(value []byte) error, compact bool, keys ...s
 	}
 	for {
 		start := i
-		// The number arm of SkipValue's dispatch, written out: a scalar
-		// element costs a call, a frame and a switch otherwise, and that is a
-		// third of this walk (ArrayEachScalars -33.7%). unstable.SkipNumber is
-		// the same function SkipValue's default case reaches, kept inlinable
-		// for exactly this. The test is one compare: '-' through '9' is '-',
-		// '.', '/' and the digits, and SkipValue sends every one of them to
-		// its number arm, so the two dispatches agree byte for byte.
+		// The number and string arms of SkipValue's dispatch, written out: a
+		// scalar element costs a call, a frame and a switch otherwise, and
+		// that is a third of this walk (ArrayEachScalars -32.5%, an array of
+		// strings -16.1%). unstable.SkipNumber and unstable.SkipString are the
+		// same functions SkipValue reaches, the first kept under the inline
+		// budget for exactly this. The number test is one compare: '-' through
+		// '9' is '-', '.', '/' and the digits, and SkipValue sends every one
+		// of them to its number arm, so the two dispatches agree byte for
+		// byte; a byte this predicate misses is not a defect, since SkipValue
+		// routes it to the same scanner. TestArrayEachDispatchMatchesSkipValue
+		// pins the direction that would be one — a predicate that claimed a
+		// quote, a brace or a literal.
 		var end int
 		var err error
 		switch c := data[i]; {
@@ -710,19 +715,26 @@ func arrayEachIndex(data []byte, fn func(index int, value []byte) error, compact
 	}
 	for n := 0; ; n++ {
 		start := i
-		// SkipValue's number arm, written out; see arrayEach. The string arm
-		// is deliberately NOT here: measured, adding it costs this walker 35%
-		// on an array of numbers, where it costs arrayEach 1.5%. The two
-		// functions differ only in the counter and the callback's extra
-		// argument, and the number-only loop runs at IPC 6.2 on this core —
-		// at the issue width, where an extra branch target in the loop body
-		// drops it to 4.7 for the SAME instruction stream (measured: -0.6%
-		// instructions, +32% cycles, branch misses unchanged).
+		// SkipValue's number and string arms, written out; see arrayEach. This
+		// loop is unusually layout-sensitive — on an array of NUMBERS its time
+		// swings between 1.08 and 1.64 us across builds and link alignments
+		// with the instruction stream and the op-cache dispatch identical, and
+		// which arrangement lands well is a coin flip that any unrelated edit
+		// re-rolls, so a single-alignment A/B of it means nothing. The arms are
+		// here because the kinds whose signal is NOT alignment-dependent say
+		// so: an array of strings is -14% with them at both alignments, an
+		// array of objects +4% (the dispatch compare it never uses), and the
+		// numbers case is better on average (1.08/1.56 against 1.60/1.64
+		// without). arrayEach, whose loop differs only by the counter and the
+		// callback's extra argument, is stable to ±1% across all of them.
 		var end int
 		var err error
-		if uint(data[i]-'-') <= 12 {
+		switch c := data[i]; {
+		case uint(c-'-') <= 12:
 			end, err = unstable.SkipNumber(data, i)
-		} else {
+		case c == '"':
+			end, err = unstable.SkipString(data, i)
+		default:
 			end, err = unstable.SkipValue(data, i)
 		}
 		if err != nil {

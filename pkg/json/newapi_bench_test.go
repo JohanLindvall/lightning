@@ -180,6 +180,33 @@ func BenchmarkArrayEachIndexVsEach(b *testing.B) {
 	walkSink = n
 }
 
+// BenchmarkArrayEachIndexShapes walks the indexed form over the element kinds
+// whose skip differs — a bare number, a string, an object — so that a change
+// to its dispatch is measured on each rather than on one.
+func BenchmarkArrayEachIndexShapes(b *testing.B) {
+	n := 0
+	fn := func(_ int, v []byte) error { n += len(v); return nil }
+	for _, c := range []struct {
+		name string
+		doc  []byte
+	}{
+		{"scalars", walkScalarArray(200)},
+		{"strings", walkStringArray(100)},
+		{"records", walkRecordArray(50)},
+	} {
+		b.Run(c.name, func(b *testing.B) {
+			b.SetBytes(int64(len(c.doc)))
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				if err := ArrayEachIndexCompact(c.doc, fn); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+	walkSink = n
+}
+
 // BenchmarkErrStop measures the early exit: a walk that stops at the first
 // element against one that runs to the end.
 func BenchmarkErrStop(b *testing.B) {

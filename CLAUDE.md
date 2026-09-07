@@ -23,7 +23,8 @@ allocation-light `json.Unmarshaler` implementations.
   distinguished by the `nocopy` decoder param / `NoCopy` suffix.
 - `pkg/unstable` — the runtime scanning primitives the generated decoders call, plus
   the handful exported for the `pkg/json` toolkit (`SkipWS`/`SkipWSCompact`/`SkipValue`/
-  `SkipString`/`ReadKey`/`DecodeValue`/`UnescapeString`/`ParseFloat` and the `Err*`
+  `SkipNumber`/`SkipString`/`ReadKey`/`DecodeValue`/`UnescapeString`/`UnescapeStringCopy`/
+  `ParseFloat`/`ParseInt`/`ParseUint`, the `NoBackslash*` word tests, and the `Err*`
   sentinels). This is where almost all performance work happens. Split into topical
   files: `read.go` (the `Read*` readers), `batch.go` (the batched scalar-array
   readers), `skip.go`, `skipfast.go` (+ `skipfast_{amd64,arm64,noasm}`,
@@ -36,9 +37,15 @@ allocation-light `json.Unmarshaler` implementations.
   *nested* paths in one prefix-sharing pass (the multi-path form of `Get`); `set.go`
   holds `Set`/`SetMany`/`SetPaths` (`SetPaths` edits/creates several nested paths in
   one rewrite); `strip_defaults.go` holds `StripDefaults`; `json.go` keeps the
-  decode-internal-bound wrappers `DecodeAny`/`UnescapeString`/`ParseFloat` (they need
-  private `decodeEscaped`/`scanFloat`, so they stay in pkg/unstable). `EscapeString` lives
-  in `escape.go`.
+  decode-internal-bound wrappers `DecodeAny`/`UnescapeString`/`UnescapeStringCopy`/
+  `ParseFloat` (they need private `decodeEscaped`/`scanFloat`, so they stay in
+  pkg/unstable). `EscapeString` lives in `escape.go`. The readers that turn a value a
+  walker hands back into a Go value live beside them: `scalar.go` (`String`/`Bool`),
+  `kind.go` (`KindOf` and the `Kind…` constants), `parseint.go` (`ParseInt`/`ParseUint`,
+  wrappers over pkg/unstable). **The `Kind` constants carry the `Kind` prefix**
+  (`KindString`, `KindNumber`, …) because `String` and `Bool` are functions in the same
+  package; they were `String`/`Number`/… in the PR that added them and could not both
+  land.
 - `bench/` — separate module (keeps easyjson/sonic deps out of the main module).
   `run_bench.sh` regenerates decoders and benchmarks lightning vs
   encoding/json, easyjson, and bytedance/sonic. `bench/large-json/input.json` is
@@ -1784,6 +1791,106 @@ byte-identical when adding cold paths; push new logic out-of-line.
   byte tail — and only a 5+-digit element (ids, timestamps) enters the loop.
   Instructions per decode mesh −3.8%, marine_ik −1.9%; cycles (counters,
   side core) mesh −6%, marine_ik −4.5%.
+- **`ParseInt`/`ParseUint` fold a token whose length is known** (`pkg/unstable/
+  parseint.go`, 2026-09-07, Zen 4). Unlike the readers in `read.go`, which scan
+  a cursor into a document and cannot know where the run ends, these are handed
+  the WHOLE token — so the digit count is known before a byte is folded, and
+  three things follow. **(1)** A run of at most 19 digits cannot overflow a
+  uint64, so the per-digit cutoff test every hand-rolled integer parser pays
+  disappears: only a 20-digit token needs a checked multiply (`bits.Mul64` on
+  the one product that can overflow), and a longer one is out of range whatever
+  its bytes are — unless it carries leading zeros, which is the sole reason the
+  slow arm skips them and retries. **(2)** The digits fold eight at a time
+  through `parse8Digits`' three multiplies instead of one multiply-add per
+  digit, and the words' folds are independent, so they issue in parallel; the
+  loop form's 13-long multiply chain on a timestamp WAS the parse (2.4 cycles a
+  digit on this core). **(3)** The decomposition is from the RIGHT — the last
+  eight digits are a whole word needing no mask, and the digits above them are
+  the same word shifted up so the vacated low lanes read as leading zeros —
+  which makes every scale a compile-time constant and removes the power-of-ten
+  table and its bounds check. A 4-to-8-digit token is two four-byte loads, at
+  its start and at its end, OR'd into one eight-lane word: they overlap when it
+  is shorter than eight and the overlapping lanes hold the same bytes, so the
+  OR is exact. Nothing reads outside the token, so a slice whose capacity stops
+  at its end is safe; validation is by coverage (the words overlap and together
+  touch every byte, so one digit test per word rejects a non-digit anywhere).
+  Two structural details each paid more than the algorithm on the short tokens
+  that dominate: the length dispatch is unsigned range tests (`uint(nd-1) < 3`)
+  so the shortest token is reached in ONE compare with the degenerate lengths
+  falling out of the same tests, and `ParseInt` returns where it folds instead
+  of joining a common tail — the merge point alone cost a one-digit parse 30%.
+  `ParseInt`'s body is `ParseUint`'s written out rather than called: the shared
+  call measured 0.7–1.0 ns against a 2.6 ns parse, a fifth of it. Interleaved
+  A/B (n=8, both sides `-funcalign=64`): ParseInt 1 digit **−6.7%**, 3 −15.4%,
+  5 −33.2%, 10 −46.0%, 13 −55.9%, 16 −63.9%, 19 −58.0%, 20 −61.0%; ParseUint
+  10 −47.2%, 13 −57.4%, 20 −63.0%; geomean **−43.7%**, nothing worse than
+  +1.5% (the non-integer rejection, 0.04 ns). Locked by
+  `TestParseIntMatchesStrconvUnstable` (a non-digit at every position of every
+  length to 24, both limits and one past them, the leading-zero shapes),
+  `TestParseIntAtBufferEnd` and `FuzzParseIntMatchesStrconv` (12.2M execs).
+- **Deciding that a short string holds no escape costs a CALL, and two word
+  loads answer instead** (`NoBackslash4`/`NoBackslash8`/`NoBackslash16` in
+  `pkg/unstable/string.go`, used by `json.String` and
+  `unstable.UnescapeStringCopy`, 2026-09-07). `bytes.IndexByte` is not an
+  intrinsic; measured, `json.String` on a seven-byte value cost 4.0 ns of which
+  **1.9 ns was the call** — the same 1.9 ns at every length, since a variant
+  with the scan removed ran at 2.1 ns for all of them. Each helper reads a
+  fixed pair of words at the input's two ends, so each decides only over a
+  range of lengths: four-byte words at 0 and n−4 cover a 4-to-8-byte input,
+  eight-byte words at 0 and n−8 cover 8 to 16, and two more at 8 and n−16 close
+  the middle to 32. `String` passes the whole quoted TOKEN rather than its
+  body: a quote is not a backslash, so the two extra bytes cost nothing and
+  they are what make every window land inside the input. The split by length is
+  not stylistic — at cost 56 each the helpers inline, and a call here would
+  replace exactly the call they exist to remove. Interleaved A/B (n=8):
+  `String` empty **−54.9%**, 7-byte −32.3%, 25-byte −24.8%, 128-byte flat;
+  `UnescapeStringCopy` short −9.9%, escaped −7.9%, a long body with a late
+  escape −12.1% (that one is a second scan the merged form did). The one cost
+  is a short ESCAPED token, +4.1%: the word test fails and IndexByte runs after
+  all. **The bounds are what the windows COVER, not what they can read, and a
+  wrong one is silent** — a missed escape returns the input's bytes verbatim
+  rather than erroring. `TestStringFindsEveryEscape` walks a two-byte escape
+  and a `\uXXXX` across every position of every length to 40 either side of
+  every boundary, held to encoding/json, with the input's capacity stopping at
+  the token; it caught this bound set two too high on its first run (words at 0
+  and n−8 cover a token of 16, not 18).
+- **The array walkers spell `SkipValue`'s number and string arms inline**
+  (`arrayEach`/`arrayEachIndex` in `pkg/json/get.go`, 2026-09-07). A 200-element
+  array of ten-digit timestamps spent 51% of its time in `skipNumber` and
+  another 30% flat in `SkipValue` itself: for a bare number the call, the frame
+  and the switch cost as much as the scan. `skipNumber` is therefore exported as
+  `SkipNumber` and left at cost 78 of the inliner's 80 — a comment there says to
+  re-check `-gcflags=-m` after any edit, since losing that inlining silently
+  gives every caller its call back — and the walkers test the leading byte
+  themselves. The number test is ONE compare: `uint(c-'-') <= 12` is `-`, `.`,
+  `/` and the ten digits, and `SkipValue`'s switch sends every one of them to
+  its default arm, so the two dispatches agree byte for byte; a byte the
+  predicate misses is not a defect (it takes `SkipValue`, which routes it to
+  the same scanner), only a byte it wrongly claims. `SkipString` is not
+  inlinable (cost 110) so the string arm still calls, but `SkipValue`'s frame
+  goes. Interleaved A/B (n=8–10): **ArrayEachScalars −32.5%**, an array of
+  strings **−16.1%**, ArrayEachIndex −6.6%, a `[ts,"v"]` series −2.4 to −5.8%;
+  ObjectEach, Get and StripDefaults flat. The costs are one compare where the
+  arm is not taken: ArrayEachRecords +1.1%, a scalar array +2.1% for the string
+  arm (34067 executed instructions against 34065 — that price is issue slots,
+  not work). Locked by `TestArrayEachDispatchMatchesSkipValue`, which walks
+  every value kind whole and every leading byte with continuation tails, and
+  fails if the predicate ever claims a quote, a brace or a literal.
+  `arrayEachIndex` carries the same two arms, but its numbers were decided
+  differently and the difference is the methodology lesson of the session: that
+  loop's time on an array of NUMBERS swings 1.08–1.64 µs across builds and link
+  alignments with an identical instruction stream, so the arms were chosen from
+  the shapes whose signal is alignment-independent (strings −14% at both
+  alignments, objects +4%) and from the average. See the rejected entry.
+- **`KindOf` dispatches through a table** (`pkg/json/kind.go`, 2026-09-07). One
+  load replaces a sixteen-case switch whose compare tree moved under an
+  unrelated edit: a first attempt kept the switch, rewrote only the literal
+  arms, and measured null −24% and invalid −38% but **number +27% and object
+  +11%**, with nothing touching those arms. The table makes every non-literal
+  kind cost the same and is a static literal, not an init function. Geomean
+  −14.8%, nothing slower. The literals are matched with the constant-string
+  compare `SkipValue`'s arms already use, and what follows them is measured
+  with `SkipWS` — see the whitespace note in the conventions.
 
 ## The inline trick — let the generator write hot bodies inline
 
@@ -2535,6 +2642,63 @@ no regressions.)
   already fast. Don't re-attempt without a way to make the miss free; the
   scanner's own block-0 branch already encodes the same length information.
 
+- **A SWAR `skipNumber` (2026-09-07, Zen 4).** `skipNumber` is 51% of a
+  scalar-array walk and 4% of cloudflare-nocopy, and its loop is six compares a
+  byte, so folding whole words looks obvious. It is not: a word test costs ~10
+  cycles of latency to cover 8 bytes where the byte loop runs at ~1.5 cycles a
+  byte under a predicted branch, so the break-even is 8–9 digits and every
+  arrangement pays that probe on the short tokens that dominate. Measured over
+  streams of 200 tokens (ns for the stream), against the byte loop: a counted
+  word run then a byte loop **int10 −21%, int19 −41%, but int1 +43%,
+  float_short +95%, float_exp +107%**; the same with a CONSTANT advance
+  (`i += 8` only when all eight are digits, so the next load's address never
+  waits on a count) int10 −23%, int19 −31%, float_long −29%, but int1 +22%,
+  int3 +21%, float_short +42%; a one-word load per eight bytes walking only the
+  flagged lanes (the best of them on long fractions, float_long −25%) int1
+  +48%, float_short +50%. There is no free length signal to dispatch on — a
+  peek at `data[i+7]` is contaminated by the NEXT token in a comma-separated
+  stream — and a table-driven byte loop (`numByte[c]`) is slower still, because
+  the load's 4-cycle latency sits on the loop's exit branch where a compare
+  does not (int10 +9%, int3 +13%). What DID pay is not touching `skipNumber` at
+  all but removing the call around it; see the walker entry above.
+- **The same inline dispatch in `objectEach`, `getMany` and `objectField`
+  (2026-09-07).** In `objectEach` the number arm measured ObjectEachRecord
+  −2.1% and ObjectEachRecordCompact −6.9% against **ObjectEachPretty +4.8%**
+  (p=0.002), reproduced across two spellings of the bounds test, and the string
+  arm measured −7.7% and **+5.3%** on the same pair — the member loop regresses
+  by about the same amount whichever branch is added, so it is the branch and
+  not the work, and a pretty member's value is a nested object whose skip is
+  20 ns against which three added instructions cannot be 0.95 ns. In `getMany`
+  and `objectField` (the non-matching-member skips) it is a wash: GetManyWithSkip
+  −1.8% and ObjectEachNested −1.4% against GetManyPretty +2.1% and GetPretty
+  +1.0%, geomean +0.05%. Object members are strings and containers far more
+  often than numbers; the array case is where the numbers are.
+- **A single-alignment A/B of `arrayEachIndex` (2026-09-07) — a phantom 35%,
+  and the reason to measure at both alignments.** Adding the string arm to
+  `arrayEachIndex` measured **+35% on an array of numbers** under
+  `-funcalign=64`, a path that arm never takes, with 0.6% FEWER instructions
+  and unchanged branch misses. That number is not real. Measured across three
+  code variants (no arm, number arm, number+string) at BOTH the default 32-byte
+  function alignment and `-funcalign=64`, the same benchmark reads 1601/1639,
+  1520/1150 and 1081/1560 ns — a 50% spread with **no consistent ordering**,
+  identical instruction counts, and `de_src_op_disp.op_cache` showing both
+  alignments fully served by the op cache (1.4 decoder ops per decode, so it is
+  not legacy decode either). The extra cycles are back-end with an identical
+  instruction stream, the same unexplained class as the amd64 string-scanner
+  re-layouts above. `arrayEach`, whose loop differs only by a counter and the
+  callback's extra argument, is stable to ±1% across all six builds.
+  **The protocol that follows**: `-funcalign=64` on both sides removes the
+  cross-function shift a code-size change causes, and it is still the right
+  default — but for a function in this regime it fixes the lottery at one
+  outcome and will report whatever that outcome is. Take the decision from
+  benchmark shapes whose signal is alignment-INDEPENDENT (here: an array of
+  strings is −14% with the arms at both alignments, an array of objects +4%),
+  or from the average over both alignments, and never from one number on one
+  build. The same mistake nearly landed the reverse change: comparing the
+  default-alignment build of the optimized tree against the default-alignment
+  build of the BASELINE tree showed +19%, which is a comparison of two
+  different lottery draws, not of the code.
+
 ## Conventions
 
 - **Generated code contains no comments** apart from the top-of-file
@@ -2547,6 +2711,19 @@ no regressions.)
   `%`-in-emitted-comment `fmt.Sprintf` trap recorded in the slice-reuse entry.
   When adding or editing a template, don't put `//` lines inside the emitted
   text; a quick check is `grep -c '//' <generated file>` == 1.
+- **This library's whitespace is every byte `<= 0x20`, at BOTH ends of every
+  value, in every function.** `SkipWS` takes that one-compare shortcut over the
+  grammar's four bytes deliberately (see the `Valid` entry: matching the decoder
+  means inheriting its leniency), and anything that trims or bounds a token must
+  use the same rule or it answers for a document the rest of the library does
+  not. Two functions got this wrong in the same week and were fixed together:
+  `KindOf` skipped leading whitespace with `SkipWS` and trimmed trailing
+  whitespace with the four-byte set, so `null` followed by a NUL was `KindInvalid`
+  while `Valid` and `DecodeAny` accepted the document; `isNullToken` (the
+  null-is-an-empty-container probe in the walkers) bounded the literal with the
+  same four bytes. `TestKindOfWhitespaceIsThePackagesOwn` and
+  `TestNullContainerWhitespaceIsThePackagesOwn` pin both, and assert `Valid` as
+  the premise so the two cannot drift apart again.
 - **The edit/transform API is deliberately two-tier.** `Set`/`SetMany`/`SetPaths`/
   `StripDefaults` return only a `[]byte` and are best effort — bracket balancers,
   not parsers, that pass uninterpretable input through rather than failing. That is
@@ -3797,3 +3974,76 @@ the v1 set, which is the wider one — every name it flags diverges on at least
 one supported toolchain. Read a fresh failure in one of these three as the
 stdlib moving again, not as a decoder bug.
 
+## Session 2026-09-07: six toolkit PRs merged, then optimized
+
+Six PRs adding readers to `pkg/json` were merged and each one benchmarked and
+tuned: `ParseInt`/`ParseUint` (#14), `String`/`Bool` (#15), `KindOf` (#16), a
+null where a container would be (#17), `UnescapeStringCopy` (#18),
+`ArrayEachIndex` and `ErrStop` (#19). The per-change entries are above; this is
+what the whole set moved, what it cost, and the three things worth carrying
+forward.
+
+**The merge itself needed one API decision.** #15 adds the FUNCTIONS `String`
+and `Bool`; #16 adds the CONSTANTS `String` and `Bool`. Git merged both
+cleanly and the result did not compile. The constants took the `Kind` prefix
+(`KindString`, `KindNumber`, …) because the functions are what the README
+documents callers writing and `KindOf(v) == json.KindString` reads no worse.
+Two semantic conflicts of that shape existed between six PRs that touched one
+package; `git merge` reports neither.
+
+**The new benchmarks are the deliverable, not scaffolding.** `ObjectEach` and
+`ArrayEach` had no committed benchmark on compact input before this (only
+`BenchmarkObjectEachPretty`, whose whitespace runs hide the per-member costs),
+so nothing would have caught a change to the member loop. `walk_bench_test.go`
+covers the four shapes callers walk — a wide flat record, an array of records,
+an array of scalars, an array of strings, and the `[timestamp, value]` series
+pair — and `newapi_bench_test.go` parameterises every new reader by SHAPE,
+because a single shape hides where the cost is: an integer's is a function of
+its digit count, a string's of its length and whether it holds an escape,
+`KindOf`'s of which arm of its dispatch it takes.
+
+**Result** (interleaved ABBA, n=8, pinned Zen 4, both sides
+`-funcalign=64`, merged-PRs baseline vs final): geomean **−11.33%** over the
+whole `pkg/json` suite. ParseInt 13 digits −56.3%, 19 −58.3%, 20 −60.9%,
+3 −15.0%, 1 −7.0%; ParseUint 13 −56.7%, 20 −63.2%; String empty −55.1%,
+7-byte −32.2%, 25-byte −26.0%; KindOf −11 to −38% across its arms;
+UnescapeStringCopy −3.6 to −11.0%; ArrayEachScalars −24.0%, the same walk
+through the index form −30.4%, an array of strings −16.1% (new), ArrayEachIndex
+−6.6%, ErrStop −18.0%, a series of pairs −6.0%. The decoder corpus in `bench/`
+(10 cases, same protocol) is **flat at −0.06%**, which is the point: the
+pkg/unstable additions are new files and one rename, and the generated decoders
+must not feel them.
+
+Costs, all reported rather than smoothed: ArrayEachRecords **+3.6%** and a
+scalar array +2.1% (the dispatch compare, on paths that never take the arm);
+a short ESCAPED string token +4.8% (its word test fails and IndexByte runs
+anyway); and ObjectEachRecordCompact +4.6%, ObjectEachNested +1.7%,
+StripDefaultsPretty +1.8%, Set/append +1.3%, EscapeString/unicode_with_quotes
++3.8% — every one of those in code this session did not touch. `get.go` grew by
+a third and the absolute ObjectEach numbers move ±8% between builds of
+identical walker source; treat any single one of them under ~5% as layout, and
+compare a walker only against a build whose `get.go` is the same size.
+
+Three lessons that generalise:
+
+- **One alignment is not a measurement.** `arrayEachIndex` reads 1.08–1.64 µs
+  on the same benchmark across three code variants × two link alignments, with
+  identical instructions and identical op-cache dispatch, and no consistent
+  ordering; `arrayEach` is stable to ±1% across the same six builds. A
+  `-funcalign=64` A/B of the sensitive one produced a confident +35% that
+  reversed at the default alignment, and a default-alignment comparison against
+  a different tree produced a confident +19% that was two lottery draws. Decide
+  such a change from shapes whose signal does not move with alignment, or from
+  the average of both — never from one build.
+- **Size a call, not a scan.** Every win here came from removing a CALL around
+  a short scan (`SkipValue`'s frame around a number, `bytes.IndexByte` around
+  a short string, the shared fold call in `ParseInt`), and every attempt to make
+  the SCAN itself wider (SWAR `skipNumber`) lost on the short tokens that
+  dominate. The rule of thumb that fell out: a call is ~2 ns here, so it is
+  worth attacking whenever the work it wraps is under ~10 ns.
+- **A window that covers too little is silent.** The word tests behind `String`
+  return the input's bytes VERBATIM when they miss an escape — no error, wrong
+  value. The first version's bounds were two too high and only an exhaustive
+  walk of an escape across every position of every length caught it. Any test
+  for a fast path of this kind has to be exhaustive over the dimension the
+  bound is in.
