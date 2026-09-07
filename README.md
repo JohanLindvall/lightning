@@ -742,14 +742,16 @@ its surrounding quotes with escapes intact, an object or array spans the whole
   counter in the closure.
 - `KindOf(raw []byte) Kind` — says what a returned value (or a whole
   document) is: `KindNull`, `KindBool`, `KindNumber`, `KindString`,
-  `KindArray` or `KindObject`, or `KindInvalid` for an empty input or a byte
-  no value starts with. The read
-  functions decide this while scanning and do not report it, so without it
-  every caller branched on `raw[0]` itself. A literal is matched whole (`nul`
-  and `truex` are `KindInvalid`); a string, number, array or object is classified
-  by its opening byte alone, as the scanner dispatches — `KindOf` says what a
-  value *is*, [`Valid`](#checking-validity) says whether it is well-formed.
-  Whitespace around the value is tolerated, as `Get` tolerates it at the root.
+  `KindArray` or `KindObject`, or `KindInvalid` for an empty input or a byte no
+  value starts with. The read functions decide this while scanning and do not
+  report it, so without it every caller branched on `raw[0]` itself. A literal
+  is matched whole (`nul` and `truex` are `KindInvalid`); a string, number,
+  array or object is classified by its opening byte alone, as the scanner
+  dispatches — `KindOf` says what a value *is*,
+  [`Valid`](#checking-validity) says whether it is well-formed. Whitespace
+  around the value is tolerated at both ends, by this package's rule (every
+  byte `<= 0x20`, what `Get` tolerates at a document's root), so a value
+  `Valid` accepts is one `KindOf` classifies.
 
 A value those functions return is a raw token, and the scalar readers turn
 one into its Go value without the caller re-deriving the grammar:
@@ -768,8 +770,10 @@ one into its Go value without the caller re-deriving the grammar:
 Both walkers treat a JSON `null` in the container's place as a container with
 nothing in it — `fn` is not called and the call returns `nil` — which is what
 unmarshalling `null` into a map or a slice does (it leaves them `nil`) and what
-`{"metric":null}` or `"values":null` mean on the wire. Any other non-container
-value there, a misspelt literal included, is still `ErrExpectObject`/`ErrExpectArray`.
+`{"metric":null}` or `"values":null` mean on the wire. The literal must end at
+a token boundary (whitespace by the rule above, a comma, a closing bracket, or
+the end of the input), so any other non-container value there, a misspelt
+literal included, is still `ErrExpectObject`/`ErrExpectArray`.
 
 A callback that returns `ErrStop` ends any of these walks early **without**
 making it a failure: the walker returns `nil`. Any other error stops the walk
