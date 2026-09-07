@@ -4003,26 +4003,28 @@ its digit count, a string's of its length and whether it holds an escape,
 `KindOf`'s of which arm of its dispatch it takes.
 
 **Result** (interleaved ABBA, n=8, pinned Zen 4, both sides
-`-funcalign=64`, merged-PRs baseline vs final): geomean **−11.33%** over the
-whole `pkg/json` suite. ParseInt 13 digits −56.3%, 19 −58.3%, 20 −60.9%,
-3 −15.0%, 1 −7.0%; ParseUint 13 −56.7%, 20 −63.2%; String empty −55.1%,
-7-byte −32.2%, 25-byte −26.0%; KindOf −11 to −38% across its arms;
-UnescapeStringCopy −3.6 to −11.0%; ArrayEachScalars −24.0%, the same walk
-through the index form −30.4%, an array of strings −16.1% (new), ArrayEachIndex
-−6.6%, ErrStop −18.0%, a series of pairs −6.0%. The decoder corpus in `bench/`
-(10 cases, same protocol) is **flat at −0.06%**, which is the point: the
-pkg/unstable additions are new files and one rename, and the generated decoders
-must not feel them.
+`-funcalign=64`, merged-PRs baseline vs final): geomean **−11.3%** over the
+whole `pkg/json` suite, **−21.6%** over the readers and walkers the six PRs
+touched. ParseInt 13 digits −56.1%, 16 −63.8%, 19 −58.3%, 20 −60.7%, 5 −32.7%,
+3 −15.8%, 1 −7.1%; ParseUint 13 −56.7%, 20 −63.2%; String empty −50.3%, 7-byte
+−32.2%, 25-byte −25.6%; KindOf −11.4 to −38.1% across its arms;
+UnescapeStringCopy short −8.9%, escaped −8.1%, a long body with a late escape
+−10.7%; ArrayEachScalars −24.7%, the same walk as a closure over `ArrayEach`
+−29.3%, an array of strings 600 → 516 ns (new benchmark), ErrStop −18.2%, a
+series of pairs −5.3%. The decoder corpus in `bench/` (10 cases, same protocol,
+run twice) is **flat**: −0.06% and +0.16%, every case p ≥ 0.13. That is the
+point — the pkg/unstable additions are new files and one rename, and the
+generated decoders must not feel them.
 
-Costs, all reported rather than smoothed: ArrayEachRecords **+3.6%** and a
-scalar array +2.1% (the dispatch compare, on paths that never take the arm);
-a short ESCAPED string token +4.8% (its word test fails and IndexByte runs
-anyway); and ObjectEachRecordCompact +4.6%, ObjectEachNested +1.7%,
-StripDefaultsPretty +1.8%, Set/append +1.3%, EscapeString/unicode_with_quotes
-+3.8% — every one of those in code this session did not touch. `get.go` grew by
-a third and the absolute ObjectEach numbers move ±8% between builds of
-identical walker source; treat any single one of them under ~5% as layout, and
-compare a walker only against a build whose `get.go` is the same size.
+Costs, all reported rather than smoothed, and each re-checked at BOTH
+alignments after the `arrayEachIndex` lesson: ArrayEachRecords **+3%** at both
+(the dispatch compare, on a path that never takes the arm) and a short ESCAPED
+string token **+3.6%** (its word test fails and `bytes.IndexByte` runs after
+all) are real. ObjectEachRecordCompact +2% at the default alignment and +5% at
+64 is not: `objectEach`'s source is byte-identical to the baseline's, `get.go`
+grew by a third around it, and the same benchmark reads 448–505 ns across
+builds of that unchanged source. Treat any walker number under ~5% as layout
+unless it reproduces at both alignments.
 
 Three lessons that generalise:
 
