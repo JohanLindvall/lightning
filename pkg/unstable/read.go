@@ -245,8 +245,8 @@ func ReadUint64OrNull(data []byte, i int) (uint64, int, error) {
 // routing through it. The mirror is not left to inspection — the accept sets are
 // compared over a generated corpus by TestReadNumberAcceptSetMatchesFloat64.
 //
-// It is deliberately not skipNumber, whose span is a strict superset of the
-// grammar: skipNumber consumes any run of [0-9.eE+-], so it happily measured
+// It is deliberately not SkipNumber, whose span is a strict superset of the
+// grammar: SkipNumber consumes any run of [0-9.eE+-], so it happily measured
 // "1.2.3", "--1" and "1e" as tokens.
 func scanNumberToken(data []byte, i int) (int, error) {
 	_, end, fast, ok := scanFloat(data, i)
@@ -442,7 +442,7 @@ func ReadTimeLaxOrNull(data []byte, i int) (time.Time, int, error) {
 		}
 		return time.Time{}, end, ErrBadTime
 	default:
-		end, err := skipNumber(data, i)
+		end, err := SkipNumber(data, i)
 		if err != nil {
 			return time.Time{}, end, err
 		}

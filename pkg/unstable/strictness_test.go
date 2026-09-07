@@ -145,7 +145,7 @@ func TestReadTimeMatchesStdlibAcceptance(t *testing.T) {
 // --- C5: json.Number literal validation ------------------------------------
 
 // TestReadNumberRejectsMalformed covers the C5 defect: the json.Number readers
-// captured skipNumber's raw token span verbatim, so a field could end up holding
+// captured SkipNumber's raw token span verbatim, so a field could end up holding
 // a string that fails at every later .Float64()/.Int64() call, far from the
 // decode — and that this library's own json.Valid rejects.
 func TestReadNumberRejectsMalformed(t *testing.T) {
@@ -256,7 +256,7 @@ func numberCorpus() []string {
 // json.Number field must capture a literal exactly when that reader would have
 // parsed one — same accept/reject decision, same error identity, same token end.
 // Without this the two disagree in whichever direction the readers happen to
-// drift, which is precisely the C5 defect (skipNumber's span is a superset of
+// drift, which is precisely the C5 defect (SkipNumber's span is a superset of
 // scanFloat's grammar).
 func TestReadNumberAcceptSetMatchesFloat64(t *testing.T) {
 	for _, in := range numberCorpus() {

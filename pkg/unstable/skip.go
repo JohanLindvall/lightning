@@ -61,7 +61,7 @@ func SkipValue(data []byte, i int) (int, error) {
 	case 'n':
 		return ExpectNull(data, i)
 	default:
-		return skipNumber(data, i)
+		return SkipNumber(data, i)
 	}
 }
 
@@ -91,7 +91,7 @@ func SkipString(data []byte, i int) (int, error) {
 	}
 }
 
-// skipNumber measures a number token; it does not validate one. Any non-empty
+// SkipNumber measures a number token; it does not validate one. Any non-empty
 // run of [0-9.eE+-] is a token, so SkipValue([]byte("+"), 0) is (1, nil) and
 // "-", "e", ".", "1.2.3" and "+-e." are number spans too — only an empty run
 // (a byte that starts none of the other value kinds, e.g. 'x') is ErrBadNumber.
@@ -103,7 +103,17 @@ func SkipString(data []byte, i int) (int, error) {
 // which runs the document through those readers, rejects the document. Only a
 // caller that mistakes SkipValue for validation is surprised here; pkg/json's
 // checked wrappers exist because the fast walkers make exactly this trade.
-func skipNumber(data []byte, i int) (int, error) {
+//
+// It is exported, and kept under the inline budget, so that a caller which has
+// already looked at data[i] and seen a digit or a '-' can spell the number arm
+// of SkipValue's dispatch INLINE: a scalar array's elements otherwise cost a
+// call, a frame and a switch each, which is a third of the walk. Every other
+// leading byte must still go to SkipValue — SkipNumber does not replace it,
+// and the two agree only where the caller has established that the value is a
+// number. Re-check `go build -gcflags=-m` after any edit here: at cost 78 of
+// the budget's 80 this function has two units of headroom, and losing the
+// inlining silently gives every one of those callers its call back.
+func SkipNumber(data []byte, i int) (int, error) {
 	start := i
 	if uint(i) < uint(len(data)) && data[i] == '-' {
 		i++

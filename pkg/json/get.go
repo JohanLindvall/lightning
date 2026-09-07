@@ -621,7 +621,20 @@ func arrayEach(data []byte, fn func(value []byte) error, compact bool, keys ...s
 	}
 	for {
 		start := i
-		end, err := unstable.SkipValue(data, i)
+		// The number arm of SkipValue's dispatch, written out: a scalar
+		// element costs a call, a frame and a switch otherwise, and that is a
+		// third of this walk (ArrayEachScalars -33.7%). unstable.SkipNumber is
+		// the same function SkipValue's default case reaches, kept inlinable
+		// for exactly this. The test is one compare: '-' through '9' is '-',
+		// '.', '/' and the digits, and SkipValue sends every one of them to
+		// its number arm, so the two dispatches agree byte for byte.
+		var end int
+		var err error
+		if uint(data[i]-'-') <= 12 {
+			end, err = unstable.SkipNumber(data, i)
+		} else {
+			end, err = unstable.SkipValue(data, i)
+		}
 		if err != nil {
 			return err
 		}
@@ -694,7 +707,14 @@ func arrayEachIndex(data []byte, fn func(index int, value []byte) error, compact
 	}
 	for n := 0; ; n++ {
 		start := i
-		end, err := unstable.SkipValue(data, i)
+		// SkipValue's number arm, written out; see arrayEach.
+		var end int
+		var err error
+		if uint(data[i]-'-') <= 12 {
+			end, err = unstable.SkipNumber(data, i)
+		} else {
+			end, err = unstable.SkipValue(data, i)
+		}
 		if err != nil {
 			return err
 		}

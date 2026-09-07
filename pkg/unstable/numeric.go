@@ -26,7 +26,7 @@ var pow10exact = [...]float64{
 // fast=false, leaving the caller to parse data[i:end] with strconv.ParseFloat.
 //
 // Folding the token scan and both fast-path parses into one pass spares the
-// separate skipNumber scan the previous two-call form made; and because the scan
+// separate SkipNumber scan the previous two-call form made; and because the scan
 // always runs to the end of the token, the slow path no longer pays for the
 // fast-path parser's full rescan-then-reject before handing off to strconv.
 func scanFloat(data []byte, i int) (f float64, end int, fast, ok bool) {
@@ -447,7 +447,7 @@ func scanFloatSlow(data []byte, i int) (f float64, end int, fast, ok bool) {
 	}
 	// A well-formed number ends here. A trailing number-continuation byte means a
 	// malformed token such as "1.2.3" or "1e2e3"; consume the rest of the run (as
-	// skipNumber would) and reject, so the reported end and error match the slow
+	// SkipNumber would) and reject, so the reported end and error match the slow
 	// path rather than silently accepting the leading "1.2".
 	if uint(end) < uint(n) {
 		if c := data[end]; c == '.' || c == 'e' || c == 'E' || (c >= '0' && c <= '9') {
