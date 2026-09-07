@@ -2008,29 +2008,89 @@ byte-identical when adding cold paths; push new logic out-of-line.
   of every array walk, and the same shape appears in any `uint(x-k) <= n` range
   test written over a byte.
 
-- **The streaming reader assembles values with the SIMD skip and only falls back
-  to the resumable scanner for values that dwarf the buffer** (`pkg/json/
-  stream.go`'s `value`, `pkg/unstable/scan.go`'s `ValueScanner`, 2026-09-07).
-  A walk over a stream has to know when a value has arrived complete before it
-  can hand it to a callback, and the obvious loop — refill, re-run `SkipValue`
-  from the value's first byte — is O(n²) in the number of chunks the value
-  arrives in. The obvious fix, a resumable byte-state machine fed each chunk
-  once, is O(n) and **three times slower per byte**: it is the scalar skip's
-  shape (indexStructural per structural byte, an escape-aware string scan)
-  where `SkipValue` on a buffered value is `skipContainerFast`'s AVX-512 block
-  scan at 10 GB/s. Using the scanner for every value cost a 4 MB matrix
-  document 350 µs against `io.ReadAll` + `ArrayEach`'s 256 µs. So `value` does
-  both: it re-offers the value to `SkipValue` after each refill for a bounded
-  number of attempts (`valueRetries` = 4) and hands over to the scanner only
-  then, which keeps the fast path for every value that is a few refills wide
-  and keeps total re-scanning a small multiple of the value's size for one that
-  is not. Same document, same protocol: **112 µs**, and 99 µs with the reader
-  reused — 2.3-2.6× FASTER than reading it all in first, because growing a 4 MB
-  buffer costs more than filling a 64 KiB one repeatedly. The scanner still
-  earns its place twice over: it is what makes a member the key path skips cost
-  no buffer at all, and it is what stops a value larger than the buffer from
-  being quadratic (`TestStreamHugeElementIsLinear` is a 256 KB value through a
-  one-byte reader — it does not finish if that regresses).
+- **The streaming skip, and the assembly of any value larger than the buffer,
+  run on the same block scan the in-memory walkers use; the resumable scanner
+  is what carries it across refills** (`pkg/json/stream.go`'s
+  `skip`/`value`/`valueMore`, `pkg/unstable/scan.go`'s `ValueScanner.ResetFast`,
+  2026-09-07). A walk over a stream has to know when a value has arrived
+  complete before it can hand it to a callback, and the obvious loop — refill,
+  re-run `SkipValue` from the value's first byte — is O(n²) in the number of
+  chunks the value arrives in. A resumable byte-state machine fed each chunk
+  once fixes the complexity; what it cost was speed, because its container
+  balance was the SCALAR skip's shape (`indexStructural` per structural byte, a
+  call per string) at **3.54 instructions a byte against `skipContainerFast`'s
+  0.25**. That ratio is what the old design was built around: `value` re-offered
+  the value to `SkipValue` after each refill for `valueRetries` = 4 rounds
+  before handing over, so that a value a few refills wide never reached the slow
+  machine. `ResetFast` puts the scanner's containers on the block scan instead,
+  and both halves of that design go with it.
+
+  **The scan is `skipContainerFast`'s, resumed, and one fact shapes the code:
+  `skipBlocks` is handed the depth and nothing else.** It has no parameter for
+  an incoming in-string or pending-escape mask, because the function it serves
+  runs once over a whole value and starts outside every string. So a chunk that
+  BEGINS inside one has to be walked out of it before the blocks resume, which
+  `stringBody` does with the same vectorized scan the scalar path uses, and the
+  two bits that survive a boundary live in the scanner's own `inString` and
+  `escaped` — the block scan's two masks reduce to exactly them. Getting this
+  wrong is invisible at most chunk sizes: the first version passed at splits of
+  1, 7 and "the whole value at once" and failed at 64 and 1000, because only
+  those landed inside a 900-byte padding string, after which every quote read
+  inverted and the container's own closer was masked away as string content.
+  `TestValueScannerFastMatchesSkipValue` (every corpus value at sixteen chunk
+  sizes, the ones either side of 64 included) and
+  `TestValueScannerFastStraddlesStrings` (a boundary walked across every byte of
+  a value whose strings hold quotes, backslashes and brackets) are the pins;
+  both catch a dropped in-string carry and a wrong consumed-block count.
+
+  **The retry rounds are gone, and their absence is worth more than they were.**
+  A retry re-reads the whole value prefix to learn what the attempt before it
+  already knew, so `valueMore` — the entry every walker's own inline scan falls
+  through to — refills ONCE and hands the value to the scanner, which reaches
+  the same end index while reading each byte once. For a value that straddles by
+  a little, one scan of the value replaces one scan of its prefix plus one of
+  the whole, so the mid-size case does not pay for it: a matrix of 5.6 KB
+  elements is **−12% instructions** (the duplicate prefix scan) and a document
+  of 148 KB elements read through a 64 KiB buffer goes **24.4M instructions to
+  1.32M, −94.6%** (1.11 instructions a byte, from 20.5). The scalar mode stays
+  the default and stays the documented one: `TestValueScannerErrors` pins
+  `ErrMaxDepth` at the recursive skips' boundary and
+  `TestValueScannerMatchesScalarSkip` pins the typed bracket balance, neither of
+  which the block scan can answer — which is why this is a second mode rather
+  than a rewrite of the first.
+
+  **What the fast mode costs is skipfast.go's divergences on malformed input**
+  (an unbalanced bracket of the other kind, nesting past `MaxDepth`, a stray
+  backslash outside a string), and it is used in exactly the two places where
+  the in-memory walkers already accept them: stepping past a value nobody asked
+  for, and finding the end of one that `SkipValue` would have settled had it
+  fitted. So this converges the streaming answer with the in-memory one rather
+  than parting from it. On an architecture with no whole-loop block assembly
+  (`useSkipBlocks` false) `ResetFast` is the scalar balance and nothing changes,
+  exactly as `SkipValue` itself falls back.
+
+  **`skip`'s own fast path is a bounded probe.** A value the path steps over is
+  usually buffered already, and then `SkipValue` settles it with no scanner at
+  all; `end < lim` is the whole test for "settled", since the scan stopped on a
+  byte it had in front of it. The probe is capped at `skipProbe` = 4 KiB so its
+  cost is a property of the VALUE and not of the buffer — without the cap a
+  reader given a 4 MB buffer would scan 4 MB to find out that a 100 MB sibling
+  does not fit. Above the cap the waste is noise (the probe is ~7% of what the
+  scanner then spends on the same bytes, less the larger the value): the
+  unbounded form measured **+0.49%** on a document whose one skipped sibling is
+  880 KB, the bounded one **+0.06%**, against **−74.7%** on a record whose
+  sixty skipped members are all buffered.
+
+  Measured, interleaved ABBA, n=8, both sides `-funcalign=64`, pinned Zen 4,
+  with the in-memory arms of each benchmark as the controls (all four flat,
+  p≥0.6): **StreamLargeElements −91.7%, StreamDescent/get −76.6%,
+  /arrayeach −76.3%, StreamSkipToKey −68.9%, StreamObjectEach −38.0%,
+  StreamShapes/scalars −32.5%, /strings −14.3%, StreamMatrix/stream −9.8%,
+  /stream_reused −9.8%, /records −2.3%**; stream_points (an in-memory walk of
+  each element, which is where its time is) and readall+walk flat. Geomean over
+  the streaming rows **−36.8%**. `TestStreamHugeElementIsLinear` — a 256 KB
+  value through a one-byte reader — is what stops the O(n²) shape from coming
+  back, and it does not finish if it does.
 - **Four call frames per element is what a streaming walk costs if the fast
   paths are not written out** (same commit). `arrayEach` over a stream reached
   the buffer through `space` (whitespace), `value` (assemble) and
@@ -2042,6 +2102,41 @@ byte-identical when adding cold paths; push new logic out-of-line.
   document from 564 to 112 µs. The remaining ~2× on small documents is the
   per-`Reader` buffer allocation plus bookkeeping that has nothing to amortise
   over; `Reset` is what a caller with many documents uses instead.
+
+  **Second pass (2026-09-07): the frames that were left are the ones the
+  in-memory walkers had already removed.** Four things, each the streaming twin
+  of something in `get.go`. **(1)** The walkers spell `SkipValue`'s number and
+  string arms out at the call site, the same three-way dispatch `arrayEach`
+  carries and for the same reason — and it has to be written out rather than
+  reached through a helper, since anything holding those three calls is far past
+  the inline budget and would put back the frame it exists to remove (measured:
+  a helper is cost 265, and the version that used one was a wash). The stream
+  adds one wrinkle: a number token ending exactly where the buffered bytes do
+  may continue in the next chunk, so only that arm carries the test, where the
+  old shape paid it on every element. Scalars **−19% instructions**, strings
+  −13%. **(2)** `space`, `colon` and `afterElement` are each a fill loop costing
+  two to three times the budget, and a member passes through three of them; the
+  buffered case of each is now written out at the call site behind `atByte`,
+  an inlinable "next byte, buffered, not whitespace" test. Nothing is consumed
+  before the fallback, so the inline answer and the function's cannot disagree.
+  **(3)** The key is read the way `get.go` reads one — a single
+  `IndexCloseOrEscapeAt` scan that settles the key's end AND whether it holds an
+  escape at once, then `UnsafeStr` over the body. That replaces two real calls:
+  `SkipString` is past the inline budget, and the decode behind it would test
+  the same bytes a second time to reach a verdict the scan already had. It is
+  two of the three frames per member the in-memory walker does not have, and it
+  measured **−17.6% instructions on the member walk and −13.8% on the descent**
+  by itself. The other half of the problem is that the key must be decoded AFTER
+  the value (a refill between them can compact the buffer and move the bytes),
+  while the index the key scan returned is stale by then — but its LENGTH is
+  not: compaction shifts the hold and every index above it by the same amount,
+  so `hold+klen` is the key's end whether or not the bytes moved, and nothing
+  has to be scanned again to find it. **(4)** `ErrStop` is compared before
+  `errors.Is` is called, which the in-memory walkers got in the same session and
+  the streaming ones did not. Together: **StreamObjectEach −50.0%,
+  StreamShapes/scalars −32.7%, /strings −14.9%**, and the streaming member walk
+  is now 1.23× the in-memory one where it was 2.46×, with the streaming
+  scalar-array walk at parity.
 
 ## The inline trick — let the generator write hot bodies inline
 
@@ -2866,6 +2961,16 @@ no regressions.)
   default-alignment build of the optimized tree against the default-alignment
   build of the BASELINE tree showed +19%, which is a comparison of two
   different lottery draws, not of the code.
+
+  **Reconfirmed again the same day, from the other direction**: adding ~230
+  lines to `stream.go` — a file `arrayEach` does not call and is not called by —
+  moved `ArrayEachScalars` **+39.4%** and `ArrayEachIndexShapes/scalars`
+  **−25.9%** (p=0.002, n=6), i.e. the two functions swapped lottery draws, with
+  `ErrStop` +26.8%, `ArrayEachSeries` +7.4% and `ObjectEachRecordCompact` +5.4%
+  alongside. Per-op instruction counts for all six are identical to ±0.11%, and
+  at `-funcalign=64` on both sides every one of them is flat (p≥0.44, geomean
+  +0.20%). A wall-clock "regression" in `get.go` from a change that does not
+  touch it is this, every time; the two-minute check is the instruction count.
 
   **Reconfirmed 2026-09-07 on a Neoverse N2**, on a change that removes
   instructions from `arrayEachIndex` and adds none: `-funcalign=64` reported
