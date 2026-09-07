@@ -380,3 +380,93 @@ func decodeBase64(b []byte) ([]byte, bool) {
 	}
 	return dst[:n], true
 }
+
+// NoBackslash8, NoBackslash16 and NoBackslash4 report whether b holds no
+// backslash — and so, when b is a JSON string body, decodes to itself. A false
+// answer means "not decided here", never "there is an escape": the caller
+// scans as it would have.
+//
+// Each reads a fixed pair of words at b's two ends, which is why each decides
+// only over a range of lengths: NoBackslash4's four-byte words at 0 and n-4
+// cover the whole of a b that is 4 to 8 bytes, NoBackslash8's eight-byte words
+// at 0 and n-8 cover one of 8 to 16, and NoBackslash16 adds the two words that
+// close the gap for one of 17 to 32. Outside those the windows still read only
+// bytes of b — nothing runs past it — but they leave a hole in the middle, and
+// a hole here is SILENT: a missed escape returns the input's bytes verbatim
+// rather than erroring. TestStringFindsEveryEscape walks an escape across
+// every position of every length for exactly that reason, and it caught these
+// bounds set two too high.
+//
+// They exist because bytes.IndexByte is a CALL, and on a short string that
+// call is the whole cost of deciding: measured, a seven-byte value costs
+// 4.0 ns through json.String of which 1.9 ns is the call, whatever the length.
+// Past 32 bytes IndexByte's vectorized scan is the better instrument and the
+// caller should use it. They are split by length, rather than written as one
+// function with the ladder inside, only to keep each inlinable: a call here
+// would replace exactly the call it exists to remove. Re-check `go build
+// -gcflags=-m` after any edit.
+//
+// A caller with a quoted token may pass the token itself rather than its body:
+// a quote is not a backslash, so the two extra bytes cost nothing and the
+// length that decides is the token's.
+func NoBackslash8(b []byte) bool {
+	n := len(b) // 8 <= n <= 16 to decide alone; see NoBackslash16
+	x0 := load64(b, 0) ^ (swarLo * '\\')
+	x1 := load64(b, n-8) ^ (swarLo * '\\')
+	return ((x0-swarLo)&^x0|(x1-swarLo)&^x1)&swarHi == 0
+}
+
+// NoBackslash16 extends NoBackslash8 to a b of 17 to 32 bytes: its words at 8
+// and n-16 cover [8,16) and [n-16,n-8), which with the other's [0,8) and
+// [n-8,n) is every byte as long as n-16 <= 16. Both must answer true.
+func NoBackslash16(b []byte) bool {
+	n := len(b) // 17 <= n <= 32, the caller's dispatch
+	x0 := load64(b, 8) ^ (swarLo * '\\')
+	x1 := load64(b, n-16) ^ (swarLo * '\\')
+	return ((x0-swarLo)&^x0|(x1-swarLo)&^x1)&swarHi == 0
+}
+
+// NoBackslash4 is NoBackslash8 for a b of 4 to 8 bytes.
+func NoBackslash4(b []byte) bool {
+	const lo, hi = uint32(0x01010101), uint32(0x80808080)
+	n := len(b)
+	x0 := load32(b, 0) ^ (lo * '\\')
+	x1 := load32(b, n-4) ^ (lo * '\\')
+	return ((x0-lo)&^x0|(x1-lo)&^x1)&hi == 0
+}
+
+// UnescapeStringCopy is UnescapeString for a result that OUTLIVES its input:
+// the returned string is always the caller's own, never a window onto in. See
+// the wrapper in pkg/json for why that matters. With no escapes it is one
+// copy; with them it is the same fresh allocation UnescapeString makes, and
+// the escape's position is carried into the decode rather than scanned for
+// twice.
+func UnescapeStringCopy(in []byte) (string, error) {
+	n := len(in)
+	// The word tests above, for the lengths they decide; longer input, and
+	// input with an escape, takes the vectorized scan.
+	if uint(n-4) < 29 {
+		var clean bool
+		switch {
+		case n <= 8:
+			clean = NoBackslash4(in)
+		case n <= 16:
+			clean = NoBackslash8(in)
+		default:
+			clean = NoBackslash8(in) && NoBackslash16(in)
+		}
+		if clean {
+			return string(in), nil
+		}
+	} else if n < 4 {
+		if n == 0 || (in[0] != '\\' && (n == 1 || (in[1] != '\\' && (n == 2 || in[2] != '\\')))) {
+			return string(in), nil
+		}
+	}
+	k := bytes.IndexByte(in, '\\')
+	if k < 0 {
+		return string(in), nil
+	}
+	s, _, err := decodeEscaped(make([]byte, 0, len(in)), in, 0, k, false)
+	return s, err
+}

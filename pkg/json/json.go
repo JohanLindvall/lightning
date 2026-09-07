@@ -60,7 +60,6 @@
 package json
 
 import (
-	"bytes"
 	"errors"
 
 	"github.com/JohanLindvall/lightning/pkg/unstable"
@@ -172,10 +171,7 @@ func UnescapeStringInto(in, out []byte) (string, error) {
 // UnescapeString's contract: the same decode, the same errors, invalid UTF-8
 // passed through.
 func UnescapeStringCopy(in []byte) (string, error) {
-	if bytes.IndexByte(in, '\\') < 0 {
-		return string(in), nil
-	}
-	return unstable.UnescapeString(in)
+	return unstable.UnescapeStringCopy(in)
 }
 
 // ParseFloat parses the number in b as a float64. It takes the scanner's

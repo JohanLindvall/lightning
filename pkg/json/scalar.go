@@ -1,6 +1,10 @@
 package json
 
-import "errors"
+import (
+	"errors"
+
+	"github.com/JohanLindvall/lightning/pkg/unstable"
+)
 
 // The scalar readers take a value exactly as [Get], [Lookup], [GetMany],
 // [GetPaths], [ObjectEach] and [ArrayEach] hand it back — a string with its
@@ -33,10 +37,43 @@ var (
 // unterminated string, an empty input — is ErrExpectString; a bad escape
 // inside the quotes is ErrBadEscape or ErrBadUnicode.
 func String(raw []byte) (string, error) {
-	if len(raw) < 2 || raw[0] != '"' || raw[len(raw)-1] != '"' {
+	n := len(raw)
+	if n < 2 || raw[0] != '"' || raw[n-1] != '"' {
 		return "", ErrExpectString
 	}
-	return UnescapeString(raw[1 : len(raw)-1])
+	// Deciding that a short token holds no escape costs a call to
+	// bytes.IndexByte — 1.9 ns of this function's 4.0 ns, whatever the length
+	// — and a pair of word loads answers for every token up to 32 bytes
+	// without one. The token is passed whole rather than its body: a quote is
+	// not a backslash, so the two extra bytes cost nothing and they are what
+	// makes the windows land inside the input. See unstable.NoBackslash8; the
+	// bounds there are what the windows COVER. A longer token, and any token
+	// with an escape, goes the ordinary way.
+	if uint(n-4) < 29 {
+		clean := false
+		switch {
+		case n <= 8:
+			clean = unstable.NoBackslash4(raw)
+		case n <= 16:
+			clean = unstable.NoBackslash8(raw)
+		default:
+			clean = unstable.NoBackslash8(raw) && unstable.NoBackslash16(raw)
+		}
+		if clean {
+			return unstable.UnsafeStr(raw[1 : n-1]), nil
+		}
+	} else if n < 4 {
+		// Two or three bytes: an empty or a one-byte body, below the shortest
+		// window. Tested after the gate, not before it, so that a token too
+		// long for any window pays two compares rather than three.
+		if n == 2 {
+			return "", nil
+		}
+		if raw[1] != '\\' {
+			return unstable.UnsafeStr(raw[1:2]), nil
+		}
+	}
+	return UnescapeString(raw[1 : n-1])
 }
 
 // Bool reads the JSON literal true or false. Anything else — null, a number,
