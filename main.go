@@ -379,13 +379,18 @@ func generateTo(inPath string, warn io.Writer) error {
 	}
 	emitted := g.entryTypes(refs, referenced)
 
-	// A referenced type's decoder is emitted by the root that reaches it, under
-	// that root's directives — its own directives are never read, so tell the
-	// user rather than silently generating the plain variant.
+	// A type another root reaches gets no method of its own — the reaching
+	// root emits its decoder, under the root's directives — unless it ASKS,
+	// by carrying a directive: then it is a root as well, with a method under
+	// its own directives, and the copy inside the reaching root still follows
+	// the root's. That is how a record nested in a schema is also decoded on
+	// its own — a dashboard's target arriving alone in an API request, a
+	// filter reached from another package, which delegates to the method
+	// and so needs one. The methodless-twin idiom is untouched: a twin
+	// carries no directive.
 	for _, name := range g.order {
-		if !emitted[name] {
-			g.warnDirectives(g.typeDirectives[name], name,
-				"the type is nested inside another type; its decoder follows the enclosing root's directives")
+		if !emitted[name] && len(g.typeDirectives[name]) > 0 {
+			emitted[name] = true
 		}
 	}
 

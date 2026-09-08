@@ -428,6 +428,14 @@ type Records []Record          // a JSON array at the root
 type ByID    map[string]Record // a JSON object used as a data map
 ```
 
+A type another root reaches gets no method of its own — the reaching root
+emits its decoder — **unless it carries a `//lightning:` directive**: then it
+is a root as well, with a method under its own directives, while the copy
+inside the reaching root keeps the root's. That is how a record nested in a
+schema is also decoded on its own: a dashboard's target arriving alone in an
+API request, or a filter that another package's decoder delegates to and so
+needs a method on. The bare `//lightning:root` asks for nothing else.
+
 A type **defined over** a struct, slice or map type — `type raw Rule` — is a
 root too, with the underlying type's shape, when it carries a `//lightning:`
 directive: `//lightning:strict` or any other, or the bare `//lightning:root`
