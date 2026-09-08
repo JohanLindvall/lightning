@@ -125,6 +125,23 @@ func BenchmarkStreamShapes(b *testing.B) {
 				}
 			}
 		})
+		// The same walk with the Reader reused, which is what separates the
+		// WALK from the setup: a fresh Reader allocates the buffer, and on a
+		// document of a few kilobytes that allocation is most of the row above
+		// — 3.3 us of the 3.5 a NewReader costs is the 64 KiB make, two thirds
+		// of which is the GC work an allocation rate buys. Read a fresh-Reader
+		// row against its in-memory twin only with this one beside it.
+		b.Run(name+"/stream_reused", func(b *testing.B) {
+			b.SetBytes(int64(len(doc)))
+			b.ReportAllocs()
+			r := NewReader(&chunkReader{})
+			for i := 0; i < b.N; i++ {
+				r.Reset(&chunkReader{data: doc, n: 32 << 10})
+				if err := r.ArrayEach(count); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }
 
