@@ -66,6 +66,113 @@ type genCase struct {
 
 var genCases = []genCase{
 	{
+		// A field whose type has its own UnmarshalJSON was decoded
+		// structurally — the method never called — where encoding/json hands
+		// the method the value, null included. Such a type is delegated to
+		// now, in every position, from this file or a sibling; and a root
+		// that carries one is not generated for, since a second method
+		// would not compile and the author's is the one that decodes the
+		// shapes a structural decode gets wrong.
+		name: "a_types_own_unmarshaljson_is_called",
+		schema: `package main
+
+type Root struct {
+	L  Level            "json:\"l\""
+	P  *Level           "json:\"p\""
+	Ls []Level          "json:\"ls\""
+	M  map[string]Level "json:\"m\""
+	N  Level            "json:\"n\""
+	S  Stamp            "json:\"s\""
+}
+
+type rootStd Root
+
+// Own has its own UnmarshalJSON and is also declared here: no method is
+// generated for it, and a field of it delegates.
+type Own struct {
+	V int "json:\"v\""
+}
+
+func (o *Own) UnmarshalJSON(b []byte) error { o.V = len(b); return nil }
+
+type Holder struct {
+	O Own "json:\"o\""
+}
+`,
+		extra: map[string]string{
+			"other.go": `package main
+
+import (
+	"encoding/json"
+	"strconv"
+)
+
+// Level decodes a number or the word "high"; a null is "unset" (-1).
+type Level struct{ N int }
+
+func (l *Level) UnmarshalJSON(b []byte) error {
+	switch string(b) {
+	case "null":
+		l.N = -1
+		return nil
+	case "\"high\"":
+		l.N = 3
+		return nil
+	}
+	n, err := strconv.Atoi(string(b))
+	l.N = n
+	return err
+}
+
+type Stamp struct{ S string }
+
+func (s *Stamp) UnmarshalJSON(b []byte) error {
+	var raw struct {
+		At string "json:\"at\""
+	}
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	s.S = "@" + raw.At
+	return nil
+}
+`,
+		},
+		probe: `package main
+
+import (
+	"encoding/json"
+	"fmt"
+)
+
+const doc = "{\"l\":\"high\",\"p\":null,\"ls\":[1,\"high\"],\"m\":{\"a\":2},\"n\":null,\"s\":{\"at\":\"x\"}}"
+
+func main() {
+	var v Root
+	if err := v.UnmarshalJSON([]byte(doc)); err != nil {
+		panic(err)
+	}
+	var s rootStd
+	if err := json.Unmarshal([]byte(doc), &s); err != nil {
+		panic(err)
+	}
+	fmt.Printf("lightning %v %v %v %v %v %v\n", v.L, v.P == nil, v.Ls, v.M, v.N, v.S)
+	fmt.Printf("stdlib    %v %v %v %v %v %v\n", s.L, s.P == nil, s.Ls, s.M, s.N, s.S)
+	var h Holder
+	fmt.Println("holder:", h.UnmarshalJSON([]byte("{\"o\":{\"v\":1}}")), h.O.V)
+	err := v.UnmarshalJSON([]byte("{\"l\":\"nope\"}"))
+	fmt.Println("error passes through:", err != nil)
+}
+`,
+		want: `lightning {3} true [{1} {3}] map[a:{2}] {-1} {@x}
+stdlib    {3} true [{1} {3}] map[a:{2}] {-1} {@x}
+holder: <nil> 7
+error passes through: true
+`,
+		wantMethods: []string{"Root", "Holder"},
+		wantWarn:    []string{"type Own has its own UnmarshalJSON and is decoded through it; no method is generated"},
+	},
+	{
 		// //lightning:strict is the DisallowUnknownFields the generator had
 		// no equivalent of: a member no field answers to fails the decode
 		// with ErrUnknownKey instead of being skipped, at every level the
