@@ -4522,6 +4522,19 @@ needed.
   this repository rests on, turned into lightning measuring itself.
   `TestStdlibTwinsAreReflectionOnly` in conformance is the standing guard;
   the case's `twin` and `rootStd` pin the silence here.
+- **An `any` field had no UseNumber.** Hugin's template parameter keeps its
+  `default` as the author wrote it (`0.95`, not float64's rendering), which
+  kept `Param`'s object form on an encoding/json Decoder with UseNumber.
+  `decodeValue` takes a `number` flag threaded through the object and array
+  arms, returning `json.Number(data[i:end])` for a number the float scan has
+  already validated — pkg/unstable imports encoding/json for the type now,
+  the first stdlib-json import there — under `DecodeValueNumber` and its
+  compact form; `pkg/json.DecodeAnyNumber` is the toolkit's spelling and
+  `TestDecodeAnyNumberMatchesUseNumber` holds it to the stdlib. In the
+  generator it is the `,number` TAG option, honoured on a field that IS
+  `any` (`isAny`; `anyValueNumber`) and warned about elsewhere: threading it
+  into slices and maps of any would touch every element decoder, and no
+  caller has asked.
 
 
 Hugin (github.com/CombinationAB/Hugin) took v0.0.86's toolkit readers and

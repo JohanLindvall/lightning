@@ -66,6 +66,56 @@ type genCase struct {
 
 var genCases = []genCase{
 	{
+		// An `any` field decoded every number to a float64, and a schema that
+		// keeps a default as the author wrote it (Hugin's template
+		// parameters: `default: 0.95` must survive as "0.95") had to stay on
+		// encoding/json for its UseNumber. The `number` tag option decodes
+		// the field's numbers, at every depth inside it, as json.Number —
+		// what UseNumber gives — and a plain any field is unchanged. The
+		// twin decodes through a Decoder with UseNumber for the comparison.
+		name: "the_number_tag_option_keeps_numbers_as_written",
+		schema: `package main
+
+type Root struct {
+	D any "json:\"d,number\""
+	N any "json:\"n,number\""
+	P any "json:\"p\""
+	W int "json:\"w,number\""
+}
+
+type rootStd Root
+`,
+		probe: `package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+)
+
+const doc = "{\"d\":0.95,\"n\":{\"a\":[10,1e400x]},\"p\":0.95,\"w\":7}"
+
+func main() {
+	var v Root
+	err := v.UnmarshalJSON([]byte("{\"d\":0.95,\"n\":{\"a\":[10,12345678901234567890]},\"p\":0.95,\"w\":7}"))
+	fmt.Printf("lightning %v %T %v %T %v %T %d\n", v.D, v.D, v.N, v.N.(map[string]any)["a"].([]any)[1], v.P, v.P, v.W)
+	var s rootStd
+	dec := json.NewDecoder(bytes.NewReader([]byte("{\"d\":0.95,\"n\":{\"a\":[10,12345678901234567890]},\"p\":0.95,\"w\":7}")))
+	dec.UseNumber()
+	if err := dec.Decode(&s); err != nil {
+		panic(err)
+	}
+	fmt.Printf("stdlib    %v %T %v %T %d\n", s.D, s.D, s.N, s.N.(map[string]any)["a"].([]any)[1], s.W)
+	fmt.Println("bad number:", err == nil, v.UnmarshalJSON([]byte(doc)) != nil)
+}
+`,
+		want: `lightning 0.95 json.Number map[a:[10 12345678901234567890]] json.Number 0.95 float64 7
+stdlib    0.95 json.Number map[a:[10 12345678901234567890]] json.Number 7
+bad number: true true
+`,
+		wantWarn: []string{`json tag option "number" on field W is ignored`},
+	},
+	{
 		// `type raw Rule` is how a hand-written UnmarshalJSON decodes its
 		// own fields without recursing into itself, and the generator saw an
 		// identifier where it wanted a struct: the idiom's inner decode had

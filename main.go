@@ -1359,6 +1359,7 @@ type fieldInfo struct {
 	nocopy bool
 	lax    bool
 	unwrap bool
+	number bool
 	tagged bool
 	depth  int
 	allocs []string
@@ -1375,7 +1376,7 @@ type fieldInfo struct {
 func (g *gen) collectFields(st *ast.StructType, prefix string, depth int, allocs []string, seen map[string]bool, out *[]fieldInfo) {
 	for _, f := range st.Fields.List {
 		tag := jsonTag(f.Tag)
-		tagNames, nocopy, lax, unwrap := tag.names, tag.nocopy, tag.lax, tag.unwrap
+		tagNames, nocopy, lax, unwrap, number := tag.names, tag.nocopy, tag.lax, tag.unwrap, tag.number
 		if len(tag.unknown) > 0 {
 			g.warnTagOptions(tag.unknown, fieldLabel(f))
 		}
@@ -1422,7 +1423,7 @@ func (g *gen) collectFields(st *ast.StructType, prefix string, depth int, allocs
 				keys = []string{name}
 			}
 			*out = append(*out, fieldInfo{keys: keys, dest: prefix + name, typ: f.Type,
-				nocopy: nocopy, lax: lax, unwrap: unwrap, tagged: len(tagNames) > 0, depth: depth, allocs: allocs})
+				nocopy: nocopy, lax: lax, unwrap: unwrap, number: number, tagged: len(tagNames) > 0, depth: depth, allocs: allocs})
 			continue
 		}
 		for _, nm := range f.Names {
@@ -1434,7 +1435,7 @@ func (g *gen) collectFields(st *ast.StructType, prefix string, depth int, allocs
 				keys = []string{nm.Name}
 			}
 			*out = append(*out, fieldInfo{keys: keys, dest: prefix + nm.Name, typ: f.Type,
-				nocopy: nocopy, lax: lax, unwrap: unwrap, tagged: len(tagNames) > 0, depth: depth, allocs: allocs})
+				nocopy: nocopy, lax: lax, unwrap: unwrap, number: number, tagged: len(tagNames) > 0, depth: depth, allocs: allocs})
 		}
 	}
 }
@@ -1695,9 +1696,19 @@ func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
 		}
 		hint := f.dest[strings.LastIndexByte(f.dest, '.')+1:]
 		var code string
-		if f.lax {
+		switch {
+		case f.number && g.isAny(f.typ):
+			// ,number: the dynamic decode keeps every number as a
+			// json.Number. Only a field that IS any takes it — inside a
+			// slice or map of any the option would have to thread through
+			// every element decoder, and no caller has asked.
+			code = g.anyValueNumber(f.dest)
+		case f.number:
+			g.warnf("json tag option \"number\" on %s is ignored: it applies to a field of type any (interface{})", "field "+strings.TrimPrefix(f.dest, "v."))
+			fallthrough
+		case f.lax:
 			code = g.laxField(f.dest, f.typ, hint, f.nocopy)
-		} else {
+		default:
 			code = g.field(f.dest, f.typ, hint, f.nocopy, false)
 		}
 		if f.unwrap {
@@ -2408,6 +2419,32 @@ if err != nil {
 }
 %s
 i = end`, reader, nullGuard(dest, "t"))
+}
+
+// isAny reports whether expr is the empty interface under any spelling.
+func (g *gen) isAny(expr ast.Expr) bool {
+	switch t := unparen(expr).(type) {
+	case *ast.Ident:
+		return t.Name == "any"
+	case *ast.InterfaceType:
+		return isAnyInterface(t)
+	}
+	return false
+}
+
+// anyValueNumber is anyValue for a ",number" field: the dynamic decode keeps
+// every number as a json.Number, as encoding/json's UseNumber does.
+func (g *gen) anyValueNumber(dest string) string {
+	decode := "unstable.DecodeValueNumber"
+	if g.compact {
+		decode = "unstable.DecodeValueNumberCompact"
+	}
+	return fmt.Sprintf(`val, end, err := %s(data, i)
+if err != nil {
+	return end, err
+}
+%s = val
+i = end`, decode, dest)
 }
 
 func (g *gen) anyValue(dest string) string {
@@ -3194,6 +3231,7 @@ type tagInfo struct {
 	nocopy  bool
 	lax     bool
 	unwrap  bool
+	number  bool     // an any field decodes its numbers as json.Number (UseNumber)
 	unknown []string // options the generator does not act on, for diagnostics
 }
 
@@ -3239,6 +3277,8 @@ func jsonTag(tag *ast.BasicLit) tagInfo {
 			t.lax = true
 		case "unwrap":
 			t.unwrap = true
+		case "number":
+			t.number = true
 		case "", "omitempty", "omitzero":
 			// A trailing comma, and the stdlib's two encode-only options
 			// (omitzero since Go 1.24).
@@ -3273,7 +3313,7 @@ func (g *gen) warnTagOptions(opts []string, field string) {
 			g.warnf("json tag option %q on %s is not implemented: the value is decoded with the field's declared Go type (for a whole JSON document embedded in a string, see the unwrap option)", o, field)
 			continue
 		}
-		g.warnf("unrecognized json tag option %q on %s; it is ignored (this generator understands nocopy, lax and unwrap)", o, field)
+		g.warnf("unrecognized json tag option %q on %s; it is ignored (this generator understands nocopy, lax, unwrap and number)", o, field)
 	}
 }
 
