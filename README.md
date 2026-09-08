@@ -978,6 +978,26 @@ documents that are large, not for all of them.
 `Valid` and `DecodeAny` need the whole value by nature and stay `[]byte` APIs,
 as does a generated `UnmarshalJSON`.
 
+**Walking on.** A Reader takes one document, but not one path: a later call
+continues from where the previous one stopped, forward only. The members
+after the last value read are searched for the new path's next key; a path
+that shares open objects with the previous one goes on inside them, one
+that leaves them skips what remains and continues in the parent; a walk a
+callback ended with `ErrStop` is finished first. A key the walk has already
+passed — or the inside of a value read whole — answers `ErrKeyNotFound`,
+and the search for it runs the object to its close, so a miss spends what
+it passed over; after a keyless call has walked the root value nothing is
+left to find. A
+Prometheus envelope reads as it is written, in one pass:
+
+```go
+status, _ := r.Get("status")                       // "success"
+kind, _ := r.Get("data", "resultType")             // "matrix"
+_ = r.ArrayEach(series, "data", "result")          // the matrix, one element at a time
+stats, _ := r.Get("data", "stats")                 // what follows the result inside data
+warnings, _ := r.Get("warnings")                   // what follows data
+```
+
 ## Decoding into `any`
 
 When a document's shape isn't known ahead of time — too variable to model, or
