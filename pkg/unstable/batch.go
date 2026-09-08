@@ -343,7 +343,8 @@ func decodeIntSlice[T intKind](out *[]T, data []byte, i int, a *Arena[T]) (int, 
 				if d > 9 {
 					break
 				}
-				n = n*10 + int64(d)
+				n *= 5 // two LEAs, not three; see ReadInt64OrNull
+				n = int64(d) + n<<1
 				i++
 			}
 			if uint(i) < uint(len(data)) && (data[i] == '.' || data[i] == 'e' || data[i] == 'E') {

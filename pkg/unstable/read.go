@@ -166,7 +166,15 @@ func ReadInt64OrNull(data []byte, i int) (int64, int, error) {
 			if d > 9 {
 				break
 			}
-			n = n*10 + int64(d)
+			// n*5 then d + n<<1 is n*10 + d, both modulo 2^64 so the wrap a
+			// long run relies on is unchanged -- but it is the shape amd64
+			// folds into TWO LEAs, LEAQ (n)(n*4) and LEAQ (d)(n5*2), where
+			// n*10 + d lowers as (n*2)*5 and then a third LEA for the add.
+			// One instruction and one cycle of the loop-carried chain per
+			// digit, on the accumulation an annotated citm profile puts 240
+			// of ReadInt64OrNull's 340 ms on.
+			n *= 5
+			n = int64(d) + n<<1
 			i++
 		}
 	}
@@ -216,7 +224,8 @@ func ReadUint64OrNull(data []byte, i int) (uint64, int, error) {
 			if d > 9 {
 				break
 			}
-			n = n*10 + uint64(d)
+			n *= 5 // two LEAs, not three; see ReadInt64OrNull
+			n = uint64(d) + n<<1
 			i++
 		}
 	}

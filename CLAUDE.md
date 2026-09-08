@@ -1754,6 +1754,28 @@ byte-identical when adding cold paths; push new logic out-of-line.
   reach — a run ending exactly on a word boundary with input behind it, so
   the next word's run length is zero (the first version folded eight lanes
   of whatever followed; the shift must be Go's, not masked `&63`).
+- **The byte loop that stayed on amd64 accumulates in TWO LEAs, not three**
+  (`n *= 5; n = int64(d) + n<<1` in `ReadInt64OrNull` / `ReadUint64OrNull`,
+  `batch.go`'s integer tail and `ParseInt`/`ParseUint`'s 1-3 digit arms;
+  2026-09-08, Meteor Lake). `n*10 + d` looks like one operation and is three:
+  the compiler lowers it as `LEAQ (n)(n*1)` → `LEAQ (n2)(n2*4)` → `LEAQ
+  (d)(n10*1)`, a **three-LEA loop-carried chain**, and adds a `MOVBLZX` to widen
+  the digit. An annotated citm_catalog profile put 240 of `ReadInt64OrNull`'s
+  340 ms on exactly those four instructions, at eleven instructions per digit for
+  9- and 10-digit ids. Writing the same value as `(n*5)*2 + d` gives the compiler
+  the two-LEA form it will not find itself — `LEAQ (n)(n*4)` then `LEAQ
+  (d)(n5*2)` — for **ten instructions and a two-cycle chain**, and the value is
+  identical including overflow: both are products modulo 2^64, and Go defines
+  signed overflow as wrapping. Interleaved ABBA (n=6, pinned, both sides
+  `-funcalign=64`): **citm_catalog −2.04%, golang_source −3.01%, gsoc_2018
+  −0.76%, marine_ik −0.68%** (all p≤0.041), every other case flat, nothing worse;
+  instructions per decode citm −1.29% and golang_source −1.29% with cycles −3.2%
+  and −3.0%. **Do not "simplify" these back to `n*10 + d`** — and note the two
+  formulations that do NOT work: accumulating in `uint64` to drop the `MOVBLZX`
+  makes the compiler hoist the `- '0'` out of the compare and emit a FOUR-LEA
+  chain instead, and `n = n*5*2 + d` folds straight back to `n*10 + d`. The
+  arm64 side is unchanged: those readers take `digitRun`'s word fold, whose whole
+  point is not to have a per-digit chain at all.
 - **The float fast path, second pass (Zen 4, 2026-09-02): one dependent
   offset for the fraction words, the exponent from one word, Eisel-Lemire
   inline, the power-of-ten entry by pointer.** Four changes to `scanFloat`,

@@ -60,7 +60,8 @@ retry:
 			if d > 9 {
 				return 0, ErrBadNumber
 			}
-			n = n*10 + d
+			n *= 5 // two LEAs, not three; see ReadInt64OrNull
+			n = d + n<<1
 			i++
 		}
 		return n, nil
@@ -158,7 +159,8 @@ retry:
 			if d > 9 {
 				return 0, ErrBadNumber
 			}
-			n = n*10 + d
+			n *= 5 // two LEAs, not three; see ReadInt64OrNull
+			n = d + n<<1
 			i++
 		}
 		return withSign(n, neg), nil
