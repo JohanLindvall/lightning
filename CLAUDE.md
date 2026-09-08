@@ -4365,6 +4365,20 @@ found:
   that with `&dest`), so it costs nothing the bare field does not. The
   test runner grew `extra` (sibling files) and `wantMethods` (the receiver
   set, read off the generated text) for these.
+- **Only string map keys, and `omitzero` warned on every run.** Hugin's
+  service graph keys its per-edge histogram by `int32`, and its records
+  carry Go 1.24's `omitzero` on their time fields. `mapKeyAssign` now
+  accepts a string, an integer kind, or a type defined over one: an integer
+  key is the member name parsed with `unstable.ParseInt`/`ParseUint` from a
+  stack `[]byte` conversion (the parser retains nothing, so the conversion
+  does not escape) and a name that is not a number is `ErrBadNumber` where
+  the stdlib raises an UnmarshalTypeError; the memo key carries the key
+  type, or an int-keyed and a string-keyed map of one value type would have
+  shared a decoder. `kn`/`kerr` joined `reservedIdents`. `omitzero` sits
+  beside `omitempty` as the second encode-only option the tag parser
+  passes over. (The case that pins the silence is NOT named after the
+  option: the diagnostics stream carries the temp path, which carries the
+  case name, so a case named `omitzero_…` finds its own name in the output.)
 
 ## Session 2026-09-07: six toolkit PRs merged, then optimized
 

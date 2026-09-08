@@ -704,7 +704,7 @@ var reservedIdents = map[string]bool{
 	// 1. decoder parameters and locals
 	"a": true, "b": true, "bend": true, "berr": true, "body": true, "data": true,
 	"depth": true, "end": true, "err": true, "f": true, "first": true, "i": true,
-	"idx": true, "ierr": true, "k": true, "ke": true, "key": true, "ks": true,
+	"idx": true, "ierr": true, "k": true, "ke": true, "kerr": true, "key": true, "kn": true, "ks": true,
 	"lax": true, "m": true, "n": true, "ni": true, "out": true, "s": true,
 	"start": true, "t": true, "v": true, "val": true, "zero": true,
 	// 2. imports of the generated file
@@ -1149,7 +1149,7 @@ func (g *gen) genUnmarshal(name string) string {
 	case g.mapTypes[name] != nil:
 		mt := g.mapTypes[name]
 		fn := g.mapDecoder(mt.Key, mt.Value, name, nocopy, false)
-		call = fmt.Sprintf("%s((*map[string]%s)(v), data, i%s%s)", fn, g.typeStr(mt.Value), g.depthArgFor(fn), rootArenaArg)
+		call = fmt.Sprintf("%s((*map[%s]%s)(v), data, i%s%s)", fn, g.typeStr(mt.Key), g.typeStr(mt.Value), g.depthArgFor(fn), rootArenaArg)
 		nullReset = "*v = nil\n\t\t"
 	default:
 		fn := g.namedStruct(name)
@@ -1686,7 +1686,7 @@ func (g *gen) field(dest string, expr ast.Expr, hint string, nocopy, lax bool) s
 			if fn == "" {
 				return g.skipEmit()
 			}
-			return g.callDecoderOn(fmt.Sprintf("(*map[string]%s)(&%s)", g.typeStr(mt.Value), dest), fn, g.arenaArg())
+			return g.callDecoderOn(fmt.Sprintf("(*map[%s]%s)(&%s)", g.typeStr(mt.Key), g.typeStr(mt.Value), dest), fn, g.arenaArg())
 		}
 		return g.unsupportedf("unknown type %q for %s", t.Name, dest)
 
@@ -2685,8 +2685,10 @@ func (g *gen) slicePresize(elt ast.Expr, eltStr string) string {
 }
 
 func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy, lax bool) string {
-	if g.typeStr(keyExpr) != "string" {
-		g.errs = append(g.errs, fmt.Errorf("unsupported map key type %s for %s", g.typeStr(keyExpr), hint))
+	keyStr := g.typeStr(keyExpr)
+	keyAssign, ok := g.mapKeyAssign(keyStr, nocopy)
+	if !ok {
+		g.errs = append(g.errs, fmt.Errorf("unsupported map key type %s for %s", keyStr, hint))
 		return ""
 	}
 	suffix := ""
@@ -2696,7 +2698,7 @@ func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy, lax boo
 	if lax {
 		suffix += "Lax"
 	}
-	key := g.prefix + g.cmark() + "map:" + suffix + ":" + g.typeStr(valExpr)
+	key := g.prefix + g.cmark() + "map:" + suffix + ":" + keyStr + ":" + g.typeStr(valExpr)
 	if fn, ok := g.memo[key]; ok {
 		return fn
 	}
@@ -2707,15 +2709,9 @@ func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy, lax boo
 	prevDepth := g.enterBody(fn, false)
 	inner := g.field("val", valExpr, hint+"Value", nocopy, lax)
 	g.depthArg = prevDepth
-	// With nocopy the key aliases the input (ReadKey already returns an alias for
-	// an unescaped key); otherwise it is copied so the map owns it.
-	keyAssign := "m[string([]byte(key))] = val"
-	if nocopy {
-		keyAssign = "m[key] = val"
-	}
 	// Trailing commas are rejected by the first-iteration flag, as in
 	// genStructBody.
-	body := fmt.Sprintf(`func %[1]s(out *map[string]%[2]s, data []byte, i int%[9]s) (int, error) {
+	body := fmt.Sprintf(`func %[1]s(out *map[%[10]s]%[2]s, data []byte, i int%[9]s) (int, error) {
 	if uint(i) >= uint(len(data)) {
 		return i, unstable.ErrTruncated
 	}
@@ -2733,7 +2729,7 @@ func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy, lax boo
 	i++
 	m := *out
 	if m == nil {
-		m = make(map[string]%[2]s)
+		m = make(map[%[10]s]%[2]s)
 	}
 	for first := true; ; first = false {
 		%[4]s
@@ -2772,9 +2768,60 @@ func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy, lax boo
 		}
 		i++
 	}
-}`, fn, valStr, inner, g.skipWS("i", "i"), g.skipWS("i", "ni"), g.skipWS("i", "i+1"), g.readKey(), keyAssign, g.depthParam(fn)+g.arenaParam())
+}`, fn, valStr, inner, g.skipWS("i", "i"), g.skipWS("i", "ni"), g.skipWS("i", "i+1"), g.readKey(), keyAssign, g.depthParam(fn)+g.arenaParam(), keyStr)
 	g.decoders = append(g.decoders, body)
 	return fn
+}
+
+// mapKeyAssign returns the statement that stores val under the member name
+// `key` (a string aliasing the input, or freshly decoded when it carried an
+// escape) for a map keyed by keyStr, and whether that key type is supported.
+// The keys are encoding/json's: a string, an integer kind, or a type defined
+// over one. A string key is copied so the map owns it unless nocopy asked for
+// the alias; an integer key is the member name parsed as a number — the form
+// encoding/json writes such a map in — and a name that is not one fails the
+// decode with ErrBadNumber, as the stdlib fails it with an UnmarshalTypeError.
+// The parse takes the name as bytes without a copy on the common path: the
+// conversion is a stack slice the parser is known not to retain.
+func (g *gen) mapKeyAssign(keyStr string, nocopy bool) (string, bool) {
+	kind, ok := g.scalarKind(keyStr)
+	if !ok {
+		return "", false
+	}
+	conv := func(v string) string {
+		if keyStr == kind {
+			return v
+		}
+		return keyStr + "(" + v + ")"
+	}
+	switch {
+	case kind == "string":
+		if nocopy {
+			return "m[" + conv("key") + "] = val", true
+		}
+		return "m[" + conv("string([]byte(key))") + "] = val", true
+	case intKinds[kind]:
+		v := "kn"
+		if kind != "int64" {
+			v = kind + "(kn)"
+		}
+		return `kn, kerr := unstable.ParseInt([]byte(key))
+		if kerr != nil {
+			return i, unstable.ErrBadNumber
+		}
+		m[` + conv(v) + `] = val`, true
+	case uintKinds[kind]:
+		v := "kn"
+		if kind != "uint64" {
+			v = kind + "(kn)"
+		}
+		return `kn, kerr := unstable.ParseUint([]byte(key))
+		if kerr != nil {
+			return i, unstable.ErrBadNumber
+		}
+		m[` + conv(v) + `] = val`, true
+	}
+	return "", false
 }
 
 func (g *gen) isStruct(expr ast.Expr) bool {
@@ -2970,8 +3017,9 @@ func jsonTag(tag *ast.BasicLit) tagInfo {
 			t.lax = true
 		case "unwrap":
 			t.unwrap = true
-		case "", "omitempty":
-			// A trailing comma, and the stdlib's encode-only option.
+		case "", "omitempty", "omitzero":
+			// A trailing comma, and the stdlib's two encode-only options
+			// (omitzero since Go 1.24).
 		default:
 			t.unknown = append(t.unknown, o)
 		}

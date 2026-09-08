@@ -130,7 +130,9 @@ silently change which key an existing decoder answers to).
 `json.RawMessage` (and `RawValue`), `time.Time` (RFC 3339, like `encoding/json`;
 the [`lax`](#the-lax-tag-option) option also accepts a space separator and Unix
 timestamps), nested named and anonymous structs, slices, fixed-size arrays
-(`[N]T`), maps with string keys, pointers, and the *empty* interface —
+(`[N]T`), maps keyed by a string or an integer kind (or a type defined over
+one — an integer key is the member name parsed, as `encoding/json` writes it,
+and a name that is not a number fails with `ErrBadNumber`), pointers, and the *empty* interface —
 `any`, `interface{}`, or a spelling of the same type like `interface{ any }` —
 decoded into the usual Go representation of an arbitrary JSON value. Unknown
 object keys are skipped.
@@ -310,7 +312,7 @@ are *silent*.
   `ErrBadNumber`; the generator prints a warning when it sees the option, rather
   than emitting a decoder that silently does the wrong thing. Declare the field as
   a `string` and convert, or — when the string holds a whole JSON *document* rather
-  than one scalar — use [`unwrap`](#the-unwrap-tag-option). `omitempty` is accepted
+  than one scalar — use [`unwrap`](#the-unwrap-tag-option). `omitempty` and `omitzero` are accepted
   and ignored, since lightning only decodes.
 - **Slice, array and map elements are reset before being decoded**, where
   `encoding/json` decodes a slice or array element into whatever it already holds.

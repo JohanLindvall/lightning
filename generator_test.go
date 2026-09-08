@@ -66,6 +66,79 @@ type genCase struct {
 
 var genCases = []genCase{
 	{
+		// A map keyed by an integer kind was "unsupported map key type" —
+		// only string keys existed — where encoding/json reads the member
+		// name as a number, which is how it writes such a map. A key that is
+		// a defined type over a string or an integer resolves the same way.
+		// The probe reads every form and a root map through the twin.
+		name: "integer_and_defined_map_keys",
+		schema: `package main
+
+type Sev string
+type Bucket int32
+
+type ByBucket map[Bucket]int64
+
+type Root struct {
+	Hist   map[int32]int64  "json:\"hist\""
+	Small  map[uint8]string "json:\"small\""
+	BySev  map[Sev]int      "json:\"bySev\""
+	Named  ByBucket         "json:\"named\""
+}
+
+type rootStd Root
+`,
+		probe: `package main
+
+import (
+	"encoding/json"
+	"fmt"
+)
+
+const doc = "{\"hist\":{\"37\":2,\"-1\":9},\"small\":{\"255\":\"x\"},\"bySev\":{\"high\":1},\"named\":{\"4\":5}}"
+
+func main() {
+	var v Root
+	if err := v.UnmarshalJSON([]byte(doc)); err != nil {
+		panic(err)
+	}
+	var s rootStd
+	if err := json.Unmarshal([]byte(doc), &s); err != nil {
+		panic(err)
+	}
+	fmt.Printf("lightning %v %v %v %v\n", v.Hist, v.Small, v.BySev, v.Named)
+	fmt.Printf("stdlib    %v %v %v %v\n", s.Hist, s.Small, s.BySev, s.Named)
+	var r ByBucket
+	if err := r.UnmarshalJSON([]byte("{\"1\":2}")); err != nil {
+		panic(err)
+	}
+	fmt.Printf("root %v\n", r)
+	var bad Root
+	err := bad.UnmarshalJSON([]byte("{\"hist\":{\"x\":1}}"))
+	fmt.Printf("bad key: %v\n", err)
+}
+`,
+		want: `lightning map[-1:9 37:2] map[255:x] map[high:1] map[4:5]
+stdlib    map[-1:9 37:2] map[255:x] map[high:1] map[4:5]
+root map[1:2]
+bad key: json: invalid number
+`,
+	},
+	{
+		// omitzero is encoding/json's second encode-only option (Go 1.24);
+		// like omitempty it says nothing to a decoder and warns about nothing.
+		name: "the_stdlib_second_encode_only_option_is_accepted",
+		schema: `package main
+
+import "time"
+
+type Root struct {
+	At time.Time "json:\"at,omitzero\""
+}
+`,
+		wantNoWarn: []string{"unrecognized json tag option"},
+	},
+	{
 		// A type declared in another file of the package was "unknown type",
 		// even when both files were named on the command line: each input
 		// resolved names against itself alone. A real package keeps its
