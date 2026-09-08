@@ -2761,7 +2761,7 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax, root bool) st
 		// array, a too-small one regrows exactly as before. Empty arrays never
 		// reach the first append, so `[]` still yields a nil slice, and decoding
 		// into a reused non-nil slice keeps appending unchanged.
-		growCall := "unstable.GrowSlice(*out)"
+		growCall := "*out = unstable.GrowSlice(*out)"
 		if root {
 			// A slice ROOT's growth extrapolates the final element count from
 			// decode progress instead of blind doubling: at the grow point the
@@ -2779,7 +2779,29 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax, root bool) st
 			// estimate always saturates its clamp, and 4x-and-up growth was
 			// measured and rejected for exactly those shapes (see GrowSlice).
 			presize = "	lightningArrStart := i\n"
-			growCall = "unstable.GrowSliceEst(*out, lightningArrStart, i, len(data))"
+			growCall = "*out = unstable.GrowSliceEst(*out, lightningArrStart, i, len(data))"
+		} else if g.eltHasPointers(elt) {
+			// A NESTED slice of elements the collector has to scan gets the
+			// same progress extrapolation, over its OWN byte span instead of
+			// the document's: the document tail says nothing about how long
+			// this array is, but the array's ']' does, and GrowSliceSpan finds
+			// it by running the container skip forward from the cursor — a
+			// quarter of an instruction per byte over bytes this loop is about
+			// to read anyway, and proportional to what is LEFT, so an array
+			// about to end settles in a block or two. The scan happens at most
+			// once per array (its answer is cached in lightningArrEnd) and only
+			// past the size and density thresholds GrowSliceSpan applies; an
+			// array that fits its capacity hint never scans at all.
+			//
+			// A pointer-free element type (the [][2]float64 / [][3]float64
+			// coordinate rings) keeps the flat-2x doubling: see eltHasPointers
+			// for why the scan cannot pay there.
+			presize = "	lightningArrStart, lightningArrEnd := i, 0\n"
+			growCall = `if lightningArrEnd != 0 || unstable.ScanWorth(cap(*out), int(unsafe.Sizeof(zero)), i-lightningArrStart) {
+					*out, lightningArrEnd = unstable.GrowSliceSpan(*out, data, lightningArrStart, i, lightningArrEnd)
+				} else {
+					*out = unstable.GrowSlice(*out)
+				}`
 		}
 		// The capacity hint below is the generated code's only use of unsafe, so
 		// this is where that import is claimed (the same emit-site rule as
@@ -2791,7 +2813,7 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax, root bool) st
 			*out = make([]%[1]s, 1, max(4, 256/max(1, int(unsafe.Sizeof(zero)))))
 		} else {
 			if len(*out) == cap(*out) {
-				*out = %[2]s
+				%[2]s
 			}
 			*out = append(*out, zero)
 		}`, eltStr, growCall)
@@ -3164,6 +3186,77 @@ func (g *gen) structSkipIsCheapSeen(expr ast.Expr, seen map[string]bool) bool {
 		return true // a scalar named type (int, string, ...)
 	}
 	return true // selector leaves (time.Time, json.RawMessage)
+}
+
+// eltHasPointers reports whether a slice element type contains a pointer the
+// garbage collector must scan — a string, slice, map, pointer or interface,
+// anywhere inside it. It decides which growth the emitted loop gets, and it is
+// a performance decision only: a wrong "no" merely keeps the flat-2x doubling
+// (today's behaviour), and a wrong "yes" costs an estimate scan that may not
+// pay.
+//
+// The distinction it draws is the one the scan's economics turn on. A backing
+// of pointer-free elements is cheap to allocate and cheap to discard — the
+// runtime skips zeroing the part append will overwrite, there is no write
+// barrier on the copy, and the collector never walks it — so the bytes a
+// doubling wastes are worth far less than the scan that would avoid them.
+// Measured on the coordinate rings ([][2]float64, [][3]float64), which are the
+// pointer-free shape in the corpus: sizing them from a scan is +3.3%
+// instructions on canada and +1.5% on canada_geometry, for a 40% cut in B/op
+// nobody feels — the same trade slicePresize already refuses for these rings
+// by not counting them at all.
+//
+// A named type resolves through g.structTypes / g.scalarTypes; anything it
+// cannot see (a foreign selector type other than the three known ones) is
+// assumed to contain pointers, since that is the answer that leaves the
+// estimate free to decide.
+func (g *gen) eltHasPointers(expr ast.Expr) bool {
+	return g.eltHasPointersSeen(expr, map[string]bool{})
+}
+
+func (g *gen) eltHasPointersSeen(expr ast.Expr, seen map[string]bool) bool {
+	switch t := unparen(expr).(type) {
+	case *ast.StarExpr, *ast.MapType, *ast.InterfaceType, *ast.ChanType, *ast.FuncType:
+		return true
+	case *ast.ArrayType:
+		if t.Len == nil {
+			return true // a slice header carries a pointer
+		}
+		return g.eltHasPointersSeen(t.Elt, seen)
+	case *ast.StructType:
+		for _, f := range t.Fields.List {
+			if g.eltHasPointersSeen(f.Type, seen) {
+				return true
+			}
+		}
+		return false
+	case *ast.Ident:
+		if t.Name == "string" || t.Name == "any" {
+			return true
+		}
+		if intKinds[t.Name] || uintKinds[t.Name] || t.Name == "bool" ||
+			t.Name == "float32" || t.Name == "float64" || t.Name == "error" {
+			return t.Name == "error"
+		}
+		if seen[t.Name] {
+			return false // already being walked; the cycle adds nothing new
+		}
+		seen[t.Name] = true
+		if st, ok := g.structTypes[t.Name]; ok {
+			return g.eltHasPointersSeen(st, seen)
+		}
+		if k, ok := g.scalarKind(t.Name); ok {
+			return k == "string"
+		}
+		return true
+	case *ast.SelectorExpr:
+		// json.Number is a string, json.RawMessage a slice and time.Time
+		// carries a *Location; a foreign type is unknown, and "yes" is the
+		// answer that leaves the estimate free to decide.
+		_ = t
+		return true
+	}
+	return true
 }
 
 func (g *gen) baseName(expr ast.Expr) string {

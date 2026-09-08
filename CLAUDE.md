@@ -1416,6 +1416,7 @@ byte-identical when adding cold paths; push new logic out-of-line.
   (n=6, funcalign=64; −3.5%/−2.5%/citm −3.2% at default alignment). An empty
   nocopy string now carries a pointer into the input, which changes nothing a
   caller can observe under the nocopy contract.
+
 - **Escaped-string decode, second pass** (on top of the four-part entry above;
   both changes in `string.go`, twitterescaped **−8.4%** and gsoc_2018 **−2.3%**
   interleaved). **(1)** `decodeEscaped`'s `\uXXXX` branch hand-encodes BMP runes
@@ -1483,9 +1484,88 @@ byte-identical when adding cold paths; push new logic out-of-line.
   all bench outputs; every nested slice keeps the tuned flat-2× byte-identically,
   so no guard measurements were even needed. Interleaved A/B (n=8):
   **github_events −27.6% time, −37.3% B/op, 1.31 GB/s** (was 0.95). Locked by
-  `TestGrowSliceEst` (clamps, pad, degenerate inputs, no aliasing). A possible
-  future extension — the estimate for *fields* that dominate the document tail
-  (large-json's `features`) — needs a way to bound nested-slice waste first.
+  `TestGrowSliceEst` (clamps, pad, degenerate inputs, no aliasing). **The
+  extension this entry left open — the estimate for *fields* that dominate the
+  document tail (large-json's `features`), which "needs a way to bound
+  nested-slice waste first" — is the next entry: the bound is the array's own
+  `]`.**
+- **A NESTED slice's growth is sized from the array's own byte span, measured
+  once** (`GrowSliceSpan`/`arrayEndAt`/`ScanWorth` in `grow.go`, `eltHasPointers`
+  and the `presize == ""` arm of `sliceDecoder` in `main.go`; 2026-09-08, Meteor
+  Lake). The root estimate above works because the array runs to the end of the
+  document; a field's array does not, so nested slices doubled blindly and
+  allocated ~2x their final size in dead backings, plus the memmove and the
+  write barrier over each. What the estimate was missing is the array's END, and
+  `arrayEndAt` supplies it by entering the container skip's block loop at depth 1
+  — the same scan `skipContainerFast` runs one byte past an open bracket — over
+  bytes the decode is about to read anyway. `GrowSliceEst`'s own arithmetic then
+  applies unchanged, with the array's `]` in place of `len(data)`.
+
+  **Three things make it pay, and each was measured by being got wrong first.**
+  **(1) Scan FORWARD FROM THE CURSOR, not from the array's `[`.** The cost is
+  then proportional to what is LEFT, so an array about to end is settled in a
+  block or two instead of re-reading everything already parsed: payload_large is
+  +5.5% instructions scanning from the start and +3.6% forward, and random went
+  −1.9% → −6.6% on the same switch. **(2) Scan at most once per array.** The
+  answer lives in a per-array local (`lightningArrEnd`, 0 until known) that every
+  later grow reuses; without it a long array re-reads its own tail once per
+  doubling. **(3) Gate it three ways** — see `arrayScanMinElems` /
+  `arrayScanMin` / `arrayScanRatio` in `grow.go` for the derivation. A scanned
+  byte costs about 0.9 instructions through the block loop and an allocated byte
+  is worth 1.5 to 7, so the scan pays only when the array still has several
+  doublings left AND its JSON is not much fatter than the Go value: scanning
+  EVERY array put `skipBlocks` at **17.9% of citm_catalog and cost it +23%**
+  (nested arrays — performances → seatCategories → areas → blockIds — each
+  re-read the same bytes once per level); with only a byte floor, citm's
+  performances array (136 bytes of Go per ~7 KB of JSON) still read the whole
+  1.7 MB document to save 18 KB, 9.8% of that decode; with only the density
+  ratio, payload_large's 30 fat Topics entries crossed the floor at 16 elements
+  and then ended, paying an 11 KB scan to size the last backing 34 instead of 32
+  (+2.9% instructions, no B/op at all).
+
+  **A pointer-free element type is excluded at generate time**
+  (`eltHasPointers`), which is the other half of the economics: the runtime skips
+  zeroing the part `append` will overwrite, there is no write barrier on the
+  copy, and the collector never walks the result, so the bytes a doubling wastes
+  there are worth far less than the scan. The coordinate rings are that shape in
+  the corpus — sizing `[][2]float64` / `[][3]float64` from a scan is **canada
+  +3.3% and canada_geometry +1.5% instructions for a 40% cut in B/op nobody
+  feels**, the same trade `slicePresize` already refuses for those rings by not
+  counting them at all.
+
+  **The gate is emitted at the CALL SITE, not inside `GrowSliceSpan`**, because
+  that function is cost 231 and can never inline: with the gate inside, an array
+  that never scans pays a call per grow for a decision that is nearly always no
+  (citm_catalog, 591 grows and no scans, measured +1.05% wall). `ScanWorth` is a
+  few compares and inlines, so the common path keeps the inlined `GrowSlice` it
+  had.
+
+  Measured (interleaved ABBA, n=6, pinned, both sides `-funcalign=64`):
+  **large-json −8.83% time / −31.5% B/op, random −6.92% / −30.4%,
+  cloudflare-compact −1.58%, twitter_status −0.49%, payload_large −0.47%**;
+  **golang_source B/op −23.7% and allocs −2.2%** (time p=0.093) and
+  **twitterescaped B/op −23.5%**, both with the time flat; citm_catalog, canada,
+  canada_geometry and the other twenty cases flat, and the residual
+  payload_medium +2.1% / mesh_pretty +1.1% / mesh +0.7% execute the same
+  instructions to within 0.05% (layout). Instructions per decode: large-json
+  −8.3%, random −6.6%, golang_source −1.4%.
+
+  **The oracle that sized this, and the one that misleads.** Decoding into a
+  REUSED target — where the backings survive, so no outer slice grows — is
+  **large-json −20.6%, random −15.3%, twitter_status −13.0%, citm_catalog
+  −4.5%, golang_source +0.9%**: that is the ceiling for anything in this area
+  and it says where to look. The opposite oracle is the trap: raising the
+  first-append hint from ~256 bytes to ~16 KiB removes **21% of citm's
+  ALLOCATIONS and costs +385% time** (B/op +2696%). Allocation BYTES are what
+  cost; allocation COUNT is not, and a presize that over-allocates loses far
+  more than the doublings it saves.
+
+  Locked by `TestArrayEndAt` (the forward scan held to `SkipValue` over the whole
+  array, from every element boundary of every array shape, at three trailing-slack
+  lengths so both the block path and the byte tail run), `TestScanWorth` and
+  `TestGrowSliceSpan`; sabotage-verified by entering the block loop at depth 2.
+  The dual-generator diff is 10 of 31 schemas byte-identical and 21 differing by
+  exactly the two locals and the gated grow.
 - **Trailing commas are rejected (first-iteration flag), matching
   encoding/json.** Every container loop — generated object/slice/fixed-array/map
   (`genStructBody`/`sliceDecoder`/`arrayDecoder`/`mapDecoder` in `main.go`), the

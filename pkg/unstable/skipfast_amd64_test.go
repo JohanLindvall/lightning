@@ -77,3 +77,29 @@ func BenchmarkSkipBlocksVariant(b *testing.B) {
 		}
 	}
 }
+
+// TestArrayEndAtVariants drives the growth estimate's forward container scan
+// through each of its three arms — the whole-loop assembly, the Go block loop,
+// and the scalar element walk — by flipping the same dispatch flags
+// TestSkipBlocksVariants does. Without this the scalar arm never runs on a
+// machine with AVX2, which is every machine this corpus is measured on.
+func TestArrayEndAtVariants(t *testing.T) {
+	sb, fs := useSkipBlocks, fastSkipAvail
+	defer func() { useSkipBlocks, fastSkipAvail = sb, fs }()
+	for _, v := range []struct {
+		name             string
+		blocks, fastSkip bool
+	}{
+		{"asm", sb, fs},
+		{"goloop", false, fs},
+		{"scalar", false, false},
+	} {
+		if v.blocks && !sb {
+			continue // no assembly on this host
+		}
+		t.Run(v.name, func(t *testing.T) {
+			useSkipBlocks, fastSkipAvail = v.blocks, v.fastSkip
+			checkArrayEndAt(t)
+		})
+	}
+}
