@@ -1,24 +1,159 @@
 # Lightning ⚡
 
-A small Go code generator that emits fast, allocation-light
-`json.Unmarshaler` implementations from your struct definitions.
+A Go code generator that turns your struct definitions into fast,
+allocation-light `json.Unmarshaler` implementations — plus
+[`pkg/json`](pkg/json), a toolkit for working with JSON documents without
+decoding them into a struct at all.
 
-Instead of decoding JSON with reflection at run time (like `encoding/json`),
-lightning reads a struct definition at build time and writes a hand-written
-style `UnmarshalJSON` method plus the recursive decoders it needs. The decoders
-share a single set of scanning primitives in [`pkg/unstable`](pkg/unstable), so the
-generated files stay small.
+Where `encoding/json` walks your types with reflection at run time, lightning
+reads them once at build time and writes the decoder out: an index-based,
+single-pass scanner with no reflection, no intermediate representation, and no
+allocation on the common paths. Across the thirty documents of the
+[benchmark corpus](#benchmarks) that is **7.6× to 23× the standard library**
+(median ~12×), and 80–260× on the two whose schemas skip most of the input.
 
-Those same primitives are also exposed directly as a small toolkit in
-[`pkg/json`](pkg/json), for working with JSON without generating or decoding into
-a struct at all: pull a few fields out of a document
-([`Get`/`GetMany`](#key-lookups)), edit values in place
-([`Set`/`SetMany`](#setting-a-value)), prune default members
-([`StripDefaults`](#stripping-default-fields)), decode into a generic value
-([`DecodeAny`](#decoding-into-any)), check a document without decoding it
-([`Valid`](#checking-validity)), and escape, unescape, or parse a JSON number
-on its own — each an allocation-light, single-pass operation over the raw bytes.
-See [Layout](#layout) for the full list.
+## Features
+
+- **Drop-in.** The generated method makes your type a `json.Unmarshaler`, so
+  `encoding/json.Unmarshal(b, &v)` uses it with no call-site change; calling
+  `v.UnmarshalJSON(b)` directly skips the reflection entry point too.
+- **Matches `encoding/json`** on the things that are easy to get subtly wrong —
+  slice and pointer reuse, `[]byte` as base64 or as a number array, `time.Time`,
+  fixed-size arrays, trailing-comma rejection — with every remaining divergence
+  listed, explained and tested in
+  [Differences from `encoding/json`](#differences-from-encodingjson).
+- **Broad type support.** Every scalar kind and defined type over one, nested
+  structs, slices, fixed-size arrays, maps keyed by string or integer, pointers,
+  `any`, `json.RawMessage`, `json.Number`, `time.Time`, and delegation to any
+  type that has an `UnmarshalJSON` of its own. See
+  [Supported types](#supported-types).
+- **Zero-allocation modes you opt into.** [`nocopy`](#the-nocopy-tag-option)
+  aliases strings into the input buffer,
+  [`//lightning:arena`](#lightningarena) batches small slice backings, and
+  [`//lightning:destructive`](#the-lightningdestructive-directive) unescapes in
+  place — each a documented trade, none of them the default.
+- **SIMD scanning**, on the scan loops that dominate: SSE2/AVX2/AVX-512 on
+  amd64, NEON and SVE2 on arm64, SWAR elsewhere — with no build tags and no
+  CPU requirement beyond each architecture's mandatory baseline. See
+  [SIMD scanning](#simd-scanning).
+- **A streaming reader** for documents too large to hold in memory, walking an
+  `io.Reader` through a bounded buffer. See [Streaming](#streaming).
+- **A schema-less toolkit** in [`pkg/json`](pkg/json) — read, edit, validate,
+  escape and parse raw JSON in a single pass over the bytes, no struct and no
+  generation required; see the table below.
+- **Small surface, small output.** Two dependencies (`golang.org/x/sys` and
+  `github.com/JohanLindvall/arena`); the generated files hold decode logic only,
+  since every scanning primitive is shared.
+
+## API at a glance
+
+### The generator
+
+```sh
+go run github.com/JohanLindvall/lightning@latest path/to/data.go
+```
+
+writes `path/to/data_unmarshal.go` with an `UnmarshalJSON` for each top-level
+type in the file. Behaviour is steered by struct tags and per-type comment
+directives:
+
+| Struct tag option | Effect |
+|---|---|
+| `json:"name"` | names the key, as in `encoding/json` |
+| `json:"a\|b\|c"` | [alternate names](#alternate-field-names) — the first that matches wins |
+| `json:"-"` | skip the field |
+| `,nocopy` | [alias the string into the input buffer](#the-nocopy-tag-option) instead of copying it |
+| `,lax` | [tolerate a value of the wrong shape](#the-lax-tag-option) and leave the field zero |
+| `,unwrap` | [decode a JSON document embedded in a string](#the-unwrap-tag-option) (or base64) |
+| `,number` | [decode an `any` field with `json.Number`](#the-number-tag-option) rather than `float64` |
+| `,omitempty` `,omitzero` | accepted and ignored (they are encode-only) |
+
+| Comment directive | Effect |
+|---|---|
+| [`//lightning:strict`](#lightningstrict) | an unknown object key is an error (`ErrUnknownKey`), not a skip |
+| [`//lightning:compact`](#lightningcompact) | the input has no insignificant whitespace; elide every inter-token skip |
+| [`//lightning:nocopy`](#lightningnocopy) | a slice or map root aliases its keys and elements |
+| [`//lightning:destructive`](#the-lightningdestructive-directive) | unescape strings into the input buffer — zero allocation, destroys the input |
+| [`//lightning:arena`](#lightningarena) | carve small scalar-slice backings from chunks instead of one `make` each |
+| [`//lightning:root`](#root-types) | make this a root — a method of its own for a type something else reaches, or one defined over a struct, slice or map |
+
+### The toolkit — [`pkg/json`](pkg/json)
+
+These work on raw bytes in a single pass, and what they hand back aliases the
+input rather than copying it — so keep the input alive and unchanged while a
+result is in use (`UnescapeStringCopy` is there for when you cannot). The
+readers and walkers each have a `…Compact` twin that assumes the document holds
+no insignificant whitespace, which lets them skip the inter-token scans.
+
+| | |
+|---|---|
+| **Read** | [`Lookup`](#key-lookups), [`Get`](#key-lookups) (with the value's offset), [`GetMany`](#key-lookups), [`GetPaths`](#key-lookups) (several nested paths in one pass), [`ObjectEach`](#key-lookups), [`ArrayEach`](#key-lookups), [`ArrayEachIndex`](#key-lookups) |
+| **Interpret** | [`KindOf`](#key-lookups), [`String`](#key-lookups), [`Bool`](#key-lookups), [`ParseInt`/`ParseUint`](#number-parsing), [`ParseFloat`](#number-parsing), [`DecodeAny`](#decoding-into-any), [`DecodeAnyNumber`](#decoding-into-any) |
+| **Edit** | [`Set`](#setting-a-value), [`SetMany`](#setting-a-value), [`SetPaths`](#setting-a-value), [`StripDefaults`](#stripping-default-fields) — and a [`…Checked`](#checked-edits) form of each, for untrusted input |
+| **Strings** | [`EscapeString`](#string-escaping-and-unescaping), [`EscapeStringInto`](#string-escaping-and-unescaping), [`UnescapeString`](#string-escaping-and-unescaping), [`UnescapeStringInto`](#string-escaping-and-unescaping), [`UnescapeStringCopy`](#string-escaping-and-unescaping) |
+| **Validate** | [`Valid`](#checking-validity) |
+| **Stream** | [`NewReader`](#streaming) (`WithBufferSize`, `WithMaxElement`) and its `Get`, `ObjectEach`, `ArrayEach`, `Elements` (a range-over-func iterator), `Reset`, `Buffered`, `Consumed` |
+
+Errors are matchable sentinels — `ErrKeyNotFound`, `ErrExpectObject`,
+`ErrTruncated`, `ErrUnknownKey` and the rest; see [Errors](#errors).
+`ErrStop` ends any of the walkers early.
+
+`pkg/json` is the public API. [`pkg/unstable`](pkg/unstable) is the generator's
+runtime, exported only because the generated files in *your* module have to call
+into it — as its name says, it is not a stable API; don't import it directly.
+
+## Quick start
+
+Put a `go:generate` line beside your structs:
+
+```go
+package cloudflare
+
+import "time"
+
+//go:generate go run github.com/JohanLindvall/lightning@latest $GOFILE
+
+type Log struct {
+    RayID              string    `json:"RayID"`
+    EdgeResponseStatus int64     `json:"EdgeResponseStatus"`
+    EdgeStartTimestamp time.Time `json:"EdgeStartTimestamp"`
+    Tags               []string  `json:"Tags"`
+}
+```
+
+`go generate ./...` writes the decoder next to it, and decoding is then just:
+
+```go
+var v Log
+if err := v.UnmarshalJSON(data); err != nil {
+    return err
+}
+```
+
+Reuse `v` across documents and the decode is allocation-free for everything
+whose backing already fits — see [Reusing a decode target](#reusing-a-decode-target).
+
+Add [`,nocopy`](#the-nocopy-tag-option) to a string field and it aliases the
+input buffer instead of copying — zero allocation, for as long as you keep the
+input alive.
+
+Without generating anything, the same scanner is available directly through
+`github.com/JohanLindvall/lightning/pkg/json`:
+
+```go
+raw, err := json.Lookup(data, "user", "name") // aliases data; quotes included
+name, err := json.String(raw)                 // unquote and unescape
+
+err = json.ArrayEach(data, func(item []byte) error { // walk data["results"]
+    id, err := json.Lookup(item, "id")
+    if err != nil {
+        return err
+    }
+    return handle(id)
+}, "results")
+
+out = json.Set(data, out[:0], []byte(`42`), []string{"meta", "count"})
+```
 
 ## Installation
 
@@ -43,14 +178,11 @@ the module you generate into must depend on lightning:
 go get github.com/JohanLindvall/lightning
 ```
 
-That pulls in two small dependencies: `golang.org/x/sys` (CPU feature detection
-for the SIMD scanners) and `github.com/JohanLindvall/arena` (the chunk-backed
-store behind [`//lightning:arena`](#lightningarena)).
-
-`pkg/unstable` is the generator's runtime: it is exported only because the
-generated `*_unmarshal.go` files (which live in your module) have to call into it.
-As its name says, it is **not a stable API** — don't import it directly; use
-[`pkg/json`](pkg/json) for the public toolkit.
+The import is `pkg/unstable`, the generator's runtime — **not a stable API**,
+and not one to import yourself; [`pkg/json`](pkg/json) is the public toolkit.
+It pulls in two small dependencies of its own: `golang.org/x/sys` (CPU feature
+detection for the SIMD scanners) and `github.com/JohanLindvall/arena` (the
+chunk-backed store behind [`//lightning:arena`](#lightningarena)).
 
 A `go:generate` directive in the file that holds your structs works well:
 
