@@ -88,6 +88,9 @@ var (
 	ErrExpectColon = unstable.ErrExpectColon
 	// ErrMaxDepth reports input nested deeper than MaxDepth.
 	ErrMaxDepth = unstable.ErrMaxDepth
+	// ErrUnknownKey reports an object member no field answers to, from a
+	// decoder generated under //lightning:strict.
+	ErrUnknownKey = unstable.ErrUnknownKey
 	// ErrBadNumber reports a malformed or unrepresentable JSON number (returned
 	// by ParseFloat, DecodeAny, Valid and generated decoders; 1e309 is
 	// unrepresentable in a float64 and so rejected).

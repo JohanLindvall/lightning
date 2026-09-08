@@ -30,6 +30,7 @@ var (
 	ErrBadTime      = errors.New("json: invalid time")
 	ErrKeyNotFound  = errors.New("json: key path not found")
 	ErrMaxDepth     = errors.New("json: exceeded max depth")
+	ErrUnknownKey   = errors.New("json: unknown object key")
 )
 
 // MaxDepth bounds how deeply the recursive walkers — DecodeValue and the

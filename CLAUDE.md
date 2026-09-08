@@ -4379,6 +4379,16 @@ found:
   passes over. (The case that pins the silence is NOT named after the
   option: the diagnostics stream carries the temp path, which carries the
   case name, so a case named `omitzero_…` finds its own name in the output.)
+- **No unknown-field mode.** Hugin's dashboard, alert and source loaders are
+  built on `DisallowUnknownFields` — a misspelled key is a hard file error
+  there — and could not move to a decoder that skips. `//lightning:strict`
+  is the directive: `g.strict` rides the per-root loop like the others,
+  `cmark`/`csuf` carry it so a nested type reached from a strict and a
+  loose root gets two decoders, and `unknownKey()` is what `keyDispatch`
+  emits for a member no field answers to — `skipUnknown`, or `return i,
+  unstable.ErrUnknownKey` (new sentinel, re-exported by pkg/json). Maps
+  are untouched. The position reported is the value's; the key is not in
+  the error, which stays a sentinel like every other.
 
 ## Session 2026-09-07: six toolkit PRs merged, then optimized
 

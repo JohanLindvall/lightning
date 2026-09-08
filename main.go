@@ -123,6 +123,7 @@ func generateTo(inPath string, warn io.Writer) error {
 		nocopyTypes:      map[string]bool{},
 		destructiveTypes: map[string]bool{},
 		arenaTypes:       map[string]bool{},
+		strictTypes:      map[string]bool{},
 		typeDirectives:   map[string][]string{},
 		depthFns:         map[string]bool{},
 	}
@@ -264,6 +265,9 @@ func generateTo(inPath string, warn io.Writer) error {
 			if hasDirective("lightning:arena", gd.Doc, ts.Doc) {
 				g.arenaTypes[ts.Name.Name] = true
 			}
+			if hasDirective("lightning:strict", gd.Doc, ts.Doc) {
+				g.strictTypes[ts.Name.Name] = true
+			}
 			// nocopy is consumed only by slice/map roots (a struct's aliasing is
 			// governed per field by the ,nocopy tag), so on a struct root the
 			// bare directive silently did nothing.
@@ -359,6 +363,7 @@ func generateTo(inPath string, warn io.Writer) error {
 		// too; a plain //lightning:nocopy root (slice/map) aliases its keys/elements.
 		g.nocopy = g.destructive || g.nocopyTypes[name]
 		g.arena = g.arenaTypes[name]
+		g.strict = g.strictTypes[name]
 		g.prefix = "lightning" + g.pathFrag + name
 		// Reset per root: the arena struct and its fields belong to this root
 		// alone, which is sound because g.prefix is per-root too, so no decoder
@@ -418,6 +423,7 @@ type gen struct {
 	nocopyTypes      map[string]bool
 	destructiveTypes map[string]bool
 	arenaTypes       map[string]bool
+	strictTypes      map[string]bool
 	typeDirectives   map[string][]string // every directive a type carries, for misplacement warnings
 
 	// Working flags for the root type currently being generated, derived from the
@@ -426,6 +432,7 @@ type gen struct {
 	destructive bool // //lightning:destructive: unescape strings in place
 	nocopy      bool // //lightning:nocopy root, or a destructive root (which aliases what it decodes)
 	arena       bool // //lightning:arena: thread the per-decode arena struct through the decoders
+	strict      bool // //lightning:strict: an unknown object key is ErrUnknownKey, not a skip
 	// An arena is typed (unstable.Arena[T] is github.com/JohanLindvall/arena's
 	// Arena[T], whose chunks are []T), so a root storing several element kinds
 	// needs one arena per kind. Rather than widen every decoder's signature by one
@@ -758,6 +765,7 @@ var knownDirectives = map[string]bool{
 	"nocopy":      true,
 	"destructive": true,
 	"arena":       true,
+	"strict":      true,
 }
 
 // directiveIn returns the name of the //lightning:* directive a single comment
@@ -989,6 +997,9 @@ func (g *gen) cmark() string {
 	if g.arena {
 		m += "arena:"
 	}
+	if g.strict {
+		m += "strict:"
+	}
 	return m
 }
 
@@ -1002,6 +1013,9 @@ func (g *gen) csuf() string {
 	}
 	if g.arena {
 		s += "Arena"
+	}
+	if g.strict {
+		s += "Strict"
 	}
 	return s
 }
@@ -1368,8 +1382,21 @@ const skipUnknown = `end, err := unstable.SkipValue(data, i)
 		}
 		i = end`
 
+// unknownKey is what a member no field answers to does: skipped, or under a
+// //lightning:strict root refused. The refusal reports the VALUE's position
+// (i), the key having been read; the key itself is not carried in the error,
+// which is a sentinel like every other, so a caller wanting the name reads
+// the document with the toolkit's ObjectEach.
+func (g *gen) unknownKey() string {
+	if g.strict {
+		return "return i, unstable.ErrUnknownKey"
+	}
+	return skipUnknown
+}
+
 // keyDispatch emits the statement that matches key against each field's names and
-// runs that field's decode, skipping the value when nothing matches.
+// runs that field's decode, skipping the value when nothing matches (or, under
+// a strict root, refusing it).
 //
 // When every name fits maxInlineCmp it is a plain `switch key`, which is already
 // optimal: cmd/compile buckets the cases by length itself and compares each with
@@ -1406,7 +1433,7 @@ func (g *gen) keyDispatch(arms []fieldArm) string {
 			}
 			fmt.Fprintf(&cases, "\tcase %s:\n%s\n", strings.Join(quoted, ", "), a.code)
 		}
-		return fmt.Sprintf("switch key {\n%s\n\t\tdefault:\n\t\t\t%s\n\t\t}", cases.String(), skipUnknown)
+		return fmt.Sprintf("switch key {\n%s\n\t\tdefault:\n\t\t\t%s\n\t\t}", cases.String(), g.unknownKey())
 	}
 
 	// Group each field's names by length. A field whose names differ in length (a
@@ -1461,7 +1488,7 @@ func (g *gen) keyDispatch(arms []fieldArm) string {
 	// The matched path jumps clear of the skip. The skip sits in its own block so
 	// that jump does not cross a variable declaration, which Go forbids.
 	b.WriteString("\t\tgoto lightningKeyDone\n")
-	b.WriteString("\tlightningSkipKey:\n\t\t{\n\t\t\t" + skipUnknown + "\n\t\t}\n")
+	b.WriteString("\tlightningSkipKey:\n\t\t{\n\t\t\t" + g.unknownKey() + "\n\t\t}\n")
 	b.WriteString("\tlightningKeyDone:")
 	return b.String()
 }

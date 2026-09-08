@@ -66,6 +66,56 @@ type genCase struct {
 
 var genCases = []genCase{
 	{
+		// //lightning:strict is the DisallowUnknownFields the generator had
+		// no equivalent of: a member no field answers to fails the decode
+		// with ErrUnknownKey instead of being skipped, at every level the
+		// root reaches. A non-strict root beside it sharing the nested type
+		// keeps skipping — the two roots get their own decoders for it, as
+		// they do for every other directive.
+		name: "strict_refuses_unknown_keys",
+		schema: `package main
+
+type Inner struct {
+	A int "json:\"a\""
+}
+
+//lightning:strict
+type Strict struct {
+	Inner Inner  "json:\"inner\""
+	Name  string "json:\"name\""
+}
+
+type Loose struct {
+	Inner Inner "json:\"inner\""
+}
+`,
+		probe: `package main
+
+import (
+	"errors"
+	"fmt"
+
+	"github.com/JohanLindvall/lightning/pkg/json"
+)
+
+func main() {
+	var s Strict
+	fmt.Println("known:", s.UnmarshalJSON([]byte("{\"name\":\"x\",\"inner\":{\"a\":1}}")), s.Name, s.Inner.A)
+	err := s.UnmarshalJSON([]byte("{\"name\":\"x\",\"extra\":1}"))
+	fmt.Println("root unknown:", errors.Is(err, json.ErrUnknownKey))
+	err = s.UnmarshalJSON([]byte("{\"inner\":{\"a\":1,\"b\":2}}"))
+	fmt.Println("nested unknown:", errors.Is(err, json.ErrUnknownKey))
+	var l Loose
+	fmt.Println("loose:", l.UnmarshalJSON([]byte("{\"inner\":{\"a\":1,\"b\":2},\"extra\":1}")), l.Inner.A)
+}
+`,
+		want: `known: <nil> x 1
+root unknown: true
+nested unknown: true
+loose: <nil> 1
+`,
+	},
+	{
 		// A map keyed by an integer kind was "unsupported map key type" —
 		// only string keys existed — where encoding/json reads the member
 		// name as a number, which is how it writes such a map. A key that is

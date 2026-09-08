@@ -394,8 +394,10 @@ Two things that are *not* differences, though they are commonly assumed to be:
   which is precisely why neither `Valid` nor `lax` uses it. It remains what an
   *unknown* field's value is skipped with, where nothing downstream depends on
   those bytes.)
-- **Unknown object keys are skipped**, as with `encoding/json`'s default; there is
-  no `DisallowUnknownFields` equivalent.
+- **Unknown object keys are skipped**, as with `encoding/json`'s default. The
+  `DisallowUnknownFields` posture is a directive on the root —
+  [`//lightning:strict`](#lightningstrict) — rather than a decoder option,
+  since a generated `UnmarshalJSON` takes no options.
 
 ## Root types
 
@@ -589,6 +591,25 @@ all whitespace still leaves the field at its zero value without an error.
 
 Some behavior is selected with a `//lightning:<name>` comment on the struct type
 (or its declaration), separate from the per-field json tags above.
+
+### `//lightning:strict`
+
+A member no field answers to is skipped by default, as `encoding/json` skips
+it. Mark a root `//lightning:strict` and such a member fails the decode with
+`ErrUnknownKey` instead — the `DisallowUnknownFields` posture, for a schema
+where a misspelled key must be an error rather than a silently zero field —
+at every object the root reaches, nested types included (a nested type
+shared with a non-strict root gets a decoder of each kind, as it does for
+the other directives). Maps are unaffected: every member of a map is a key.
+The error is a sentinel like every other and does not carry the name; a
+caller that wants it reads the document with `ObjectEach`.
+
+```go
+//lightning:strict
+type Config struct {
+    Listen string `json:"listen"`
+}
+```
 
 ### `//lightning:compact`
 
