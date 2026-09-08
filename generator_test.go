@@ -66,6 +66,74 @@ type genCase struct {
 
 var genCases = []genCase{
 	{
+		// A type from another package — anything but the three the generator
+		// knows — was "unsupported type", so a schema that names a record
+		// from a sibling package (Hugin's dashboard spec carries the explore
+		// request's filter type) could not be generated for. It is
+		// delegated to its own UnmarshalJSON now, in every position, as a
+		// local type with one is; a foreign type without the method fails
+		// to compile, which is the assertion the generator leans on.
+		name: "a_type_from_another_package_is_delegated_to",
+		schema: `package main
+
+import "lightningprobe/sub"
+
+type Root struct {
+	F  sub.Filter            "json:\"f\""
+	Fs []sub.Filter          "json:\"fs\""
+	P  *sub.Filter           "json:\"p\""
+	M  map[string]sub.Filter "json:\"m\""
+	N  sub.Filter            "json:\"n\""
+}
+
+type rootStd Root
+`,
+		extra: map[string]string{
+			"sub/sub.go": `package sub
+
+import "strconv"
+
+// Filter decodes a number as its Field's length, or null as -1.
+type Filter struct{ N int }
+
+func (f *Filter) UnmarshalJSON(b []byte) error {
+	if string(b) == "null" {
+		f.N = -1
+		return nil
+	}
+	n, err := strconv.Atoi(string(b))
+	f.N = n
+	return err
+}
+`,
+		},
+		probe: `package main
+
+import (
+	"encoding/json"
+	"fmt"
+)
+
+const doc = "{\"f\":1,\"fs\":[2,3],\"p\":4,\"m\":{\"a\":5},\"n\":null}"
+
+func main() {
+	var v Root
+	if err := v.UnmarshalJSON([]byte(doc)); err != nil {
+		panic(err)
+	}
+	var s rootStd
+	if err := json.Unmarshal([]byte(doc), &s); err != nil {
+		panic(err)
+	}
+	fmt.Printf("lightning %v %v %v %v %v\n", v.F, v.Fs, *v.P, v.M, v.N)
+	fmt.Printf("stdlib    %v %v %v %v %v\n", s.F, s.Fs, *s.P, s.M, s.N)
+}
+`,
+		want: `lightning {1} [{2} {3}] {4} map[a:{5}] {-1}
+stdlib    {1} [{2} {3}] {4} map[a:{5}] {-1}
+`,
+	},
+	{
 		// A field whose type has its own UnmarshalJSON was decoded
 		// structurally — the method never called — where encoding/json hands
 		// the method the value, null included. Such a type is delegated to
@@ -644,9 +712,10 @@ type Root struct {
 		// G3. isRaw matched RawMessage/RawValue qualified by ANY package, so a
 		// foreign type of that name was decoded as if it were encoding/json's —
 		// generator exits 0, package does not compile (or, worse, compiles and
-		// appends raw bytes to something that is not a []byte). It must be
-		// reported as the unsupported type it is. Nothing is compiled here: the
-		// run fails, so no decoder is written.
+		// appends raw bytes to something that is not a []byte). A foreign type
+		// is delegated to its own UnmarshalJSON now, whatever it is called, so
+		// the look-alike must reach ITS method, never the raw copy: the probe's
+		// method stamps what it was handed.
 		name: "foreign_rawmessage_is_not_encoding_json",
 		schema: `package main
 
@@ -657,7 +726,31 @@ type Root struct {
 	V foreign.RawValue   "json:\"v\""
 }
 `,
-		wantErr: "unsupported type foreign.RawMessage",
+		extra: map[string]string{
+			"foreign/foreign.go": `package foreign
+
+type RawMessage []byte
+
+func (m *RawMessage) UnmarshalJSON(b []byte) error { *m = append([]byte("R:"), b...); return nil }
+
+type RawValue struct{ S string }
+
+func (v *RawValue) UnmarshalJSON(b []byte) error { v.S = "V:" + string(b); return nil }
+`,
+		},
+		probe: `package main
+
+import "fmt"
+
+func main() {
+	var v Root
+	if err := v.UnmarshalJSON([]byte("{\"r\":{\"x\":1},\"v\":[1,2]}")); err != nil {
+		panic(err)
+	}
+	fmt.Printf("%s %s\n", v.R, v.V.S)
+}
+`,
+		want: "R:{\"x\":1} V:[1,2]\n",
 	},
 	{
 		// C1. encoding/json calls RawMessage's UnmarshalJSON even for a JSON
@@ -1931,6 +2024,9 @@ const lightningMod = "github.com/JohanLindvall/lightning"
 
 func writeFile(t *testing.T, dir, name, content string) {
 	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(filepath.Join(dir, name)), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}

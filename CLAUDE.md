@@ -4407,6 +4407,16 @@ found:
   warning: a second method would not compile. `nullAssigns` treats a
   delegated type like a nested struct (the method answers for null).
   Foreign types are not looked inside; the embedded-type divergence stands.
+- **A type from another package was "unsupported"** unless it was one of
+  the three the generator knows. Hugin's dashboard spec carries the explore
+  request's `query.Filter` and its alert spec `dash.Param`, so neither
+  loader could be generated for. Every other `pkg.Type` is delegated to its
+  own `UnmarshalJSON` now (the `field` SelectorExpr arm falls through to
+  `delegate`; `nullAssigns` lets it answer for null) — a foreign type
+  without the method fails to compile, which is where a generation-time
+  "unsupported" became a compile-time "has no method": the generator
+  cannot see inside the package, and the compiler can. The probe case
+  needs a second package, so `writeFile` creates directories.
 
 ## Session 2026-09-07: six toolkit PRs merged, then optimized
 

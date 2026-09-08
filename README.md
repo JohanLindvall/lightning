@@ -89,9 +89,10 @@ it emits its decoder, exactly as for an in-file nested type — and a
 `//lightning:` directive on it warns, since only the reaching root's
 directives apply; to give it a method of its own, generate its file. One
 rule: a sibling that imports `encoding/json` or `time` under a different
-alias than the input file is skipped whole, with a warning, because the
-generated file imports those under the input's qualifier and prints every
-type expression as written.
+alias than the input file — or any other package under a qualifier the
+input file gives a different package — is skipped whole, with a warning,
+because the generated file imports every package a decoder names under the
+input's qualifiers and prints every type expression as written.
 
 Given:
 
@@ -153,9 +154,12 @@ included, as `encoding/json` passes it) is handed to the method, and its
 error is the decode's error. Such a type is never generated for; a root that
 declares one is skipped with a warning, since a second method would not
 compile and the hand-written one is the author's answer to a shape a
-structural decode gets wrong. A type from another package is not looked
-inside, so only `time.Time`, `json.RawMessage` and `json.Number` decode among
-foreign types. An *embedded* type's method does not take over the struct it
+structural decode gets wrong. A type from **another package** is never
+looked inside: `time.Time`, `json.RawMessage` and `json.Number` decode as
+themselves, and any other is delegated to its own `UnmarshalJSON` the same
+way — one that does not implement `json.Unmarshaler` fails to compile
+("has no field or method UnmarshalJSON"), which is the generator's usual
+assertion. An *embedded* type's method does not take over the struct it
 is embedded in — see the divergences below.
 
 An interface with any content of its own (a method, an embedded named interface,
@@ -261,7 +265,8 @@ Two limits on that:
 - **A struct type from another package cannot be embedded.** Its fields aren't
   visible to the generator, so there is nothing to promote, and generation
   *fails* — `type Root struct { strings.Builder; … }` reports `unsupported type
-  strings.Builder`. Only the three foreign types the generator knows —
+  strings.Builder` (name it as a field instead, and it is delegated to its own
+  `UnmarshalJSON`). Only the three foreign types the generator knows —
   `time.Time`, `json.RawMessage` and `json.Number` — decode when embedded, and
   they decode as a single named field keyed by the type name (`"Time"`,
   `"RawMessage"`, `"Number"`), not flattened.
