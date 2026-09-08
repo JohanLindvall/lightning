@@ -80,6 +80,19 @@ member of that cycle gets the method, so which of them you decode into is not
 decided by declaration order. The generated code imports `github.com/JohanLindvall/lightning/pkg/unstable` for the
 shared scanner.
 
+**Types declared in the package's other files resolve too.** The generator
+reads every sibling `.go` file of the input (same package; not a test file,
+not a generated `_unmarshal.go`) for its struct, slice, map and defined
+scalar types, so a root in the input may name a record kept where it is
+used. A sibling type gets no method from this run — the root that reaches
+it emits its decoder, exactly as for an in-file nested type — and a
+`//lightning:` directive on it warns, since only the reaching root's
+directives apply; to give it a method of its own, generate its file. One
+rule: a sibling that imports `encoding/json` or `time` under a different
+alias than the input file is skipped whole, with a warning, because the
+generated file imports those under the input's qualifier and prints every
+type expression as written.
+
 Given:
 
 ```go
@@ -117,7 +130,9 @@ silently change which key an existing decoder answers to).
 `json.RawMessage` (and `RawValue`), `time.Time` (RFC 3339, like `encoding/json`;
 the [`lax`](#the-lax-tag-option) option also accepts a space separator and Unix
 timestamps), nested named and anonymous structs, slices, fixed-size arrays
-(`[N]T`), maps with string keys, pointers, and the *empty* interface —
+(`[N]T`), maps keyed by a string or an integer kind (or a type defined over
+one — an integer key is the member name parsed, as `encoding/json` writes it,
+and a name that is not a number fails with `ErrBadNumber`), pointers, and the *empty* interface —
 `any`, `interface{}`, or a spelling of the same type like `interface{ any }` —
 decoded into the usual Go representation of an arbitrary JSON value. Unknown
 object keys are skipped.
@@ -130,6 +145,18 @@ the underlying kind's exactly. The declaration order does not matter
 (`type Chain Sev` may precede `type Sev string`). Such a type gets no
 `UnmarshalJSON` of its own — there is no document it could be the root of —
 see [Declarations that get no method](#declarations-that-get-no-method).
+
+A type with an `UnmarshalJSON` of its own — declared in the input file or in
+a sibling file of the package — is **delegated to** wherever it stands as a
+field, an element, a map value or a pointee: the value's span (a JSON null
+included, as `encoding/json` passes it) is handed to the method, and its
+error is the decode's error. Such a type is never generated for; a root that
+declares one is skipped with a warning, since a second method would not
+compile and the hand-written one is the author's answer to a shape a
+structural decode gets wrong. A type from another package is not looked
+inside, so only `time.Time`, `json.RawMessage` and `json.Number` decode among
+foreign types. An *embedded* type's method does not take over the struct it
+is embedded in — see the divergences below.
 
 An interface with any content of its own (a method, an embedded named interface,
 a type set) is **not** supported: a decoded value is an `any` and assigns to
@@ -297,7 +324,7 @@ are *silent*.
   `ErrBadNumber`; the generator prints a warning when it sees the option, rather
   than emitting a decoder that silently does the wrong thing. Declare the field as
   a `string` and convert, or — when the string holds a whole JSON *document* rather
-  than one scalar — use [`unwrap`](#the-unwrap-tag-option). `omitempty` is accepted
+  than one scalar — use [`unwrap`](#the-unwrap-tag-option). `omitempty` and `omitzero` are accepted
   and ignored, since lightning only decodes.
 - **Slice, array and map elements are reset before being decoded**, where
   `encoding/json` decodes a slice or array element into whatever it already holds.
@@ -379,8 +406,10 @@ Two things that are *not* differences, though they are commonly assumed to be:
   which is precisely why neither `Valid` nor `lax` uses it. It remains what an
   *unknown* field's value is skipped with, where nothing downstream depends on
   those bytes.)
-- **Unknown object keys are skipped**, as with `encoding/json`'s default; there is
-  no `DisallowUnknownFields` equivalent.
+- **Unknown object keys are skipped**, as with `encoding/json`'s default. The
+  `DisallowUnknownFields` posture is a directive on the root —
+  [`//lightning:strict`](#lightningstrict) — rather than a decoder option,
+  since a generated `UnmarshalJSON` takes no options.
 
 ## Root types
 
@@ -397,7 +426,11 @@ type ByID    map[string]Record // a JSON object used as a data map
 `type ByID map[string]Record` decodes a top-level `{…}` as a map, its keys the
 object's member names. Either element/value type, and any nested types and field
 options, behave exactly as the same type used for a struct field would. Several
-root types (struct, slice, map, in any mix) can live in one input file. For a
+root types (struct, slice, map, in any mix) can live in one input file. A named
+slice or map type may also be a **field** (`Items Items`, `*Items`, an element
+of another slice): it decodes through the element type's own decoder with the
+destination converted to the underlying type, and a null nils it, exactly as
+the bare `[]Item` or `map[string]Item` would. For a
 root that is a *bare* `any`/`interface{}` — whose schema you don't know at all —
 there is no method to generate (Go forbids methods on interface types); decode it
 dynamically with [`json.DecodeAny`](#decoding-into-any) instead.
@@ -570,6 +603,26 @@ all whitespace still leaves the field at its zero value without an error.
 
 Some behavior is selected with a `//lightning:<name>` comment on the struct type
 (or its declaration), separate from the per-field json tags above.
+
+### `//lightning:strict`
+
+A member no field answers to is skipped by default, as `encoding/json` skips
+it. Mark a root `//lightning:strict` and such a member fails the decode with
+`ErrUnknownKey` instead — the `DisallowUnknownFields` posture, for a schema
+where a misspelled key must be an error rather than a silently zero field —
+at every object the root reaches, nested types included (a nested type
+shared with a non-strict root gets a decoder of each kind, as it does for
+the other directives). Maps are unaffected: every member of a map is a key.
+The error is an `*UnknownKeyError` naming the member (`Key`), and it
+matches `ErrUnknownKey` under `errors.Is` for a caller that only asks
+whether the refusal was that.
+
+```go
+//lightning:strict
+type Config struct {
+    Listen string `json:"listen"`
+}
+```
 
 ### `//lightning:compact`
 

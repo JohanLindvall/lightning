@@ -4345,6 +4345,68 @@ found:
   directive on it warns like any other method-less declaration — and it
   is deliberately NOT counted by `isFlatScalarStringStruct`: that is a
   presize heuristic, and a miscount there costs a resize, never a value.
+- **Types resolved per input file, and a named slice or map could not be a
+  field.** Two files named on one command line each resolved against
+  themselves, so a record kept where it is used (Hugin's `Instance` in
+  state.go, reached from `Notification` in cardbuild.go) was "unknown
+  type". `registerSiblings` parses the package's other files (same package,
+  no `_test.go`, no `_unmarshal.go`, no `_`/`.`-prefixed file) and
+  registers their struct/slice/map/scalar types by name, never in
+  `g.order`, so the reaching root emits their decoders and none gets a
+  method; `computeDepthThreading` walks `allNamed()` so a recursive
+  sibling keeps its depth guard. The one refusal is an import alias for
+  encoding/json or time that differs from the input's (the generated file
+  imports under the input's qualifier and prints type expressions as
+  written): the sibling is skipped whole with a warning, which the case
+  `a_sibling_with_another_import_alias_is_skipped` pins. And a named slice
+  or map in a FIELD position — refused before, only a root could be one —
+  decodes through the element type's existing decoder with the destination
+  converted (`callDecoderOn` spells the receiver; `callDecoderArena` is now
+  that with `&dest`), so it costs nothing the bare field does not. The
+  test runner grew `extra` (sibling files) and `wantMethods` (the receiver
+  set, read off the generated text) for these.
+- **Only string map keys, and `omitzero` warned on every run.** Hugin's
+  service graph keys its per-edge histogram by `int32`, and its records
+  carry Go 1.24's `omitzero` on their time fields. `mapKeyAssign` now
+  accepts a string, an integer kind, or a type defined over one: an integer
+  key is the member name parsed with `unstable.ParseInt`/`ParseUint` from a
+  stack `[]byte` conversion (the parser retains nothing, so the conversion
+  does not escape) and a name that is not a number is `ErrBadNumber` where
+  the stdlib raises an UnmarshalTypeError; the memo key carries the key
+  type, or an int-keyed and a string-keyed map of one value type would have
+  shared a decoder. `kn`/`kerr` joined `reservedIdents`. `omitzero` sits
+  beside `omitempty` as the second encode-only option the tag parser
+  passes over. (The case that pins the silence is NOT named after the
+  option: the diagnostics stream carries the temp path, which carries the
+  case name, so a case named `omitzero_…` finds its own name in the output.)
+- **No unknown-field mode.** Hugin's dashboard, alert and source loaders are
+  built on `DisallowUnknownFields` — a misspelled key is a hard file error
+  there — and could not move to a decoder that skips. `//lightning:strict`
+  is the directive: `g.strict` rides the per-root loop like the others,
+  `cmark`/`csuf` carry it so a nested type reached from a strict and a
+  loose root gets two decoders, and `unknownKey()` is what `keyDispatch`
+  emits for a member no field answers to — `skipUnknown`, or `return i,
+  unstable.ErrUnknownKey` (new sentinel, re-exported by pkg/json). Maps
+  are untouched. The position reported is the value's. The error is an
+  `*UnknownKeyError` naming the key (copied out of the input, since an
+  error outlives the decode) that matches `ErrUnknownKey` under `errors.Is`
+  — a sentinel alone was the first cut, and the first caller (Hugin's
+  loaders, whose "unknown setting X" message is a test-pinned promise)
+  needed the name back.
+- **A field type's own `UnmarshalJSON` was not called.** The generator
+  decoded every named struct structurally, where encoding/json hands an
+  Unmarshaler the value; Hugin's spec types (`Spark`, `DashStyle`, `Param`,
+  `CardSpec`, `Condition`, `Duration`) are hand-written unmarshalers for
+  exactly the shapes a structural decode gets wrong (a string OR an object,
+  a placeholder in a number's place). `collectUnmarshalers` records every
+  type with such a method, in the input file and in each sibling (never
+  from a `_unmarshal.go`, which the sibling scan excludes), `field`
+  delegates to it before the struct lookup — `delegate` finds the span
+  with SkipValue and calls the method, null included, reporting the value's
+  start on failure — and a ROOT with one is removed from `g.order` with a
+  warning: a second method would not compile. `nullAssigns` treats a
+  delegated type like a nested struct (the method answers for null).
+  Foreign types are not looked inside; the embedded-type divergence stands.
 
 ## Session 2026-09-07: six toolkit PRs merged, then optimized
 

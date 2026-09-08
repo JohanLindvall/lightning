@@ -56,9 +56,402 @@ type genCase struct {
 	// the generator's diagnostic stream.
 	wantWarn   []string
 	wantNoWarn []string
+	// extra are further files written beside data.go — the package's sibling
+	// files, which the generator reads for types but never generates for.
+	extra map[string]string
+	// wantMethods, when set, is exactly the set of receiver types the
+	// generated file declares UnmarshalJSON on.
+	wantMethods []string
 }
 
 var genCases = []genCase{
+	{
+		// A field whose type has its own UnmarshalJSON was decoded
+		// structurally — the method never called — where encoding/json hands
+		// the method the value, null included. Such a type is delegated to
+		// now, in every position, from this file or a sibling; and a root
+		// that carries one is not generated for, since a second method
+		// would not compile and the author's is the one that decodes the
+		// shapes a structural decode gets wrong.
+		name: "a_types_own_unmarshaljson_is_called",
+		schema: `package main
+
+type Root struct {
+	L  Level            "json:\"l\""
+	P  *Level           "json:\"p\""
+	Ls []Level          "json:\"ls\""
+	M  map[string]Level "json:\"m\""
+	N  Level            "json:\"n\""
+	S  Stamp            "json:\"s\""
+}
+
+type rootStd Root
+
+// Own has its own UnmarshalJSON and is also declared here: no method is
+// generated for it, and a field of it delegates.
+type Own struct {
+	V int "json:\"v\""
+}
+
+func (o *Own) UnmarshalJSON(b []byte) error { o.V = len(b); return nil }
+
+type Holder struct {
+	O Own "json:\"o\""
+}
+`,
+		extra: map[string]string{
+			"other.go": `package main
+
+import (
+	"encoding/json"
+	"strconv"
+)
+
+// Level decodes a number or the word "high"; a null is "unset" (-1).
+type Level struct{ N int }
+
+func (l *Level) UnmarshalJSON(b []byte) error {
+	switch string(b) {
+	case "null":
+		l.N = -1
+		return nil
+	case "\"high\"":
+		l.N = 3
+		return nil
+	}
+	n, err := strconv.Atoi(string(b))
+	l.N = n
+	return err
+}
+
+type Stamp struct{ S string }
+
+func (s *Stamp) UnmarshalJSON(b []byte) error {
+	var raw struct {
+		At string "json:\"at\""
+	}
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	s.S = "@" + raw.At
+	return nil
+}
+`,
+		},
+		probe: `package main
+
+import (
+	"encoding/json"
+	"fmt"
+)
+
+const doc = "{\"l\":\"high\",\"p\":null,\"ls\":[1,\"high\"],\"m\":{\"a\":2},\"n\":null,\"s\":{\"at\":\"x\"}}"
+
+func main() {
+	var v Root
+	if err := v.UnmarshalJSON([]byte(doc)); err != nil {
+		panic(err)
+	}
+	var s rootStd
+	if err := json.Unmarshal([]byte(doc), &s); err != nil {
+		panic(err)
+	}
+	fmt.Printf("lightning %v %v %v %v %v %v\n", v.L, v.P == nil, v.Ls, v.M, v.N, v.S)
+	fmt.Printf("stdlib    %v %v %v %v %v %v\n", s.L, s.P == nil, s.Ls, s.M, s.N, s.S)
+	var h Holder
+	fmt.Println("holder:", h.UnmarshalJSON([]byte("{\"o\":{\"v\":1}}")), h.O.V)
+	err := v.UnmarshalJSON([]byte("{\"l\":\"nope\"}"))
+	fmt.Println("error passes through:", err != nil)
+}
+`,
+		want: `lightning {3} true [{1} {3}] map[a:{2}] {-1} {@x}
+stdlib    {3} true [{1} {3}] map[a:{2}] {-1} {@x}
+holder: <nil> 7
+error passes through: true
+`,
+		wantMethods: []string{"Root", "Holder"},
+		wantWarn:    []string{"type Own has its own UnmarshalJSON and is decoded through it; no method is generated"},
+	},
+	{
+		// //lightning:strict is the DisallowUnknownFields the generator had
+		// no equivalent of: a member no field answers to fails the decode
+		// with ErrUnknownKey instead of being skipped, at every level the
+		// root reaches. A non-strict root beside it sharing the nested type
+		// keeps skipping — the two roots get their own decoders for it, as
+		// they do for every other directive.
+		name: "strict_refuses_unknown_keys",
+		schema: `package main
+
+type Inner struct {
+	A int "json:\"a\""
+}
+
+//lightning:strict
+type Strict struct {
+	Inner Inner  "json:\"inner\""
+	Name  string "json:\"name\""
+}
+
+type Loose struct {
+	Inner Inner "json:\"inner\""
+}
+`,
+		probe: `package main
+
+import (
+	"errors"
+	"fmt"
+
+	"github.com/JohanLindvall/lightning/pkg/json"
+)
+
+func main() {
+	var s Strict
+	fmt.Println("known:", s.UnmarshalJSON([]byte("{\"name\":\"x\",\"inner\":{\"a\":1}}")), s.Name, s.Inner.A)
+	err := s.UnmarshalJSON([]byte("{\"name\":\"x\",\"extra\":1}"))
+	var uk *json.UnknownKeyError
+	fmt.Println("root unknown:", errors.Is(err, json.ErrUnknownKey), errors.As(err, &uk), uk.Key, err)
+	err = s.UnmarshalJSON([]byte("{\"inner\":{\"a\":1,\"b\":2}}"))
+	fmt.Println("nested unknown:", errors.Is(err, json.ErrUnknownKey), errors.As(err, &uk), uk.Key)
+	var l Loose
+	fmt.Println("loose:", l.UnmarshalJSON([]byte("{\"inner\":{\"a\":1,\"b\":2},\"extra\":1}")), l.Inner.A)
+}
+`,
+		want: `known: <nil> x 1
+root unknown: true true extra json: unknown object key "extra"
+nested unknown: true true b
+loose: <nil> 1
+`,
+	},
+	{
+		// A map keyed by an integer kind was "unsupported map key type" —
+		// only string keys existed — where encoding/json reads the member
+		// name as a number, which is how it writes such a map. A key that is
+		// a defined type over a string or an integer resolves the same way.
+		// The probe reads every form and a root map through the twin.
+		name: "integer_and_defined_map_keys",
+		schema: `package main
+
+type Sev string
+type Bucket int32
+
+type ByBucket map[Bucket]int64
+
+type Root struct {
+	Hist   map[int32]int64  "json:\"hist\""
+	Small  map[uint8]string "json:\"small\""
+	BySev  map[Sev]int      "json:\"bySev\""
+	Named  ByBucket         "json:\"named\""
+}
+
+type rootStd Root
+`,
+		probe: `package main
+
+import (
+	"encoding/json"
+	"fmt"
+)
+
+const doc = "{\"hist\":{\"37\":2,\"-1\":9},\"small\":{\"255\":\"x\"},\"bySev\":{\"high\":1},\"named\":{\"4\":5}}"
+
+func main() {
+	var v Root
+	if err := v.UnmarshalJSON([]byte(doc)); err != nil {
+		panic(err)
+	}
+	var s rootStd
+	if err := json.Unmarshal([]byte(doc), &s); err != nil {
+		panic(err)
+	}
+	fmt.Printf("lightning %v %v %v %v\n", v.Hist, v.Small, v.BySev, v.Named)
+	fmt.Printf("stdlib    %v %v %v %v\n", s.Hist, s.Small, s.BySev, s.Named)
+	var r ByBucket
+	if err := r.UnmarshalJSON([]byte("{\"1\":2}")); err != nil {
+		panic(err)
+	}
+	fmt.Printf("root %v\n", r)
+	var bad Root
+	err := bad.UnmarshalJSON([]byte("{\"hist\":{\"x\":1}}"))
+	fmt.Printf("bad key: %v\n", err)
+}
+`,
+		want: `lightning map[-1:9 37:2] map[255:x] map[high:1] map[4:5]
+stdlib    map[-1:9 37:2] map[255:x] map[high:1] map[4:5]
+root map[1:2]
+bad key: json: invalid number
+`,
+	},
+	{
+		// omitzero is encoding/json's second encode-only option (Go 1.24);
+		// like omitempty it says nothing to a decoder and warns about nothing.
+		name: "the_stdlib_second_encode_only_option_is_accepted",
+		schema: `package main
+
+import "time"
+
+type Root struct {
+	At time.Time "json:\"at,omitzero\""
+}
+`,
+		wantNoWarn: []string{"unrecognized json tag option"},
+	},
+	{
+		// A type declared in another file of the package was "unknown type",
+		// even when both files were named on the command line: each input
+		// resolved names against itself alone. A real package keeps its
+		// record types where they are used — Hugin's Instance in state.go,
+		// its Notification in cardbuild.go — so the generator now reads the
+		// package's sibling files for their struct, slice, map and defined
+		// scalar types, resolves them as fields, and gives none of them a
+		// method: the root here reaches them, exactly as an in-file nested
+		// type is reached. The recursive Node crosses the file boundary and
+		// keeps its depth guard.
+		name: "types_declared_in_sibling_files_resolve",
+		schema: `package main
+
+type Root struct {
+	Items []Item          "json:\"items\""
+	Sev   Sev             "json:\"sev\""
+	Tags  Tags            "json:\"tags\""
+	Index Index           "json:\"index\""
+	Tree  *Node           "json:\"tree\""
+	When  Stamp           "json:\"when\""
+}
+
+type rootStd Root
+`,
+		extra: map[string]string{
+			"other.go": `package main
+
+import "time"
+
+type Item struct {
+	ID int "json:\"id\""
+}
+
+type Sev Level
+type Level string
+
+type Tags []string
+
+type Index map[string]Item
+
+type Node struct {
+	Children []*Node "json:\"c\""
+}
+
+type Stamp struct {
+	At time.Time "json:\"at\""
+}
+`,
+		},
+		probe: `package main
+
+import (
+	"encoding/json"
+	"fmt"
+)
+
+const doc = "{\"items\":[{\"id\":1},{\"id\":2}],\"sev\":\"high\",\"tags\":[\"a\",\"b\"],\"index\":{\"k\":{\"id\":3}},\"tree\":{\"c\":[{\"c\":[{\"c\":null}]}]},\"when\":{\"at\":\"2021-01-02T03:04:05Z\"}}"
+
+func main() {
+	var v Root
+	if err := v.UnmarshalJSON([]byte(doc)); err != nil {
+		panic(err)
+	}
+	var s rootStd
+	if err := json.Unmarshal([]byte(doc), &s); err != nil {
+		panic(err)
+	}
+	fmt.Printf("lightning %v %q %q %v %d %v\n", v.Items, v.Sev, v.Tags, v.Index, len(v.Tree.Children[0].Children), v.When.At)
+	fmt.Printf("stdlib    %v %q %q %v %d %v\n", s.Items, s.Sev, s.Tags, s.Index, len(s.Tree.Children[0].Children), s.When.At)
+}
+`,
+		want: `lightning [{1} {2}] "high" ["a" "b"] map[k:{3}] 1 2021-01-02 03:04:05 +0000 UTC
+stdlib    [{1} {2}] "high" ["a" "b"] map[k:{3}] 1 2021-01-02 03:04:05 +0000 UTC
+`,
+		wantMethods: []string{"Root"},
+	},
+	{
+		// A named slice or map type in a FIELD position was rejected — only a
+		// root could be one — where encoding/json decodes it like the bare
+		// type. It decodes through the element type's own slice/map decoder
+		// with the destination converted to the underlying type, so it costs
+		// nothing the bare field does not; a null nils it like the bare one.
+		name: "a_named_slice_or_map_type_may_be_a_field",
+		schema: `package main
+
+type Item struct {
+	ID int "json:\"id\""
+}
+
+type Items []Item
+type ByID map[string]Item
+
+type Root struct {
+	Items Items   "json:\"items\""
+	ByID  ByID    "json:\"byId\""
+	P     *Items  "json:\"p\""
+	N     Items   "json:\"n\""
+}
+
+type rootStd Root
+`,
+		probe: `package main
+
+import (
+	"encoding/json"
+	"fmt"
+)
+
+const doc = "{\"items\":[{\"id\":1}],\"byId\":{\"a\":{\"id\":2}},\"p\":[{\"id\":3}],\"n\":null}"
+
+func main() {
+	var v Root
+	if err := v.UnmarshalJSON([]byte(doc)); err != nil {
+		panic(err)
+	}
+	var s rootStd
+	if err := json.Unmarshal([]byte(doc), &s); err != nil {
+		panic(err)
+	}
+	fmt.Printf("lightning %v %v %v %v\n", v.Items, v.ByID, *v.P, v.N == nil)
+	fmt.Printf("stdlib    %v %v %v %v\n", s.Items, s.ByID, *s.P, s.N == nil)
+}
+`,
+		want: `lightning [{1}] map[a:{2}] [{3}] true
+stdlib    [{1}] map[a:{2}] [{3}] true
+`,
+	},
+	{
+		// A sibling that imports time (or encoding/json) under another alias
+		// cannot be spelled in the generated file, which imports under the
+		// input's qualifier: it is skipped whole, named in a warning, and the
+		// type stays unknown rather than half-resolved.
+		name: "a_sibling_with_another_import_alias_is_skipped",
+		schema: `package main
+
+import "time"
+
+type Root struct {
+	At   time.Time "json:\"at\""
+	When Stamp     "json:\"when\""
+}
+`,
+		extra: map[string]string{
+			"other.go": `package main
+
+import tm "time"
+
+type Stamp struct {
+	At tm.Time "json:\"at\""
+}
+`,
+		},
+		wantErr:  `unknown type "Stamp"`,
+		wantWarn: []string{"other.go: its encoding/json or time import alias differs"},
+	},
 	{
 		// A defined scalar type — the enum idiom, `type Severity string` with
 		// constants — was "unknown type": the field switch knew the built-in
@@ -1327,6 +1720,9 @@ func TestGenerate(t *testing.T) {
 			writeFile(t, dir, "go.sum", string(goSum))
 			writeFile(t, dir, "data.go", c.schema)
 			writeFile(t, dir, "probe.go", probe)
+			for name, src := range c.extra {
+				writeFile(t, dir, name, src)
+			}
 
 			var warn bytes.Buffer
 			err := generateTo(filepath.Join(dir, "data.go"), &warn)
@@ -1353,6 +1749,18 @@ func TestGenerate(t *testing.T) {
 			}
 			if c.wantErr != "" {
 				return // a failed run writes no decoder; nothing to compile
+			}
+			if c.wantMethods != nil {
+				var got []string
+				for _, m := range unmarshalerRe.FindAllStringSubmatch(readFile(t, dir, "data_unmarshal.go"), -1) {
+					got = append(got, m[1])
+				}
+				slices.Sort(got)
+				want := slices.Clone(c.wantMethods)
+				slices.Sort(want)
+				if !slices.Equal(got, want) {
+					t.Errorf("UnmarshalJSON receivers %v, want %v", got, want)
+				}
 			}
 
 			if c.probe == "" {

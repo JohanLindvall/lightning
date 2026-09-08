@@ -115,6 +115,8 @@ func generateTo(inPath string, warn io.Writer) error {
 		sliceTypes:       map[string]*ast.ArrayType{},
 		mapTypes:         map[string]*ast.MapType{},
 		scalarTypes:      map[string]string{},
+		sibling:          map[string]bool{},
+		unmarshaler:      map[string]bool{},
 		order:            nil,
 		used:             map[string]bool{},
 		memo:             map[string]string{},
@@ -122,6 +124,7 @@ func generateTo(inPath string, warn io.Writer) error {
 		nocopyTypes:      map[string]bool{},
 		destructiveTypes: map[string]bool{},
 		arenaTypes:       map[string]bool{},
+		strictTypes:      map[string]bool{},
 		typeDirectives:   map[string][]string{},
 		depthFns:         map[string]bool{},
 	}
@@ -140,6 +143,8 @@ func generateTo(inPath string, warn io.Writer) error {
 	}
 
 	g.collectQualifiers(file)
+	g.collectUnmarshalers(file)
+	g.registerSiblings(inPath, file)
 
 	// Collect every top-level struct type, in source order, recording the
 	// //lightning:compact / :nocopy / :destructive / :arena directives each
@@ -262,6 +267,9 @@ func generateTo(inPath string, warn io.Writer) error {
 			if hasDirective("lightning:arena", gd.Doc, ts.Doc) {
 				g.arenaTypes[ts.Name.Name] = true
 			}
+			if hasDirective("lightning:strict", gd.Doc, ts.Doc) {
+				g.strictTypes[ts.Name.Name] = true
+			}
 			// nocopy is consumed only by slice/map roots (a struct's aliasing is
 			// governed per field by the ,nocopy tag), so on a struct root the
 			// bare directive silently did nothing.
@@ -297,6 +305,18 @@ func generateTo(inPath string, warn io.Writer) error {
 			}
 		}
 	}
+	// A type with an UnmarshalJSON of its own is decoded through it wherever it
+	// stands (field), and never generated for: a second method would not
+	// compile, and the hand-written one is the author's answer to a shape a
+	// structural decode gets wrong. It stays in the maps so fields of the
+	// type resolve; it leaves the roots.
+	g.order = slices.DeleteFunc(g.order, func(name string) bool {
+		if !g.unmarshaler[name] {
+			return false
+		}
+		g.warnf("type %s has its own UnmarshalJSON and is decoded through it; no method is generated", name)
+		return true
+	})
 	if len(g.order) == 0 {
 		return errors.New("no top-level struct, slice or map types found")
 	}
@@ -357,6 +377,7 @@ func generateTo(inPath string, warn io.Writer) error {
 		// too; a plain //lightning:nocopy root (slice/map) aliases its keys/elements.
 		g.nocopy = g.destructive || g.nocopyTypes[name]
 		g.arena = g.arenaTypes[name]
+		g.strict = g.strictTypes[name]
 		g.prefix = "lightning" + g.pathFrag + name
 		// Reset per root: the arena struct and its fields belong to this root
 		// alone, which is sound because g.prefix is per-root too, so no decoder
@@ -399,6 +420,8 @@ type gen struct {
 	sliceTypes  map[string]*ast.ArrayType // named slice root types (type X []T)
 	mapTypes    map[string]*ast.MapType   // named map root types (type X map[string]V)
 	scalarTypes map[string]string         // defined scalar types (type Sev string): name -> underlying (possibly another defined type)
+	sibling     map[string]bool           // named types declared in the package's other files: resolvable as fields, never roots
+	unmarshaler map[string]bool           // types with a hand-written UnmarshalJSON, in this file or a sibling: delegated to, never generated for
 	order       []string
 
 	used map[string]bool   // reserved decoder function names
@@ -415,6 +438,7 @@ type gen struct {
 	nocopyTypes      map[string]bool
 	destructiveTypes map[string]bool
 	arenaTypes       map[string]bool
+	strictTypes      map[string]bool
 	typeDirectives   map[string][]string // every directive a type carries, for misplacement warnings
 
 	// Working flags for the root type currently being generated, derived from the
@@ -423,6 +447,7 @@ type gen struct {
 	destructive bool // //lightning:destructive: unescape strings in place
 	nocopy      bool // //lightning:nocopy root, or a destructive root (which aliases what it decodes)
 	arena       bool // //lightning:arena: thread the per-decode arena struct through the decoders
+	strict      bool // //lightning:strict: an unknown object key is ErrUnknownKey, not a skip
 	// An arena is typed (unstable.Arena[T] is github.com/JohanLindvall/arena's
 	// Arena[T], whose chunks are []T), so a root storing several element kinds
 	// needs one arena per kind. Rather than widen every decoder's signature by one
@@ -478,6 +503,169 @@ type gen struct {
 // own AST. A blank or dot import contributes no qualifier: `_` names nothing and
 // a dot-imported RawMessage arrives as a bare identifier, which the generator
 // does not resolve.
+// registerSiblings makes the package's other files' named types resolvable:
+// every struct, slice, map and defined scalar type declared in a sibling .go
+// file of inPath's directory — the same package, not a test file, not a
+// generated one — is registered by name, without joining g.order. A root in
+// the input file that names one of them then emits its decoder exactly as it
+// would for a type declared beside it; the sibling type never gets a method
+// of its own from this run (generate its own file for that), and a
+// directive it carries warns, since only the reaching root's directives
+// apply.
+//
+// The one thing a sibling cannot do is spell encoding/json or time under a
+// different import alias than the input file: the generated file imports
+// those under the input's qualifier and prints every type expression as
+// written, so a sibling's `tm.Time` would not compile there. Such a file is
+// skipped whole, with a warning naming it, rather than half-registered.
+func (g *gen) registerSiblings(inPath string, file *ast.File) {
+	dir := filepath.Dir(inPath)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	self := filepath.Base(inPath)
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || name == self || !strings.HasSuffix(name, ".go") ||
+			strings.HasSuffix(name, "_test.go") || strings.HasSuffix(name, "_unmarshal.go") ||
+			strings.HasPrefix(name, "_") || strings.HasPrefix(name, ".") {
+			continue
+		}
+		sib, err := parser.ParseFile(g.fset, filepath.Join(dir, name), nil, parser.SkipObjectResolution|parser.ParseComments)
+		if err != nil || sib.Name.Name != file.Name.Name {
+			continue
+		}
+		if !g.qualifiersAgree(sib) {
+			g.warnf("%s: its encoding/json or time import alias differs from %s's; the types it declares are not resolvable from here", name, self)
+			continue
+		}
+		g.collectUnmarshalers(sib)
+		for _, d := range sib.Decls {
+			gd, ok := d.(*ast.GenDecl)
+			if !ok || gd.Tok != token.TYPE {
+				continue
+			}
+			for _, sp := range gd.Specs {
+				ts, ok := sp.(*ast.TypeSpec)
+				if !ok || ts.TypeParams != nil || ts.Assign.IsValid() {
+					continue
+				}
+				n := ts.Name.Name
+				if g.structTypes[n] != nil || g.sliceTypes[n] != nil || g.mapTypes[n] != nil || g.scalarTypes[n] != "" {
+					continue
+				}
+				switch t := ts.Type.(type) {
+				case *ast.StructType:
+					g.structTypes[n] = t
+				case *ast.ArrayType:
+					if t.Len != nil {
+						continue
+					}
+					g.sliceTypes[n] = t
+				case *ast.MapType:
+					g.mapTypes[n] = t
+				case *ast.Ident:
+					// Registered by name, resolved at use: scalarKind follows
+					// the chain, so a sibling defined over a type declared
+					// after it (or in a third file) resolves too.
+					g.scalarTypes[n] = t.Name
+				default:
+					continue
+				}
+				g.sibling[n] = true
+				g.warnDirectives(lightningDirectives(gd.Doc, ts.Doc), n,
+					"the type is declared in "+name+"; its decoder follows the root that reaches it")
+			}
+		}
+	}
+}
+
+// collectUnmarshalers records every type file declares an UnmarshalJSON method
+// on — `func (t *T) UnmarshalJSON([]byte) error`, either receiver form — so a
+// field of that type is decoded by calling it, as encoding/json calls it,
+// rather than by a structural decoder that would bypass what the author
+// wrote it for. A generated `*_unmarshal.go` is never read here (the sibling
+// scan excludes the suffix), so a method this generator wrote on an earlier
+// run does not count as hand-written.
+func (g *gen) collectUnmarshalers(file *ast.File) {
+	for _, d := range file.Decls {
+		fd, ok := d.(*ast.FuncDecl)
+		if !ok || fd.Name.Name != "UnmarshalJSON" || fd.Recv == nil || len(fd.Recv.List) != 1 {
+			continue
+		}
+		recv := unparen(fd.Recv.List[0].Type)
+		if st, ok := recv.(*ast.StarExpr); ok {
+			recv = unparen(st.X)
+		}
+		if id, ok := recv.(*ast.Ident); ok {
+			g.unmarshaler[id.Name] = true
+		}
+	}
+}
+
+// delegate emits the read for a field whose type has its own UnmarshalJSON:
+// the value's span is found and handed to the method whole, a JSON null
+// included — encoding/json calls an Unmarshaler for null too, and leaves
+// the method to say what null means for its type. The span aliases the
+// input, as the stdlib's does; a method that keeps it copies, as
+// json.RawMessage's does. On failure the value's start is reported, since
+// the method's own error carries no position.
+func delegate(dest string) string {
+	return fmt.Sprintf(`start := i
+end, err := unstable.SkipValue(data, i)
+if err != nil {
+	return end, err
+}
+if err := %s.UnmarshalJSON(data[start:end]); err != nil {
+	return start, err
+}
+i = end`, dest)
+}
+
+// qualifiersAgree reports whether sib's encoding/json and time imports use the
+// same names the input file does, adopting them when the input file has none.
+func (g *gen) qualifiersAgree(sib *ast.File) bool {
+	for _, imp := range sib.Imports {
+		path, err := strconv.Unquote(imp.Path.Value)
+		if err != nil {
+			continue
+		}
+		name := path[strings.LastIndexByte(path, '/')+1:]
+		if imp.Name != nil {
+			name = imp.Name.Name
+		}
+		if name == "_" || name == "." {
+			continue
+		}
+		switch path {
+		case "encoding/json":
+			if g.jsonQual != "" && g.jsonQual != name {
+				return false
+			}
+			g.jsonQual = name
+		case "time":
+			if g.timeQual != "" && g.timeQual != name {
+				return false
+			}
+			g.timeQual = name
+		}
+	}
+	return true
+}
+
+// allNamed is every named type the run can reach: the input file's roots in
+// declaration order, then the sibling files' types by name.
+func (g *gen) allNamed() []string {
+	names := slices.Clone(g.order)
+	var sibs []string
+	for n := range g.sibling {
+		sibs = append(sibs, n)
+	}
+	slices.Sort(sibs)
+	return append(names, sibs...)
+}
+
 func (g *gen) collectQualifiers(file *ast.File) {
 	for _, imp := range file.Imports {
 		path, err := strconv.Unquote(imp.Path.Value)
@@ -581,7 +769,7 @@ var reservedIdents = map[string]bool{
 	// 1. decoder parameters and locals
 	"a": true, "b": true, "bend": true, "berr": true, "body": true, "data": true,
 	"depth": true, "end": true, "err": true, "f": true, "first": true, "i": true,
-	"idx": true, "ierr": true, "k": true, "ke": true, "key": true, "ks": true,
+	"idx": true, "ierr": true, "k": true, "ke": true, "kerr": true, "key": true, "kn": true, "ks": true,
 	"lax": true, "m": true, "n": true, "ni": true, "out": true, "s": true,
 	"start": true, "t": true, "v": true, "val": true, "zero": true,
 	// 2. imports of the generated file
@@ -635,6 +823,7 @@ var knownDirectives = map[string]bool{
 	"nocopy":      true,
 	"destructive": true,
 	"arena":       true,
+	"strict":      true,
 }
 
 // directiveIn returns the name of the //lightning:* directive a single comment
@@ -866,6 +1055,9 @@ func (g *gen) cmark() string {
 	if g.arena {
 		m += "arena:"
 	}
+	if g.strict {
+		m += "strict:"
+	}
 	return m
 }
 
@@ -879,6 +1071,9 @@ func (g *gen) csuf() string {
 	}
 	if g.arena {
 		s += "Arena"
+	}
+	if g.strict {
+		s += "Strict"
 	}
 	return s
 }
@@ -1026,7 +1221,7 @@ func (g *gen) genUnmarshal(name string) string {
 	case g.mapTypes[name] != nil:
 		mt := g.mapTypes[name]
 		fn := g.mapDecoder(mt.Key, mt.Value, name, nocopy, false)
-		call = fmt.Sprintf("%s((*map[string]%s)(v), data, i%s%s)", fn, g.typeStr(mt.Value), g.depthArgFor(fn), rootArenaArg)
+		call = fmt.Sprintf("%s((*map[%s]%s)(v), data, i%s%s)", fn, g.typeStr(mt.Key), g.typeStr(mt.Value), g.depthArgFor(fn), rootArenaArg)
 		nullReset = "*v = nil\n\t\t"
 	default:
 		fn := g.namedStruct(name)
@@ -1245,8 +1440,22 @@ const skipUnknown = `end, err := unstable.SkipValue(data, i)
 		}
 		i = end`
 
+// unknownKey is what a member no field answers to does: skipped, or under a
+// //lightning:strict root refused with an *UnknownKeyError naming the key
+// (errors.Is(err, ErrUnknownKey) still holds). The position reported is the
+// VALUE's, the key having been read.
+func (g *gen) unknownKey() string {
+	if g.strict {
+		// The key travels in the error, copied: it aliases the input (or a
+		// nocopy buffer), and an error outlives the decode that made it.
+		return "return i, &unstable.UnknownKeyError{Key: string([]byte(key))}"
+	}
+	return skipUnknown
+}
+
 // keyDispatch emits the statement that matches key against each field's names and
-// runs that field's decode, skipping the value when nothing matches.
+// runs that field's decode, skipping the value when nothing matches (or, under
+// a strict root, refusing it).
 //
 // When every name fits maxInlineCmp it is a plain `switch key`, which is already
 // optimal: cmd/compile buckets the cases by length itself and compares each with
@@ -1283,7 +1492,7 @@ func (g *gen) keyDispatch(arms []fieldArm) string {
 			}
 			fmt.Fprintf(&cases, "\tcase %s:\n%s\n", strings.Join(quoted, ", "), a.code)
 		}
-		return fmt.Sprintf("switch key {\n%s\n\t\tdefault:\n\t\t\t%s\n\t\t}", cases.String(), skipUnknown)
+		return fmt.Sprintf("switch key {\n%s\n\t\tdefault:\n\t\t\t%s\n\t\t}", cases.String(), g.unknownKey())
 	}
 
 	// Group each field's names by length. A field whose names differ in length (a
@@ -1338,7 +1547,7 @@ func (g *gen) keyDispatch(arms []fieldArm) string {
 	// The matched path jumps clear of the skip. The skip sits in its own block so
 	// that jump does not cross a variable declaration, which Go forbids.
 	b.WriteString("\t\tgoto lightningKeyDone\n")
-	b.WriteString("\tlightningSkipKey:\n\t\t{\n\t\t\t" + skipUnknown + "\n\t\t}\n")
+	b.WriteString("\tlightningSkipKey:\n\t\t{\n\t\t\t" + g.unknownKey() + "\n\t\t}\n")
 	b.WriteString("\tlightningKeyDone:")
 	return b.String()
 }
@@ -1537,6 +1746,11 @@ func (g *gen) field(dest string, expr ast.Expr, hint string, nocopy, lax bool) s
 		if isScalar(t.Name) {
 			return g.scalar(dest, t.Name, nocopy)
 		}
+		if g.unmarshaler[t.Name] {
+			// The type's own method wins over any structural decode, as it
+			// does under encoding/json.
+			return delegate(dest)
+		}
 		if _, ok := g.structTypes[t.Name]; ok {
 			// A struct's own field tags govern its nocopy/lax behavior.
 			return g.callDecoder(dest, g.namedStruct(t.Name))
@@ -1549,6 +1763,21 @@ func (g *gen) field(dest string, expr ast.Expr, hint string, nocopy, lax bool) s
 			// through a conversion. The reader is the kind's own, so the
 			// null and nocopy rules are exactly the plain scalar's.
 			return g.scalarAs(dest, kind, t.Name, nocopy)
+		}
+		if at, ok := g.sliceTypes[t.Name]; ok {
+			// A named slice type as a field decodes through the slice decoder
+			// its element type already has, the destination converted to the
+			// underlying []T that decoder takes — so `type Items []Item` in a
+			// field position costs nothing a `[]Item` field does not.
+			fn := g.sliceDecoder(at.Elt, t.Name, nocopy, lax, false)
+			return g.callDecoderOn(fmt.Sprintf("(*[]%s)(&%s)", g.typeStr(at.Elt), dest), fn, g.arenaArgForExpr(at))
+		}
+		if mt, ok := g.mapTypes[t.Name]; ok {
+			fn := g.mapDecoder(mt.Key, mt.Value, t.Name, nocopy, lax)
+			if fn == "" {
+				return g.skipEmit()
+			}
+			return g.callDecoderOn(fmt.Sprintf("(*map[%s]%s)(&%s)", g.typeStr(mt.Key), g.typeStr(mt.Value), dest), fn, g.arenaArg())
 		}
 		return g.unsupportedf("unknown type %q for %s", t.Name, dest)
 
@@ -1617,11 +1846,19 @@ func (g *gen) callDecoder(dest, fn string) string {
 // the root's whole arena struct — a batched slice reader, which takes the arena
 // for its own element type. See arenaArgForExpr.
 func (g *gen) callDecoderArena(dest, fn, arenaArg string) string {
-	return fmt.Sprintf(`end, err := %s(&%s, data, i%s%s)
+	return g.callDecoderOn("&"+dest, fn, arenaArg)
+}
+
+// callDecoderOn is the call itself, with the receiver expression spelled by
+// the caller: `&v.Field` for a field of the decoder's own type, a conversion
+// such as `(*[]Item)(&v.Items)` for a named slice or map field whose decoder
+// takes the underlying type.
+func (g *gen) callDecoderOn(recv, fn, arenaArg string) string {
+	return fmt.Sprintf(`end, err := %s(%s, data, i%s%s)
 if err != nil {
 	return end, err
 }
-i = end`, fn, dest, g.depthArgFor(fn), arenaArg)
+i = end`, fn, recv, g.depthArgFor(fn), arenaArg)
 }
 
 // unsupportedf records a generation error for a type the generator cannot decode
@@ -1712,9 +1949,9 @@ i = end`, g.typeStr(expr), fn, dest, g.depthArgFor(fn), g.arenaArgForExpr(expr),
 // the guarded side here in the same change.
 //
 // A field's *ast.Ident is a scalar (built-in or defined over one), a named
-// struct or `any` — the generator rejects a named slice/map as a field type —
-// so the Ident arm only has to separate `any` and named structs out; a
-// defined scalar stores the zero exactly as its underlying kind does.
+// struct, a named slice or map, or `any`, so the Ident arm only has to
+// separate named structs out: a defined scalar stores the zero exactly as its
+// underlying kind does, and a named slice or map is nil'd like the bare one.
 func (g *gen) nullAssigns(expr ast.Expr) bool {
 	switch t := unparen(expr).(type) {
 	case *ast.StarExpr, *ast.MapType, *ast.InterfaceType:
@@ -1724,8 +1961,8 @@ func (g *gen) nullAssigns(expr ast.Expr) bool {
 	case *ast.StructType:
 		return false // a nested struct is left untouched
 	case *ast.Ident:
-		if _, ok := g.structTypes[t.Name]; ok {
-			return false // a named nested struct, likewise
+		if _, ok := g.structTypes[t.Name]; ok || g.unmarshaler[t.Name] {
+			return false // a named nested struct, likewise; a delegated type answers for itself
 		}
 		return true // a scalar stores the zero, and `any` is nil'd
 	case *ast.SelectorExpr:
@@ -2539,8 +2776,10 @@ func (g *gen) slicePresize(elt ast.Expr, eltStr string) string {
 }
 
 func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy, lax bool) string {
-	if g.typeStr(keyExpr) != "string" {
-		g.errs = append(g.errs, fmt.Errorf("unsupported map key type %s for %s", g.typeStr(keyExpr), hint))
+	keyStr := g.typeStr(keyExpr)
+	keyAssign, ok := g.mapKeyAssign(keyStr, nocopy)
+	if !ok {
+		g.errs = append(g.errs, fmt.Errorf("unsupported map key type %s for %s", keyStr, hint))
 		return ""
 	}
 	suffix := ""
@@ -2550,7 +2789,7 @@ func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy, lax boo
 	if lax {
 		suffix += "Lax"
 	}
-	key := g.prefix + g.cmark() + "map:" + suffix + ":" + g.typeStr(valExpr)
+	key := g.prefix + g.cmark() + "map:" + suffix + ":" + keyStr + ":" + g.typeStr(valExpr)
 	if fn, ok := g.memo[key]; ok {
 		return fn
 	}
@@ -2561,15 +2800,9 @@ func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy, lax boo
 	prevDepth := g.enterBody(fn, false)
 	inner := g.field("val", valExpr, hint+"Value", nocopy, lax)
 	g.depthArg = prevDepth
-	// With nocopy the key aliases the input (ReadKey already returns an alias for
-	// an unescaped key); otherwise it is copied so the map owns it.
-	keyAssign := "m[string([]byte(key))] = val"
-	if nocopy {
-		keyAssign = "m[key] = val"
-	}
 	// Trailing commas are rejected by the first-iteration flag, as in
 	// genStructBody.
-	body := fmt.Sprintf(`func %[1]s(out *map[string]%[2]s, data []byte, i int%[9]s) (int, error) {
+	body := fmt.Sprintf(`func %[1]s(out *map[%[10]s]%[2]s, data []byte, i int%[9]s) (int, error) {
 	if uint(i) >= uint(len(data)) {
 		return i, unstable.ErrTruncated
 	}
@@ -2587,7 +2820,7 @@ func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy, lax boo
 	i++
 	m := *out
 	if m == nil {
-		m = make(map[string]%[2]s)
+		m = make(map[%[10]s]%[2]s)
 	}
 	for first := true; ; first = false {
 		%[4]s
@@ -2626,9 +2859,60 @@ func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy, lax boo
 		}
 		i++
 	}
-}`, fn, valStr, inner, g.skipWS("i", "i"), g.skipWS("i", "ni"), g.skipWS("i", "i+1"), g.readKey(), keyAssign, g.depthParam(fn)+g.arenaParam())
+}`, fn, valStr, inner, g.skipWS("i", "i"), g.skipWS("i", "ni"), g.skipWS("i", "i+1"), g.readKey(), keyAssign, g.depthParam(fn)+g.arenaParam(), keyStr)
 	g.decoders = append(g.decoders, body)
 	return fn
+}
+
+// mapKeyAssign returns the statement that stores val under the member name
+// `key` (a string aliasing the input, or freshly decoded when it carried an
+// escape) for a map keyed by keyStr, and whether that key type is supported.
+// The keys are encoding/json's: a string, an integer kind, or a type defined
+// over one. A string key is copied so the map owns it unless nocopy asked for
+// the alias; an integer key is the member name parsed as a number — the form
+// encoding/json writes such a map in — and a name that is not one fails the
+// decode with ErrBadNumber, as the stdlib fails it with an UnmarshalTypeError.
+// The parse takes the name as bytes without a copy on the common path: the
+// conversion is a stack slice the parser is known not to retain.
+func (g *gen) mapKeyAssign(keyStr string, nocopy bool) (string, bool) {
+	kind, ok := g.scalarKind(keyStr)
+	if !ok {
+		return "", false
+	}
+	conv := func(v string) string {
+		if keyStr == kind {
+			return v
+		}
+		return keyStr + "(" + v + ")"
+	}
+	switch {
+	case kind == "string":
+		if nocopy {
+			return "m[" + conv("key") + "] = val", true
+		}
+		return "m[" + conv("string([]byte(key))") + "] = val", true
+	case intKinds[kind]:
+		v := "kn"
+		if kind != "int64" {
+			v = kind + "(kn)"
+		}
+		return `kn, kerr := unstable.ParseInt([]byte(key))
+		if kerr != nil {
+			return i, unstable.ErrBadNumber
+		}
+		m[` + conv(v) + `] = val`, true
+	case uintKinds[kind]:
+		v := "kn"
+		if kind != "uint64" {
+			v = kind + "(kn)"
+		}
+		return `kn, kerr := unstable.ParseUint([]byte(key))
+		if kerr != nil {
+			return i, unstable.ErrBadNumber
+		}
+		m[` + conv(v) + `] = val`, true
+	}
+	return "", false
 }
 
 func (g *gen) isStruct(expr ast.Expr) bool {
@@ -2824,8 +3108,9 @@ func jsonTag(tag *ast.BasicLit) tagInfo {
 			t.lax = true
 		case "unwrap":
 			t.unwrap = true
-		case "", "omitempty":
-			// A trailing comma, and the stdlib's encode-only option.
+		case "", "omitempty", "omitzero":
+			// A trailing comma, and the stdlib's two encode-only options
+			// (omitzero since Go 1.24).
 		default:
 			t.unknown = append(t.unknown, o)
 		}
@@ -2996,12 +3281,16 @@ func (g *gen) namedRefs(name string) map[string]bool {
 func (g *gen) computeDepthThreading() {
 	g.threadDepth = map[string]bool{}
 
-	refs := make(map[string]map[string]bool, len(g.order))
-	for _, n := range g.order {
+	// Every named type takes part, the sibling files' ones included: a
+	// recursive record declared in another file is reached by a root here,
+	// and its decoder needs the depth guard as much as an in-file one.
+	names := g.allNamed()
+	refs := make(map[string]map[string]bool, len(names))
+	for _, n := range names {
 		refs[n] = g.namedRefs(n)
 	}
-	reach := make(map[string]map[string]bool, len(g.order))
-	for _, n := range g.order {
+	reach := make(map[string]map[string]bool, len(names))
+	for _, n := range names {
 		seen := map[string]bool{}
 		var dfs func(string)
 		dfs = func(cur string) {
@@ -3017,12 +3306,12 @@ func (g *gen) computeDepthThreading() {
 	}
 	// A type on a cycle is one that reaches itself.
 	cyclic := map[string]bool{}
-	for _, n := range g.order {
+	for _, n := range names {
 		if reach[n][n] {
 			cyclic[n] = true
 		}
 	}
-	for _, n := range g.order {
+	for _, n := range names {
 		if cyclic[n] {
 			g.threadDepth[n] = true
 			continue

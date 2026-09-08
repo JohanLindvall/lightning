@@ -88,6 +88,10 @@ var (
 	ErrExpectColon = unstable.ErrExpectColon
 	// ErrMaxDepth reports input nested deeper than MaxDepth.
 	ErrMaxDepth = unstable.ErrMaxDepth
+	// ErrUnknownKey reports an object member no field answers to, from a
+	// decoder generated under //lightning:strict. The error returned is an
+	// *UnknownKeyError, which names the key and matches this sentinel.
+	ErrUnknownKey = unstable.ErrUnknownKey
 	// ErrBadNumber reports a malformed or unrepresentable JSON number (returned
 	// by ParseFloat, DecodeAny, Valid and generated decoders; 1e309 is
 	// unrepresentable in a float64 and so rejected).
@@ -246,3 +250,8 @@ func decodeAny(data []byte, compact bool) (any, error) {
 
 // Valid lives in valid.go, which checks the JSON grammar directly rather than
 // decoding the document.
+
+// UnknownKeyError is the error a decoder generated under //lightning:strict
+// returns for a member no field answers to: Key is the member's name, and
+// errors.Is(err, ErrUnknownKey) holds.
+type UnknownKeyError = unstable.UnknownKeyError
