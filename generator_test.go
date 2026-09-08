@@ -66,6 +66,60 @@ type genCase struct {
 
 var genCases = []genCase{
 	{
+		// A type another root reached got no method, whatever it carried —
+		// its directives drew a "no effect" warning — so a record that is
+		// nested in a schema AND arrives on its own (a dashboard target in
+		// an API request; a filter another package's decoder delegates to)
+		// had to be moved out of the schema or shadowed. A directive on such
+		// a type makes it a root as well: a method under its own directives,
+		// while the copy inside the reaching root keeps the root's. The probe
+		// shows the same object refused through Item's strict method and
+		// skipped through the loose Root.
+		name: "a_directive_makes_a_reached_type_a_root_too",
+		schema: `package main
+
+type Root struct {
+	Items []Item "json:\"items\""
+}
+
+//lightning:strict
+type Item struct {
+	ID int "json:\"id\""
+}
+
+type Plain struct {
+	N int "json:\"n\""
+}
+
+type Holder struct {
+	P Plain "json:\"p\""
+}
+`,
+		probe: `package main
+
+import (
+	"errors"
+	"fmt"
+
+	"github.com/JohanLindvall/lightning/pkg/json"
+)
+
+func main() {
+	var it Item
+	err := it.UnmarshalJSON([]byte("{\"id\":1,\"x\":2}"))
+	fmt.Println("alone:", errors.Is(err, json.ErrUnknownKey))
+	var r Root
+	err = r.UnmarshalJSON([]byte("{\"items\":[{\"id\":1,\"x\":2}]}"))
+	fmt.Println("through the root:", err, r.Items[0].ID)
+}
+`,
+		want: `alone: true
+through the root: <nil> 1
+`,
+		wantMethods: []string{"Root", "Item", "Holder"},
+		wantNoWarn:  []string{"no effect"},
+	},
+	{
 		// An `any` field decoded every number to a float64, and a schema that
 		// keeps a default as the author wrote it (Hugin's template
 		// parameters: `default: 0.95` must survive as "0.95") had to stay on

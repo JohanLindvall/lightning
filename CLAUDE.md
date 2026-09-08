@@ -4535,6 +4535,16 @@ needed.
   `any` (`isAny`; `anyValueNumber`) and warned about elsewhere: threading it
   into slices and maps of any would touch every element decoder, and no
   caller has asked.
+- **A reached type could not have a method.** Hugin's API requests carry
+  dashboard spec types (`Target`, `Variable`, …) that `Dashboard` reaches,
+  and a foreign field delegates to a method, so those types needed one
+  — and the only way was a shadow root per type behind a hand-written
+  method. Now a directive on a reached type makes it a root as well
+  (`emitted[name] = true` after `entryTypes`, for any type carrying one):
+  its own method under its own directives, the copy inside the reaching
+  root still under the root's. The twins are untouched, carrying nothing;
+  the "nested type; follows the root's directives" warning is gone with
+  the rule it explained.
 - **The streaming Reader walked one path per document.** Hugin's Prometheus
   decode had to peek a head for status and resultType, walk `data.result`,
   then re-wrap the tail as a document to read stats and warnings. `enter`
