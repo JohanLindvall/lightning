@@ -1417,6 +1417,28 @@ byte-identical when adding cold paths; push new logic out-of-line.
   nocopy string now carries a pointer into the input, which changes nothing a
   caller can observe under the nocopy contract.
 
+  **And it does not call `unsafe.String` at all any more (2026-09-08, Meteor
+  Lake): it reinterprets the slice header.** `unsafe.String(ptr, len)` has to
+  reject a pointer/length pair whose sum would wrap the address space, and the
+  compiler emits that check at every call — `MOVQ`, `NEGQ`, `CMPQ` and a branch
+  to a panic, four instructions guarding against a slice no caller can build,
+  on the path that reads every object key and every nocopy string value. A
+  `[]byte`'s first two words ARE a string header, so
+  `*(*string)(unsafe.Pointer(&b))` is exactly the value `unsafe.String` would
+  have built, with nothing in front of it: in the key-read shape
+  (`unsafeStr(data[ks:ke])` handed to a call) the function goes 167 → 137 bytes
+  and the check disappears, while the reslice's own cap arithmetic was already
+  dead-code-eliminated. Instructions per decode: **cloudflare −3.9%,
+  cloudflare-compact −3.8%, pretty −3.3%, update_center −2.4%, string_unicode
+  −2.3%, golang_source −2.0%, twitter_status −1.9%, cloudflare-nocopy −1.6%,
+  citm_catalog −1.4%, gsoc_2018 −1.2%, synthea_fhir −1.1%**, branches −1.0 to
+  −3.5% on the same set. **The wall clock is a lottery on this one and the
+  instruction count is the verdict**, per the protocol the arrayEachIndex entry
+  sets out: at `-funcalign=64` string_unicode reads **+4.6%** and mesh_pretty
+  −1.9%; at the default alignment the same pair reads **−1.4%** and +2.5%, and
+  `mesh` — which has no string field at all — moves 1.6% in one of them. Kept
+  because it is strictly less work, provably the same value, and negative in
+  instructions on every case measured; not because a benchmark said so.
 - **Escaped-string decode, second pass** (on top of the four-part entry above;
   both changes in `string.go`, twitterescaped **−8.4%** and gsoc_2018 **−2.3%**
   interleaved). **(1)** `decodeEscaped`'s `\uXXXX` branch hand-encodes BMP runes
@@ -5450,3 +5472,84 @@ and left alone. What the checking found is the part worth keeping.
   session's work on that file too, silently, because the file is dirty for a
   reason. Copy it aside first; the mistake costs a reconstruction and is not
   visible in the test output.
+
+## Meteor Lake pass over slice growth and two per-token costs (2026-09-08)
+
+A pass over the whole library on the Intel Core Ultra 9 185H the Meteor Lake
+section above describes. Three changes landed, each with its own entry:
+the nested-slice growth estimate over the array's own byte span, the two-LEA
+digit accumulation in the amd64 integer readers, and the slice-header
+reinterpretation in `unsafeStr`. Cumulative against the session's starting
+commit (interleaved ABBA, n=8, pinned, both sides `-funcalign=64`):
+**large-json −10.00% time / −31.5% B/op, random −7.40% / −30.4%,
+golang_source −5.00% / −23.7% / −2.2% allocs, payload_small −3.30%,
+citm_catalog −1.82%, mesh −1.55%, instruments −1.29%, github_events −1.03%,
+synthea_fhir −0.93%, twitter_status −0.88%, twitterescaped −0.75% time and
+−23.5% B/op, mesh_pretty −0.58%, skip-heavy −0.35%**; cloudflare, canada,
+gsoc_2018, marine_ik, payload_large, pretty, time-array and apache_builds flat.
+The reported residuals are all contradicted by their own counters — see below.
+A second run from the final tree over the ten cases that move agrees and is a
+little better on the two largest (**large-json −12.30%, random −7.55%,
+golang_source −4.57%, payload_small −2.96%, citm_catalog −2.02%, twitterescaped
+−1.78%, mesh −1.33%, instruments −1.05%, github_events −0.72%**, n=6).
+
+- **Where the corpus actually spends, measured before touching anything.**
+  A merged flat profile over fourteen cases (each normalised to its own decode)
+  puts **22% in the generated decoders, 17% in `indexQuoteOrBackslashSSE2`, and
+  ~21% in the runtime's allocator, collector and write barriers** — memclr 3.1,
+  the GC mark set (typePointers/scanObject/findObject/scanblock/spanOf/
+  gcmarknewobject/tryDeferToSpanScan) 9.3, the barrier set (wbBufFlush1/
+  bulkBarrierPreWrite/gcWriteBarrier) 4.0, mallocgc and its friends 5.6, memmove
+  1.9. That third bucket was the largest addressable one and is what this
+  session went after; the scanner is ABI-bound (see the standing entries) and
+  the decoders are the object loop, tuned by three prior sessions.
+- **Two oracles bracket a slice-growth idea in five minutes each, and they
+  disagree in the instructive direction.** Decoding into a REUSED target (the
+  backings survive, so no outer slice grows) is the ceiling: large-json −20.6%,
+  random −15.3%, twitter_status −13.0%, citm_catalog −4.5%, golang_source
+  +0.9%. Raising the first-append capacity hint to ~16 KiB — "no growth at all"
+  from the other side — is **citm +385% time for 21% FEWER allocations**. Any
+  plan that trades bytes for allocation count is dead on arrival; the win has to
+  come from allocating fewer BYTES, which is what an exact-ish presize does and
+  a fat hint does not.
+- **`GrowSlice` was 13–19% of six of the largest cases** (`pprof -peek`:
+  golang_source 19.5%, large-json 18.4%, github_events 16.9%, random 14.1%,
+  twitter_status 13.6%, citm_catalog 13.2%), 57–87% of it inside `makeslice`.
+  Nearly all of that is irreducible for a pointer-ful element type — `make` and
+  `growslice` both zero the whole new backing, and the copy needs its barrier
+  either way; the only removable part is the growth that need not happen, which
+  is the nested-span estimate.
+- **Sizing a scan needs its real rate, not the file's.** The standing entries
+  quote `skipContainerFast` at "a quarter of an instruction per byte". Measured
+  here in the shape this gate sees — one scan and the call around it, over an
+  11 KB array — it is **~0.9**, and the block loop's own counter elsewhere in
+  this file (86.8 instructions per 64-byte block, i.e. 1.36) agrees with the
+  larger number. The 0.25 figure holds only where most blocks take the
+  popcount bulk path; do not size a new scan with it.
+- **A rejection can be an artefact of where the experiment started.** Scanning
+  for the array's end from the array's `[` — the obvious implementation — was
+  +5.5% instructions on payload_large and made the whole idea look marginal;
+  scanning forward from the CURSOR, which is the same answer for a quarter of
+  the work on an array about to end, turned random from −1.9% to −6.6%. Ask
+  where a scan can start before concluding it is too expensive.
+- **`unsafe.String` is not free, and neither is any of the safe-construction
+  helpers on a hot path.** It emits a NEG, a compare and a branch to reject a
+  wrapping pointer/length pair; `unsafe.Slice` does the same. On the key-read
+  path that is four instructions per object member to guard against a slice no
+  caller can build. Reading the disassembly of the *helper* — not of the loop
+  that calls it — is what found it, and the same question is worth asking of
+  every `unsafe.*` constructor in the tree.
+- **`n*10 + d` is three LEAs, and the compiler will not find the two-LEA form.**
+  It reads as one operation and lowers to four instructions with a three-cycle
+  loop-carried chain; `pprof -disasm` put 240 of `ReadInt64OrNull`'s 340 ms on
+  citm_catalog on exactly those four. Write the algebra the way the machine wants it — see the entry —
+  and re-check with `-gcflags=-S` on a three-line probe package, which is where
+  the two failed spellings were found and discarded in a minute each.
+- **The wall clock lost to the counters five times in this session, in both
+  directions.** string_unicode reads **+5.20%** cumulative while executing
+  **1.95% fewer** instructions in **0.7% fewer** cycles; cloudflare-nocopy reads
+  +1.34% at 3.3% fewer instructions and 6.3% fewer cycles; the same
+  `unsafeStr` change alone reads +4.58% on string_unicode at `-funcalign=64`
+  and **−1.37%** at the default alignment, and `mesh` — which has no string
+  field at all — moves 1.6% between the two. Take `perf stat` N/3N differencing
+  first; it is one command and it is the only number that survives a rebuild.

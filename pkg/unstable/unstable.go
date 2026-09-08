@@ -74,8 +74,16 @@ func ExpectNull(data []byte, i int) (int, error) {
 	return i + 4, nil
 }
 
+// unsafeStr aliases b's bytes as a string. It reinterprets the slice header
+// rather than calling unsafe.String, which is not the same code: unsafe.String
+// must reject a pointer/length pair that would wrap, so it emits a NEG, a
+// compare and a branch to a panic at every call — four instructions on the path
+// that reads every object key and every nocopy string value, guarding against a
+// slice no caller can construct. A []byte's first two words ARE a string
+// header, so the reinterpretation is exactly the value unsafe.String would have
+// built.
 func unsafeStr(b []byte) string {
-	return unsafe.String(unsafe.SliceData(b), len(b))
+	return *(*string)(unsafe.Pointer(&b))
 }
 
 // SameBuffer reports whether a and b are backed by the same array, which is how
