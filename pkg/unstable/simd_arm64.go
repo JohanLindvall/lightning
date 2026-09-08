@@ -2,7 +2,11 @@
 
 package unstable
 
-import "golang.org/x/sys/cpu"
+import (
+	"math/bits"
+
+	"golang.org/x/sys/cpu"
+)
 
 // Three of the four NEON routines below have no Go caller: the SVE2 entry points
 // in simd_arm64.s reach them with a tail branch (`B ·indexEscapeNEON(SB)`) when
@@ -124,18 +128,26 @@ const structuralPrescan = 16
 // and the scalar prescan loop, so it is far past the inline budget either way
 // and the branch costs nothing. The three scanners the decode path calls per
 // key and per string value cannot afford that — see indexCloseOrEscape.
-func indexStructural(b []byte) int {
-	if len(b) < structuralPrescan+16 {
-		return indexStructuralScalar(b)
+func indexStructural(b []byte) int { return indexStructuralAt(b, 0) }
+
+// indexStructuralAt is indexStructural starting at i, returning an absolute
+// index; see the amd64 file for why the offset is an argument rather than a
+// b[i:] at each of the three call sites.
+func indexStructuralAt(b []byte, i int) int {
+	if len(b)-i < structuralPrescan+16 {
+		return i + indexStructuralScalar(b[i:])
 	}
-	for i, c := range b[:structuralPrescan] {
-		switch c {
-		case '{', '}', '[', ']', '"':
-			return i
-		}
+	// The prescan is two SWAR words rather than sixteen byte compares; see
+	// structuralMask. Both loads are unchecked because the guard above has
+	// already established structuralPrescan+16 bytes past i.
+	if m := structuralMask(load64(b, i)); m != 0 {
+		return i + bits.TrailingZeros64(m)>>3
+	}
+	if m := structuralMask(load64(b, i+8)); m != 0 {
+		return i + 8 + bits.TrailingZeros64(m)>>3
 	}
 	if useSVE2 {
-		return structuralPrescan + indexStructuralSVE2(b[structuralPrescan:])
+		return i + structuralPrescan + indexStructuralSVE2(b[i+structuralPrescan:])
 	}
-	return structuralPrescan + indexStructuralNEON(b[structuralPrescan:])
+	return i + structuralPrescan + indexStructuralNEON(b[i+structuralPrescan:])
 }

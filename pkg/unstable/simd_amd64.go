@@ -2,7 +2,11 @@
 
 package unstable
 
-import "golang.org/x/sys/cpu"
+import (
+	"math/bits"
+
+	"golang.org/x/sys/cpu"
+)
 
 //go:noescape
 func indexQuoteOrBackslashSSE2(b []byte, i int) int
@@ -82,15 +86,30 @@ const structuralPrescan = 16
 
 // indexStructural returns the index of the first '{', '}', '[', ']' or '"' byte
 // in b, or len(b) if none is present.
-func indexStructural(b []byte) int {
-	if !useAVX2 || len(b) < 32 {
-		return indexStructuralScalar(b)
+func indexStructural(b []byte) int { return indexStructuralAt(b, 0) }
+
+// indexStructuralAt is indexStructural starting at i, returning an absolute
+// index — the shape every caller wants, since all three of them (skipObject,
+// skipArray and the scanner's container balance) wrote i += indexStructural(
+// data[i:]) and put i back. That reslice is seven instructions of len and cap
+// subtraction and a negative-length clamp, per structural jump, which on an
+// array of small values is once or twice an element; taking the offset costs
+// nothing but an argument word, and the prescan simply starts there. It is the
+// same trade IndexCloseOrEscapeAt already makes for the string scanner, and the
+// one reslice left is on the path where the first structuralPrescan bytes hold
+// no structural byte at all, where an assembly call is about to be paid anyway.
+func indexStructuralAt(b []byte, i int) int {
+	if !useAVX2 || len(b)-i < 32 {
+		return i + indexStructuralScalar(b[i:])
 	}
-	for i, c := range b[:structuralPrescan] {
-		switch c {
-		case '{', '}', '[', ']', '"':
-			return i
-		}
+	// The prescan is two SWAR words rather than sixteen byte compares; see
+	// structuralMask. Both loads are unchecked because the guard above has
+	// already established structuralPrescan+16 bytes past i.
+	if m := structuralMask(load64(b, i)); m != 0 {
+		return i + bits.TrailingZeros64(m)>>3
 	}
-	return structuralPrescan + indexStructuralAVX2(b[structuralPrescan:])
+	if m := structuralMask(load64(b, i+8)); m != 0 {
+		return i + 8 + bits.TrailingZeros64(m)>>3
+	}
+	return i + structuralPrescan + indexStructuralAVX2(b[i+structuralPrescan:])
 }

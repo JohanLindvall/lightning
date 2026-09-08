@@ -20,6 +20,15 @@ func indexCloseOrEscapeAt(b []byte, i int) int {
 
 func indexStructural(b []byte) int { return indexStructuralScalar(b) }
 
+// indexStructuralAt is indexStructural starting at i, returning an absolute
+// index; here, with no assembly to carry the offset, it is just the reslice.
+func indexStructuralAt(b []byte, i int) int {
+	if i >= len(b) {
+		return len(b)
+	}
+	return i + indexStructuralScalar(b[i:])
+}
+
 func indexEscape(b []byte) int { return indexEscapeScalar(b) }
 
 func indexEscapeNonASCII(b []byte) int { return indexEscapeNonASCIIScalar(b) }

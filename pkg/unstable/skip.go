@@ -12,11 +12,16 @@ import (
 // (skipContainerFast) when it is available (AVX2 on amd64): it absorbs string
 // keys/values into one bulk pass instead of a SkipString call per string, which
 // is a large win on the containers Get/GetPaths and unknown-field skipping walk
-// over. A scalar-element array ('[1,2,...]') keeps the indexStructural skip,
-// where a single vectorized scan already reaches the closing bracket and the
-// mask path would only add per-block work. The array probe is a heuristic; a
-// wrong guess only costs speed, never correctness — both paths are bracket
-// balancers that return the same end index for every well-formed value.
+// over. An array of nothing but scalars ('[1,2,...]') keeps the indexStructural
+// skip, where a single vectorized scan already reaches the closing bracket and
+// the mask path would only add per-block work — but "nothing but scalars" is
+// decided by looking sixteen bytes past the first element rather than at its
+// leading byte, so an array that merely OPENS with a number and then holds a
+// string ('[timestamp,"value"]') takes the mask path too; see the arm below.
+// The array probe is a heuristic; a wrong guess only costs speed, never
+// correctness — both paths are bracket balancers that return the same end index
+// for every well-formed value, which TestSkipValueArrayProbeMatchesScalar
+// pins over the probe's boundaries.
 //
 // Off the well-formed set the two paths are not interchangeable, so which one
 // runs — and therefore what SkipValue answers on malformed input — depends on
@@ -33,10 +38,7 @@ func SkipValue(data []byte, i int) (int, error) {
 	case '"':
 		return SkipString(data, i)
 	case '{':
-		if fastSkipAvail {
-			return skipContainerFast(data, i, '{')
-		}
-		return skipObject(data, i)
+		return skipContainerFast(data, i, '{')
 	case '[':
 		if fastSkipAvail {
 			j := SkipWS(data, i+1)
@@ -44,6 +46,55 @@ func SkipValue(data []byte, i int) (int, error) {
 				switch data[j] {
 				case '{', '[', '"':
 					return skipContainerFast(data, i, '[')
+				case ']':
+					return j + 1, nil
+				}
+				// A scalar first element used to send the whole array to
+				// skipArray, on the reasoning that one vectorized structural
+				// scan already reaches its ']'. That is true of an array of
+				// nothing but scalars and false of every other array a scalar
+				// happens to open — the [timestamp,"value"] pair a Prometheus
+				// matrix is made of is the case in point, where skipArray then
+				// pays a structural jump, a SkipString call and its own frame
+				// for a twenty-byte value the block scan settles in one block.
+				//
+				// Sixteen bytes of SWAR, written out here rather than reached
+				// through indexStructuralAt, decide between them. A ']' within
+				// them is the array's close — nothing before it was a string or
+				// a container, so the answer is already in hand and skipArray's
+				// frame is not paid at all. A '"' is a string the block scan
+				// absorbs and the scalar path would pay a call for. Anything
+				// else, and a long enough run of digits that neither appears,
+				// keeps the scalar path — which for an array of nothing but
+				// numbers is one vectorized scan to the ']' and is what this
+				// probe must not get in the way of (SkipContainer/numberArr is
+				// +29% if every array takes the block scan).
+				//
+				// The call is what is being avoided, not the scan: the mask
+				// needs six 64-bit immediates, which the callee re-materialises
+				// per call and which are shared between the two words here.
+				//
+				// A '{' or a '[' deliberately keeps the scalar path even though
+				// the block scan would skip it faster. That path is the
+				// recursive one, and it is what bounds nesting at MaxDepth: the
+				// block scan is iterative and accepts any depth (skipfast.go's
+				// second divergence class), so routing a scalar-first array
+				// there would quietly lift the bound for exactly the shape
+				// TestSkipDepthBound was written around — a 20 MB [0,[[[…]]]]
+				// that used to kill the process.
+				if uint(j)+16 <= uint(len(data)) {
+					k, m := j, structuralMask(load64(data, j))
+					if m == 0 {
+						k, m = j+8, structuralMask(load64(data, j+8))
+					}
+					if m != 0 {
+						switch k += bits.TrailingZeros64(m) >> 3; data[k] {
+						case ']':
+							return k + 1, nil
+						case '"':
+							return skipContainerFast(data, i, '[')
+						}
+					}
 				}
 			}
 		}
@@ -163,9 +214,24 @@ func skipObjectDepth(data []byte, i, depth int) (int, error) {
 	i++
 	for uint(i) < uint(len(data)) {
 		// Jump to the next structural byte, skipping inert content (keys' inner
-		// chars, numbers, bools, whitespace) in one vectorized pass.
-		i += indexStructural(data[i:])
-		if uint(i) >= uint(len(data)) {
+		// chars, numbers, bools, whitespace) in one vectorized pass — with
+		// indexStructural's first SWAR word written out here.
+		//
+		// That is not just the call frame. structuralMask needs six 64-bit
+		// immediates, and the callee re-materialises all six on every call,
+		// where in this loop they are loop-invariant and the compiler hoists
+		// them: a jump of eight bytes or fewer costs about twenty instructions
+		// here against sixty in the callee. The distances this loop walks are
+		// the bytes between one structural byte and the next — ':' and ',' and
+		// whitespace, a number, a literal — which is one to three bytes across
+		// an object and a number's width across an array of them.
+		if uint(i)+8 <= uint(len(data)) {
+			if m := structuralMask(load64(data, i)); m != 0 {
+				i += bits.TrailingZeros64(m) >> 3
+			} else if i = indexStructuralAt(data, i+8); uint(i) >= uint(len(data)) {
+				break
+			}
+		} else if i = indexStructuralAt(data, i); uint(i) >= uint(len(data)) {
 			break
 		}
 		switch data[i] {
@@ -203,8 +269,14 @@ func skipArrayDepth(data []byte, i, depth int) (int, error) {
 	// data[i] == '['
 	i++
 	for uint(i) < uint(len(data)) {
-		i += indexStructural(data[i:])
-		if uint(i) >= uint(len(data)) {
+		// The first SWAR word of the structural jump, inline; see skipObjectDepth.
+		if uint(i)+8 <= uint(len(data)) {
+			if m := structuralMask(load64(data, i)); m != 0 {
+				i += bits.TrailingZeros64(m) >> 3
+			} else if i = indexStructuralAt(data, i+8); uint(i) >= uint(len(data)) {
+				break
+			}
+		} else if i = indexStructuralAt(data, i); uint(i) >= uint(len(data)) {
 			break
 		}
 		switch data[i] {

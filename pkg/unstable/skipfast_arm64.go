@@ -9,7 +9,7 @@ package unstable
 // container skip beats the per-string indexStructural path on dense object/record
 // containers (and is flat on scalar arrays, which take the indexStructural path
 // anyway). The weight-and-fold gather in maskBlock (see the .s) is what makes it
-// pay. With the whole-loop skipBlocksNEON on top (useSkipBlocks below), the live
+// pay. With the whole-loop skipBlocks assembly on top (useSkipBlocks below), the live
 // dispatch runs 10-15 GB/s on the object shapes (BenchmarkSkipContainer, M2).
 const fastSkipAvail = true
 
@@ -20,7 +20,7 @@ const fastSkipAvail = true
 //go:noescape
 func maskBlock(b []byte, isArray bool) (quote, bslash, open, close uint64)
 
-// useSkipBlocks gates the whole-loop NEON block scan (skipBlocksNEON): the
+// useSkipBlocks gates the whole-loop NEON block scan (skipBlocks): the
 // character classes, escape/in-string bit math and bracket balancing run in
 // one assembly loop with the splats and bit-weight vector loaded once and the
 // carried state in registers — removing the per-block maskBlock call, its four
@@ -48,9 +48,12 @@ func maskBlock(b []byte, isArray bool) (quote, bslash, open, close uint64)
 // predicate-to-GP move.
 var useSkipBlocks = true
 
-func skipBlocks(data []byte, pos, depth int, isArray bool) (end, ndepth int, prevEscaped, prevInString uint64) {
-	return skipBlocksNEON(data, pos, depth, isArray)
-}
-
+// skipBlocks IS the NEON assembly. It was a Go wrapper holding the one call,
+// which the inliner priced at 81 against its budget of 80 — one over, and so a
+// real function: a stack check, a frame, six argument stores and four result
+// loads around a routine that on a small container does one 64-byte block of
+// work. amd64 makes its AVX2/AVX-512 choice inside the assembly for the same
+// reason; here there is only one body and nothing to choose.
+//
 //go:noescape
-func skipBlocksNEON(data []byte, pos, depth int, isArray bool) (end, ndepth int, prevEscaped, prevInString uint64)
+func skipBlocks(data []byte, pos, depth int, isArray bool) (end, ndepth int, prevEscaped, prevInString uint64)

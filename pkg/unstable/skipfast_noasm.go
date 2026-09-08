@@ -8,8 +8,8 @@ const fastSkipAvail = false
 
 // useSkipBlocks is false because this file covers the architectures with no
 // assembly at all. Both SIMD arches have the whole-loop block scan: amd64
-// (skipBlocksAVX2/skipBlocksAVX512, gated on the CPU features) and arm64
-// (skipBlocksNEON, unconditional since NEON is baseline). Here skipBlocks below
+// (skipBlocks, which selects an AVX2 or AVX-512 body from the CPU features) and arm64
+// (the NEON body, unconditional since NEON is baseline). Here skipBlocks below
 // is unreachable — fastSkipAvail already keeps SkipValue off the fast path — and
 // panics rather than pretending to scan.
 const useSkipBlocks = false

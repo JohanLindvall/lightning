@@ -20,7 +20,7 @@ var fastSkipAvail = useAVX2
 func maskBlock(b []byte, isArray bool) (quote, bslash, open, close uint64)
 
 // useSkipBlocks gates the whole-loop assembly form of the block scan
-// (skipBlocksAVX2/skipBlocksAVX512): the per-block character classes, the
+// (skipBlocks and the AVX-512 body it selects): the per-block character classes, the
 // escape/in-string bit math, and the bracket balancing all run in one assembly
 // loop with the splats loaded once and the carried state in registers,
 // removing the per-block Go<->asm call and result marshaling the maskBlock
@@ -41,15 +41,22 @@ var useSkipBlocks512 = useSkipBlocks && cpu.X86.HasAVX512BW
 // index + 1 in end; otherwise end is -1 and ndepth/prevEscaped/prevInString
 // return the carried state for the caller's scalar tail, which resumes at
 // pos + (len(data)-pos)&^63.
-func skipBlocks(data []byte, pos, depth int, isArray bool) (end, ndepth int, prevEscaped, prevInString uint64) {
-	if useSkipBlocks512 {
-		return skipBlocksAVX512(data, pos, depth, isArray)
-	}
-	return skipBlocksAVX2(data, pos, depth, isArray)
-}
-
+//
+// It IS the assembly — the AVX-512 selection is made inside it, off
+// useSkipBlocks512, exactly as the SSE2/AVX2 and NEON/SVE2 scanners select
+// their bodies. A Go wrapper holding the two calls was what stood here, and it
+// could not inline (cost 164 against the budget of 80), so every container skip
+// paid a second frame for a branch; see the comment on the TEXT symbol.
+//
 //go:noescape
-func skipBlocksAVX2(data []byte, pos, depth int, isArray bool) (end, ndepth int, prevEscaped, prevInString uint64)
+func skipBlocks(data []byte, pos, depth int, isArray bool) (end, ndepth int, prevEscaped, prevInString uint64)
 
+// skipBlocksAVX512 is reached only by skipBlocks' tail JMP; nothing in Go calls
+// it. The declaration is still load-bearing — asmdecl validates the assembly's
+// frame offsets against exactly this signature, and go vet reports assembly
+// with no Go prototype — but the `unused` linter reads Go only and sees a dead
+// declaration, the same blind spot the NEON routines in simd_arm64.go carry.
+//
+//nolint:unused // called from assembly; see above
 //go:noescape
 func skipBlocksAVX512(data []byte, pos, depth int, isArray bool) (end, ndepth int, prevEscaped, prevInString uint64)

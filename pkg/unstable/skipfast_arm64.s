@@ -100,7 +100,7 @@ haveBrackets:
 	VUADDLV V24.B8, V24      \
 	FMOVD   F24, rd
 
-// func skipBlocksNEON(data []byte, pos, depth int, isArray bool) (end, ndepth int, prevEscaped, prevInString uint64)
+// func skipBlocks(data []byte, pos, depth int, isArray bool) (end, ndepth int, prevEscaped, prevInString uint64)
 //
 // The arm64 whole-loop form of skipContainerFast's block scan (see the amd64
 // twin in skipfast_amd64.s): splats and the bit-weight vector loaded once,
@@ -122,7 +122,7 @@ haveBrackets:
 // (0/all-ones), R6=evenBits 0x5555...; R10-R13 the block's quote/bslash/open/
 // close masks (CLASS2 outputs), R7-R9/R14/R15 scratch. V0-V3 splats, V16 bit
 // weights, V6-V9 chunks, V17/V20-V24 scratch.
-TEXT ·skipBlocksNEON(SB), NOSPLIT, $0-80
+TEXT ·skipBlocks(SB), NOSPLIT, $0-80
 	MOVD data_base+0(FP), R0
 	MOVD data_len+8(FP), R1
 	SUB  $64, R1

@@ -37,7 +37,7 @@ DATA mbRbrack<>+16(SB)/8, $0x5d5d5d5d5d5d5d5d
 DATA mbRbrack<>+24(SB)/8, $0x5d5d5d5d5d5d5d5d
 GLOBL mbRbrack<>(SB), RODATA|NOPTR, $32
 
-// skipBlocksAVX2 / skipBlocksAVX512 run skipContainerFast's whole 64-byte block
+// skipBlocks / skipBlocksAVX512 run skipContainerFast's whole 64-byte block
 // loop in assembly (see the Go declarations in skipfast_amd64.go): character
 // classification, the escape / in-string bit math, and the bracket balancing,
 // with the splats loaded once and the carried state (depth, prevEscaped,
@@ -180,8 +180,21 @@ haveBrackets:
 	RET
 
 
-// func skipBlocksAVX2(data []byte, pos, depth int, isArray bool) (end, ndepth int, prevEscaped, prevInString uint64)
-TEXT ·skipBlocksAVX2(SB), NOSPLIT, $0-80
+// func skipBlocks(data []byte, pos, depth int, isArray bool) (end, ndepth int, prevEscaped, prevInString uint64)
+//
+// The AVX-512 selection lives HERE rather than in a Go wrapper, for the reason
+// the SVE2 gate gives on arm64 and ·useAVX2 gives in simd_amd64.s: a Go
+// dispatch holding two calls of this signature costs 164 against the inliner's
+// budget of 80, so it stayed a real function — 26 instructions of stack check,
+// 80-byte frame, six argument stores and four result loads, ALL of it around a
+// call that on a small container does one 64-byte block of actual work. Reading
+// the flag here costs the AVX2 path three instructions and a perfectly
+// predicted not-taken branch, and the AVX-512 path a tail JMP into a routine
+// with the identical ABI0 frame.
+TEXT ·skipBlocks(SB), NOSPLIT, $0-80
+	MOVBLZX ·useSkipBlocks512(SB), AX
+	TESTL   AX, AX
+	JNZ     to512
 	MOVQ    data_base+0(FP), SI
 	MOVQ    data_len+8(FP), CX
 	SUBQ    $64, CX
@@ -243,6 +256,9 @@ exhausted:
 	MOVQ    R10, prevInString+72(FP)
 	VZEROUPPER
 	RET
+
+to512:
+	JMP     ·skipBlocksAVX512(SB)
 
 // func skipBlocksAVX512(data []byte, pos, depth int, isArray bool) (end, ndepth int, prevEscaped, prevInString uint64)
 //

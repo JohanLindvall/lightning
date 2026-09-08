@@ -102,17 +102,22 @@ func findEscaped64(backslash uint64, prevEscaped *uint64) uint64 {
 // bracket of the other type is ignored rather than descended into, which is one
 // of the two documented divergences from skipObject/skipArray above. A
 // truncated container returns ErrTruncated. Depth is an int, not recursion, so
-// arbitrarily deep input is safe here (and, unlike the scalar path, accepted).
+// arbitrarily deep input is safe here (and, unlike the scalar path, accepted)
+// — except on a machine without the SIMD maskBlock, where the first line hands
+// the value straight to skipObject/skipArray and their bound applies.
 func skipContainerFast(data []byte, i int, open byte) (int, error) {
-	close := byte('}')
-	if open == '[' {
-		close = ']'
+	if !fastSkipAvail {
+		// No SIMD maskBlock here, and the scalar one is slower than the
+		// indexStructural balance — which is what fastSkipAvail says. The gate
+		// used to sit in SkipValue's arms; it moved here so that SkipObject can
+		// be a single call and inline into a walker that has already seen the
+		// brace.
+		if open == '{' {
+			return skipObject(data, i)
+		}
+		return skipArray(data, i)
 	}
-	depth := 1
 	pos := i + 1
-	var prevEscaped, prevInString uint64
-
-	isArray := open == '['
 	if useSkipBlocks && pos+64 <= len(data) {
 		// amd64: the whole block loop runs in assembly (skipBlocks) — splats
 		// loaded once, depth/escape/in-string state carried in registers, the
@@ -120,13 +125,36 @@ func skipContainerFast(data []byte, i int, open byte) (int, error) {
 		// per-block maskBlock call/marshaling that dominated the Go loop. It
 		// consumes every full 64-byte block: either it finds the close (end >=
 		// 0) or it hands the carried state to the shared scalar tail below.
-		end, d, pe, pis := skipBlocks(data, pos, depth, isArray)
+		//
+		// Everything that follows the call is out of line — skipContainerBlocks
+		// holds the Go block loop and the byte tail — and that is not tidiness.
+		// With them inline the compiler must keep data, i, open, close, isArray
+		// and depth alive ACROSS the call, which on the path that returns right
+		// after it (a container whose close is in the first block: every record
+		// in an array of records, every unknown-field skip a generated decoder
+		// does) cost a 136-byte frame and eight spill stores before the call
+		// was even made. The outlined form asks only for what a failed scan
+		// needs, and the arguments it needs are this function's own.
+		end, d, pe, pis := skipBlocks(data, pos, 1, open == '[')
 		if end >= 0 {
 			return end, nil
 		}
-		pos += (len(data) - pos) &^ 63
-		depth, prevEscaped, prevInString = d, pe, pis
+		return skipContainerBlocks(data, pos+((len(data)-pos)&^63), open, d, pe, pis)
 	}
+	return skipContainerBlocks(data, pos, open, 1, 0, 0)
+}
+
+// skipContainerBlocks is skipContainerFast's continuation: the Go maskBlock
+// block loop (which runs only where the whole-loop assembly is unavailable —
+// see useSkipBlocks) and the byte tail both paths end in. pos is the first byte
+// it has not accounted for, depth the balance there, and prevEscaped /
+// prevInString the two bits that carry across a block boundary.
+func skipContainerBlocks(data []byte, pos int, open byte, depth int, prevEscaped, prevInString uint64) (int, error) {
+	close := byte('}')
+	if open == '[' {
+		close = ']'
+	}
+	isArray := open == '['
 	for pos+64 <= len(data) {
 		quote, bslash, op, cl := maskBlock(data[pos:], isArray)
 
@@ -213,4 +241,14 @@ func skipContainerFast(data []byte, i int, open byte) (int, error) {
 		}
 	}
 	return len(data), ErrTruncated
+}
+
+// SkipObject is SkipValue's '{' arm, exported for the same reason SkipNumber
+// is: a walker that has already looked at data[i] and seen a '{' can spell the
+// arm at the call site and skip SkipValue's frame and its comparison tree. It
+// is kept to a single call so that it inlines — a wrapper that did not would
+// only trade one frame for another — which is why the fastSkipAvail gate moved
+// inside skipContainerFast.
+func SkipObject(data []byte, i int) (int, error) {
+	return skipContainerFast(data, i, '{')
 }

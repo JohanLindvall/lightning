@@ -200,7 +200,7 @@ func (s *ValueScanner) container(chunk []byte, i int, final bool) (int, bool, er
 		if i >= len(chunk) {
 			break
 		}
-		i += indexStructural(chunk[i:])
+		i = indexStructuralAt(chunk, i)
 		if i >= len(chunk) {
 			break
 		}
