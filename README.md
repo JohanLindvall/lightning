@@ -122,6 +122,15 @@ timestamps), nested named and anonymous structs, slices, fixed-size arrays
 decoded into the usual Go representation of an arbitrary JSON value. Unknown
 object keys are skipped.
 
+A **defined scalar type** — `type Severity string`, `type Level int32`, the
+enum idiom, or a type defined over another such type — decodes as its
+underlying kind and converts, wherever a scalar can stand: a field, a slice
+or array element, a map value, a pointee. Its null and `nocopy` rules are
+the underlying kind's exactly. The declaration order does not matter
+(`type Chain Sev` may precede `type Sev string`). Such a type gets no
+`UnmarshalJSON` of its own — there is no document it could be the root of —
+see [Declarations that get no method](#declarations-that-get-no-method).
+
 An interface with any content of its own (a method, an embedded named interface,
 a type set) is **not** supported: a decoded value is an `any` and assigns to
 nothing narrower, so the generator reports the field as an unsupported type
@@ -420,6 +429,10 @@ import, or a predeclared identifier — `data`, `i`, `err`, `key`, `zero`, `out`
 zero zero`, or `new(data)` where `data` is the `[]byte` parameter), so the
 generator reports `type name "data" collides with an identifier used by the
 generated code; rename it` instead of writing a package that does not compile.
+
+A defined scalar type (`type Severity string`) is the fourth kind: it is
+registered so fields of that type resolve, and a `//lightning:` directive on
+it warns, since there is nothing for the directive to govern.
 
 ## The `nocopy` tag option
 

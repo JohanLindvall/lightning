@@ -114,6 +114,7 @@ func generateTo(inPath string, warn io.Writer) error {
 		structTypes:      map[string]*ast.StructType{},
 		sliceTypes:       map[string]*ast.ArrayType{},
 		mapTypes:         map[string]*ast.MapType{},
+		scalarTypes:      map[string]string{},
 		order:            nil,
 		used:             map[string]bool{},
 		memo:             map[string]string{},
@@ -226,6 +227,22 @@ func generateTo(inPath string, warn io.Writer) error {
 				// documents that are data maps rather than fixed records.
 				g.mapTypes[ts.Name.Name] = t
 				g.order = append(g.order, ts.Name.Name)
+			case *ast.Ident:
+				// A defined scalar type — `type Severity string`, `type Level
+				// int32`, or one defined over another such type — gets no
+				// method (there is no document it could be the root of) but
+				// is resolvable wherever it is used: a field, an element, a
+				// map value or a pointee decodes as the underlying kind and
+				// converts. Registered by name; the chain is followed at the
+				// point of use (scalarKind), so a type defined over one
+				// declared later in the file resolves too.
+				if isScalar(t.Name) || g.scalarTypes[t.Name] != "" || g.declaresScalar(file, t.Name) {
+					g.scalarTypes[ts.Name.Name] = t.Name
+					g.warnDirectives(dirs, ts.Name.Name, "a defined scalar type gets no UnmarshalJSON; where it is used as a field it decodes as its underlying kind")
+					continue
+				}
+				g.warnDirectives(dirs, ts.Name.Name, "not a struct, slice or map type")
+				continue
 			default:
 				g.warnDirectives(dirs, ts.Name.Name, "not a struct, slice or map type")
 				continue
@@ -381,6 +398,7 @@ type gen struct {
 	structTypes map[string]*ast.StructType
 	sliceTypes  map[string]*ast.ArrayType // named slice root types (type X []T)
 	mapTypes    map[string]*ast.MapType   // named map root types (type X map[string]V)
+	scalarTypes map[string]string         // defined scalar types (type Sev string): name -> underlying (possibly another defined type)
 	order       []string
 
 	used map[string]bool   // reserved decoder function names
@@ -1526,6 +1544,12 @@ func (g *gen) field(dest string, expr ast.Expr, hint string, nocopy, lax bool) s
 		if t.Name == "any" {
 			return g.anyValue(dest)
 		}
+		if kind, ok := g.scalarKind(t.Name); ok {
+			// A defined scalar type: read as the underlying kind, store
+			// through a conversion. The reader is the kind's own, so the
+			// null and nocopy rules are exactly the plain scalar's.
+			return g.scalarAs(dest, kind, t.Name, nocopy)
+		}
 		return g.unsupportedf("unknown type %q for %s", t.Name, dest)
 
 	case *ast.SelectorExpr:
@@ -1687,9 +1711,10 @@ i = end`, g.typeStr(expr), fn, dest, g.depthArgFor(fn), g.arenaArgForExpr(expr),
 // Were nullGuard's parity version ever restored, those three kinds would move to
 // the guarded side here in the same change.
 //
-// A field's *ast.Ident is a scalar, a named struct or `any` — the generator
-// rejects a named slice/map as a field type — so the Ident arm only has to
-// separate `any` and named structs out.
+// A field's *ast.Ident is a scalar (built-in or defined over one), a named
+// struct or `any` — the generator rejects a named slice/map as a field type —
+// so the Ident arm only has to separate `any` and named structs out; a
+// defined scalar stores the zero exactly as its underlying kind does.
 func (g *gen) nullAssigns(expr ast.Expr) bool {
 	switch t := unparen(expr).(type) {
 	case *ast.StarExpr, *ast.MapType, *ast.InterfaceType:
@@ -1830,6 +1855,72 @@ func nullGuard(dest, val string) string {
 // oversight: a decoder that must reject out-of-range numbers has to check the
 // decoded field itself.
 func (g *gen) scalar(dest, name string, nocopy bool) string {
+	return g.scalarAs(dest, name, "", nocopy)
+}
+
+// scalarKind resolves a defined scalar type to the kind it is declared over,
+// following `type A B; type B string` to "string". A cycle (`type A B; type B
+// A` does not compile, but the parser accepts it) ends the walk.
+func (g *gen) scalarKind(name string) (string, bool) {
+	for hops := 0; hops < 64; hops++ {
+		if isScalar(name) {
+			return name, true
+		}
+		u, ok := g.scalarTypes[name]
+		if !ok {
+			return "", false
+		}
+		name = u
+	}
+	return "", false
+}
+
+// declaresScalar reports whether file declares name as a type whose underlying
+// type is (transitively) a scalar kind — the forward-reference case the
+// collection loop meets when `type A B` precedes `type B string`.
+func (g *gen) declaresScalar(file *ast.File, name string) bool {
+	seen := map[string]bool{}
+	for !seen[name] {
+		seen[name] = true
+		next := ""
+		for _, d := range file.Decls {
+			gd, ok := d.(*ast.GenDecl)
+			if !ok || gd.Tok != token.TYPE {
+				continue
+			}
+			for _, sp := range gd.Specs {
+				ts, ok := sp.(*ast.TypeSpec)
+				if !ok || ts.Name.Name != name || ts.Assign.IsValid() || ts.TypeParams != nil {
+					continue
+				}
+				id, ok := ts.Type.(*ast.Ident)
+				if !ok {
+					return false
+				}
+				if isScalar(id.Name) {
+					return true
+				}
+				next = id.Name
+			}
+		}
+		if next == "" {
+			return false
+		}
+		name = next
+	}
+	return false
+}
+
+// scalarAs is scalar with the value stored through a conversion to conv when
+// conv is not "" — a defined scalar type's name — so `type Sev string` reads
+// with the string reader and assigns Sev(s).
+func (g *gen) scalarAs(dest, name, conv string, nocopy bool) string {
+	wrap := func(val string) string {
+		if conv == "" {
+			return val
+		}
+		return conv + "(" + val + ")"
+	}
 	switch {
 	case name == "string":
 		reader := "unstable.ReadStringOrNull"
@@ -1846,7 +1937,7 @@ if err != nil {
 	return end, err
 }
 %s
-i = end`, reader, nullGuard(dest, "s"))
+i = end`, reader, nullGuard(dest, wrap("s")))
 
 	case name == "bool":
 		return fmt.Sprintf(`b, end, err := unstable.ReadBoolOrNull(data, i)
@@ -1854,7 +1945,7 @@ if err != nil {
 	return end, err
 }
 %s
-i = end`, nullGuard(dest, "b"))
+i = end`, nullGuard(dest, wrap("b")))
 
 	case name == "float32" || name == "float64":
 		val := "f"
@@ -1866,7 +1957,7 @@ if err != nil {
 	return end, err
 }
 %s
-i = end`, nullGuard(dest, val))
+i = end`, nullGuard(dest, wrap(val)))
 
 	case intKinds[name]:
 		val := "n"
@@ -1878,7 +1969,7 @@ if err != nil {
 	return end, err
 }
 %s
-i = end`, nullGuard(dest, val))
+i = end`, nullGuard(dest, wrap(val)))
 
 	case uintKinds[name]:
 		val := "n"
@@ -1890,7 +1981,7 @@ if err != nil {
 	return end, err
 }
 %s
-i = end`, nullGuard(dest, val))
+i = end`, nullGuard(dest, wrap(val)))
 	}
 	// Defensive: every caller gates on isScalar, so this fires only if isScalar
 	// and the switch above drift apart. Routed through the error accumulator so
