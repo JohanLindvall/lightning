@@ -394,6 +394,7 @@ type rootStd Root
 
 import "time"
 
+//lightning:strict
 type Item struct {
 	ID int "json:\"id\""
 }
@@ -440,6 +441,7 @@ func main() {
 stdlib    [{1} {2}] "high" ["a" "b"] map[k:{3}] 1 2021-01-02 03:04:05 +0000 UTC
 `,
 		wantMethods: []string{"Root"},
+		wantNoWarn:  []string{"no effect"},
 	},
 	{
 		// A named slice or map type in a FIELD position was rejected — only a

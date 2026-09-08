@@ -4353,7 +4353,10 @@ found:
   no `_test.go`, no `_unmarshal.go`, no `_`/`.`-prefixed file) and
   registers their struct/slice/map/scalar types by name, never in
   `g.order`, so the reaching root emits their decoders and none gets a
-  method; `computeDepthThreading` walks `allNamed()` so a recursive
+  method (a directive a sibling carries is NOT warned about: it governs
+  the run whose input that file is, and Hugin's alert package — a strict
+  spec.go beside three record files — drew four "no effect" warnings per
+  generate before this was understood); `computeDepthThreading` walks `allNamed()` so a recursive
   sibling keeps its depth guard. The one refusal is an import alias for
   encoding/json or time that differs from the input's (the generated file
   imports under the input's qualifier and prints type expressions as
