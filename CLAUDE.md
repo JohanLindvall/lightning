@@ -2196,6 +2196,138 @@ byte-identical when adding cold paths; push new logic out-of-line.
   number-byte entry's note that all three predicate spellings cost eight
   instructions a byte on arm64.
 
+- **The container skip's Go glue was two frames and sixty-two instructions
+  around one 64-byte block** (`skipBlocks` is now the assembly symbol itself;
+  `skipContainerFast`'s continuation is out of line in `skipContainerBlocks`;
+  2026-09-08, Meteor Lake). A container whose close is in the first block —
+  every element of an array of records, every unknown-field skip a generated
+  decoder does — reached the block scan through a Go dispatch that could not
+  inline (two calls of a four-argument, four-result signature: **cost 164**
+  against the budget of 80, and 81 on arm64, one over) and a caller that had to
+  keep `data`, `i`, `open`, `close`, `isArray` and `depth` live across the call
+  for the Go block loop and byte tail that follow it. The dispatch alone was 26
+  instructions — a stack check, an 80-byte frame, a dead spill, the
+  `useSkipBlocks512` test, six argument stores, four result loads, the
+  `XORPS`/`R14` restore an ABI0 call needs, and the epilogue — and the caller
+  another 36, of which eight were spill stores into a 136-byte frame.
+  Two changes, both the shape the SVE2 gate and `·useAVX2` already have:
+  **the AVX-512 selection moved INTO the assembly** (`MOVBLZX
+  ·useSkipBlocks512(SB)` + a not-taken `JNZ` to a tail `JMP`, three
+  instructions for the AVX2 path), so `skipBlocks` IS the TEXT symbol and there
+  is no Go wrapper to inline or not; and **everything after the call is
+  outlined**, so the fast path asks only for what a failed scan needs. 62 → 36
+  instructions on that path. Instructions per decode: **ArrayEachRecords −9.4%,
+  an in-memory walk of an array of records −9.5%, the same walk over a stream
+  −9.2%, StreamDescent/get −5.7%**; `BenchmarkSkipContainer`, which skips one
+  large container per op, is flat, which is the control — this is per-call
+  overhead, not per-byte work. Time (interleaved ABBA, n=6, `-funcalign=64`,
+  as throughput): **ArrayEachRecords +4.24%, StreamShapes/records/inmemory
+  +7.09%, the reused-reader records walk +7.96%, StreamDescent/get +4.46%,
+  /arrayeach +4.16%** (all p≤0.015), everything else flat, geomean +0.66%, no
+  regressions. The arm64 side is the same rename with no flag to read.
+- **The structural scanner takes the scan START as an argument, and its prescan
+  is SWAR** (`indexStructuralAt(b, i)` and `structuralMask` in
+  `structural.go`, 2026-09-08). All three callers — `skipObjectDepth`,
+  `skipArrayDepth` and the resumable scanner's container balance — wrote
+  `i += indexStructural(data[i:])`, which is the seven-instruction reslice the
+  `IndexCloseOrEscapeAt` entry above records, once per structural jump. Worse,
+  the 16-byte prescan in front of the assembly was a BYTE LOOP testing five
+  bytes per position, and the distances it walks are a number's width: a
+  Prometheus `[timestamp,"value"]` pair puts eleven digits between the opening
+  bracket and the string, so the loop ran eleven times at ~7 instructions each.
+  It is now two SWAR words. `structuralMask` is three has-byte tests over
+  `t = w | 0x20`: ORing bit 5 folds `[` onto `{` and `]` onto `}` — they differ
+  in nothing else — so `t == '{'` holds for exactly `{` and `[`, `t == '}'` for
+  exactly `}` and `]`, and `w == '"'` for the quote. **That is exact, and the
+  cheaper-looking alternative is not**: the smallest single cube containing all
+  four brackets also contains `Y`, `_`, `y` and DEL, which a scan that stopped
+  on them would make a heuristic rather than the scanner it replaces. Only the
+  LOWEST flagged lane is meaningful — a borrow out of a matching lane can flag
+  the lane above it — which is all `TrailingZeros64` needs, the same contract
+  the SWAR digit tests carry. Instructions / cycles per decode: **ArrayEachSeries
+  −9.1% / −17.8%, StreamMatrix/stream_points −16.1% / −16.6%**; time (n=6)
+  **stream_points +20.50%, ArrayEachSeries +19.63%**, everything else flat,
+  geomean +0.83%. Locked by `TestStructuralMaskMatchesByteScan` (every byte
+  value through every lane against the fillers a borrow chain can exploit,
+  every pair of targets at every pair of lanes, 2M random words) and
+  `TestIndexStructuralAtMatchesScalar`; sabotage-verified — the approximate
+  single-cube mask fails on the first `Y`.
+
+  **The first word of that jump is written out in `skipObjectDepth` and
+  `skipArrayDepth`, and the reason is the constants.** `structuralMask` needs
+  six 64-bit immediates, and the callee re-materialises all six on every call
+  where in those loops they are loop-invariant and the compiler hoists them: a
+  jump of eight bytes or fewer costs about twenty instructions inline against
+  sixty in the callee. `BenchmarkSkipContainer/stringObj/current` — the scalar
+  object balance — **−6.6%** instructions.
+- **The walkers spell SkipValue's object, string and number arms at the call
+  site** (`unstable.SkipObject`, 2026-09-08). `SkipNumber` was exported for
+  exactly this and the array walkers already had the number and string arms;
+  the container arm is what was missing, and objectEach, getMany, objectField
+  and walkPaths had none of the three. `SkipObject` is SkipValue's `{` arm and
+  is kept to a SINGLE call so that it inlines (cost 72) — a wrapper that did
+  not would trade one frame for another — which is why the `fastSkipAvail` gate
+  moved inside `skipContainerFast`. The three-arm sites also take over the
+  bounds test SkipValue used to make for them (`uint(i) >= uint(len(data))`),
+  which is not a cost: it is what makes `data[i]` provably in range, so the
+  dispatch carries no bounds check of its own. Instructions per decode:
+  **ObjectEachNested −6.6%, GetManyWithSkip −6.1%, ArrayEachIndexShapes/records
+  −6.0%, ArrayEachRecords −5.4%, ObjectEachRecordCompact −5.0%,
+  StreamDescent/inmemory −4.6%, GetPathsWithSkip −4.3%, ObjectEachRecord −4.2%,
+  the streaming descent's own skip −3.4%, GetManyPretty −2.9%, ObjectEachPretty
+  −2.7%, GetPretty −2.5%**; time **ObjectEachNested +7.28%, GetManyWithSkip
+  +5.46%, ObjectEachRecord +3.39%, ObjectEachRecordCompact +2.53%**.
+
+  **This supersedes the N2 rejection of the same arms in objectEach** (in the
+  rejected list below): that measurement was wall time at one link alignment on
+  a benchmark family whose alignment sensitivity the session itself documented,
+  and it read ObjectEachPretty +4.8% as evidence that "it is the branch and not
+  the work". Instruction counts — which are noise-free and were not taken then
+  — fall on **every** shape here, pretty included, and the `{` arm was never
+  tried at all. What the arms do cost is register-allocation churn in
+  `arrayEach` and `arrayEachIndex`: two register moves appear at the loop top
+  and the per-element count moves ±2–3% in either direction depending on the
+  element kind, which is the same pathological sensitivity those two functions
+  already carry a warning about.
+- **SkipValue's array probe reads sixteen bytes, not one** (2026-09-08). The
+  probe decides whether an array goes to the block scan or to `skipArray`, and
+  it looked only at the first element's leading byte: a scalar there meant "an
+  array of scalars, where one vectorized structural scan already reaches the
+  `]`". That is true of `[1,2,3,…]` and false of every other array a scalar
+  happens to open — `[timestamp,"value"]`, the pair a Prometheus matrix is made
+  of, then paid a structural jump, a `SkipString` call and `skipArray`'s frame
+  for a twenty-byte value the block scan settles in one block. The probe now
+  runs `structuralMask` over the sixteen bytes after the first element: a `]`
+  in them IS the array's close (nothing before it was a string or a container),
+  so the answer is in hand and `skipArray`'s frame is not paid at all; a `"` is
+  a string the block scan absorbs; anything else, and a digit run long enough
+  that neither appears, keeps the scalar path. Instructions **ArrayEachSeries
+  −4.2%, stream_points −10.4%**, `SkipContainer/numberArr` and `nestedMixed`
+  flat; time **stream_points +19.93%, ArrayEachSeries +6.17%**.
+  Two things this probe must not do, both measured. **Routing every array to
+  the block scan** is stream_points −31.7% instructions and ArrayEachSeries
+  −15.6% — and `SkipContainer/numberArr` **+28.7% instructions, +39.6%
+  cycles**, which is the long scalar array the old heuristic exists for.
+  **Reaching the decision through `indexStructuralAt`** instead of writing the
+  SWAR out costs 83 instructions where the inline form costs about 40 — the six
+  immediates again — and gave back four fifths of the win. And a `{` or a `[`
+  deliberately keeps the scalar path even though the block scan would be
+  faster: that path is the recursive one, and it is the only thing bounding
+  nesting at MaxDepth for a scalar-first array, which is exactly the shape
+  `TestSkipDepthBound` was written around (the block scan is iterative and
+  accepts any depth — skipfast.go's second divergence class). Locked by
+  `TestSkipValueArrayProbeMatchesScalar`, which holds SkipValue to `skipArray`
+  over the probe's boundaries: a `]` or a `"` at every offset the two words
+  cover and one past them, at four trailing slack lengths, since the probe
+  needs sixteen bytes and the block scan sixty-four.
+- **The streaming descent reads its key inline** (`Reader.enter`, 2026-09-08),
+  which `ObjectEach` already did and `enter` reached through `r.key()`: one
+  vectorized scan settles the key's end and whether it holds an escape, and the
+  frame it removes is one per member of a descent — what a keyed walk pays
+  before it does anything at all. **StreamDescent/get −4.8%, /arrayeach −4.7%**
+  instructions. The `'"'` test the inline form needs is the byte the loop has
+  already loaded to check for `}`.
+
 ## The inline trick — let the generator write hot bodies inline
 
 Go's inliner refuses `SkipWS`, `ReadKey`, and `indexCloseOrEscape` (each exceeds
@@ -2994,6 +3126,15 @@ no regressions.)
   −1.8% and ObjectEachNested −1.4% against GetManyPretty +2.1% and GetPretty
   +1.0%, geomean +0.05%. Object members are strings and containers far more
   often than numbers; the array case is where the numbers are.
+
+  **SUPERSEDED (2026-09-08, Meteor Lake): these arms are in, and this entry is
+  what a wall-clock verdict on an alignment-sensitive benchmark looks like.**
+  The numbers above are single-alignment wall time on the family the same
+  session documented as a layout lottery, and they were read as "it is the
+  branch and not the work". Instructions per decode — noise-free, and not taken
+  here — fall on every one of those shapes, ObjectEachPretty included; and the
+  arm that mattered most, the `{` one, was never tried, because SkipObject did
+  not exist yet. See the entry in the performance architecture.
 - **A single-alignment A/B of `arrayEachIndex` (2026-09-07) — a phantom 35%,
   and the reason to measure at both alignments.** Adding the string arm to
   `arrayEachIndex` measured **+35% on an array of numbers** under
@@ -3048,6 +3189,37 @@ no regressions.)
   went 43541 → 43410 instructions, **−0.3%**, and every other case was flat.
   The register allocator had already placed them about as well as the guard
   would. Reverted; the source stays as it was.
+
+- **The `isNumberByte` table on Meteor Lake** (2026-09-08). The table is what
+  arm64 compiles and the comparisons are what amd64 does, decided on Zen 4
+  where the table measured +9% and +13% on ten- and three-digit tokens. On an
+  Intel Core Ultra 9 185H the same build-tag flip is **contradictory on the
+  same token shape**: instructions/cycles ArrayEachScalars −6.0% / −7.0% and
+  ObjectEachRecordCompact −1.6% / −3.5%, against ArrayEachSeries +3.1% cycles
+  and the streaming walk of the identical scalar array +1.2% / +2.9%. A
+  build-tag decision needs a verdict that holds across a microarchitecture's
+  own benchmarks; amd64 keeps the comparisons. The two cores that disagree
+  about this (N2 yes, Zen 4 no) still disagree — Meteor Lake is simply not a
+  tiebreaker.
+- **Growing the streaming Reader's buffer from a small initial allocation**
+  (2026-09-08). `NewReader` costs 3.5 us on this core and **3.3 of it is
+  `make([]byte, 64<<10)`**, of which about two thirds is the GC work an
+  allocation rate buys (GOGC=off takes the same call to 1.2 us). The
+  allocation's cost is linear in bytes — 4 KiB 0.52 us through 128 KiB 12.0 us,
+  no size-class cliff at 32 KiB — so the only lever is fewer bytes. Allocating
+  8 KiB and doubling toward the configured size on every fill is
+  StreamShapes/strings **−21%**, /scalars −9.5%, records −1.4% — and
+  StreamMatrix/stream **+6.5%**, StreamSkipToKey **+8.7%**, because a document
+  larger than the initial buffer pays 8+16+32+64 KiB where it used to pay 64.
+  That is a bet on document size, made against the case the reader exists for.
+  Two shapes that look like escapes are not: growing straight to the configured
+  size on the first fill helps only documents under 8 KiB, which no committed
+  benchmark has and which fit in memory anyway; and growing on how much of the
+  buffer a VALUE spans, rather than on fullness, leaves a reader whose values
+  are small reading in 8 KiB bites for as long as the document lasts, which on
+  a real source is syscalls. The 64 KiB default stays, and `WithBufferSize` is
+  how a caller who knows better says so. (The earlier 32 KiB experiment,
+  recorded above, is the same trade at a different point on the curve.)
 
 ## Conventions
 
@@ -4570,3 +4742,101 @@ decided it.
   the pinning do not rescue a busy box, which the null-guard entry already
   warns about; the tell was that the *unchanged* shapes moved too. Check
   `uptime` before and after any A/B that matters.
+
+## Meteor Lake pass over the streaming reader and the walkers (2026-09-08)
+
+The first pass over the code the 2026-09-07 sessions added — `pkg/json`'s
+streaming `Reader`, the resumable `ValueScanner`, and the walkers the six
+merged toolkit PRs changed — on the Intel Core Ultra 9 185H the 2026-09-02
+Meteor Lake section describes. Five changes landed; each has its own entry
+above. The map of how they were found is the part worth keeping, because the
+profile pointed somewhere different from where the time was three times in a
+row.
+
+Cumulative, instructions per decode (noise-free, by differencing):
+**StreamMatrix/stream_points −23.5%, the reused-reader records walk −16.0%,
+ArrayEachIndexShapes/records −14.6%, ArrayEachRecords −14.3%, ArrayEachSeries
+−12.9%, StreamDescent/get −12.8%, ObjectEachPretty −6.8%, ObjectEachNested
+−6.3%, GetManyWithSkip −5.8%, ObjectEachRecordCompact −5.3%, GetPathsWithSkip
+−4.3%, ArrayEachScalars −3.6%**; ArrayEachStrings and
+ArrayEachIndexShapes/scalars +2.3% (register-allocation churn in the two
+walkers that carry the layout warning) and the streaming scalar walk +6.9%
+(two NOPs, see below). Wall time, interleaved ABBA against the session's
+starting commit at BOTH link alignments (n=8 at `-funcalign=64`, n=6 at the
+default), as throughput: **stream_points +41.6% / +29.1%, ArrayEachSeries
++32.6% / +24.0%, the reused-reader records walk +14.4% / +15.2%,
+StreamDescent/get +11.7% / +11.3%, /arrayeach +10.2% / +10.7%,
+ArrayEachIndexShapes/records +10.1% / +8.2%, StreamShapes/records/inmemory
++9.4% / +9.3%, /stream +9.4% / +10.6%, GetManyWithSkip +7.6% / +10.4%,
+ObjectEachRecordCompact +6.2% / +6.6%, GetManyPretty +6.2% / +8.4%,
+ObjectEachRecord +3.7% / +4.7%, GetPretty +3.4% / +3.5%, GetPathsWithSkip
++3.3% / +4.3%**; geomean **+6.64% / +6.93%**; the generated decoders
+(cloudflare, its compact and nocopy twins, pretty) are flat and skip-heavy is
+−1.2% instructions.
+
+Two rows in that table are layout, not work, and saying so is the point.
+**ArrayEachScalars +44% / +43%** is a 3.6% instruction reduction and a
+*shorter digit loop by one NOP*: the starting commit had `NOPL 0(AX)` between
+the `LEAL` and the `CMPL` of the inlined `isNumberByte`, on the path every
+digit takes, and the final build has it after the branch a digit takes. Same
+uop source (both 99.7% DSB), same branches, same mispredicts, 4.26 → 5.62 IPC.
+And **ArrayEachIndexShapes/scalars −14.6% at `-funcalign=64` and flat at the
+default** is `arrayEachIndex`'s documented lottery, with `arrayEach` over the
+identical array +48% in the same build — the two swapped draws again.
+
+- **The streaming walk was already at parity; the benchmark row was not.**
+  `StreamShapes/*/stream` reads 1.3–1.9× its in-memory twin, and with the
+  Reader REUSED the same walks are 1.03× (scalars), 1.07× (strings) and 1.13×
+  (records). The whole difference is `NewReader`, and 3.3 of its 3.5 us is one
+  `make([]byte, 64<<10)`. The rejected-list entry says why that stays; the
+  lasting fix was to commit the reused-reader rows next to the fresh ones so
+  the confound is visible in the table rather than in a comment.
+- **`skipBlocks.abi0` at 47–65% of a profile is not 47–65% of removable work.**
+  It is the largest symbol in every container-heavy benchmark, and what was
+  actually removable sat beside it: a Go dispatch that could not inline and a
+  caller that spilled six values across the call. 62 instructions of glue
+  around a 45-instruction block scan, all of it invisible in the profile
+  because it is attributed to two other symbols at 6% and 24%.
+- **The prescan in front of an assembly scanner is where the time went, twice.**
+  `indexStructuralAt` was 36% of a walk over Prometheus `[timestamp,"value"]`
+  pairs, and 31% again after its byte loop became SWAR — the second time
+  because the mask needs six 64-bit immediates and a non-inlined callee
+  re-materialises all six per call. Writing the first word out at the call site
+  (where they are loop-invariant) and writing the array probe out in SkipValue
+  are the same fix twice; a probe that reached the same decision through the
+  call gave back four fifths of its win.
+- **Instruction counts decided every keep, and wall time never contradicted one
+  that mattered.** The box shares a socket with a database server, so `benchstat`
+  rows carried ±40% variance on a bad minute, and `arrayEach`/`arrayEachIndex`
+  swapped their documented layout lottery twice during the session
+  (ArrayEachScalars +40% from a change to an arm it never executes). Per-op
+  instructions by differencing — the method the 2026-09-02 sections describe —
+  moved by a few tenths of a percent between repeats and are what every
+  decision here rests on.
+- **An instruction count is noise-free but not work-free: a NOP inside a hot
+  loop is counted.** The streaming scalar walk reads **+6.9% instructions**
+  after the `{` arm was added to `Reader.ArrayEach` — an arm an array of
+  numbers never reaches — and the whole of it is two `NOPL`s the assembler
+  placed for branch-target alignment INSIDE `SkipNumber`'s inlined digit loop,
+  so a ten-digit element executes twenty of them. The disassembly diff is the
+  check (`objdump` both builds, strip addresses and line numbers, diff): here
+  it showed the executed path identical but for padding, and the wall clock
+  agreed — that row is +12.8% at `-funcalign=64` and −2.4% at the default. Read
+  an instruction delta on a loop-bearing function next to a NOP count before
+  believing it.
+- **A rejection can be an artifact of the measurement it was made with.** The
+  N2 rejection of the same value dispatch in `objectEach` was single-alignment
+  wall time on the family whose alignment sensitivity that same session
+  documented. Instruction counts fall on every one of its shapes. When a
+  rejected entry's evidence is wall time on a benchmark the file elsewhere
+  calls a lottery, it is worth re-measuring rather than re-litigating.
+
+**Left on the table, sized.** The array probe is now 38% of `stream_points`,
+and two thirds of that is the exact structural mask; a quote-only probe is
+about 30 instructions cheaper per pair but routes `[scalar,{…}]` to the
+iterative scan, which lifts the MaxDepth bound for that shape — not worth
+moving a safety bound for 7%. `set.go`'s walkers reach every member's value
+through `skipValueOrEnd`, which is the same SkipValue frame the get.go walkers
+just shed and the same mechanical change. And the ~13 instructions of ABI0
+marshaling per scanner call remain the floor under every key and string read,
+as on the other three cores.
