@@ -235,6 +235,31 @@ func generateTo(inPath string, warn io.Writer) error {
 				g.mapTypes[ts.Name.Name] = t
 				g.order = append(g.order, ts.Name.Name)
 			case *ast.Ident:
+				// A type defined over a STRUCT, slice or map — `type raw Rule`
+				// — is a root of its own with the underlying type's shape
+				// WHEN IT ASKS: any //lightning: directive on it, the bare
+				// //lightning:root where no other applies. It is the idiom a
+				// hand-written UnmarshalJSON uses to decode its own fields
+				// without recursing into itself, so `raw` gets the generated
+				// method and `Rule` keeps the hand-written one, under raw's
+				// own directives. Opt-in, because the same spelling is the
+				// methodless TWIN — `type rootStd Root`, the reflection-only
+				// baseline the benchmarks and the stdlib comparisons are built
+				// on — and a twin that grew a method would measure lightning
+				// against itself.
+				if u := g.underlying(file, t.Name); u != nil && len(dirs) > 0 {
+					switch ut := u.(type) {
+					case *ast.StructType:
+						g.structTypes[ts.Name.Name] = ut
+						isStruct = true
+					case *ast.ArrayType:
+						g.sliceTypes[ts.Name.Name] = ut
+					case *ast.MapType:
+						g.mapTypes[ts.Name.Name] = ut
+					}
+					g.order = append(g.order, ts.Name.Name)
+					break
+				}
 				// A defined scalar type — `type Severity string`, `type Level
 				// int32`, or one defined over another such type — gets no
 				// method (there is no document it could be the root of) but
@@ -845,6 +870,7 @@ var knownDirectives = map[string]bool{
 	"destructive": true,
 	"arena":       true,
 	"strict":      true,
+	"root":        true,
 }
 
 // directiveIn returns the name of the //lightning:* directive a single comment
@@ -1333,6 +1359,7 @@ type fieldInfo struct {
 	nocopy bool
 	lax    bool
 	unwrap bool
+	number bool
 	tagged bool
 	depth  int
 	allocs []string
@@ -1349,7 +1376,7 @@ type fieldInfo struct {
 func (g *gen) collectFields(st *ast.StructType, prefix string, depth int, allocs []string, seen map[string]bool, out *[]fieldInfo) {
 	for _, f := range st.Fields.List {
 		tag := jsonTag(f.Tag)
-		tagNames, nocopy, lax, unwrap := tag.names, tag.nocopy, tag.lax, tag.unwrap
+		tagNames, nocopy, lax, unwrap, number := tag.names, tag.nocopy, tag.lax, tag.unwrap, tag.number
 		if len(tag.unknown) > 0 {
 			g.warnTagOptions(tag.unknown, fieldLabel(f))
 		}
@@ -1396,7 +1423,7 @@ func (g *gen) collectFields(st *ast.StructType, prefix string, depth int, allocs
 				keys = []string{name}
 			}
 			*out = append(*out, fieldInfo{keys: keys, dest: prefix + name, typ: f.Type,
-				nocopy: nocopy, lax: lax, unwrap: unwrap, tagged: len(tagNames) > 0, depth: depth, allocs: allocs})
+				nocopy: nocopy, lax: lax, unwrap: unwrap, number: number, tagged: len(tagNames) > 0, depth: depth, allocs: allocs})
 			continue
 		}
 		for _, nm := range f.Names {
@@ -1408,7 +1435,7 @@ func (g *gen) collectFields(st *ast.StructType, prefix string, depth int, allocs
 				keys = []string{nm.Name}
 			}
 			*out = append(*out, fieldInfo{keys: keys, dest: prefix + nm.Name, typ: f.Type,
-				nocopy: nocopy, lax: lax, unwrap: unwrap, tagged: len(tagNames) > 0, depth: depth, allocs: allocs})
+				nocopy: nocopy, lax: lax, unwrap: unwrap, number: number, tagged: len(tagNames) > 0, depth: depth, allocs: allocs})
 		}
 	}
 }
@@ -1669,9 +1696,19 @@ func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
 		}
 		hint := f.dest[strings.LastIndexByte(f.dest, '.')+1:]
 		var code string
-		if f.lax {
+		switch {
+		case f.number && g.isAny(f.typ):
+			// ,number: the dynamic decode keeps every number as a
+			// json.Number. Only a field that IS any takes it — inside a
+			// slice or map of any the option would have to thread through
+			// every element decoder, and no caller has asked.
+			code = g.anyValueNumber(f.dest)
+		case f.number:
+			g.warnf("json tag option \"number\" on %s is ignored: it applies to a field of type any (interface{})", "field "+strings.TrimPrefix(f.dest, "v."))
+			fallthrough
+		case f.lax:
 			code = g.laxField(f.dest, f.typ, hint, f.nocopy)
-		} else {
+		default:
 			code = g.field(f.dest, f.typ, hint, f.nocopy, false)
 		}
 		if f.unwrap {
@@ -2150,6 +2187,58 @@ func (g *gen) scalarKind(name string) (string, bool) {
 	return "", false
 }
 
+// underlying resolves name to the struct, slice or map type it is defined
+// over — through a chain of definitions, in the input file (in any order)
+// or already registered from a sibling — and nil where it is none of those.
+func (g *gen) underlying(file *ast.File, name string) ast.Expr {
+	seen := map[string]bool{}
+	for !seen[name] {
+		seen[name] = true
+		if st := g.structTypes[name]; st != nil {
+			return st
+		}
+		if at := g.sliceTypes[name]; at != nil {
+			return at
+		}
+		if mt := g.mapTypes[name]; mt != nil {
+			return mt
+		}
+		next := ""
+		for _, d := range file.Decls {
+			gd, ok := d.(*ast.GenDecl)
+			if !ok || gd.Tok != token.TYPE {
+				continue
+			}
+			for _, sp := range gd.Specs {
+				ts, ok := sp.(*ast.TypeSpec)
+				if !ok || ts.Name.Name != name || ts.Assign.IsValid() || ts.TypeParams != nil {
+					continue
+				}
+				switch t := ts.Type.(type) {
+				case *ast.StructType:
+					return t
+				case *ast.ArrayType:
+					if t.Len == nil {
+						return t
+					}
+					return nil
+				case *ast.MapType:
+					return t
+				case *ast.Ident:
+					next = t.Name
+				default:
+					return nil
+				}
+			}
+		}
+		if next == "" {
+			return nil
+		}
+		name = next
+	}
+	return nil
+}
+
 // declaresScalar reports whether file declares name as a type whose underlying
 // type is (transitively) a scalar kind — the forward-reference case the
 // collection loop meets when `type A B` precedes `type B string`.
@@ -2330,6 +2419,32 @@ if err != nil {
 }
 %s
 i = end`, reader, nullGuard(dest, "t"))
+}
+
+// isAny reports whether expr is the empty interface under any spelling.
+func (g *gen) isAny(expr ast.Expr) bool {
+	switch t := unparen(expr).(type) {
+	case *ast.Ident:
+		return t.Name == "any"
+	case *ast.InterfaceType:
+		return isAnyInterface(t)
+	}
+	return false
+}
+
+// anyValueNumber is anyValue for a ",number" field: the dynamic decode keeps
+// every number as a json.Number, as encoding/json's UseNumber does.
+func (g *gen) anyValueNumber(dest string) string {
+	decode := "unstable.DecodeValueNumber"
+	if g.compact {
+		decode = "unstable.DecodeValueNumberCompact"
+	}
+	return fmt.Sprintf(`val, end, err := %s(data, i)
+if err != nil {
+	return end, err
+}
+%s = val
+i = end`, decode, dest)
 }
 
 func (g *gen) anyValue(dest string) string {
@@ -3116,6 +3231,7 @@ type tagInfo struct {
 	nocopy  bool
 	lax     bool
 	unwrap  bool
+	number  bool     // an any field decodes its numbers as json.Number (UseNumber)
 	unknown []string // options the generator does not act on, for diagnostics
 }
 
@@ -3161,6 +3277,8 @@ func jsonTag(tag *ast.BasicLit) tagInfo {
 			t.lax = true
 		case "unwrap":
 			t.unwrap = true
+		case "number":
+			t.number = true
 		case "", "omitempty", "omitzero":
 			// A trailing comma, and the stdlib's two encode-only options
 			// (omitzero since Go 1.24).
@@ -3195,7 +3313,7 @@ func (g *gen) warnTagOptions(opts []string, field string) {
 			g.warnf("json tag option %q on %s is not implemented: the value is decoded with the field's declared Go type (for a whole JSON document embedded in a string, see the unwrap option)", o, field)
 			continue
 		}
-		g.warnf("unrecognized json tag option %q on %s; it is ignored (this generator understands nocopy, lax and unwrap)", o, field)
+		g.warnf("unrecognized json tag option %q on %s; it is ignored (this generator understands nocopy, lax, unwrap and number)", o, field)
 	}
 }
 

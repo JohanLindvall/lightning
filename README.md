@@ -428,6 +428,18 @@ type Records []Record          // a JSON array at the root
 type ByID    map[string]Record // a JSON object used as a data map
 ```
 
+A type **defined over** a struct, slice or map type — `type raw Rule` — is a
+root too, with the underlying type's shape, when it carries a `//lightning:`
+directive: `//lightning:strict` or any other, or the bare `//lightning:root`
+where no other applies. That is the idiom a hand-written `UnmarshalJSON`
+uses to decode its own fields without recursing into itself: `Rule` keeps
+the method it wrote, `raw` gets the generated one, and the two cannot
+collide. The definition may precede or follow what it is defined over, and
+may run through a chain. It is opt-in because the same spelling is the
+methodless twin — `type rootStd Root`, the reflection-only baseline the
+benchmarks and the `encoding/json` comparisons rest on — which must never
+grow a method.
+
 `type Records []Record` decodes a top-level `[…]` with the slice element rules;
 `type ByID map[string]Record` decodes a top-level `{…}` as a map, its keys the
 object's member names. Either element/value type, and any nested types and field
@@ -604,6 +616,24 @@ more, so content after it fails with `ErrInvalidJSON` exactly as it would at the
 root — `"{\"id\":7} trailing garbage"` is an error, not an `{"id":7}` with the
 rest ignored. Whitespace around the value is fine, and a body that is empty or
 all whitespace still leaves the field at its zero value without an error.
+
+## The `number` tag option
+
+An `any` field decodes a JSON number to a `float64`, as `encoding/json` does by
+default. Add `number` to the field's json tag and every number inside it — at
+any depth of the value's objects and arrays — is a `json.Number` holding its
+literal instead, which is what `encoding/json`'s `UseNumber` gives: `0.95`
+survives as written, and an integer past 2^53 is not rounded.
+
+```go
+type Param struct {
+    Default any `json:"default,omitempty,number"` // 0.95 stays "0.95"
+}
+```
+
+It applies to a field that IS `any` (or `interface{}`); on any other field it
+warns and is ignored. The toolkit has the same mode as `DecodeAnyNumber` (and
+`DecodeAnyNumberCompact`).
 
 ## Comment directives
 

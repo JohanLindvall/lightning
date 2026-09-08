@@ -1,6 +1,9 @@
 package unstable
 
-import "strconv"
+import (
+	"encoding/json"
+	"strconv"
+)
 
 // DecodeValue decodes an arbitrary JSON value at data[i] into the standard Go
 // representation (nil, bool, float64, string, []any, map[string]any).
@@ -14,7 +17,21 @@ import "strconv"
 // leniencies are shared with Valid, which is what lets Valid promise it accepts
 // exactly what this does.
 func DecodeValue(data []byte, i int) (any, int, error) {
-	return decodeValue(data, i, false, 0)
+	return decodeValue(data, i, false, false, 0)
+}
+
+// DecodeValueNumber is DecodeValue with every JSON number decoded as a
+// json.Number holding its literal — encoding/json's UseNumber — rather than a
+// float64, so "0.95" survives exactly and an integer past 2^53 is not rounded.
+// The literal is checked by the same scan the float path uses; nothing else
+// changes.
+func DecodeValueNumber(data []byte, i int) (any, int, error) {
+	return decodeValue(data, i, false, true, 0)
+}
+
+// DecodeValueNumberCompact is DecodeValueNumber for compact input.
+func DecodeValueNumberCompact(data []byte, i int) (any, int, error) {
+	return decodeValue(data, i, true, true, 0)
 }
 
 // DecodeValueCompact is DecodeValue for compact JSON — input with no whitespace
@@ -24,7 +41,7 @@ func DecodeValue(data []byte, i int) (any, int, error) {
 // identically to DecodeValue but faster; given inter-token whitespace it may
 // report an error.
 func DecodeValueCompact(data []byte, i int) (any, int, error) {
-	return decodeValue(data, i, true, 0)
+	return decodeValue(data, i, true, false, 0)
 }
 
 // decodeValue decodes the value at data[i]. depth is the number of enclosing
@@ -32,7 +49,7 @@ func DecodeValueCompact(data []byte, i int) (any, int, error) {
 // MaxDepth, which is what keeps a deeply nested document from exhausting the
 // stack (see MaxDepth). Only container entry pays for the bound — one compare per
 // '{' or '[', nothing on the scalar paths.
-func decodeValue(data []byte, i int, compact bool, depth int) (any, int, error) {
+func decodeValue(data []byte, i int, compact, number bool, depth int) (any, int, error) {
 	if uint(i) >= uint(len(data)) {
 		return nil, i, ErrTruncated
 	}
@@ -53,9 +70,9 @@ func decodeValue(data []byte, i int, compact bool, depth int) (any, int, error) 
 		s, end, err := ReadStringOrNull(data, i)
 		return s, end, err
 	case '{':
-		return decodeAnyObject(data, i, compact, depth+1)
+		return decodeAnyObject(data, i, compact, number, depth+1)
 	case '[':
-		return decodeAnyArray(data, i, compact, depth+1)
+		return decodeAnyArray(data, i, compact, number, depth+1)
 	case 't', 'f':
 		b, end, err := ReadBoolOrNull(data, i)
 		return b, end, err
@@ -74,6 +91,11 @@ func decodeValue(data []byte, i int, compact bool, depth int) (any, int, error) 
 		if !ok {
 			return nil, end, ErrBadNumber
 		}
+		if number {
+			// The literal itself, copied: a json.Number is a string, and the
+			// value outlives the buffer it was scanned from.
+			return json.Number(data[i:end]), end, nil
+		}
 		if !fast {
 			f2, perr := strconv.ParseFloat(unsafeStr(data[i:end]), 64)
 			if perr != nil {
@@ -85,7 +107,7 @@ func decodeValue(data []byte, i int, compact bool, depth int) (any, int, error) 
 	}
 }
 
-func decodeAnyObject(data []byte, i int, compact bool, depth int) (any, int, error) {
+func decodeAnyObject(data []byte, i int, compact, number bool, depth int) (any, int, error) {
 	if depth > MaxDepth {
 		return nil, i, ErrMaxDepth
 	}
@@ -141,7 +163,7 @@ func decodeAnyObject(data []byte, i int, compact bool, depth int) (any, int, err
 			return nil, i, ErrExpectColon
 		}
 		i = SkipWSCompact(data, i+1, compact)
-		val, end, err := decodeValue(data, i, compact, depth)
+		val, end, err := decodeValue(data, i, compact, number, depth)
 		if err != nil {
 			return nil, end, err
 		}
@@ -160,7 +182,7 @@ func decodeAnyObject(data []byte, i int, compact bool, depth int) (any, int, err
 	}
 }
 
-func decodeAnyArray(data []byte, i int, compact bool, depth int) (any, int, error) {
+func decodeAnyArray(data []byte, i int, compact, number bool, depth int) (any, int, error) {
 	if depth > MaxDepth {
 		return nil, i, ErrMaxDepth
 	}
@@ -180,7 +202,7 @@ func decodeAnyArray(data []byte, i int, compact bool, depth int) (any, int, erro
 			}
 			return nil, i, ErrInvalidJSON
 		}
-		val, end, err := decodeValue(data, i, compact, depth)
+		val, end, err := decodeValue(data, i, compact, number, depth)
 		if err != nil {
 			return nil, end, err
 		}
