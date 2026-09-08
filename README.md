@@ -80,6 +80,19 @@ member of that cycle gets the method, so which of them you decode into is not
 decided by declaration order. The generated code imports `github.com/JohanLindvall/lightning/pkg/unstable` for the
 shared scanner.
 
+**Types declared in the package's other files resolve too.** The generator
+reads every sibling `.go` file of the input (same package; not a test file,
+not a generated `_unmarshal.go`) for its struct, slice, map and defined
+scalar types, so a root in the input may name a record kept where it is
+used. A sibling type gets no method from this run — the root that reaches
+it emits its decoder, exactly as for an in-file nested type — and a
+`//lightning:` directive on it warns, since only the reaching root's
+directives apply; to give it a method of its own, generate its file. One
+rule: a sibling that imports `encoding/json` or `time` under a different
+alias than the input file is skipped whole, with a warning, because the
+generated file imports those under the input's qualifier and prints every
+type expression as written.
+
 Given:
 
 ```go
@@ -397,7 +410,11 @@ type ByID    map[string]Record // a JSON object used as a data map
 `type ByID map[string]Record` decodes a top-level `{…}` as a map, its keys the
 object's member names. Either element/value type, and any nested types and field
 options, behave exactly as the same type used for a struct field would. Several
-root types (struct, slice, map, in any mix) can live in one input file. For a
+root types (struct, slice, map, in any mix) can live in one input file. A named
+slice or map type may also be a **field** (`Items Items`, `*Items`, an element
+of another slice): it decodes through the element type's own decoder with the
+destination converted to the underlying type, and a null nils it, exactly as
+the bare `[]Item` or `map[string]Item` would. For a
 root that is a *bare* `any`/`interface{}` — whose schema you don't know at all —
 there is no method to generate (Go forbids methods on interface types); decode it
 dynamically with [`json.DecodeAny`](#decoding-into-any) instead.

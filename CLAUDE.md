@@ -4345,6 +4345,26 @@ found:
   directive on it warns like any other method-less declaration — and it
   is deliberately NOT counted by `isFlatScalarStringStruct`: that is a
   presize heuristic, and a miscount there costs a resize, never a value.
+- **Types resolved per input file, and a named slice or map could not be a
+  field.** Two files named on one command line each resolved against
+  themselves, so a record kept where it is used (Hugin's `Instance` in
+  state.go, reached from `Notification` in cardbuild.go) was "unknown
+  type". `registerSiblings` parses the package's other files (same package,
+  no `_test.go`, no `_unmarshal.go`, no `_`/`.`-prefixed file) and
+  registers their struct/slice/map/scalar types by name, never in
+  `g.order`, so the reaching root emits their decoders and none gets a
+  method; `computeDepthThreading` walks `allNamed()` so a recursive
+  sibling keeps its depth guard. The one refusal is an import alias for
+  encoding/json or time that differs from the input's (the generated file
+  imports under the input's qualifier and prints type expressions as
+  written): the sibling is skipped whole with a warning, which the case
+  `a_sibling_with_another_import_alias_is_skipped` pins. And a named slice
+  or map in a FIELD position — refused before, only a root could be one —
+  decodes through the element type's existing decoder with the destination
+  converted (`callDecoderOn` spells the receiver; `callDecoderArena` is now
+  that with `&dest`), so it costs nothing the bare field does not. The
+  test runner grew `extra` (sibling files) and `wantMethods` (the receiver
+  set, read off the generated text) for these.
 
 ## Session 2026-09-07: six toolkit PRs merged, then optimized
 

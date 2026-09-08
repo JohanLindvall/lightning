@@ -115,6 +115,7 @@ func generateTo(inPath string, warn io.Writer) error {
 		sliceTypes:       map[string]*ast.ArrayType{},
 		mapTypes:         map[string]*ast.MapType{},
 		scalarTypes:      map[string]string{},
+		sibling:          map[string]bool{},
 		order:            nil,
 		used:             map[string]bool{},
 		memo:             map[string]string{},
@@ -140,6 +141,7 @@ func generateTo(inPath string, warn io.Writer) error {
 	}
 
 	g.collectQualifiers(file)
+	g.registerSiblings(inPath, file)
 
 	// Collect every top-level struct type, in source order, recording the
 	// //lightning:compact / :nocopy / :destructive / :arena directives each
@@ -399,6 +401,7 @@ type gen struct {
 	sliceTypes  map[string]*ast.ArrayType // named slice root types (type X []T)
 	mapTypes    map[string]*ast.MapType   // named map root types (type X map[string]V)
 	scalarTypes map[string]string         // defined scalar types (type Sev string): name -> underlying (possibly another defined type)
+	sibling     map[string]bool           // named types declared in the package's other files: resolvable as fields, never roots
 	order       []string
 
 	used map[string]bool   // reserved decoder function names
@@ -478,6 +481,126 @@ type gen struct {
 // own AST. A blank or dot import contributes no qualifier: `_` names nothing and
 // a dot-imported RawMessage arrives as a bare identifier, which the generator
 // does not resolve.
+// registerSiblings makes the package's other files' named types resolvable:
+// every struct, slice, map and defined scalar type declared in a sibling .go
+// file of inPath's directory — the same package, not a test file, not a
+// generated one — is registered by name, without joining g.order. A root in
+// the input file that names one of them then emits its decoder exactly as it
+// would for a type declared beside it; the sibling type never gets a method
+// of its own from this run (generate its own file for that), and a
+// directive it carries warns, since only the reaching root's directives
+// apply.
+//
+// The one thing a sibling cannot do is spell encoding/json or time under a
+// different import alias than the input file: the generated file imports
+// those under the input's qualifier and prints every type expression as
+// written, so a sibling's `tm.Time` would not compile there. Such a file is
+// skipped whole, with a warning naming it, rather than half-registered.
+func (g *gen) registerSiblings(inPath string, file *ast.File) {
+	dir := filepath.Dir(inPath)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	self := filepath.Base(inPath)
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || name == self || !strings.HasSuffix(name, ".go") ||
+			strings.HasSuffix(name, "_test.go") || strings.HasSuffix(name, "_unmarshal.go") ||
+			strings.HasPrefix(name, "_") || strings.HasPrefix(name, ".") {
+			continue
+		}
+		sib, err := parser.ParseFile(g.fset, filepath.Join(dir, name), nil, parser.SkipObjectResolution|parser.ParseComments)
+		if err != nil || sib.Name.Name != file.Name.Name {
+			continue
+		}
+		if !g.qualifiersAgree(sib) {
+			g.warnf("%s: its encoding/json or time import alias differs from %s's; the types it declares are not resolvable from here", name, self)
+			continue
+		}
+		for _, d := range sib.Decls {
+			gd, ok := d.(*ast.GenDecl)
+			if !ok || gd.Tok != token.TYPE {
+				continue
+			}
+			for _, sp := range gd.Specs {
+				ts, ok := sp.(*ast.TypeSpec)
+				if !ok || ts.TypeParams != nil || ts.Assign.IsValid() {
+					continue
+				}
+				n := ts.Name.Name
+				if g.structTypes[n] != nil || g.sliceTypes[n] != nil || g.mapTypes[n] != nil || g.scalarTypes[n] != "" {
+					continue
+				}
+				switch t := ts.Type.(type) {
+				case *ast.StructType:
+					g.structTypes[n] = t
+				case *ast.ArrayType:
+					if t.Len != nil {
+						continue
+					}
+					g.sliceTypes[n] = t
+				case *ast.MapType:
+					g.mapTypes[n] = t
+				case *ast.Ident:
+					// Registered by name, resolved at use: scalarKind follows
+					// the chain, so a sibling defined over a type declared
+					// after it (or in a third file) resolves too.
+					g.scalarTypes[n] = t.Name
+				default:
+					continue
+				}
+				g.sibling[n] = true
+				g.warnDirectives(lightningDirectives(gd.Doc, ts.Doc), n,
+					"the type is declared in "+name+"; its decoder follows the root that reaches it")
+			}
+		}
+	}
+}
+
+// qualifiersAgree reports whether sib's encoding/json and time imports use the
+// same names the input file does, adopting them when the input file has none.
+func (g *gen) qualifiersAgree(sib *ast.File) bool {
+	for _, imp := range sib.Imports {
+		path, err := strconv.Unquote(imp.Path.Value)
+		if err != nil {
+			continue
+		}
+		name := path[strings.LastIndexByte(path, '/')+1:]
+		if imp.Name != nil {
+			name = imp.Name.Name
+		}
+		if name == "_" || name == "." {
+			continue
+		}
+		switch path {
+		case "encoding/json":
+			if g.jsonQual != "" && g.jsonQual != name {
+				return false
+			}
+			g.jsonQual = name
+		case "time":
+			if g.timeQual != "" && g.timeQual != name {
+				return false
+			}
+			g.timeQual = name
+		}
+	}
+	return true
+}
+
+// allNamed is every named type the run can reach: the input file's roots in
+// declaration order, then the sibling files' types by name.
+func (g *gen) allNamed() []string {
+	names := slices.Clone(g.order)
+	var sibs []string
+	for n := range g.sibling {
+		sibs = append(sibs, n)
+	}
+	slices.Sort(sibs)
+	return append(names, sibs...)
+}
+
 func (g *gen) collectQualifiers(file *ast.File) {
 	for _, imp := range file.Imports {
 		path, err := strconv.Unquote(imp.Path.Value)
@@ -1550,6 +1673,21 @@ func (g *gen) field(dest string, expr ast.Expr, hint string, nocopy, lax bool) s
 			// null and nocopy rules are exactly the plain scalar's.
 			return g.scalarAs(dest, kind, t.Name, nocopy)
 		}
+		if at, ok := g.sliceTypes[t.Name]; ok {
+			// A named slice type as a field decodes through the slice decoder
+			// its element type already has, the destination converted to the
+			// underlying []T that decoder takes — so `type Items []Item` in a
+			// field position costs nothing a `[]Item` field does not.
+			fn := g.sliceDecoder(at.Elt, t.Name, nocopy, lax, false)
+			return g.callDecoderOn(fmt.Sprintf("(*[]%s)(&%s)", g.typeStr(at.Elt), dest), fn, g.arenaArgForExpr(at))
+		}
+		if mt, ok := g.mapTypes[t.Name]; ok {
+			fn := g.mapDecoder(mt.Key, mt.Value, t.Name, nocopy, lax)
+			if fn == "" {
+				return g.skipEmit()
+			}
+			return g.callDecoderOn(fmt.Sprintf("(*map[string]%s)(&%s)", g.typeStr(mt.Value), dest), fn, g.arenaArg())
+		}
 		return g.unsupportedf("unknown type %q for %s", t.Name, dest)
 
 	case *ast.SelectorExpr:
@@ -1617,11 +1755,19 @@ func (g *gen) callDecoder(dest, fn string) string {
 // the root's whole arena struct — a batched slice reader, which takes the arena
 // for its own element type. See arenaArgForExpr.
 func (g *gen) callDecoderArena(dest, fn, arenaArg string) string {
-	return fmt.Sprintf(`end, err := %s(&%s, data, i%s%s)
+	return g.callDecoderOn("&"+dest, fn, arenaArg)
+}
+
+// callDecoderOn is the call itself, with the receiver expression spelled by
+// the caller: `&v.Field` for a field of the decoder's own type, a conversion
+// such as `(*[]Item)(&v.Items)` for a named slice or map field whose decoder
+// takes the underlying type.
+func (g *gen) callDecoderOn(recv, fn, arenaArg string) string {
+	return fmt.Sprintf(`end, err := %s(%s, data, i%s%s)
 if err != nil {
 	return end, err
 }
-i = end`, fn, dest, g.depthArgFor(fn), arenaArg)
+i = end`, fn, recv, g.depthArgFor(fn), arenaArg)
 }
 
 // unsupportedf records a generation error for a type the generator cannot decode
@@ -1712,9 +1858,9 @@ i = end`, g.typeStr(expr), fn, dest, g.depthArgFor(fn), g.arenaArgForExpr(expr),
 // the guarded side here in the same change.
 //
 // A field's *ast.Ident is a scalar (built-in or defined over one), a named
-// struct or `any` — the generator rejects a named slice/map as a field type —
-// so the Ident arm only has to separate `any` and named structs out; a
-// defined scalar stores the zero exactly as its underlying kind does.
+// struct, a named slice or map, or `any`, so the Ident arm only has to
+// separate named structs out: a defined scalar stores the zero exactly as its
+// underlying kind does, and a named slice or map is nil'd like the bare one.
 func (g *gen) nullAssigns(expr ast.Expr) bool {
 	switch t := unparen(expr).(type) {
 	case *ast.StarExpr, *ast.MapType, *ast.InterfaceType:
@@ -2996,12 +3142,16 @@ func (g *gen) namedRefs(name string) map[string]bool {
 func (g *gen) computeDepthThreading() {
 	g.threadDepth = map[string]bool{}
 
-	refs := make(map[string]map[string]bool, len(g.order))
-	for _, n := range g.order {
+	// Every named type takes part, the sibling files' ones included: a
+	// recursive record declared in another file is reached by a root here,
+	// and its decoder needs the depth guard as much as an in-file one.
+	names := g.allNamed()
+	refs := make(map[string]map[string]bool, len(names))
+	for _, n := range names {
 		refs[n] = g.namedRefs(n)
 	}
-	reach := make(map[string]map[string]bool, len(g.order))
-	for _, n := range g.order {
+	reach := make(map[string]map[string]bool, len(names))
+	for _, n := range names {
 		seen := map[string]bool{}
 		var dfs func(string)
 		dfs = func(cur string) {
@@ -3017,12 +3167,12 @@ func (g *gen) computeDepthThreading() {
 	}
 	// A type on a cycle is one that reaches itself.
 	cyclic := map[string]bool{}
-	for _, n := range g.order {
+	for _, n := range names {
 		if reach[n][n] {
 			cyclic[n] = true
 		}
 	}
-	for _, n := range g.order {
+	for _, n := range names {
 		if cyclic[n] {
 			g.threadDepth[n] = true
 			continue

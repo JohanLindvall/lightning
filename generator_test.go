@@ -56,9 +56,171 @@ type genCase struct {
 	// the generator's diagnostic stream.
 	wantWarn   []string
 	wantNoWarn []string
+	// extra are further files written beside data.go — the package's sibling
+	// files, which the generator reads for types but never generates for.
+	extra map[string]string
+	// wantMethods, when set, is exactly the set of receiver types the
+	// generated file declares UnmarshalJSON on.
+	wantMethods []string
 }
 
 var genCases = []genCase{
+	{
+		// A type declared in another file of the package was "unknown type",
+		// even when both files were named on the command line: each input
+		// resolved names against itself alone. A real package keeps its
+		// record types where they are used — Hugin's Instance in state.go,
+		// its Notification in cardbuild.go — so the generator now reads the
+		// package's sibling files for their struct, slice, map and defined
+		// scalar types, resolves them as fields, and gives none of them a
+		// method: the root here reaches them, exactly as an in-file nested
+		// type is reached. The recursive Node crosses the file boundary and
+		// keeps its depth guard.
+		name: "types_declared_in_sibling_files_resolve",
+		schema: `package main
+
+type Root struct {
+	Items []Item          "json:\"items\""
+	Sev   Sev             "json:\"sev\""
+	Tags  Tags            "json:\"tags\""
+	Index Index           "json:\"index\""
+	Tree  *Node           "json:\"tree\""
+	When  Stamp           "json:\"when\""
+}
+
+type rootStd Root
+`,
+		extra: map[string]string{
+			"other.go": `package main
+
+import "time"
+
+type Item struct {
+	ID int "json:\"id\""
+}
+
+type Sev Level
+type Level string
+
+type Tags []string
+
+type Index map[string]Item
+
+type Node struct {
+	Children []*Node "json:\"c\""
+}
+
+type Stamp struct {
+	At time.Time "json:\"at\""
+}
+`,
+		},
+		probe: `package main
+
+import (
+	"encoding/json"
+	"fmt"
+)
+
+const doc = "{\"items\":[{\"id\":1},{\"id\":2}],\"sev\":\"high\",\"tags\":[\"a\",\"b\"],\"index\":{\"k\":{\"id\":3}},\"tree\":{\"c\":[{\"c\":[{\"c\":null}]}]},\"when\":{\"at\":\"2021-01-02T03:04:05Z\"}}"
+
+func main() {
+	var v Root
+	if err := v.UnmarshalJSON([]byte(doc)); err != nil {
+		panic(err)
+	}
+	var s rootStd
+	if err := json.Unmarshal([]byte(doc), &s); err != nil {
+		panic(err)
+	}
+	fmt.Printf("lightning %v %q %q %v %d %v\n", v.Items, v.Sev, v.Tags, v.Index, len(v.Tree.Children[0].Children), v.When.At)
+	fmt.Printf("stdlib    %v %q %q %v %d %v\n", s.Items, s.Sev, s.Tags, s.Index, len(s.Tree.Children[0].Children), s.When.At)
+}
+`,
+		want: `lightning [{1} {2}] "high" ["a" "b"] map[k:{3}] 1 2021-01-02 03:04:05 +0000 UTC
+stdlib    [{1} {2}] "high" ["a" "b"] map[k:{3}] 1 2021-01-02 03:04:05 +0000 UTC
+`,
+		wantMethods: []string{"Root"},
+	},
+	{
+		// A named slice or map type in a FIELD position was rejected — only a
+		// root could be one — where encoding/json decodes it like the bare
+		// type. It decodes through the element type's own slice/map decoder
+		// with the destination converted to the underlying type, so it costs
+		// nothing the bare field does not; a null nils it like the bare one.
+		name: "a_named_slice_or_map_type_may_be_a_field",
+		schema: `package main
+
+type Item struct {
+	ID int "json:\"id\""
+}
+
+type Items []Item
+type ByID map[string]Item
+
+type Root struct {
+	Items Items   "json:\"items\""
+	ByID  ByID    "json:\"byId\""
+	P     *Items  "json:\"p\""
+	N     Items   "json:\"n\""
+}
+
+type rootStd Root
+`,
+		probe: `package main
+
+import (
+	"encoding/json"
+	"fmt"
+)
+
+const doc = "{\"items\":[{\"id\":1}],\"byId\":{\"a\":{\"id\":2}},\"p\":[{\"id\":3}],\"n\":null}"
+
+func main() {
+	var v Root
+	if err := v.UnmarshalJSON([]byte(doc)); err != nil {
+		panic(err)
+	}
+	var s rootStd
+	if err := json.Unmarshal([]byte(doc), &s); err != nil {
+		panic(err)
+	}
+	fmt.Printf("lightning %v %v %v %v\n", v.Items, v.ByID, *v.P, v.N == nil)
+	fmt.Printf("stdlib    %v %v %v %v\n", s.Items, s.ByID, *s.P, s.N == nil)
+}
+`,
+		want: `lightning [{1}] map[a:{2}] [{3}] true
+stdlib    [{1}] map[a:{2}] [{3}] true
+`,
+	},
+	{
+		// A sibling that imports time (or encoding/json) under another alias
+		// cannot be spelled in the generated file, which imports under the
+		// input's qualifier: it is skipped whole, named in a warning, and the
+		// type stays unknown rather than half-resolved.
+		name: "a_sibling_with_another_import_alias_is_skipped",
+		schema: `package main
+
+import "time"
+
+type Root struct {
+	At   time.Time "json:\"at\""
+	When Stamp     "json:\"when\""
+}
+`,
+		extra: map[string]string{
+			"other.go": `package main
+
+import tm "time"
+
+type Stamp struct {
+	At tm.Time "json:\"at\""
+}
+`,
+		},
+		wantErr:  `unknown type "Stamp"`,
+		wantWarn: []string{"other.go: its encoding/json or time import alias differs"},
+	},
 	{
 		// A defined scalar type — the enum idiom, `type Severity string` with
 		// constants — was "unknown type": the field switch knew the built-in
@@ -1327,6 +1489,9 @@ func TestGenerate(t *testing.T) {
 			writeFile(t, dir, "go.sum", string(goSum))
 			writeFile(t, dir, "data.go", c.schema)
 			writeFile(t, dir, "probe.go", probe)
+			for name, src := range c.extra {
+				writeFile(t, dir, name, src)
+			}
 
 			var warn bytes.Buffer
 			err := generateTo(filepath.Join(dir, "data.go"), &warn)
@@ -1353,6 +1518,18 @@ func TestGenerate(t *testing.T) {
 			}
 			if c.wantErr != "" {
 				return // a failed run writes no decoder; nothing to compile
+			}
+			if c.wantMethods != nil {
+				var got []string
+				for _, m := range unmarshalerRe.FindAllStringSubmatch(readFile(t, dir, "data_unmarshal.go"), -1) {
+					got = append(got, m[1])
+				}
+				slices.Sort(got)
+				want := slices.Clone(c.wantMethods)
+				slices.Sort(want)
+				if !slices.Equal(got, want) {
+					t.Errorf("UnmarshalJSON receivers %v, want %v", got, want)
+				}
 			}
 
 			if c.probe == "" {
