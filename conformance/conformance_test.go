@@ -1484,3 +1484,63 @@ func wrapKey(key, body string) string {
 	}
 	return `{"` + key + `":` + string(q) + `,"x":9}`
 }
+
+// TestUnknownFieldSkipMatchesSkipValue holds the generated unknown-field skip to
+// unstable.SkipValue byte for byte. The generator no longer emits a SkipValue
+// call there: it reaches SkipString and SkipNumber directly for the two hot
+// value kinds and keeps SkipValue for everything from '[' up (see skipUnknown in
+// main.go). That is a three-way partition of the leading byte, and it is right
+// only if it agrees with SkipValue's own switch on EVERY byte — including the
+// malformed ones, where the two skip paths already diverge from each other in
+// documented ways and this dispatch must not add a fourth.
+//
+// So every case is checked twice: the decode must accept exactly when SkipValue
+// accepts the same value at the same offset, and must resume where SkipValue
+// says the value ends, which is what leaves "str" readable behind it.
+func TestUnknownFieldSkipMatchesSkipValue(t *testing.T) {
+	values := []string{
+		// every value kind
+		`"a string"`, `"with \" an escape"`, `""`, `123`, `-1.5e10`, `0`,
+		`{"a":1}`, `{}`, `{"n":{"d":[1,2]}}`, `[1,2,3]`, `[]`, `[[{"k":"v"}]]`,
+		`true`, `false`, `null`,
+		// bytes on and around the '[' boundary the dispatch splits at, and the
+		// shapes SkipValue answers with its default arm
+		`[`, `]`, `{`, `}`, `\`, `^`, `_`, "`", `~`, `x`, `Z`, `@`, `+5`, `.5`,
+		`-`, `e`, `1.2.3`, `tru`, `nul`, `fals`, `"unterminated`,
+	}
+	for _, v := range values {
+		doc := []byte(`{"unknown":` + v + `,"str":"after"}`)
+		const at = len(`{"unknown":`)
+
+		wantEnd, wantErr := unstable.SkipValue(doc, at)
+
+		var got Doc
+		err := got.UnmarshalJSON(doc)
+		// Whether the whole document decodes is decided by where SkipValue says
+		// the value ends: if it ends at the comma the rest parses, and if
+		// SkipValue errs the decode must err too.
+		if wantErr != nil {
+			if err == nil {
+				t.Errorf("%s: decode accepted a value SkipValue rejected (%v)", v, wantErr)
+			}
+			continue
+		}
+		if wantEnd != len(doc)-len(`,"str":"after"}`) {
+			// SkipValue consumed a different span than the value's text — the
+			// document is malformed in a way that makes the rest unparseable,
+			// so only agreement on the error matters.
+			if err == nil {
+				t.Errorf("%s: decode accepted, but SkipValue ended at %d not %d",
+					v, wantEnd, len(doc)-len(`,"str":"after"}`))
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%s: decode failed (%v) though SkipValue accepted", v, err)
+			continue
+		}
+		if got.Str != "after" {
+			t.Errorf("%s: resumed wrong — Str = %q, want %q", v, got.Str, "after")
+		}
+	}
+}

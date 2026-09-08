@@ -30,7 +30,9 @@ allocation-light `json.Unmarshaler` implementations.
   files: `read.go` (the `Read*` readers), `batch.go` (the batched scalar-array
   readers), `skip.go`, `skipfast.go` (+ `skipfast_{amd64,arm64,noasm}`,
   the SIMD container skip), `count.go` (slice-presize counters), `numeric.go` (`scanFloat`
-  + Eisel-Lemire), `string.go` (unescape/`Unwrap`), `date.go`/`time.go`, `any.go` (the
+  + Eisel-Lemire), `string.go` (unescape/`Unwrap`) and `escbuf.go` (the chunk the
+  buffers escaped strings decode into — and alias — are carved from),
+  `date.go`/`time.go`, `any.go` (the
   dynamic `DecodeValue`), and the `simd_*` SIMD kernels; `unstable.go` holds the rest.
 - `pkg/json` — small public API over the scanner, **implemented here** (not just
   wrappers) on the exported pkg/unstable primitives: `get.go` holds the read toolkit
@@ -2328,6 +2330,109 @@ byte-identical when adding cold paths; push new logic out-of-line.
   instructions. The `'"'` test the inline form needs is the byte the loop has
   already loaded to check for `}`.
 
+- **Escaped strings are carved from a chunk, not made one at a time**
+  (`escapeScratch`/`escapeRelease` in `pkg/unstable/escbuf.go`, 2026-09-08,
+  Neoverse N2). `decodeEscaped` hands its buffer out with `unsafeStr`, so that
+  buffer is not scratch — it IS the decoded string's backing, and
+  `decodeStringEscaped` was paying one `make` per escaped string for it. On an
+  escape-heavy document that is most of the decode: `makeslice` under
+  `decodeStringEscaped` measured **22% of gsoc_2018** here (`pprof -peek`), and
+  rerunning under `GOGC=off` splits it — the same batching is worth 13.6% with
+  the collector off and 25.9% with it on, so about half is the allocator and half
+  is the marking and pacing that thousands of extra objects per decode buy.
+  A carve sets cap to exactly n, so a caller's append reallocates onto the heap
+  rather than reaching its neighbour, and no chunk is ever reused; a carved
+  buffer is therefore indistinguishable from a made one except in which object
+  the collector sees it, i.e. **how much one surviving string keeps alive**.
+  That retention is the whole design constraint — the copying readers exist so a
+  caller need not hold the document — and three rules bound it: a chunk is never
+  larger than `escapeChunkMax` (16 KiB), never larger than the document that
+  needed it (so a small document cannot create a large chunk, and the real bound
+  is `min(16 KiB, largest document decoded into this chunk)` — no more than a
+  nocopy decode of that document already keeps), and a body over
+  `escapeMaxCarve` (4 KiB) gets its own `make`, which caps both the tail a chunk
+  can waste and the size of a string that can pin one. `escapeRelease` gives back
+  the difference between the estimate and what the decode actually wrote, which
+  matters on `\uXXXX`-dense text where a body decodes to half its escaped
+  length — worth twitterescaped 690 → 654 ns on its own.
+  **The chunk lives in a `sync.Pool` and that is not a detail**: `Get` removes
+  it, so the bump is exclusive for the one carve it is checked out for, and a
+  pool emptied at a GC costs only that chunk's tail. The pair measures 25.0 ns
+  against a make's 42.5 ns (`BenchmarkEscapeScratch`); a package variable would
+  be 11.7 ns and is not an option, and that 13 ns is the price of the design
+  being usable from more than one goroutine. Interleaved ABBA (n=8, pinned,
+  `-funcalign=64`): **gsoc_2018 −16.0%, twitterescaped −10.6%, string_unicode
+  −2.8%, twitter_status −1.4%**, everything without escapes flat; B/op falls too
+  (gsoc −4.2%) because a carve is exact where a `make` rounds to a size class.
+  **The chunk-size curve is the part to re-derive before touching the
+  constants**, because it is not the shape the allocation-count model predicts:
+  4 KiB is worth only −4.4% (and +13% B/op — chunk tails), 16 KiB −18.6%, 32 KiB
+  −21.6%, 64 KiB −24.4%. A 40× reduction in allocation count buys 4.4% and the
+  next 15× buys another 20%, so this is a bytes-and-objects effect, not a
+  malloc-count one — the same correction the string-arena entry in the rejected
+  list already carries. 16 KiB is chosen for the retention bound, not the last
+  8%. Locked by `TestEscapeScratchExclusive` (4000 carves, each filled with its
+  own mark and **retained**, then all re-read — see the note there about why
+  comparing addresses instead is wrong and looks right),
+  `TestEscapeScratchChunkBound`, `TestEscapedStringsSurviveChunkReuse` (2000
+  escaped strings out of one document through the real reader) and
+  `TestEscapeScratchConcurrent` under `-race`.
+
+- **The generated unknown-field skip reaches the scanners directly**
+  (`skipUnknown` in `main.go`, 2026-09-08). A wide record's members are mostly
+  unknown — 35 of cloudflare's 48 keys — and what one costs is `SkipValue`'s
+  frame and dispatch, not the scan. The template now spells three arms out: from
+  `'['` up (both brackets, the three literals, and every byte `SkipValue` would
+  send to its default from there) `SkipValue`; `'"'` `SkipString`; everything
+  else `SkipNumber`, which is where `SkipValue`'s default sends it too. The
+  partition is exact, so the two agree on malformed input as well, and the
+  bounds test is already made by the loop's own "truncated" guard in front of the
+  key switch, so the dispatch carries no bounds check. **Testing for `'['`
+  first, though strings are far commoner, is what measured best** — cloudflare
+  −1.8% cycles that way against −1.2% with the quote arm leading — because the
+  container arm is the one the compiler lays out as the fall-through. And there
+  is deliberately **no `'{'` arm**, though `SkipObject` exists for exactly this
+  and the pkg/json walkers take it: a walker is one function, this template is
+  emitted into every struct decoder, and `SkipObject` inlines (cost 72), so the
+  object arm grew the cloudflare package's decoders by ~950 instructions and
+  bought 78 cycles of front-end stall per decode against the ~90 the removed
+  instructions were worth — a wash, and the reason a change that removes 3.5% of
+  a case's instructions can be worth nothing. Instructions per decode:
+  **cloudflare-compact −5.2%, cloudflare-nocopy −4.8%, cloudflare −3.4%,
+  pretty −3.9%, github_events −1.8%**, everything else flat; time (n=8)
+  cloudflare −1.4%, cloudflare-nocopy −0.5%, skip-heavy **+0.2%** (one unknown
+  member, a huge array: it pays the dispatch and gains nothing). Locked by
+  conformance `TestUnknownFieldSkipMatchesSkipValue`, which holds the decode to
+  `SkipValue` over every value kind and the bytes either side of the `'['`
+  boundary — sabotage-verified, a boundary of `'a'` fails it (`[` would go to
+  `SkipNumber`) while `'Z'` does not, because for that byte both routes reach
+  the same scanner.
+
+- **`SkipString`'s first scan is peeled out of its loop** (2026-09-08). With the
+  scan inside a `for`, the register allocator has to keep the slice header live
+  across the scanner call at the loop head, so every escape-free string — which
+  is nearly all of them — paid a spill and a reload it never read; the
+  disassembly showed it as a store of the cap word immediately followed by its
+  own load into the argument area. The peeled form returns with no back edge
+  above it and the escape continuation is a separate function. Instructions:
+  **ArrayEachStrings −1.8%, ObjectEachNested −0.8%, ObjectEachRecordCompact
+  −0.6%, GetManyWithSkip −0.5%**. It does NOT make `SkipString` inlinable (cost
+  167, up from 110 — the continuation call is 57 of it), and that was never the
+  point; the rejected list records three cores agreeing that removing its frame
+  is worth nothing.
+
+- **The container-skip assembly builds its splats with `VMOVI`**
+  (`skipfast_arm64.s`, 2026-09-08). The four NEON scanners in `simd_arm64.s` took
+  this in 2026-08 and `skipfast_arm64.s` never did: `maskBlock` and `skipBlocks`
+  each built six splats with a `MOVD` immediate plus a `VDUP`, twelve
+  instructions and twelve GP→SIMD transfers ahead of the first `CLASS2`. `VMOVI`
+  builds each inside the vector unit from an 8-bit immediate with no general
+  register in the way. Honest sizing: **flat** — `BenchmarkSkipSmall/tiny` −2.1%
+  and `ArrayEachSeries` −0.5% are the largest moves and both are inside the noise
+  floor. Kept because it is strictly less code (12 instructions gone), provably
+  identical, and the idiom the rest of the tree already uses; not because it
+  measured.
+
 ## The inline trick — let the generator write hot bodies inline
 
 Go's inliner refuses `SkipWS`, `ReadKey`, and `indexCloseOrEscape` (each exceeds
@@ -2790,6 +2895,30 @@ no regressions.)
 - **Skipping a clean string inside `SkipValue` without the `SkipString` frame**,
   re-measured on Meteor Lake: flat on every case (geomean −0.3%), the same
   verdict as the M2 and N2 entries above. Three microarchitectures now agree.
+- **Masking the `pow10exact` index to remove Clinger's two bounds checks**
+  (2026-09-08, N2). The prove pass will not remove them — it tracks neither the
+  negation nor the unsigned range test that guards the lookups — and padding the
+  table to 32 entries so the index can be `&31` does remove them, worth
+  `BenchmarkScanFloatShapes/array` −1.2% and `/mesh` −0.8% in isolation. End to
+  end it measured **numbers +1.9%**, reproduced across two builds and reverted by
+  taking the padding out again, from nothing but the 72 bytes of rodata the
+  padding adds and the alignment shift behind it. The same mask on `pow10u64` is
+  worse and for a real reason rather than layout: there the index feeds the
+  mantissa fold, so the `AND` lands on the value chain, where it costs more than
+  the never-taken branch it replaces (**canada +2.1%**) — the third confirmation
+  of the rule that a bounds check is a predicted branch and is cheaper than one
+  dependent ALU op on a latency-bound chain.
+- **Reading `scanFloat`'s sign byte out of the wide load** instead of as
+  `data[i]` (2026-09-08, N2). The 48-byte window test is an unsigned relation the
+  prove pass does not carry to a byte index, so `data[i]` keeps a bounds check on
+  the first byte of every float; `neg := byte(load64(data, i)) == '-'` has none
+  and lets a positive number reach its digit mask with one load instead of two.
+  It removes 1.3–2.9% of the shapes' instructions and measured **canada +2.0%,
+  float-array +1.7%, mesh +0.7%** — slower on every one. The mechanism was not
+  identified; what is clear is that the byte load and the word load were already
+  issuing as well as they can, and that instruction counts do not decide a change
+  on this path. Both halves of the bounds-check pair above were built together,
+  measured together, looked like a win on instructions, and are both reverted.
 - **No-corpus determinations (quantified, don't build without a workload):**
   `[]float32`/`[]bool` batch readers — zero bench-corpus fields of those types
   (if a real workload appears, the `DecodeFloat64Slice` pattern ports
@@ -4905,3 +5034,83 @@ through `skipValueOrEnd`, which is the same SkipValue frame the get.go walkers
 just shed and the same mechanical change. And the ~13 instructions of ABI0
 marshaling per scanner call remain the floor under every key and string read,
 as on the other three cores.
+
+## Neoverse N2 pass over allocation and the skip dispatch (2026-09-08)
+
+The escaped-string chunk allocator, the generator's unknown-field dispatch,
+`SkipString`'s peel and the `VMOVI` splats all landed here; each has its own
+entry above. Cumulative over the 30-case corpus against the session's starting
+commit (interleaved ABBA, n=8, pinned, both sides `-funcalign=64`):
+**gsoc_2018 −16.0%, twitterescaped −10.6%, string_unicode −2.8%,
+cloudflare −1.4%, twitter_status −1.4%, cloudflare-nocopy −0.5%**, everything
+else flat, skip-heavy **+0.2%**, geomean **−1.55%**; the `pkg/json` toolkit
+suite is flat (geomean −0.10%) with `ArrayEachStrings` −5.5%,
+`ArrayEachIndex` −5.4% and `ArrayEachIndexShapes/strings` −3.2%.
+
+- **The prize was where the profile said and NOT where the model said.**
+  `pprof -peek` put `makeslice` under `decodeStringEscaped` at 22% of gsoc_2018,
+  which the standing string-arena entry had already flagged and its own
+  correction had already sized at "−8.78% ceiling on Zen 4". On this core the
+  measured ceiling is **−25.9%**, and the reason the two differ is that the win
+  is not a function of allocation count: 4 KiB chunks cut the count 40× and buy
+  4.4%, 64 KiB cut it a further 15× and buy another 20%. Size an
+  allocation-batching idea by building the throwaway probe and sweeping the
+  chunk size, not by multiplying a malloc cost by a count.
+- **`GOGC=off` is worth running once, as a split rather than as a sizing.** The
+  old note "never size an allocation idea with GOGC=off" stands — it removes
+  collection and keeps the allocate-and-zero — but running BOTH tells you what
+  kind of win you have: 13.6% with the collector off and 25.9% with it on says
+  half the prize is the objects the marker no longer walks, which is the half a
+  bump allocator keeps even when the bytes are unchanged.
+- **A retention change needs a rule, not a constant.** The reason this could
+  ship default-on where `//lightning:arena` could not is that the chunk is
+  bounded by the document as well as by 16 KiB, so a decode cannot leave a
+  string pinning more than a nocopy decode of the same document already would.
+  The version that bounded it by ramping chunk sizes per document was better on
+  paper and much worse in practice — `sync.Pool` is emptied at every GC, so the
+  ramp restarted constantly and most chunks stayed small (gsoc −6.8% instead of
+  −14.8%). Do not put adaptive state in a pooled object.
+- **A stray benchmark process makes an A/B look fine and be wrong.** One
+  `-test.benchtime=300000x` run left over from a mis-sized measurement sat at
+  78% of a core for twenty minutes. Every case in the A/B came out ~2× its usual
+  absolute time, both arms equally, with ±50% within-arm variance — and the
+  deltas still looked plausible. The tell is the ABSOLUTE numbers: cloudflare is
+  1.05 µs on this box, and any run where it is 2.1 µs is measuring something
+  else. Check `ps aux --sort=-%cpu | head -3` before and after, and compare the
+  absolute time of a case you know.
+- **A new benchmark is how a whole shape stays hidden.** `BenchmarkSkipContainer`
+  only ever measured 300-member documents, where the block loop's prologue is
+  amortized over dozens of blocks. `BenchmarkSkipSmall` (this session) measures
+  the shape every walker over an array of records actually skips, and it says
+  `SkipValue` costs a flat **193 instructions and 48 cycles** whether the
+  container is 7 bytes or 52 — `skipBlocks` is 78% of `ArrayEachRecords` and 58%
+  of `StreamMatrix/stream_points`. `BenchmarkSkipSmallScalar` is the same shapes
+  through `skipObject`/`skipArray` so the routing can be checked rather than
+  assumed: scalar is better at `{"a":1}` (13.9 ns vs 14.5) and at
+  `[1788087600,"0.0"]` (17.4 vs 18.5), and 3.3× worse at a 52-byte record with
+  twelve quotes (47.6 vs 14.6), so the probe's current choice is right and the
+  floor is the fixed cost, not the routing.
+
+**Left on the table, sized.** The 193-instruction floor under a one-block
+container skip is the largest single thing this session found and did not take:
+~87 of it is the block itself, and the rest is `SkipValue`'s frame,
+`skipContainerFast`'s (whose five spill stores exist only for a slow path the
+common call never reaches, and whose `isArray` is recomputed from `open` on
+every call), and `skipBlocks`' ABI0 — six argument words in and four result
+words out, of which three are needed only when the scan fails. Packing those
+three into one and having the assembly take the byte tail as well would make the
+common call a single result; that is ~15 of the 193, and the sizing to beat is
+`BenchmarkSkipSmall`. A SWAR pre-walk instead was costed and rejected on paper:
+it needs an EXACT structural mask (the cheap one is only exact in its lowest
+lane, which is all `indexStructuralAt` ever takes), so it runs ~217 operations
+on the 52-byte record against the 193 it replaces, and wins only below ~24
+bytes. And `set.go`'s walkers still reach every member's value through
+`skipValueOrEnd`: giving them the generated decoder's three-way dispatch would
+cost `skipValueOrEnd` its inlining at all twelve of its call sites, so it needs
+writing out at the three hot ones, for a ~3% ceiling on `SetPaths`.
+
+**`<ABIInternal>` re-checked on Go 1.27.1 and still refused** outside
+`package runtime` ("ABI selector only permitted when compiling runtime"), so the
+~11 memory operations per scanner call remain the floor. Go 1.27 does ship a
+`simd` package with arm64 files, but it is behind `goexperiment.simd` (off by
+default), which a library cannot require of its users.

@@ -173,7 +173,10 @@ func decodeStringEscaped(data []byte, start, i int) (string, int, error) {
 		}
 		j = q + 1 // escaped \": resume the scan just past it
 	}
-	return decodeEscaped(make([]byte, 0, capHint), data, start, i, true)
+	buf, chunk, off := escapeScratch(data, capHint)
+	s, end, err := decodeEscaped(buf, data, start, i, true)
+	escapeRelease(chunk, off, capHint, len(s))
+	return s, end, err
 }
 
 // decodeEscaped decodes a backslash-escaped string body, starting from the

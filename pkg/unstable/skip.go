@@ -122,9 +122,33 @@ func SkipValue(data []byte, i int) (int, error) {
 // validate or decode the escapes. It returns ErrTruncated if the closing quote
 // is missing before the end of data.
 func SkipString(data []byte, i int) (int, error) {
-	// data[i] == '"'
-	i++
+	// data[i] == '"'. The first scan is peeled out of the loop, and the escape
+	// continuation is a separate function, so the overwhelmingly common
+	// escape-free string reaches its return with no back edge above it. That is
+	// worth more than it looks: with the scan inside a loop the register
+	// allocator must keep the slice header live across the scanner call at the
+	// loop head, so every clean string paid a spill and a reload it never read
+	// (visible in the disassembly as a store of the cap word immediately
+	// followed by its own load into the argument area).
+	e := indexCloseOrEscapeAt(data, i+1)
+	if uint(e) >= uint(len(data)) {
+		return len(data), ErrTruncated
+	}
+	if data[e] == '"' {
+		return e + 1, nil
+	}
+	return skipStringEscaped(data, e+2)
+}
+
+// skipStringEscaped is SkipString's continuation once an escape has been found:
+// i is the byte after the escaped character (the escape sequence is skipped two
+// bytes at a time, which is enough — for \uXXXX the remaining hex digits are
+// ordinary bytes the next scan runs over).
+func skipStringEscaped(data []byte, i int) (int, error) {
 	for {
+		if i > len(data) {
+			return len(data), ErrTruncated
+		}
 		e := indexCloseOrEscapeAt(data, i)
 		if uint(e) >= uint(len(data)) {
 			return len(data), ErrTruncated
@@ -132,13 +156,7 @@ func SkipString(data []byte, i int) (int, error) {
 		if data[e] == '"' {
 			return e + 1, nil
 		}
-		// Skip the escape sequence. For \uXXXX we only need to skip the
-		// backslash and the next char; subsequent bytes are processed on the
-		// next iteration.
 		i = e + 2
-		if i > len(data) {
-			return len(data), ErrTruncated
-		}
 	}
 }
 

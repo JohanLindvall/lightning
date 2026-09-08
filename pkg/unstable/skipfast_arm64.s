@@ -58,24 +58,18 @@ GLOBL bitWeights<>(SB), RODATA|NOPTR, $16
 // 64-byte block is four 16-byte chunks (V6..V9); the classes fold to their 64-bit
 // masks two at a time via the CLASS2 cascade above.
 TEXT ·maskBlock(SB), NOSPLIT, $0-64
-	MOVD b_base+0(FP), R0
-	MOVD $0x22, R1
-	VDUP R1, V0.B16            // '"'
-	MOVD $0x5c, R1
-	VDUP R1, V1.B16            // '\\'
+	MOVD  b_base+0(FP), R0
+	VMOVI $0x22, V0.B16        // '"'
+	VMOVI $0x5c, V1.B16        // '\\'
 	// Select the container's bracket splats: '['/']' for an array, else '{'/'}'.
 	MOVBU isArray+24(FP), R1
 	CBNZ  R1, arrayBrackets
-	MOVD  $0x7b, R1
-	VDUP  R1, V2.B16           // '{'
-	MOVD  $0x7d, R1
-	VDUP  R1, V3.B16           // '}'
+	VMOVI $0x7b, V2.B16        // '{'
+	VMOVI $0x7d, V3.B16        // '}'
 	JMP   haveBrackets
 arrayBrackets:
-	MOVD $0x5b, R1
-	VDUP R1, V2.B16            // '['
-	MOVD $0x5d, R1
-	VDUP R1, V3.B16            // ']'
+	VMOVI $0x5b, V2.B16        // '['
+	VMOVI $0x5d, V3.B16        // ']'
 haveBrackets:
 	MOVD $bitWeights<>(SB), R1
 	VLD1 (R1), [V16.B16]
@@ -109,7 +103,7 @@ haveBrackets:
 // prefix XOR when the block has no unescaped quote, and update depth with
 // popcounts in bulk whenever the block cannot cross depth 0. Per block it does
 // exactly the work maskBlock + the Go bit math did, minus the per-block call,
-// four results through memory, five splat VDUPs and the isArray branch.
+// four results through memory, five splat builds and the isArray branch.
 //
 // Unlike the amd64 twin there is no carryless-multiply prefix XOR: the mask is
 // in the GP domain (the escape math needs GP add-with-carry) and a
@@ -130,23 +124,17 @@ TEXT ·skipBlocks(SB), NOSPLIT, $0-80
 	MOVD depth+32(FP), R3
 	MOVD ZR, R4
 	MOVD ZR, R5
-	MOVD $0x5555555555555555, R6
-	MOVD $0x22, R7
-	VDUP R7, V0.B16            // '"'
-	MOVD $0x5c, R7
-	VDUP R7, V1.B16            // '\\'
+	MOVD  $0x5555555555555555, R6
+	VMOVI $0x22, V0.B16        // '"'
+	VMOVI $0x5c, V1.B16        // '\\'
 	MOVBU isArray+40(FP), R7
-	CBNZ R7, arrayBrackets
-	MOVD $0x7b, R7
-	VDUP R7, V2.B16            // '{'
-	MOVD $0x7d, R7
-	VDUP R7, V3.B16            // '}'
-	JMP  haveBrackets
+	CBNZ  R7, arrayBrackets
+	VMOVI $0x7b, V2.B16        // '{'
+	VMOVI $0x7d, V3.B16        // '}'
+	JMP   haveBrackets
 arrayBrackets:
-	MOVD $0x5b, R7
-	VDUP R7, V2.B16            // '['
-	MOVD $0x5d, R7
-	VDUP R7, V3.B16            // ']'
+	VMOVI $0x5b, V2.B16        // '['
+	VMOVI $0x5d, V3.B16        // ']'
 haveBrackets:
 	MOVD $bitWeights<>(SB), R7
 	VLD1 (R7), [V16.B16]

@@ -9,6 +9,13 @@ import (
 
 // pow10exact holds the powers of ten that are exactly representable as a
 // float64 (10^0 .. 10^22). Used by the fast-path float parser.
+//
+// Clinger's two lookups here keep a bounds check each, which the prove pass
+// will not remove: it tracks neither the negation nor the unsigned range test
+// that guards them. Padding the table to a power of two and masking the index
+// does remove them and is NOT worth it — see the rejected list in CLAUDE.md,
+// where the 72 bytes of rodata it adds cost `numbers` more than the checks were
+// worth.
 var pow10exact = [...]float64{
 	1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11,
 	1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22,

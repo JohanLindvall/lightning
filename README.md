@@ -511,6 +511,15 @@ type Log struct {
 boundaries (each struct's own field tags govern). Strings containing escape
 sequences still allocate, since they can't be a slice of the raw input.
 
+Those escaped strings do not get one allocation each, though. A decoded string
+is handed out aliasing the buffer it was unescaped into, so that buffer *is* the
+string, and lightning carves them from a shared chunk rather than making one per
+string — worth **−14% on an escape-heavy document** and rather more on its
+allocation counts. The chunk is never larger than 16 KiB and never larger than
+the document that needed it, so one string that outlives its document keeps at
+most that much alive; escape-free strings, which is nearly all of them in most
+documents, are unaffected either way.
+
 ## The `//lightning:destructive` directive
 
 The one allocation `nocopy` can't avoid is unescaping: a string like `"a\/b"` has

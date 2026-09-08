@@ -1496,7 +1496,44 @@ type fieldArm struct {
 const maxInlineCmp = 16
 
 // skipUnknown is the code that skips an object member whose key matched no field.
-const skipUnknown = `end, err := unstable.SkipValue(data, i)
+//
+// It reaches the string and number scanners directly rather than through
+// SkipValue, which is the same change pkg/json's walkers took: on a wide record
+// most members are unknown, and what one costs is the frame, not the scan. The
+// bounds test SkipValue would make has already been made by the loop above (the
+// "truncated" guard in front of the key switch), so data[i] is provably in range
+// and the dispatch carries no bounds check of its own.
+//
+// The three arms partition the byte exactly as SkipValue's own switch does, so
+// the two agree on every input including malformed ones. Everything from '['
+// up — both brackets, the three literals, and every byte SkipValue would send
+// to its default arm from there — goes to SkipValue; '"' is the only value byte
+// below it that is not a number's, so everything else is SkipNumber, which is
+// where SkipValue's default sends it too.
+//
+// Testing for '[' FIRST, though strings are much the commoner member, is what
+// measured best: cloudflare -1.8% cycles this way against -1.2% with the quote
+// arm leading, and skip-heavy (one unknown member, a huge array) 4 cycles back
+// of the 8 it otherwise lost. The container arm is the one the compiler lays
+// out as the fall-through.
+//
+// There is deliberately NO separate '{' arm, though SkipObject exists for
+// exactly this and the walkers take it. A walker is one function; this template
+// is emitted into every struct decoder, and SkipObject inlines (cost 72) — the
+// object arm grew the cloudflare package's decoders by ~950 instructions and
+// bought 78 cycles of front-end stall per decode against the ~90 the removed
+// instructions were worth, a wash. Without it the same case is 3.4% fewer
+// instructions AND 1.8% fewer cycles.
+const skipUnknown = `var end int
+		var err error
+		switch lightningC := data[i]; {
+		case lightningC >= '[':
+			end, err = unstable.SkipValue(data, i)
+		case lightningC == '"':
+			end, err = unstable.SkipString(data, i)
+		default:
+			end, err = unstable.SkipNumber(data, i)
+		}
 		if err != nil {
 			return end, err
 		}
