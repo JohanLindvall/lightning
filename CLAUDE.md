@@ -2362,8 +2362,13 @@ byte-identical when adding cold paths; push new logic out-of-line.
   be 11.7 ns and is not an option, and that 13 ns is the price of the design
   being usable from more than one goroutine. Interleaved ABBA (n=8, pinned,
   `-funcalign=64`): **gsoc_2018 −16.0%, twitterescaped −10.6%, string_unicode
-  −2.8%, twitter_status −1.4%**, everything without escapes flat; B/op falls too
-  (gsoc −4.2%) because a carve is exact where a `make` rounds to a size class.
+  −2.8%, twitter_status −1.4%**, everything without escapes flat. The allocation
+  numbers are the larger part of the story: **allocs/op twitterescaped −64.9%
+  (1235 → 434), gsoc_2018 −52.8% (2995 → 1413), twitter_status −36.1%
+  (857 → 548), string_unicode 2 → 0, update_center −9.0%**, and B/op falls with
+  them — twitterescaped −14.1%, string_unicode −6.5%, gsoc −2.3% — because a
+  carve is exact where a `make` rounds up to a size class, and because
+  `escapeRelease` gives the estimate's slack back.
   **The chunk-size curve is the part to re-derive before touching the
   constants**, because it is not the shape the allocation-count model predicts:
   4 KiB is worth only −4.4% (and +13% B/op — chunk tails), 16 KiB −18.6%, 32 KiB
