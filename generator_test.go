@@ -209,16 +209,17 @@ func main() {
 	var s Strict
 	fmt.Println("known:", s.UnmarshalJSON([]byte("{\"name\":\"x\",\"inner\":{\"a\":1}}")), s.Name, s.Inner.A)
 	err := s.UnmarshalJSON([]byte("{\"name\":\"x\",\"extra\":1}"))
-	fmt.Println("root unknown:", errors.Is(err, json.ErrUnknownKey))
+	var uk *json.UnknownKeyError
+	fmt.Println("root unknown:", errors.Is(err, json.ErrUnknownKey), errors.As(err, &uk), uk.Key, err)
 	err = s.UnmarshalJSON([]byte("{\"inner\":{\"a\":1,\"b\":2}}"))
-	fmt.Println("nested unknown:", errors.Is(err, json.ErrUnknownKey))
+	fmt.Println("nested unknown:", errors.Is(err, json.ErrUnknownKey), errors.As(err, &uk), uk.Key)
 	var l Loose
 	fmt.Println("loose:", l.UnmarshalJSON([]byte("{\"inner\":{\"a\":1,\"b\":2},\"extra\":1}")), l.Inner.A)
 }
 `,
 		want: `known: <nil> x 1
-root unknown: true
-nested unknown: true
+root unknown: true true extra json: unknown object key "extra"
+nested unknown: true true b
 loose: <nil> 1
 `,
 	},

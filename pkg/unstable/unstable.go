@@ -14,6 +14,7 @@ package unstable
 
 import (
 	"errors"
+	"strconv"
 	"unsafe"
 )
 
@@ -32,6 +33,18 @@ var (
 	ErrMaxDepth     = errors.New("json: exceeded max depth")
 	ErrUnknownKey   = errors.New("json: unknown object key")
 )
+
+// UnknownKeyError is what a decoder generated under //lightning:strict
+// returns for a member no field answers to. It names the key — the one
+// thing a caller that refuses unknown settings has to say back — and
+// matches ErrUnknownKey under errors.Is, so a caller that only asks "was it
+// an unknown key" needs no type assertion.
+type UnknownKeyError struct{ Key string }
+
+func (e *UnknownKeyError) Error() string { return "json: unknown object key " + strconv.Quote(e.Key) }
+
+// Is reports the sentinel every strict refusal shares.
+func (e *UnknownKeyError) Is(target error) bool { return target == ErrUnknownKey }
 
 // MaxDepth bounds how deeply the recursive walkers — DecodeValue and the
 // validator — will descend into nested objects and arrays before giving up with
