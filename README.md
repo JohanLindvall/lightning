@@ -85,9 +85,10 @@ reads every sibling `.go` file of the input (same package; not a test file,
 not a generated `_unmarshal.go`) for its struct, slice, map and defined
 scalar types, so a root in the input may name a record kept where it is
 used. A sibling type gets no method from this run — the root that reaches
-it emits its decoder, exactly as for an in-file nested type — and a
-`//lightning:` directive on it warns, since only the reaching root's
-directives apply; to give it a method of its own, generate its file. One
+it emits its decoder, exactly as for an in-file nested type — under the
+reaching root's directives; a `//lightning:` directive the sibling type
+carries belongs to the run its own file is the input of, and is not
+reported here. To give it a method of its own, generate its file. One
 rule: a sibling that imports `encoding/json` or `time` under a different
 alias than the input file — or any other package under a qualifier the
 input file gives a different package — is skipped whole, with a warning,

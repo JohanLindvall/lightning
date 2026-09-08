@@ -516,9 +516,10 @@ type gen struct {
 // generated one — is registered by name, without joining g.order. A root in
 // the input file that names one of them then emits its decoder exactly as it
 // would for a type declared beside it; the sibling type never gets a method
-// of its own from this run (generate its own file for that), and a
-// directive it carries warns, since only the reaching root's directives
-// apply.
+// of its own from this run (generate its own file for that), and only the
+// reaching root's directives apply to the decoder emitted here — a
+// directive the sibling carries belongs to the run its own file is the
+// input of, and is not reported.
 //
 // The one thing a sibling cannot do is spell encoding/json or time under a
 // different import alias than the input file: the generated file imports
@@ -580,9 +581,11 @@ func (g *gen) registerSiblings(inPath string, file *ast.File) {
 				default:
 					continue
 				}
+				// A directive a sibling type carries is for the run whose
+				// input that file is — a strict root there is a root — and
+				// says nothing about this run, where the reaching root's
+				// directives govern its decoder; so it is not reported.
 				g.sibling[n] = true
-				g.warnDirectives(lightningDirectives(gd.Doc, ts.Doc), n,
-					"the type is declared in "+name+"; its decoder follows the root that reaches it")
 			}
 		}
 	}
