@@ -235,6 +235,31 @@ func generateTo(inPath string, warn io.Writer) error {
 				g.mapTypes[ts.Name.Name] = t
 				g.order = append(g.order, ts.Name.Name)
 			case *ast.Ident:
+				// A type defined over a STRUCT, slice or map — `type raw Rule`
+				// — is a root of its own with the underlying type's shape
+				// WHEN IT ASKS: any //lightning: directive on it, the bare
+				// //lightning:root where no other applies. It is the idiom a
+				// hand-written UnmarshalJSON uses to decode its own fields
+				// without recursing into itself, so `raw` gets the generated
+				// method and `Rule` keeps the hand-written one, under raw's
+				// own directives. Opt-in, because the same spelling is the
+				// methodless TWIN — `type rootStd Root`, the reflection-only
+				// baseline the benchmarks and the stdlib comparisons are built
+				// on — and a twin that grew a method would measure lightning
+				// against itself.
+				if u := g.underlying(file, t.Name); u != nil && len(dirs) > 0 {
+					switch ut := u.(type) {
+					case *ast.StructType:
+						g.structTypes[ts.Name.Name] = ut
+						isStruct = true
+					case *ast.ArrayType:
+						g.sliceTypes[ts.Name.Name] = ut
+					case *ast.MapType:
+						g.mapTypes[ts.Name.Name] = ut
+					}
+					g.order = append(g.order, ts.Name.Name)
+					break
+				}
 				// A defined scalar type — `type Severity string`, `type Level
 				// int32`, or one defined over another such type — gets no
 				// method (there is no document it could be the root of) but
@@ -845,6 +870,7 @@ var knownDirectives = map[string]bool{
 	"destructive": true,
 	"arena":       true,
 	"strict":      true,
+	"root":        true,
 }
 
 // directiveIn returns the name of the //lightning:* directive a single comment
@@ -2148,6 +2174,58 @@ func (g *gen) scalarKind(name string) (string, bool) {
 		name = u
 	}
 	return "", false
+}
+
+// underlying resolves name to the struct, slice or map type it is defined
+// over — through a chain of definitions, in the input file (in any order)
+// or already registered from a sibling — and nil where it is none of those.
+func (g *gen) underlying(file *ast.File, name string) ast.Expr {
+	seen := map[string]bool{}
+	for !seen[name] {
+		seen[name] = true
+		if st := g.structTypes[name]; st != nil {
+			return st
+		}
+		if at := g.sliceTypes[name]; at != nil {
+			return at
+		}
+		if mt := g.mapTypes[name]; mt != nil {
+			return mt
+		}
+		next := ""
+		for _, d := range file.Decls {
+			gd, ok := d.(*ast.GenDecl)
+			if !ok || gd.Tok != token.TYPE {
+				continue
+			}
+			for _, sp := range gd.Specs {
+				ts, ok := sp.(*ast.TypeSpec)
+				if !ok || ts.Name.Name != name || ts.Assign.IsValid() || ts.TypeParams != nil {
+					continue
+				}
+				switch t := ts.Type.(type) {
+				case *ast.StructType:
+					return t
+				case *ast.ArrayType:
+					if t.Len == nil {
+						return t
+					}
+					return nil
+				case *ast.MapType:
+					return t
+				case *ast.Ident:
+					next = t.Name
+				default:
+					return nil
+				}
+			}
+		}
+		if next == "" {
+			return nil
+		}
+		name = next
+	}
+	return nil
 }
 
 // declaresScalar reports whether file declares name as a type whose underlying

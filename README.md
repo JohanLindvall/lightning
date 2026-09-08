@@ -428,6 +428,18 @@ type Records []Record          // a JSON array at the root
 type ByID    map[string]Record // a JSON object used as a data map
 ```
 
+A type **defined over** a struct, slice or map type — `type raw Rule` — is a
+root too, with the underlying type's shape, when it carries a `//lightning:`
+directive: `//lightning:strict` or any other, or the bare `//lightning:root`
+where no other applies. That is the idiom a hand-written `UnmarshalJSON`
+uses to decode its own fields without recursing into itself: `Rule` keeps
+the method it wrote, `raw` gets the generated one, and the two cannot
+collide. The definition may precede or follow what it is defined over, and
+may run through a chain. It is opt-in because the same spelling is the
+methodless twin — `type rootStd Root`, the reflection-only baseline the
+benchmarks and the `encoding/json` comparisons rest on — which must never
+grow a method.
+
 `type Records []Record` decodes a top-level `[…]` with the slice element rules;
 `type ByID map[string]Record` decodes a top-level `{…}` as a map, its keys the
 object's member names. Either element/value type, and any nested types and field

@@ -4498,6 +4498,32 @@ stdlib moving again, not as a decoder bug.
 
 ## Session 2026-09-08: the generator meets a real schema (Hugin's)
 
+Second round, after the stack (#21–#29) was on main as v0.0.89 and Hugin's
+loaders had moved: what the hand-written unmarshalers' INNER decodes still
+needed.
+
+- **A type defined over a struct was not a root.** `type raw Rule;
+  DecodeStrict(b, &out)` is every hand-written unmarshaler's shape — decode
+  your own fields without recursing into your own method — and the
+  collection loop saw an identifier where it wanted a struct, so those
+  inner decodes stayed on encoding/json. `underlying` resolves a defined
+  type to the struct, slice or map it is declared over (in-file in any
+  order, or a sibling's), and such a type joins `g.order` with the
+  underlying shape under its own name and directives. The case's `Rule`
+  keeps its hand-written method (skipped as a root by the #25 rule) and
+  delegates to the generated `ruleRaw`, strict, which the probe reaches
+  through both decoders. NOTE for callers: the idiom has to move the
+  defined type to the TOP LEVEL (`type ruleRaw Rule` beside the method) —
+  a type declared inside the function body is invisible to the generator.
+  And it is OPT-IN, by any `//lightning:` directive or the bare
+  `//lightning:root`: the first cut made every defined-over-struct type a
+  root and the test's own `type rootStd Root` grew a method — the
+  methodless-twin idiom every benchmark baseline and stdlib comparison in
+  this repository rests on, turned into lightning measuring itself.
+  `TestStdlibTwinsAreReflectionOnly` in conformance is the standing guard;
+  the case's `twin` and `rootStd` pin the silence here.
+
+
 Hugin (github.com/CombinationAB/Hugin) took v0.0.86's toolkit readers and
 then tried the generator on its record types, and each thing the generator
 could not take is a PR here, in the order Hugin needs them. What each one
