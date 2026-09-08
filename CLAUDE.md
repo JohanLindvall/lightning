@@ -4389,6 +4389,20 @@ found:
   unstable.ErrUnknownKey` (new sentinel, re-exported by pkg/json). Maps
   are untouched. The position reported is the value's; the key is not in
   the error, which stays a sentinel like every other.
+- **A field type's own `UnmarshalJSON` was not called.** The generator
+  decoded every named struct structurally, where encoding/json hands an
+  Unmarshaler the value; Hugin's spec types (`Spark`, `DashStyle`, `Param`,
+  `CardSpec`, `Condition`, `Duration`) are hand-written unmarshalers for
+  exactly the shapes a structural decode gets wrong (a string OR an object,
+  a placeholder in a number's place). `collectUnmarshalers` records every
+  type with such a method, in the input file and in each sibling (never
+  from a `_unmarshal.go`, which the sibling scan excludes), `field`
+  delegates to it before the struct lookup — `delegate` finds the span
+  with SkipValue and calls the method, null included, reporting the value's
+  start on failure — and a ROOT with one is removed from `g.order` with a
+  warning: a second method would not compile. `nullAssigns` treats a
+  delegated type like a nested struct (the method answers for null).
+  Foreign types are not looked inside; the embedded-type divergence stands.
 
 ## Session 2026-09-07: six toolkit PRs merged, then optimized
 

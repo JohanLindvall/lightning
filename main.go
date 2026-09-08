@@ -116,6 +116,7 @@ func generateTo(inPath string, warn io.Writer) error {
 		mapTypes:         map[string]*ast.MapType{},
 		scalarTypes:      map[string]string{},
 		sibling:          map[string]bool{},
+		unmarshaler:      map[string]bool{},
 		order:            nil,
 		used:             map[string]bool{},
 		memo:             map[string]string{},
@@ -142,6 +143,7 @@ func generateTo(inPath string, warn io.Writer) error {
 	}
 
 	g.collectQualifiers(file)
+	g.collectUnmarshalers(file)
 	g.registerSiblings(inPath, file)
 
 	// Collect every top-level struct type, in source order, recording the
@@ -303,6 +305,18 @@ func generateTo(inPath string, warn io.Writer) error {
 			}
 		}
 	}
+	// A type with an UnmarshalJSON of its own is decoded through it wherever it
+	// stands (field), and never generated for: a second method would not
+	// compile, and the hand-written one is the author's answer to a shape a
+	// structural decode gets wrong. It stays in the maps so fields of the
+	// type resolve; it leaves the roots.
+	g.order = slices.DeleteFunc(g.order, func(name string) bool {
+		if !g.unmarshaler[name] {
+			return false
+		}
+		g.warnf("type %s has its own UnmarshalJSON and is decoded through it; no method is generated", name)
+		return true
+	})
 	if len(g.order) == 0 {
 		return errors.New("no top-level struct, slice or map types found")
 	}
@@ -407,6 +421,7 @@ type gen struct {
 	mapTypes    map[string]*ast.MapType   // named map root types (type X map[string]V)
 	scalarTypes map[string]string         // defined scalar types (type Sev string): name -> underlying (possibly another defined type)
 	sibling     map[string]bool           // named types declared in the package's other files: resolvable as fields, never roots
+	unmarshaler map[string]bool           // types with a hand-written UnmarshalJSON, in this file or a sibling: delegated to, never generated for
 	order       []string
 
 	used map[string]bool   // reserved decoder function names
@@ -525,6 +540,7 @@ func (g *gen) registerSiblings(inPath string, file *ast.File) {
 			g.warnf("%s: its encoding/json or time import alias differs from %s's; the types it declares are not resolvable from here", name, self)
 			continue
 		}
+		g.collectUnmarshalers(sib)
 		for _, d := range sib.Decls {
 			gd, ok := d.(*ast.GenDecl)
 			if !ok || gd.Tok != token.TYPE {
@@ -563,6 +579,48 @@ func (g *gen) registerSiblings(inPath string, file *ast.File) {
 			}
 		}
 	}
+}
+
+// collectUnmarshalers records every type file declares an UnmarshalJSON method
+// on — `func (t *T) UnmarshalJSON([]byte) error`, either receiver form — so a
+// field of that type is decoded by calling it, as encoding/json calls it,
+// rather than by a structural decoder that would bypass what the author
+// wrote it for. A generated `*_unmarshal.go` is never read here (the sibling
+// scan excludes the suffix), so a method this generator wrote on an earlier
+// run does not count as hand-written.
+func (g *gen) collectUnmarshalers(file *ast.File) {
+	for _, d := range file.Decls {
+		fd, ok := d.(*ast.FuncDecl)
+		if !ok || fd.Name.Name != "UnmarshalJSON" || fd.Recv == nil || len(fd.Recv.List) != 1 {
+			continue
+		}
+		recv := unparen(fd.Recv.List[0].Type)
+		if st, ok := recv.(*ast.StarExpr); ok {
+			recv = unparen(st.X)
+		}
+		if id, ok := recv.(*ast.Ident); ok {
+			g.unmarshaler[id.Name] = true
+		}
+	}
+}
+
+// delegate emits the read for a field whose type has its own UnmarshalJSON:
+// the value's span is found and handed to the method whole, a JSON null
+// included — encoding/json calls an Unmarshaler for null too, and leaves
+// the method to say what null means for its type. The span aliases the
+// input, as the stdlib's does; a method that keeps it copies, as
+// json.RawMessage's does. On failure the value's start is reported, since
+// the method's own error carries no position.
+func delegate(dest string) string {
+	return fmt.Sprintf(`start := i
+end, err := unstable.SkipValue(data, i)
+if err != nil {
+	return end, err
+}
+if err := %s.UnmarshalJSON(data[start:end]); err != nil {
+	return start, err
+}
+i = end`, dest)
 }
 
 // qualifiersAgree reports whether sib's encoding/json and time imports use the
@@ -1687,6 +1745,11 @@ func (g *gen) field(dest string, expr ast.Expr, hint string, nocopy, lax bool) s
 		if isScalar(t.Name) {
 			return g.scalar(dest, t.Name, nocopy)
 		}
+		if g.unmarshaler[t.Name] {
+			// The type's own method wins over any structural decode, as it
+			// does under encoding/json.
+			return delegate(dest)
+		}
 		if _, ok := g.structTypes[t.Name]; ok {
 			// A struct's own field tags govern its nocopy/lax behavior.
 			return g.callDecoder(dest, g.namedStruct(t.Name))
@@ -1897,8 +1960,8 @@ func (g *gen) nullAssigns(expr ast.Expr) bool {
 	case *ast.StructType:
 		return false // a nested struct is left untouched
 	case *ast.Ident:
-		if _, ok := g.structTypes[t.Name]; ok {
-			return false // a named nested struct, likewise
+		if _, ok := g.structTypes[t.Name]; ok || g.unmarshaler[t.Name] {
+			return false // a named nested struct, likewise; a delegated type answers for itself
 		}
 		return true // a scalar stores the zero, and `any` is nil'd
 	case *ast.SelectorExpr:

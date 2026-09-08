@@ -146,6 +146,18 @@ the underlying kind's exactly. The declaration order does not matter
 `UnmarshalJSON` of its own — there is no document it could be the root of —
 see [Declarations that get no method](#declarations-that-get-no-method).
 
+A type with an `UnmarshalJSON` of its own — declared in the input file or in
+a sibling file of the package — is **delegated to** wherever it stands as a
+field, an element, a map value or a pointee: the value's span (a JSON null
+included, as `encoding/json` passes it) is handed to the method, and its
+error is the decode's error. Such a type is never generated for; a root that
+declares one is skipped with a warning, since a second method would not
+compile and the hand-written one is the author's answer to a shape a
+structural decode gets wrong. A type from another package is not looked
+inside, so only `time.Time`, `json.RawMessage` and `json.Number` decode among
+foreign types. An *embedded* type's method does not take over the struct it
+is embedded in — see the divergences below.
+
 An interface with any content of its own (a method, an embedded named interface,
 a type set) is **not** supported: a decoded value is an `any` and assigns to
 nothing narrower, so the generator reports the field as an unsupported type
