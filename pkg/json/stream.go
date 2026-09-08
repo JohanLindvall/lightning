@@ -51,6 +51,21 @@ type Reader struct {
 	consumed       int64
 	rerr           error // the reader's error, once it has given one
 	sc             unstable.ValueScanner
+
+	// Where the last call left the walk, so the next one continues from
+	// there (see "Walking on" in the type's doc). open holds the keys of
+	// the nested objects entered and not yet closed, the root object apart
+	// (entered says whether its '{' has been passed); after says the cursor
+	// sits just past a member's value inside the innermost open container,
+	// a separator next; pending is the closer of a container a callback
+	// stopped inside with ErrStop, whose remainder is skipped before the
+	// next path is looked for; done says a keyless call consumed the root
+	// value, after which nothing is left to find.
+	open    []string
+	entered bool
+	after   bool
+	pending byte
+	done    bool
 }
 
 // ErrElementTooLarge reports a value larger than the reader's buffer limit.
@@ -144,6 +159,7 @@ func (r *Reader) Reset(rd io.Reader) {
 	r.r = rd
 	r.hold, r.pos, r.end = 0, 0, 0
 	r.consumed, r.rerr = 0, nil
+	r.open, r.entered, r.after, r.pending, r.done = r.open[:0], false, false, 0, false
 }
 
 // Consumed reports how many bytes have been READ from the underlying reader,
@@ -170,20 +186,34 @@ func (r *Reader) ArrayEach(fn func(value []byte) error, keys ...string) error {
 	if err := r.enter(keys); err != nil {
 		return err
 	}
-	c, err := r.space()
+	stopped, err := r.arrayEach(fn)
 	if err != nil {
 		return err
 	}
+	if stopped {
+		r.pending = ']'
+	}
+	r.after = true
+	return nil
+}
+
+// arrayEach walks the array at the cursor; stopped reports a callback's
+// ErrStop, which leaves the cursor after that element with the rest unread.
+func (r *Reader) arrayEach(fn func(value []byte) error) (stopped bool, _ error) {
+	c, err := r.space()
+	if err != nil {
+		return false, err
+	}
 	if c != '[' {
-		return r.emptyOrExpect(unstable.ErrExpectArray)
+		return false, r.emptyOrExpect(unstable.ErrExpectArray)
 	}
 	r.pos++
 	if c, err = r.space(); err != nil {
-		return err
+		return false, err
 	}
 	if c == ']' {
 		r.pos++
-		return nil
+		return false, nil
 	}
 	for {
 		r.hold = r.pos
@@ -221,14 +251,15 @@ func (r *Reader) ArrayEach(fn func(value []byte) error, keys ...string) error {
 		}
 		if err != nil {
 			if end, err = r.valueMore(); err != nil {
-				return err
+				return false, err
 			}
 		}
 		if err := fn(r.buf[r.pos:end]); err != nil {
 			if err == ErrStop || errors.Is(err, ErrStop) {
-				return nil
+				r.hold, r.pos = end, end
+				return true, nil
 			}
-			return err
+			return false, err
 		}
 		r.hold, r.pos = end, end
 		// afterElement's fast path, written out: on compact input the
@@ -240,7 +271,7 @@ func (r *Reader) ArrayEach(fn func(value []byte) error, keys ...string) error {
 			if c := r.buf[r.pos]; c > ' ' {
 				if c == ']' {
 					r.pos++
-					return nil
+					return false, nil
 				}
 				if c == ',' && uint(r.pos+1) < uint(r.end) && r.buf[r.pos+1] > ' ' {
 					r.pos++
@@ -250,7 +281,7 @@ func (r *Reader) ArrayEach(fn func(value []byte) error, keys ...string) error {
 		}
 		done, err2 := r.afterElement(']')
 		if done || err2 != nil {
-			return err2
+			return false, err2
 		}
 	}
 }
@@ -265,12 +296,25 @@ func (r *Reader) ObjectEach(fn func(key string, value []byte) error, keys ...str
 	if err := r.enter(keys); err != nil {
 		return err
 	}
-	c, err := r.space()
+	stopped, err := r.objectEach(fn)
 	if err != nil {
 		return err
 	}
+	if stopped {
+		r.pending = '}'
+	}
+	r.after = true
+	return nil
+}
+
+// objectEach walks the object at the cursor; stopped as in arrayEach.
+func (r *Reader) objectEach(fn func(key string, value []byte) error) (stopped bool, _ error) {
+	c, err := r.space()
+	if err != nil {
+		return false, err
+	}
 	if c != '{' {
-		return r.emptyOrExpect(unstable.ErrExpectObject)
+		return false, r.emptyOrExpect(unstable.ErrExpectObject)
 	}
 	r.pos++
 	for {
@@ -282,12 +326,12 @@ func (r *Reader) ObjectEach(fn func(key string, value []byte) error, keys ...str
 		if c <= ' ' {
 			var err error
 			if c, err = r.space(); err != nil {
-				return err
+				return false, err
 			}
 		}
 		if c == '}' {
 			r.pos++
-			return nil
+			return false, nil
 		}
 		// fn is handed the key and the value together, so the key has to
 		// outlive the scan of the value — which may refill several times. The
@@ -296,7 +340,7 @@ func (r *Reader) ObjectEach(fn func(key string, value []byte) error, keys ...str
 		// compaction moves the bytes within the buffer, and a string made
 		// before it would still point at the offset they left.
 		if c != '"' {
-			return unstable.ErrInvalidJSON
+			return false, unstable.ErrInvalidJSON
 		}
 		r.hold = r.pos
 		// The no-escape key read, inline: get.go's readKey trick, which
@@ -315,7 +359,7 @@ func (r *Reader) ObjectEach(fn func(key string, value []byte) error, keys ...str
 			kend, clean = k+1, true
 		} else if kend, err = unstable.SkipString(kbuf, r.pos); err != nil {
 			if kend, err = r.valueMore(); err != nil {
-				return err
+				return false, err
 			}
 		}
 		klen := kend - r.pos
@@ -326,7 +370,7 @@ func (r *Reader) ObjectEach(fn func(key string, value []byte) error, keys ...str
 		if uint(r.pos+1) < uint(r.end) && r.buf[r.pos] == ':' && r.buf[r.pos+1] > ' ' {
 			r.pos++
 		} else if err := r.colon(); err != nil {
-			return err
+			return false, err
 		}
 		// SkipValue's number and string arms, written out; see ArrayEach. The
 		// buffer is taken again here rather than reused: the key's own scan
@@ -347,7 +391,7 @@ func (r *Reader) ObjectEach(fn func(key string, value []byte) error, keys ...str
 		}
 		if err != nil {
 			if end, err = r.valueMore(); err != nil {
-				return err
+				return false, err
 			}
 		}
 		// The key is decoded AFTER the value, for the reason above, and from
@@ -361,13 +405,14 @@ func (r *Reader) ObjectEach(fn func(key string, value []byte) error, keys ...str
 		if clean {
 			key = unstable.UnsafeStr(r.buf[r.hold+1 : r.hold+klen-1])
 		} else if key, err = String(r.buf[r.hold : r.hold+klen]); err != nil {
-			return err
+			return false, err
 		}
 		if err := fn(key, r.buf[r.pos:end]); err != nil {
 			if err == ErrStop || errors.Is(err, ErrStop) {
-				return nil
+				r.hold, r.pos = end, end
+				return true, nil
 			}
-			return err
+			return false, err
 		}
 		r.hold, r.pos = end, end
 		// afterElement's fast path, written out; see ArrayEach.
@@ -375,7 +420,7 @@ func (r *Reader) ObjectEach(fn func(key string, value []byte) error, keys ...str
 			if c := r.buf[r.pos]; c > ' ' {
 				if c == '}' {
 					r.pos++
-					return nil
+					return false, nil
 				}
 				if c == ',' && uint(r.pos+1) < uint(r.end) && r.buf[r.pos+1] > ' ' {
 					r.pos++
@@ -385,7 +430,7 @@ func (r *Reader) ObjectEach(fn func(key string, value []byte) error, keys ...str
 		}
 		done, err := r.afterElement('}')
 		if done || err != nil {
-			return err
+			return false, err
 		}
 	}
 }
@@ -411,6 +456,7 @@ func (r *Reader) Get(keys ...string) ([]byte, error) {
 	}
 	v := r.buf[r.pos:end]
 	r.hold, r.pos = end, end
+	r.after = true
 	return v, nil
 }
 
@@ -435,16 +481,72 @@ func (r *Reader) Elements(keys ...string) iter.Seq2[[]byte, error] {
 // enter descends the path, leaving pos at the first byte of the value the last
 // key names (or at the document's first value when there are none). Members
 // passed over are streamed past, never buffered whole.
+//
+// A path is resolved from where the LAST call left the walk, forward only:
+// the nested objects still open (r.open) are the prefix a new path may share;
+// deeper ones are closed by skipping what remains of them, and the members
+// the earlier calls passed cannot be reached again — a key behind the cursor
+// is ErrKeyNotFound. On a fresh document, and for the first key that opens
+// a new object, the scan is the original one.
 func (r *Reader) enter(keys []string) error {
-	for _, key := range keys {
-		c, err := r.space()
-		if err != nil {
+	if r.pending != 0 {
+		if err := r.finish(); err != nil {
 			return err
 		}
-		if c != '{' {
-			return unstable.ErrExpectObject
+	}
+	if r.done {
+		// A keyless call consumed the root value; nothing follows it.
+		return unstable.ErrKeyNotFound
+	}
+	if len(keys) == 0 {
+		if r.entered {
+			return unstable.ErrKeyNotFound
 		}
-		r.pos++
+		r.done = true
+		return nil
+	}
+	// The open objects the path shares, innermost first to close.
+	n := 0
+	for n < len(r.open) && n < len(keys)-1 && r.open[n] == keys[n] {
+		n++
+	}
+	for len(r.open) > n {
+		if err := r.closeObject(); err != nil {
+			return err
+		}
+		r.open = r.open[:len(r.open)-1]
+	}
+	// continuing: the first key of the remainder is looked for among the
+	// members that follow the cursor in the innermost open object (the root
+	// once entered); every later key opens a new object.
+	continuing := r.entered && r.after
+	for i, key := range keys[n:] {
+		c := byte(0)
+		var err error
+		if !continuing || i > 0 {
+			if c, err = r.space(); err != nil {
+				return err
+			}
+			if c != '{' {
+				return unstable.ErrExpectObject
+			}
+			r.pos++
+			if !r.entered {
+				r.entered = true
+			}
+		} else {
+			// Past a member's value: its separator comes first. A closing
+			// brace ends the object without the key — and leaves the object
+			// closed, so the caller's next path resolves from its parent.
+			done, err := r.afterElement('}')
+			if err != nil {
+				return err
+			}
+			if done {
+				r.after = true
+				return r.closed(n)
+			}
+		}
 		for {
 			// The fast paths of space, colon and afterElement, written out
 			// exactly as in the walkers: a descent reads a key and steps over
@@ -460,7 +562,8 @@ func (r *Reader) enter(keys []string) error {
 				}
 			}
 			if c == '}' {
-				return unstable.ErrKeyNotFound
+				r.pos++
+				return r.closed(n + i)
 			}
 			if c != '"' {
 				return unstable.ErrInvalidJSON
@@ -496,7 +599,7 @@ func (r *Reader) enter(keys []string) error {
 				if c := r.buf[r.pos]; c > ' ' {
 					if c == '}' {
 						r.pos++
-						return unstable.ErrKeyNotFound
+						return r.closed(n + i)
 					}
 					if c == ',' && uint(r.pos+1) < uint(r.end) && r.buf[r.pos+1] > ' ' {
 						r.pos++
@@ -510,11 +613,85 @@ func (r *Reader) enter(keys []string) error {
 				return err
 			}
 			if done {
-				return unstable.ErrKeyNotFound
+				return r.closed(n + i)
 			}
 		}
+		if i < len(keys)-n-1 {
+			// The value this key names is the object the next key is looked
+			// for in: it stays open once entered.
+			r.open = append(r.open, key)
+		}
 	}
+	r.after = false
 	return nil
+}
+
+// closed records that the object a key was looked for in — the root when d
+// is 0, otherwise the value of open[d-1] — has been passed over to its
+// closing brace, and reports the miss: that entry and everything past it are
+// no longer open, and the cursor sits after the closed object in its parent.
+func (r *Reader) closed(d int) error {
+	r.after = true
+	if d == 0 {
+		// The root object itself was closed: the document is spent.
+		r.open, r.done = r.open[:0], true
+		return unstable.ErrKeyNotFound
+	}
+	if d-1 < len(r.open) {
+		r.open = r.open[:d-1]
+	}
+	return unstable.ErrKeyNotFound
+}
+
+// finish skips what remains of a container a callback stopped inside with
+// ErrStop — the elements or members after the one it returned from, and the
+// closer — so the next path resolves from the container's parent.
+func (r *Reader) finish() error {
+	closer := r.pending
+	r.pending = 0
+	for {
+		done, err := r.afterElement(closer)
+		if err != nil {
+			return err
+		}
+		if done {
+			return nil
+		}
+		if closer == '}' {
+			if _, err := r.key(); err != nil {
+				return err
+			}
+			if err := r.colon(); err != nil {
+				return err
+			}
+		}
+		if err := r.skip(); err != nil {
+			return err
+		}
+	}
+}
+
+// closeObject skips the members that remain of the innermost open object,
+// from just past a member's value to the closing brace.
+func (r *Reader) closeObject() error {
+	for {
+		done, err := r.afterElement('}')
+		if err != nil {
+			return err
+		}
+		if done {
+			return nil
+		}
+		if _, err := r.key(); err != nil {
+			return err
+		}
+		if err := r.colon(); err != nil {
+			return err
+		}
+		if err := r.skip(); err != nil {
+			return err
+		}
+	}
 }
 
 // afterElement reads the separator that follows a member or an element: the

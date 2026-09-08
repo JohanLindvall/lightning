@@ -4535,6 +4535,22 @@ needed.
   `any` (`isAny`; `anyValueNumber`) and warned about elsewhere: threading it
   into slices and maps of any would touch every element decoder, and no
   caller has asked.
+- **The streaming Reader walked one path per document.** Hugin's Prometheus
+  decode had to peek a head for status and resultType, walk `data.result`,
+  then re-wrap the tail as a document to read stats and warnings. `enter`
+  is relative now: `open` (the nested objects entered and not closed),
+  `entered` (the root's brace passed), `after` (the cursor sits past a
+  member's value, a separator next), `pending` (the closer of a container
+  a callback stopped in, skipped by `finish` before anything else) and
+  `done` (a keyless call consumed the root). A new path shares the open
+  prefix, closes deeper objects with `closeObject`, and scans forward from
+  the cursor for its next key; a miss that runs an object to its brace
+  reports it through `closed`, which drops that open entry so the caller's
+  next path resolves from the parent. Forward only, by design: the buffer
+  holds a bounded window, so what is behind the cursor is gone. The
+  walkers became `arrayEach`/`objectEach` returning whether they stopped,
+  with the exported forms doing the bookkeeping; the fresh-document path
+  through `enter` is the original scan, so the one-path cost is unchanged.
 
 
 Hugin (github.com/CombinationAB/Hugin) took v0.0.86's toolkit readers and
