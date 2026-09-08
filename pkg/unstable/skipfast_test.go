@@ -195,8 +195,14 @@ func TestSkipContainerBoundaries(t *testing.T) {
 	if !fastSkipAvail {
 		t.Skip("skipContainerFast's maskBlock has no SIMD implementation here")
 	}
+	// The pad is swept, not sampled at two points, because the container's
+	// close now lands in a BLOCK wherever it falls: the final < 64 bytes are
+	// read as an overlapping last block (see skipfast.go), so every offset of
+	// the close relative to both the 64-byte grid and the document's end is a
+	// distinct case, and the shift that aligns that block is off by one at
+	// exactly one of them.
 	for _, c := range boundaryDocs() {
-		for _, pad := range []int{0, 70} {
+		for pad := 0; pad <= 80; pad++ {
 			data := []byte(c + strings.Repeat(" ", pad))
 			want, werr := refSkip(data, 0)
 			got, gerr := skipContainerFast(data, 0, data[0])
@@ -228,8 +234,12 @@ func testSkipVariantCorpus(t *testing.T, name string) {
 			docs = append(docs, string(doc))
 		}
 	}
+	// Pads either side of the block grid as well as 0 and 70: the last < 64
+	// bytes of a document are an overlapping block whose alignment shift is a
+	// function of that distance (see TestSkipContainerBoundaries, which sweeps
+	// it exhaustively over the smaller boundary corpus).
 	for _, c := range docs {
-		for _, pad := range []int{0, 70} {
+		for _, pad := range []int{0, 1, 31, 63, 64, 65, 70} {
 			data := []byte(c + strings.Repeat(" ", pad))
 			want, werr := refSkip(data, 0)
 			got, gerr := skipContainerFast(data, 0, data[0])

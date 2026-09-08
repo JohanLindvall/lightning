@@ -55,5 +55,10 @@ var useSkipBlocks = true
 // work. amd64 makes its AVX2/AVX-512 choice inside the assembly for the same
 // reason; here there is only one body and nothing to choose.
 //
+// end is -1 when the close was not found in any full block, and only then are
+// ndepth/prevEscaped/prevInString written: once the close is found they are
+// dead — skipContainerFast reads them under end < 0 and nowhere else — so
+// writing them cost three stores on the path every small container takes.
+//
 //go:noescape
 func skipBlocks(data []byte, pos, depth int, isArray bool) (end, ndepth int, prevEscaped, prevInString uint64)

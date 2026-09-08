@@ -37,6 +37,25 @@ DATA mbRbrack<>+16(SB)/8, $0x5d5d5d5d5d5d5d5d
 DATA mbRbrack<>+24(SB)/8, $0x5d5d5d5d5d5d5d5d
 GLOBL mbRbrack<>(SB), RODATA|NOPTR, $32
 
+// The same bytes, one byte each, for the whole-loop scans below: they BROADCAST
+// their splats rather than loading a 32-byte one, which on AVX-512 replaces a
+// MOVL of the immediate and a broadcast from the register with one instruction,
+// and on both variants lets the bracket pair be reached by INDEXING this table
+// with isArray instead of branching to a second pair of loads. mbBrackets holds
+// the two opens then the two closes, so one base register serves both: open at
+// (base)(isArray*1), close two bytes on.
+DATA mbBrackets<>+0(SB)/1, $0x7b // '{'
+DATA mbBrackets<>+1(SB)/1, $0x5b // '['
+DATA mbBrackets<>+2(SB)/1, $0x7d // '}'
+DATA mbBrackets<>+3(SB)/1, $0x5d // ']'
+GLOBL mbBrackets<>(SB), RODATA|NOPTR, $4
+
+DATA mbQuoteB<>+0(SB)/1, $0x22  // '"'
+GLOBL mbQuoteB<>(SB), RODATA|NOPTR, $1
+
+DATA mbBslashB<>+0(SB)/1, $0x5c // '\\'
+GLOBL mbBslashB<>(SB), RODATA|NOPTR, $1
+
 // skipBlocks / skipBlocksAVX512 run skipContainerFast's whole 64-byte block
 // loop in assembly (see the Go declarations in skipfast_amd64.go): character
 // classification, the escape / in-string bit math, and the bracket balancing,
@@ -125,10 +144,7 @@ clearBit:                       \
 	JMP   bitLoop               \
 foundEnd:                       \
 	LEAQ  1(DX)(BX*1), AX       \ // end = pos + j + 1
-	MOVQ  AX, end+48(FP)        \
-	MOVQ  R8, ndepth+56(FP)     \
-	MOVQ  R9, prevEscaped+64(FP) \
-	MOVQ  R10, prevInString+72(FP) \
+	MOVQ  AX, end+48(FP)        \ // the carried state is dead once end >= 0
 	VZEROUPPER                  \
 	RET                         \
 nextBlock:                      \
@@ -207,14 +223,9 @@ TEXT ·skipBlocks(SB), NOSPLIT, $0-80
 	VMOVDQU mbQuote<>(SB), Y10
 	VMOVDQU mbBslash<>(SB), Y11
 	MOVBLZX isArray+40(FP), AX
-	TESTL   AX, AX
-	JNZ     arrayBrackets
-	VMOVDQU mbLbrace<>(SB), Y12
-	VMOVDQU mbRbrace<>(SB), Y13
-	JMP     blockLoop
-arrayBrackets:
-	VMOVDQU mbLbrack<>(SB), Y12
-	VMOVDQU mbRbrack<>(SB), Y13
+	LEAQ    mbBrackets<>(SB), BX
+	VPBROADCASTB (BX)(AX*1), Y12
+	VPBROADCASTB 2(BX)(AX*1), Y13
 blockLoop:
 	CMPQ    DX, CX
 	JGT     exhausted
@@ -277,23 +288,12 @@ TEXT ·skipBlocksAVX512(SB), NOSPLIT, $0-80
 	XORQ    R10, R10
 	MOVQ    $0x5555555555555555, DI
 	VPCMPEQB X7, X7, X7         // all-ones CLMUL operand
-	MOVL    $0x22, AX           // '"'
-	VPBROADCASTB AX, Z10
-	MOVL    $0x5c, AX           // '\\'
-	VPBROADCASTB AX, Z11
+	VPBROADCASTB mbQuoteB<>(SB), Z10
+	VPBROADCASTB mbBslashB<>(SB), Z11
 	MOVBLZX isArray+40(FP), AX
-	TESTL   AX, AX
-	JNZ     arrayBrackets
-	MOVL    $0x7b, AX           // '{'
-	VPBROADCASTB AX, Z12
-	MOVL    $0x7d, AX           // '}'
-	VPBROADCASTB AX, Z13
-	JMP     blockLoop
-arrayBrackets:
-	MOVL    $0x5b, AX           // '['
-	VPBROADCASTB AX, Z12
-	MOVL    $0x5d, AX           // ']'
-	VPBROADCASTB AX, Z13
+	LEAQ    mbBrackets<>(SB), BX
+	VPBROADCASTB (BX)(AX*1), Z12
+	VPBROADCASTB 2(BX)(AX*1), Z13
 blockLoop:
 	CMPQ    DX, CX
 	JGT     exhausted

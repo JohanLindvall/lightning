@@ -99,3 +99,28 @@ func BenchmarkSet(b *testing.B) {
 		})
 	}
 }
+
+// TestSetTruncatedNoPanic walks every prefix of a set of documents through the
+// whole Set family. Every other Set test decodes a well-formed document, so
+// nothing else in the suite reaches the shape that matters here: all three
+// walkers step from a member's colon to its value with a SkipWS that can land
+// at len(in) — `{"a":` is enough — and then hand that index to skipValueOrEnd,
+// whose bounds test is SkipValue's own. Anything that reads in[p] there instead
+// (writing out SkipValue's arms at the call site is the obvious candidate, and
+// was tried) has to make that test itself; without it this panics.
+func TestSetTruncatedNoPanic(t *testing.T) {
+	docs := []string{
+		`{"a":1,"b":{"c":2},"d":"x","e":[1,2],"f":true}`,
+		`{"a":`, `{"a": `, `{"a":"`, `{"a":{`, `{ "k" : `, `[1,2,3]`, `null`, ``, `{`, `{"a"`, `{"a":,`,
+		`{"a":1,"b":`, `{"b":{"c":`,
+	}
+	for _, d := range docs {
+		for n := 0; n <= len(d); n++ {
+			in := []byte(d[:n])
+			_ = Set(in, nil, []byte(`9`), []string{"a"})
+			_ = Set(in, nil, []byte(`9`), []string{"a", "z"})
+			_ = SetMany(in, nil, [][]byte{[]byte(`9`), []byte(`8`)}, []string{"a", "q"})
+			_ = SetPaths(in, nil, [][]byte{[]byte(`9`), []byte(`8`)}, [][]string{{"a"}, {"b", "c"}})
+		}
+	}
+}

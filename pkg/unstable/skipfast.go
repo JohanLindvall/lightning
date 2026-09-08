@@ -46,16 +46,22 @@ import "math/bits"
 //     is not inside a string, so it masks the following byte out of the quote
 //     bitmap, and a `\"` sitting between tokens silently changes where the
 //     in-string regions begin. The scalar path has no such state — indexStructural
-//     simply never stops on a backslash. This one diverges in *both* directions
-//     and, uniquely, is sensitive to where the 64-byte grid falls, so the same
-//     logical document flips verdict on padding alone. Measured:
-//     `{"a":1,\"b":2,"pad":"…"}` gives (93, ErrTruncated) here and (93, nil)
-//     there — the fast path rejecting what the scalar accepts, the opposite of
-//     the first bullet; `{\"}` + slack gives (4, nil) vs (84, ErrTruncated); and
-//     `{` + N spaces + `\}` is accepted at N=62, rejected at N=63, accepted again
-//     at N=64, because at N=63 the backslash is the block's last byte, so
-//     prevEscaped carries into the tail and swallows the container's own closing
-//     brace. TestSkipPathsDivergeOnMalformed pins all three classes.
+//     simply never stops on a backslash. This one diverges in *both* directions.
+//     Measured: `{"a":1,\"b":2,"pad":"…"}` gives (93, ErrTruncated) here and
+//     (93, nil) there — the fast path rejecting what the scalar accepts, the
+//     opposite of the first bullet; `{\"}` + slack gives (4, nil) vs (84,
+//     ErrTruncated). It also splits this path against ITSELF, at one place and
+//     only one: a document too short to hold a 64-byte block never reaches the
+//     block math and is walked byte by byte instead, and the byte walk sets its
+//     escape flag only inside a string. So `{\"a}` is truncated at 63 bytes and
+//     accepted at 64. (Until the final < 64 bytes became an overlapping block,
+//     that split ran through the MIDDLE of every document — the block loop
+//     handed its tail to the byte walk along with a carried prevEscaped the walk
+//     applied to the very next byte, brace or not — and the verdict then turned
+//     on where the 64-byte grid fell, which padding alone could move.
+//     TestSkipBackslashLengthCliff pins both the cliff that is left and the
+//     absence of the one that is gone.) TestSkipPathsDivergeOnMalformed pins all
+//     three classes.
 //
 // None costs correctness today — every caller treats such input as an error
 // or, for the presize counters, as a hint that missed — but do not build on the
@@ -103,20 +109,14 @@ func findEscaped64(backslash uint64, prevEscaped *uint64) uint64 {
 // of the two documented divergences from skipObject/skipArray above. A
 // truncated container returns ErrTruncated. Depth is an int, not recursion, so
 // arbitrarily deep input is safe here (and, unlike the scalar path, accepted)
-// — except on a machine without the SIMD maskBlock, where the first line hands
-// the value straight to skipObject/skipArray and their bound applies.
+// — except on a machine without the SIMD maskBlock, where the !fastSkipAvail
+// arm hands the value straight to skipObject/skipArray and their bound applies.
 func skipContainerFast(data []byte, i int, open byte) (int, error) {
-	if !fastSkipAvail {
-		// No SIMD maskBlock here, and the scalar one is slower than the
-		// indexStructural balance — which is what fastSkipAvail says. The gate
-		// used to sit in SkipValue's arms; it moved here so that SkipObject can
-		// be a single call and inline into a walker that has already seen the
-		// brace.
-		if open == '{' {
-			return skipObject(data, i)
-		}
-		return skipArray(data, i)
-	}
+	// useSkipBlocks is tested FIRST, and it implies fastSkipAvail on every
+	// architecture that defines both (amd64: useAVX2 plus three feature belts,
+	// against fastSkipAvail's useAVX2; arm64: both const true; elsewhere both
+	// false), so the common path reads one flag rather than two. That is worth
+	// the pair of instructions because this runs once per container skipped.
 	pos := i + 1
 	if useSkipBlocks && pos+64 <= len(data) {
 		// amd64: the whole block loop runs in assembly (skipBlocks) — splats
@@ -141,6 +141,17 @@ func skipContainerFast(data []byte, i int, open byte) (int, error) {
 		}
 		return skipContainerBlocks(data, pos+((len(data)-pos)&^63), open, d, pe, pis)
 	}
+	if !fastSkipAvail {
+		// No SIMD maskBlock here, and the scalar one is slower than the
+		// indexStructural balance — which is what fastSkipAvail says. The gate
+		// used to sit in SkipValue's arms; it moved here so that SkipObject can
+		// be a single call and inline into a walker that has already seen the
+		// brace.
+		if open == '{' {
+			return skipObject(data, i)
+		}
+		return skipArray(data, i)
+	}
 	return skipContainerBlocks(data, pos, open, 1, 0, 0)
 }
 
@@ -155,8 +166,38 @@ func skipContainerBlocks(data []byte, pos int, open byte, depth int, prevEscaped
 		close = ']'
 	}
 	isArray := open == '['
-	for pos+64 <= len(data) {
-		quote, bslash, op, cl := maskBlock(data[pos:], isArray)
+	// A document of at least one block is walked entirely in blocks, the last
+	// of them OVERLAPPING: the final < 64 bytes are read as data's last 64 and
+	// the four bitmaps shifted right so bit 0 is pos again, which drops the
+	// bytes already accounted for and brings in zeros above the end (a zero
+	// byte is not a quote, a backslash or a bracket, so it is inert). The
+	// alternative is the byte walk below, and it is not a rounding error: that
+	// walk costs ~7 instructions and a mispredictable branch per byte, and the
+	// LAST element of every array pays it — on BenchmarkArrayEachRecords one
+	// record in fifty was 15% of the walk, and skipping a whole document (which
+	// ends AT the tail) paid up to 63 bytes of it every time. The block math is
+	// unchanged, so on well-formed input this is the same answer by the same
+	// steps; on malformed input it extends the fast path's own leniency over
+	// the tail, where the byte walk had the scalar path's (see the divergence
+	// classes above).
+	for len(data) >= 64 {
+		var quote, bslash, op, cl uint64
+		switch {
+		case pos+64 <= len(data):
+			quote, bslash, op, cl = maskBlock(data[pos:], isArray)
+		case pos < len(data):
+			// The overlapping last block. pos+64 is past the end after it, so
+			// the next trip lands in the default arm and ends the loop — no
+			// flag, and so no test per block to read one.
+			k := uint(64 - (len(data) - pos))
+			quote, bslash, op, cl = maskBlock(data[len(data)-64:], isArray)
+			quote >>= k
+			bslash >>= k
+			op >>= k
+			cl >>= k
+		default:
+			return len(data), ErrTruncated
+		}
 
 		// The escaped -> inStr -> prevInString computation is a loop-carried
 		// dependency chain (each block's in-string mask depends on the previous
@@ -209,8 +250,10 @@ func skipContainerBlocks(data []byte, pos int, open byte, depth int, prevEscaped
 		pos += 64
 	}
 
-	// Tail: fewer than 64 bytes remain. Walk byte by byte, carrying the
-	// inside-string / pending-escape state out of the block loop.
+	// Under one block, so there are no 64 readable bytes to take: walk byte by
+	// byte, carrying the inside-string / pending-escape state out of the block
+	// loop above (which such a document never entered, so in practice both bits
+	// are zero here).
 	inStr := prevInString != 0
 	esc := prevEscaped != 0
 	for ; uint(pos) < uint(len(data)); pos++ {

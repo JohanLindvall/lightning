@@ -222,10 +222,7 @@ nextBlock:
 foundEnd:
 	ADD  R2, R9, R7            // end = pos + j + 1
 	ADD  $1, R7
-	MOVD R7, end+48(FP)
-	MOVD R3, ndepth+56(FP)
-	MOVD R4, prevEscaped+64(FP)
-	MOVD R5, prevInString+72(FP)
+	MOVD R7, end+48(FP)        // the carried state is dead once end >= 0
 	RET
 
 exhausted:

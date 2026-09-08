@@ -42,6 +42,12 @@ var useSkipBlocks512 = useSkipBlocks && cpu.X86.HasAVX512BW
 // return the carried state for the caller's scalar tail, which resumes at
 // pos + (len(data)-pos)&^63.
 //
+// The three carried results are written ONLY on that failing return: once the
+// close is found they are dead — skipContainerFast reads them under end < 0 and
+// nowhere else — so writing them cost three stores on the path every small
+// container takes. Anything reading them when end >= 0 reads the frame's
+// leftovers.
+//
 // It IS the assembly — the AVX-512 selection is made inside it, off
 // useSkipBlocks512, exactly as the SSE2/AVX2 and NEON/SVE2 scanners select
 // their bodies. A Go wrapper holding the two calls was what stood here, and it

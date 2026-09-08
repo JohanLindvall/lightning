@@ -90,33 +90,53 @@ func TestSkipPathsDivergeOnMalformed(t *testing.T) {
 	}
 }
 
-// TestSkipBackslashAlignmentCliff pins the one property of the backslash
-// divergence that makes it more than a curiosity: it depends on where the 64-byte
-// block grid falls, so padding a document without changing its meaning flips the
-// fast path's verdict. At 63 spaces the backslash is the block's last byte, so
-// findEscaped64's prevEscaped carry reaches the tail and masks the container's own
-// closing brace out of the close bitmap.
-func TestSkipBackslashAlignmentCliff(t *testing.T) {
+// TestSkipBackslashLengthCliff pins where the backslash divergence still turns
+// on something other than the document's meaning: the fast path answers with the
+// block math whenever it has 64 bytes to read and with a byte walk when it does
+// not, and the two disagree about a stray backslash OUTSIDE a string. The block
+// math masks the byte after it out of the quote bitmap (findEscaped64 is pure bit
+// math and cannot know the backslash is not in a string); the byte walk only ever
+// sets its escape flag inside one. So `{\"a}` is a truncated container under a
+// block and an accepted one over it, and the flip is at 64 bytes of input.
+//
+// This USED to be an alignment cliff — the same document flipping on where the
+// 64-byte grid fell, at 62/63/64 spaces of padding — because the block loop
+// handed its final < 64 bytes to that byte walk together with a carried
+// prevEscaped the walk applied to the very next byte, brace or not. The tail is
+// now one more (overlapping) block, so the block math decides every byte of a
+// document that reaches one block, and the grid no longer shows: `{`+pad+`\}` is
+// accepted at every padding. The remaining threshold is a property of the input's
+// LENGTH, which is at least visible in the input.
+func TestSkipBackslashLengthCliff(t *testing.T) {
 	if !fastSkipAvail {
 		t.Skip("no SIMD skip path on this build/CPU")
 	}
+	// The old cliff, gone: padding does not change the verdict.
+	for pad := 0; pad <= 130; pad++ {
+		data := []byte(`{` + strings.Repeat(" ", pad) + `\}`)
+		if _, err := skipContainerFast(data, 0, '{'); err != nil {
+			t.Fatalf("pad=%d: skipContainerFast err = %v, want nil (the grid must not show)", pad, err)
+		}
+	}
+	// The one that is left: under a block the byte walk decides, over it the
+	// block math does, and they read a stray backslash differently.
 	for _, tc := range []struct {
 		pad     int
 		wantErr error
 	}{
-		{62, nil},
-		{63, ErrTruncated},
-		{64, nil},
+		{0, ErrTruncated},  // 5 bytes: byte walk, the backslash escapes nothing
+		{58, ErrTruncated}, // 63 bytes: still the byte walk
+		{59, nil},          // 64 bytes: the block math, which escapes the quote
+		{60, nil},
 	} {
-		data := []byte(`{` + strings.Repeat(" ", tc.pad) + `\}`)
-		_, err := skipContainerFast(data, 0, '{')
-		if err != tc.wantErr {
-			t.Errorf("pad=%d: skipContainerFast err = %v, want %v", tc.pad, err, tc.wantErr)
+		data := []byte(`{` + strings.Repeat(" ", tc.pad) + `\"a}`)
+		if _, err := skipContainerFast(data, 0, '{'); err != tc.wantErr {
+			t.Errorf("pad=%d (len %d): skipContainerFast err = %v, want %v", tc.pad, len(data), err, tc.wantErr)
 		}
-		// The scalar path has no block grid and no escape state, so it accepts
-		// every one of these regardless of padding.
-		if _, err := skipObject(data, 0); err != nil {
-			t.Errorf("pad=%d: scalar skipObject err = %v, want nil", tc.pad, err)
+		// The scalar path has neither a block grid nor escape state, so it reads
+		// the quote as opening a string at every length.
+		if _, err := skipObject(data, 0); err != ErrTruncated {
+			t.Errorf("pad=%d: scalar skipObject err = %v, want %v", tc.pad, err, ErrTruncated)
 		}
 	}
 }

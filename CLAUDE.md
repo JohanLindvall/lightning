@@ -754,12 +754,20 @@ byte-identical when adding cold paths; push new logic out-of-line.
   unbalanced bracket of the *other* type (fast ignores, scalar descends), nesting
   past `MaxDepth` (fast is iterative and accepts, scalar now returns `ErrMaxDepth`),
   and a stray backslash *outside* a string (`findEscaped64` is pure bit math and
-  cannot know it is not in a string, so the verdict flips on 64-byte-grid alignment
-  alone: `{`+N spaces+`\}` is accepted at N=62, rejected at 63, accepted at 64).
+  cannot know it is not in a string, so it masks the next byte out of the quote
+  bitmap where the scalar path never stops on a backslash at all).
   Because `SkipValue` picks the path by CPU feature, all three make its answer on
   **malformed** input host-dependent. Pinned by `TestSkipPathsDivergeOnMalformed` /
-  `TestSkipBackslashAlignmentCliff` / `TestSkipDepthDivergence`, in the spirit of
-  `TestValidDivergesFromStdlib`. **This is not the rejected two-stage
+  `TestSkipBackslashLengthCliff` / `TestSkipDepthDivergence`, in the spirit of
+  `TestValidDivergesFromStdlib`. **The third class used to be sensitive to where
+  the 64-byte GRID fell** — `{`+N spaces+`\}` accepted at N=62, rejected at 63,
+  accepted at 64 — and that is gone (2026-09-08): the grid dependence was never
+  the bit math, which carries its escape and in-string state across boundaries by
+  construction, but the block loop handing its final < 64 bytes to a *byte walk*
+  with different escape semantics. The tail is a block now (see the overlapping
+  final block below), so the split that remains is on the input's LENGTH, not its
+  padding: under 64 bytes there is no block to read and the byte walk decides,
+  which is why `{\"a}` is truncated at 63 bytes and accepted at 64. **This is not the rejected two-stage
   feed** (below): the skip path has no typed stage-2, so the index-like scan *is* the
   work and the economics that sank two-stage do not apply. Wins: **`Get` end-to-end
   +105%** (skip-heavy doc, skipping 500 nested-object siblings: 27.9→13.6 µs),
@@ -879,6 +887,73 @@ byte-identical when adding cold paths; push new logic out-of-line.
   `prevEscaped` carry), quotes on the boundary, deep bracket runs, close-dense
   blocks, closes at exact block multiples — plus per-variant truncation safety;
   `BenchmarkSkipBlocksVariant` is the standing AVX2-vs-512-vs-Go comparison.
+- **The container skip's last bytes are a block, not a byte walk, and its
+  prologue costs nine instructions less** (`skipContainerBlocks` in `skipfast.go`,
+  the two `skipBlocks` bodies in `skipfast_amd64.s`, `foundEnd` in both arches'
+  assembly; 2026-09-08, Zen 4). Three changes, one of them the interesting one.
+  **(1) The final < 64 bytes are ONE MORE BLOCK, overlapping.** The block loop
+  covered full blocks and handed whatever was left to a byte-by-byte state
+  machine — ~7 instructions and a mispredictable branch per byte — and that walk
+  is not a rounding error: the LAST element of every array pays it (on
+  `BenchmarkArrayEachRecords` one record in fifty was **15% of the walk**), and
+  skipping a whole document, which ends AT the tail, paid up to 63 bytes of it
+  every time. The tail is now read as the document's last 64 bytes with the four
+  bitmaps shifted right so bit 0 is `pos` again: the shift drops the bytes the
+  loop already accounted for and brings in zeros above the end, and a zero byte
+  is not a quote, a backslash or a bracket, so it is inert. `end = pos + j + 1`
+  is unchanged, and the carried escape/in-string bits sit at bit 0 exactly as at
+  a real block boundary — which is the whole reason the shift is right where a
+  low-bit MASK would be wrong (`prevEscaped` means "the byte at pos is escaped",
+  bit 0, not bit k). The loop needs no flag to stop: after the overlapping block
+  `pos += 64` is past the end, so the next trip falls into the arm that returns
+  `ErrTruncated`. The byte walk survives only for a document under one block,
+  where it is reached with both carried bits zero. **(2) The AVX2 and AVX-512
+  prologues broadcast their splats from single bytes and INDEX the bracket pair**
+  (`mbBrackets<>` holds `{ [ } ]`, so open is `(base)(isArray*1)` and close two
+  bytes on): the branch to a second pair of loads goes, and on AVX-512 a
+  `VPBROADCASTB` from memory replaces a `MOVL` of the immediate plus a broadcast
+  from the register — 12 instructions of prologue become 6. **(3) `foundEnd`
+  writes only `end`.** The other three results are the carried state for the
+  caller's tail, `skipContainerFast` reads them under `end < 0` and nowhere else,
+  and writing them cost three stores on the path every small container takes.
+  Plus one in Go: `skipContainerFast` tests `useSkipBlocks` FIRST, which implies
+  `fastSkipAvail` on every architecture defining both, so the common path reads
+  one flag instead of two. Measured (per-op counters by differencing, exact):
+  a one-block skip **151 → 140 instructions**, `SkipContainer/nestedMixed`
+  −6.6%, and end to end **ArrayEachRecords −14.3% instructions,
+  ArrayEachIndexShapes/records −14.0%, StreamShapes/records −7.5%,
+  StreamMatrix/stream_points −4.6%, StreamDescent/get −3.8%, ArrayEachSeries
+  −3.3%, GetPretty −3.0%, ObjectEachRecordCompact −2.2%, cloudflare −1.6%**.
+  Wall clock (interleaved ABBA, pinned, both sides `-funcalign=64`), pkg/unstable
+  at n=6: `SkipSmall` **record −11.8%, tiny −11.6%, twoBlock −10.4%, pair
+  −5.6%**; `SkipContainer/nestedMixed` **−14.3%**, stringObj −6.8%, numberObj
+  −5.7%; `SkipBlocksVariant` avx512 −5.4…−14.8%, avx2 −3.2…−6.3%, goloop
+  −3.8…−6.7%; geomean −1.8%. pkg/json at n=8: **ArrayEachRecords −10.5%,
+  ArrayEachIndexShapes/records −10.1%, GetPretty −7.1%,
+  StreamShapes/records/stream_reused −6.5%, ObjectEachPretty −6.2%,
+  StreamDescent/arrayeach −5.7% and /get −5.5%, ObjectEachRecordCompact −5.1%,
+  ArrayEachSeries −5.1%, StreamShapes/records/stream −3.7%,
+  StreamMatrix/stream −3.3%, /stream_points −3.3%, /stream_reused −2.5%,
+  StreamShapes/scalars/stream −1.8%**, geomean over that set −2.6% (over the
+  whole pkg/json suite at n=6, −0.8%). The decoder corpus (20 cases, n=6) is
+  flat but for **cloudflare −2.7%, -nocopy −3.5%, -compact −3.7%** — their
+  unknown-field skips are near the document's end — and nothing is worse. Every residual
+  checked by instruction count and every one of them layout: `SetMany`/`SetPaths`
+  +3% and `StripDefaultsPretty` +1% execute the IDENTICAL instruction stream,
+  and `StreamShapes/records/inmemory` reads +1.9% while executing **7.5% fewer**
+  instructions. **The semantic side is a simplification, not a cost**: the byte
+  walk had the scalar path's escape rule and the block math has its own, so
+  handing the tail to the walk is what made the fast path's verdict on malformed
+  input depend on where the 64-byte grid fell. That cliff is gone —
+  `{`+N spaces+`\}` is now accepted at every N — and what remains is a length
+  threshold (`{\"a}` truncated at 63 bytes, accepted at 64), which
+  `TestSkipBackslashLengthCliff` pins in both directions. Locked by the existing
+  `TestSkipContainerFastMatches` / `TestSkipBlocksVariants` /
+  `TestSkipContainerBoundaries`, the last two with their pad sweeps widened
+  (0..80 over the boundary corpus, and either side of the grid for the random
+  one) because the close now lands in a block wherever it falls and the aligning
+  shift is off by one at exactly one offset — sabotage-verified with `63 -` and
+  `65 -` in place of `64 -`, and with the shift dropped.
 - **Un-presized slices grow at a flat 2×, not Go's damped 1.25×**
   (`unstable.GrowSlice` in `pkg/unstable/grow.go`, emitted by `sliceDecoder`'s
   `presize == ""` path). Bare `append` lets `runtime.nextslicecap` decide capacity,
@@ -2515,6 +2590,29 @@ no regressions.)
 
 ## Tried and rejected (don't re-attempt without a new idea)
 
+- **Writing `SkipValue`'s arms out in `set.go`'s three walkers** (2026-09-08,
+  Zen 4) — the mechanical twin of the get.go change that measured well the day
+  before, and the thing two sessions' "left on the table" notes had already sized
+  at a ~3% ceiling on `SetPaths`. Built at the three hot sites (`setSpan`'s and
+  `setObject`'s per-member skip, `setMany`'s every-member skip) and **measured
+  negative**: instructions `SetPaths` **+2.25%**, SetManyEarlyExit +0.13%,
+  SetPathsEarlyExit +0.38%, against SetMany −0.75% and Set/append −2.07%;
+  reverted. Two things the estimate missed. `skipValueOrEnd` already INLINES at
+  all twelve of its call sites, so the arms remove only `SkipValue`'s own frame,
+  not a call — and `unstable.SkipObject` inlines too, so writing the arms out
+  puts three copies of `skipContainerFast`'s call sequence into each walker,
+  which is the per-field-read bloat the inline-trick section warns about in the
+  generator. And the values these walkers skip are not the object members the
+  get.go walkers see: `SetPaths`' benchmark document skips `[1,2,3]` and `true`,
+  both of which reach the `default` arm and pay the added dispatch for nothing.
+  A better-shaped benchmark might change the verdict, but there is no evidence
+  for one, and the committed benchmarks are what there is. **What DID come out of
+  it is a test**: the arms index `in[p]` where `skipValueOrEnd` made the bounds
+  check itself, and `p` is a `SkipWS` result that can legitimately equal
+  `len(in)` — `{"a":` is enough to panic. `TestSetTruncatedNoPanic` (every prefix
+  of a dozen documents through the whole Set family) is kept, because nothing
+  else in the suite decodes a truncated document and the next person to try this
+  will meet the same trap.
 - **skipWS inline trick in the pkg/json walkers — split verdict, measured 2026-08.**
   The two-compare + `SkipWSRun` block (the generated decoders' whitespace shape)
   was ported to every `SkipWSCompact` site in both `strip_defaults.go` and
@@ -4121,9 +4219,10 @@ See the corrected note in the `skipContainerFast` entry above. Three divergence
 classes, all confined to malformed input, all host-dependent because `SkipValue`
 picks the path by CPU feature. The third was found only by an exhaustive
 differential (708k malformed documents): a **stray backslash outside a string**,
-where `findEscaped64`'s pure bit math cannot know it is not in a string, producing a
-verdict that flips on 64-byte-grid alignment alone. Pinned by
-`TestSkipPathsDivergeOnMalformed` / `TestSkipBackslashAlignmentCliff` /
+where `findEscaped64`'s pure bit math cannot know it is not in a string. It flipped
+on 64-byte-grid alignment alone until the block loop's byte tail became a block
+(2026-09-08) and now flips only on whether the input reaches one block. Pinned by
+`TestSkipPathsDivergeOnMalformed` / `TestSkipBackslashLengthCliff` /
 `TestSkipDepthDivergence` — the `TestValidDivergesFromStdlib` pattern, which exists
 precisely so a documented disagreement cannot rot into an undocumented one.
 
@@ -5138,8 +5237,82 @@ bytes. And `set.go`'s walkers still reach every member's value through
 cost `skipValueOrEnd` its inlining at all twelve of its call sites, so it needs
 writing out at the three hot ones, for a ~3% ceiling on `SetPaths`.
 
+**Both of those were followed up on 2026-09-08, with opposite outcomes** (Zen 4;
+the entry on the overlapping final block above, and the set.go rejection below).
+The three cheap parts of the floor — the results dead on success, the prologue's
+bracket branch, and the second flag read in Go — came to nine instructions of the
+140 a one-block skip now costs, and the byte TAIL, which that sizing did not
+count at all, turned out to be worth more than all of them. The set.go port was
+built and **measured negative**; its "~3% ceiling" was an estimate, and estimates
+of this kind have been wrong in this file often enough to be worth the hour.
+
 **`<ABIInternal>` re-checked on Go 1.27.1 and still refused** outside
 `package runtime` ("ABI selector only permitted when compiling runtime"), so the
 ~11 memory operations per scanner call remain the floor. Go 1.27 does ship a
 `simd` package with arm64 files, but it is behind `goexperiment.simd` (off by
 default), which a library cannot require of its users.
+
+## Zen 4 pass over the container skip, and a check of the day's other work (2026-09-08)
+
+A pass over everything committed in the previous 24 hours — the escaped-string
+chunk, the generated unknown-field dispatch, the walkers' inline arms, the
+resumable stream reader and its continuation, the `,number` any decoder, and the
+eight generator feature PRs — on the local Ryzen 7 8840HS (Zen 4, AVX-512,
+`perf_event_paranoid=2`, so `:u` counting of one's own process). One change
+landed (the entry on the overlapping final block above); one was built and
+rejected (set.go, in the rejected list); the rest of the day's work was checked
+and left alone. What the checking found is the part worth keeping.
+
+- **The generator PRs are output-neutral, and that is now measured rather than
+  claimed.** Building the generator at the last commit before them and at the
+  last commit after them, and generating all 30 bench schemas with each, gives
+  **30 of 30 byte-identical decoders and identical diagnostic streams**. That is
+  the proof any change in `main.go`'s front end owes — the same dual-generator
+  diff the depth-threading and arena entries rest on — and it takes two minutes.
+  Note the loop must run the generator IN each case's directory: the sibling
+  scan reads the package's other files, so generating into a scratch directory
+  measures a different thing.
+- **The streaming continuation PR is instruction-neutral on the walk.** Building
+  `pkg/json` either side of it and counting per-op instructions on the nine
+  streaming benchmarks: everything within ±2.3%, most within 1%. The relative
+  `enter` — the open-prefix loop, the `continuing` flag, the `pending`/`done`
+  state — costs a handful of compares once per call, not per member.
+- **The escaped-string chunk holds on this core too, and its own micro says it
+  should not.** `BenchmarkEscapeScratch` measures the carve at **20.1 ns against
+  a make's 16.2 ns** here (on the N2 where it was developed: 25.0 against 42.5),
+  i.e. the carve is the SLOWER of the two in isolation — and interleaved A/B of
+  the real decode says **gsoc_2018 −11.0%, twitterescaped −5.4%** (p=0.000,
+  n=8), with the same allocation numbers the N2 measured (allocs/op −52.8% and
+  −64.9%). The micro is not wrong, it is answering a different question: what
+  the chunk removes is not the malloc fast path but the collector work thousands
+  of extra objects per decode pace, and a two-call micro cannot see that. Do not
+  re-litigate this entry from `BenchmarkEscapeScratch` alone.
+- **What is left in gsoc is bytes, not overhead.** `makeslice` under
+  `escapeScratch` is still **22% of the decode**, and an allocation profile says
+  why: 128 chunks and **1.99 MB per decode**, because that document really is
+  ~2 MB of escaped strings. Half of that 22% is zeroing the bytes the strings
+  will occupy and the rest is span acquisition at one 16 KiB object per span.
+  The only levers are a bigger chunk (which the entry deliberately traded away
+  for its retention bound) or fewer bytes (there are none). Size the next idea
+  here against 1.99 MB, not against the allocation count.
+- **A `SkipValue` arm nobody had measured was the day's biggest number.**
+  `BenchmarkSkipSmall`, added the day before, says a one-block container skip is
+  a flat ~150 instructions — but the LAST element of an array does not get a
+  block, and its byte walk was 15% of `BenchmarkArrayEachRecords`. The lesson
+  generalises past this fix: a benchmark that pads its document (as SkipSmall
+  does, deliberately, to reach the fast path) measures the fast path and hides
+  what the shape costs at the document's end, which for a walker is once per
+  array and for `SkipValue` on a whole document is every time.
+- **Every wall-clock residual in this session was layout, and the instruction
+  count said so in one command each.** `SetMany` +3.0%, `SetPaths` +1.3% and
+  `StripDefaultsPretty` +1.0% execute the IDENTICAL stream (set.go and
+  strip_defaults.go were not touched in the landed change);
+  `StreamShapes/records/inmemory` reads +1.9% while executing 7.5% FEWER
+  instructions; `ArrayEachIndex` reads −36% while executing 15% fewer. The rule
+  the file already states — take the instruction count first — paid for itself
+  four times in one afternoon.
+- **`git checkout <file>` is not an undo for a scratch edit.** Sabotage-testing a
+  guard by patching a file and then restoring it with `git checkout` reverts the
+  session's work on that file too, silently, because the file is dirty for a
+  reason. Copy it aside first; the mistake costs a reconstruction and is not
+  visible in the test output.
