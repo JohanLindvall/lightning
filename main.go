@@ -116,6 +116,8 @@ func generateTo(inPath string, warn io.Writer) error {
 		mapTypes:         map[string]*ast.MapType{},
 		scalarTypes:      map[string]string{},
 		sibling:          map[string]bool{},
+		foreign:          map[string]string{},
+		needForeign:      map[string]bool{},
 		unmarshaler:      map[string]bool{},
 		order:            nil,
 		used:             map[string]bool{},
@@ -488,6 +490,11 @@ type gen struct {
 	needJSON   bool
 	needTime   bool
 	needUnsafe bool
+	// foreign maps every other import's qualifier to its path, from the
+	// input file and the siblings; needForeign marks those a decoder spells,
+	// which the generated file then imports under the same name.
+	foreign     map[string]string
+	needForeign map[string]bool
 
 	decoders []string        // generated decoder functions, in creation order
 	errs     []error         // generation errors; reported together after the walk
@@ -509,9 +516,10 @@ type gen struct {
 // generated one — is registered by name, without joining g.order. A root in
 // the input file that names one of them then emits its decoder exactly as it
 // would for a type declared beside it; the sibling type never gets a method
-// of its own from this run (generate its own file for that), and a
-// directive it carries warns, since only the reaching root's directives
-// apply.
+// of its own from this run (generate its own file for that), and only the
+// reaching root's directives apply to the decoder emitted here — a
+// directive the sibling carries belongs to the run its own file is the
+// input of, and is not reported.
 //
 // The one thing a sibling cannot do is spell encoding/json or time under a
 // different import alias than the input file: the generated file imports
@@ -573,9 +581,11 @@ func (g *gen) registerSiblings(inPath string, file *ast.File) {
 				default:
 					continue
 				}
+				// A directive a sibling type carries is for the run whose
+				// input that file is — a strict root there is a root — and
+				// says nothing about this run, where the reaching root's
+				// directives govern its decoder; so it is not reported.
 				g.sibling[n] = true
-				g.warnDirectives(lightningDirectives(gd.Doc, ts.Doc), n,
-					"the type is declared in "+name+"; its decoder follows the root that reaches it")
 			}
 		}
 	}
@@ -649,6 +659,11 @@ func (g *gen) qualifiersAgree(sib *ast.File) bool {
 				return false
 			}
 			g.timeQual = name
+		default:
+			if p, ok := g.foreign[name]; ok && p != path {
+				return false
+			}
+			g.foreign[name] = path
 		}
 	}
 	return true
@@ -684,6 +699,8 @@ func (g *gen) collectQualifiers(file *ast.File) {
 			g.jsonQual = name
 		case "time":
 			g.timeQual = name
+		default:
+			g.foreign[name] = path
 		}
 	}
 }
@@ -720,6 +737,10 @@ func (g *gen) noteQualifiers(e ast.Expr) {
 				g.needJSON = true
 			case g.timeQual:
 				g.needTime = true
+			default:
+				if _, ok := g.foreign[id.Name]; ok {
+					g.needForeign[id.Name] = true
+				}
 			}
 		}
 		return true
@@ -1361,6 +1382,15 @@ func (g *gen) collectFields(st *ast.StructType, prefix string, depth int, allocs
 			}
 			// Tagged embed, or a non-struct/opaque embed: a plain named field
 			// keyed by the tag name(s) or, lacking those, the embedded type name.
+			// A foreign struct cannot be embedded at all: its fields are not
+			// visible to promote, and delegating the whole embed to a method
+			// it may not have would turn a schema mistake into a compile
+			// error two steps away — the three foreign types the generator
+			// knows are the exception, decoding as that named field.
+			if sel, ok := unparen(f.Type).(*ast.SelectorExpr); ok && !g.isRaw(sel) && !g.isNumber(sel) && !g.isTime(sel) {
+				g.errs = append(g.errs, fmt.Errorf("unsupported type %s: a type from another package cannot be embedded (name it as a field to delegate to its UnmarshalJSON)", g.typeStr(f.Type)))
+				continue
+			}
 			keys := tagNames
 			if len(keys) == 0 {
 				keys = []string{name}
@@ -1791,7 +1821,13 @@ func (g *gen) field(dest string, expr ast.Expr, hint string, nocopy, lax bool) s
 		if g.isTime(t) {
 			return g.timeRead(dest, lax)
 		}
-		return g.unsupportedf("unsupported type %s for %s", g.typeStr(t), dest)
+		// Any other type from another package is delegated to its own
+		// UnmarshalJSON: the generator cannot see inside the package, and
+		// a record type worth naming from another package decodes itself.
+		// One that does not implement json.Unmarshaler fails to compile —
+		// "has no field or method UnmarshalJSON" — which is the assertion
+		// this generator leans on everywhere.
+		return delegate(dest)
 
 	case *ast.StructType:
 		return g.callDecoder(dest, g.anonStruct(t, hint))
@@ -1966,7 +2002,9 @@ func (g *gen) nullAssigns(expr ast.Expr) bool {
 		}
 		return true // a scalar stores the zero, and `any` is nil'd
 	case *ast.SelectorExpr:
-		return true // RawMessage stores "null"; Number and Time store the zero
+		// RawMessage stores "null"; Number and Time store the zero; any
+		// other foreign type is delegated to and answers for itself.
+		return g.isRaw(t) || g.isNumber(t) || g.isTime(t)
 	}
 	return true
 }
@@ -3042,6 +3080,21 @@ func (g *gen) assemble(inPath string, methods []string) string {
 	}
 	if g.needUnsafe {
 		imports = append(imports, `"unsafe"`)
+	}
+	// A foreign type a decoder spells (delegated to its own UnmarshalJSON)
+	// needs its package, under the qualifier the schema used for it.
+	var quals []string
+	for q := range g.needForeign {
+		quals = append(quals, q)
+	}
+	slices.Sort(quals)
+	for _, q := range quals {
+		path := g.foreign[q]
+		if q == path[strings.LastIndexByte(path, '/')+1:] {
+			imports = append(imports, strconv.Quote(path))
+		} else {
+			imports = append(imports, fmt.Sprintf("%s %q", q, path))
+		}
 	}
 
 	var b strings.Builder
