@@ -93,7 +93,30 @@ func getMany(data []byte, keys []string, out [][]byte, compact bool) ([][]byte, 
 		}
 		i = unstable.SkipWSCompact(data, i+1, compact)
 		start := i
-		end, err := unstable.SkipValue(data, i)
+		// SkipValue's arms, written out; see arrayEach for the trade and
+		// SkipObject for why the brace arm inlines. The order is the other way
+		// round from the array walkers': an object member's value is a string
+		// or a container far more often than a number, and an array's elements
+		// are where the numbers are.
+		//
+		// SkipValue made the bounds test itself; the arms index data directly,
+		// so it is theirs now — and having it is what makes data[i] provably in
+		// range, which is the check the dispatch would otherwise carry.
+		if uint(i) >= uint(len(data)) {
+			return out, unstable.ErrTruncated
+		}
+		var end int
+		var err error
+		switch c := data[i]; {
+		case c == '"':
+			end, err = unstable.SkipString(data, i)
+		case c == '{':
+			end, err = unstable.SkipObject(data, i)
+		case uint(c)-'-' <= 12:
+			end, err = unstable.SkipNumber(data, i)
+		default:
+			end, err = unstable.SkipValue(data, i)
+		}
 		if err != nil {
 			return out, err
 		}
@@ -319,10 +342,24 @@ func walkPaths(data []byte, i, depth int, active, free []int, paths [][]string, 
 				}
 			}
 		} else {
-			// start may be past the end here (a truncated "key:" with no
-			// value); SkipValue bounds-checks and returns ErrTruncated.
+			// SkipValue's arms, written out; see objectEach. start may be past
+			// the end here (a truncated "key:" with no value), which SkipValue
+			// bounds-checked itself and the arms do not, so the test is theirs.
 			var err error
-			if end, err = unstable.SkipValue(data, start); err != nil {
+			if uint(start) >= uint(len(data)) {
+				return start, unstable.ErrTruncated, true
+			}
+			switch c := data[start]; {
+			case c == '"':
+				end, err = unstable.SkipString(data, start)
+			case c == '{':
+				end, err = unstable.SkipObject(data, start)
+			case uint(c)-'-' <= 12:
+				end, err = unstable.SkipNumber(data, start)
+			default:
+				end, err = unstable.SkipValue(data, start)
+			}
+			if err != nil {
 				return end, err, true
 			}
 		}
@@ -536,7 +573,22 @@ func objectEach(data []byte, fn func(key string, value []byte) error, compact bo
 		}
 		i = unstable.SkipWSCompact(data, i+1, compact)
 		start := i
-		end, err := unstable.SkipValue(data, i)
+		// SkipValue's arms, written out; see getMany.
+		if uint(i) >= uint(len(data)) {
+			return unstable.ErrTruncated
+		}
+		var end int
+		var err error
+		switch c := data[i]; {
+		case c == '"':
+			end, err = unstable.SkipString(data, i)
+		case c == '{':
+			end, err = unstable.SkipObject(data, i)
+		case uint(c)-'-' <= 12:
+			end, err = unstable.SkipNumber(data, i)
+		default:
+			end, err = unstable.SkipValue(data, i)
+		}
 		if err != nil {
 			return err
 		}
@@ -639,6 +691,13 @@ func arrayEach(data []byte, fn func(value []byte) error, compact bool, keys ...s
 		// unsigned compare and that is an instruction per element. Widening
 		// first is the same predicate, since a byte below '-' underflows to a
 		// huge uint and fails the bound.
+		//
+		// The '{' arm is the same trade a third time. unstable.SkipObject is
+		// SkipValue's brace arm and inlines (it is one call, which is why the
+		// fastSkipAvail gate lives inside skipContainerFast now), so an element
+		// that is an object reaches the block scan without SkipValue's frame
+		// and comparison tree. The compare it adds is never reached by a number
+		// or a string, which the two arms above have already taken.
 		var end int
 		var err error
 		switch c := data[i]; {
@@ -646,6 +705,8 @@ func arrayEach(data []byte, fn func(value []byte) error, compact bool, keys ...s
 			end, err = unstable.SkipNumber(data, i)
 		case c == '"':
 			end, err = unstable.SkipString(data, i)
+		case c == '{':
+			end, err = unstable.SkipObject(data, i)
 		default:
 			end, err = unstable.SkipValue(data, i)
 		}
@@ -740,6 +801,8 @@ func arrayEachIndex(data []byte, fn func(index int, value []byte) error, compact
 			end, err = unstable.SkipNumber(data, i)
 		case c == '"':
 			end, err = unstable.SkipString(data, i)
+		case c == '{':
+			end, err = unstable.SkipObject(data, i)
 		default:
 			end, err = unstable.SkipValue(data, i)
 		}
@@ -816,7 +879,22 @@ func objectField(data []byte, i int, key string, compact bool) (int, error) {
 		if k == key {
 			return i, nil
 		}
-		end, err := unstable.SkipValue(data, i)
+		// SkipValue's arms, written out; see getMany.
+		if uint(i) >= uint(len(data)) {
+			return i, unstable.ErrTruncated
+		}
+		var end int
+		var err error
+		switch c := data[i]; {
+		case c == '"':
+			end, err = unstable.SkipString(data, i)
+		case c == '{':
+			end, err = unstable.SkipObject(data, i)
+		case uint(c)-'-' <= 12:
+			end, err = unstable.SkipNumber(data, i)
+		default:
+			end, err = unstable.SkipValue(data, i)
+		}
 		if err != nil {
 			return end, err
 		}

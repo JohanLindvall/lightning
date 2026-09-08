@@ -214,6 +214,8 @@ func (r *Reader) ArrayEach(fn func(value []byte) error, keys ...string) error {
 			}
 		case c == '"':
 			end, err = unstable.SkipString(buf, r.pos)
+		case c == '{':
+			end, err = unstable.SkipObject(buf, r.pos)
 		default:
 			end, err = unstable.SkipValue(buf, r.pos)
 		}
@@ -338,6 +340,8 @@ func (r *Reader) ObjectEach(fn func(key string, value []byte) error, keys ...str
 			}
 		case c == '"':
 			end, err = unstable.SkipString(buf, r.pos)
+		case c == '{':
+			end, err = unstable.SkipObject(buf, r.pos)
 		default:
 			end, err = unstable.SkipValue(buf, r.pos)
 		}
@@ -458,9 +462,19 @@ func (r *Reader) enter(keys []string) error {
 			if c == '}' {
 				return unstable.ErrKeyNotFound
 			}
+			if c != '"' {
+				return unstable.ErrInvalidJSON
+			}
 			r.hold = r.pos
-			k, err := r.key()
-			if err != nil {
+			// The no-escape key read, inline, as ObjectEach has it: one
+			// vectorized scan settles the key's end and whether it holds an
+			// escape, and r.key's frame is one per member of the descent —
+			// which is what a keyed walk pays before it does anything at all.
+			var k string
+			kbuf := r.buf[:r.end]
+			if e := unstable.IndexCloseOrEscapeAt(kbuf, r.pos+1); uint(e) < uint(r.end) && kbuf[e] == '"' {
+				k, r.pos = unstable.UnsafeStr(kbuf[r.pos+1:e]), e+1
+			} else if k, err = r.key(); err != nil {
 				return err
 			}
 			// The key has been compared, so it need not outlive the value.
@@ -761,9 +775,26 @@ func (r *Reader) skip() error {
 	if lim-r.pos > skipProbe {
 		lim = r.pos + skipProbe
 	}
-	if end, err := unstable.SkipValue(r.buf[:lim], r.pos); err == nil && end < lim {
-		r.pos, r.hold = end, end
-		return nil
+	// SkipValue's arms, written out; see ArrayEach. A descent steps over one
+	// member's value per key it passes, so this is once per member, and the
+	// arms are the same functions SkipValue's own dispatch reaches.
+	if buf := r.buf[:lim]; uint(r.pos) < uint(lim) {
+		var end int
+		var err error
+		switch c := buf[r.pos]; {
+		case c == '"':
+			end, err = unstable.SkipString(buf, r.pos)
+		case c == '{':
+			end, err = unstable.SkipObject(buf, r.pos)
+		case uint(c)-'-' <= 12:
+			end, err = unstable.SkipNumber(buf, r.pos)
+		default:
+			end, err = unstable.SkipValue(buf, r.pos)
+		}
+		if err == nil && end < lim {
+			r.pos, r.hold = end, end
+			return nil
+		}
 	}
 	// A value too large for the buffer is where the streaming skip earns its
 	// keep, and ResetFast is what makes it cost the read rather than several
