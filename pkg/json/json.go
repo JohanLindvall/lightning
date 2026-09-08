@@ -215,7 +215,7 @@ func ParseFloat(b []byte) (float64, error) {
 // verbatim — invalid UTF-8 included, where encoding/json coerces it to U+FFFD.
 // Only an unpaired \u surrogate escape is normalized to U+FFFD, as it is there.
 func DecodeAny(data []byte) (any, error) {
-	return decodeAny(data, false)
+	return decodeAny(data, false, false)
 }
 
 // DecodeAnyCompact is DecodeAny for compact JSON — input with no whitespace
@@ -224,19 +224,36 @@ func DecodeAny(data []byte) (any, error) {
 // still tolerated). On such input it behaves identically to DecodeAny but faster;
 // given input that does contain inter-token whitespace it may report an error.
 func DecodeAnyCompact(data []byte) (any, error) {
-	return decodeAny(data, true)
+	return decodeAny(data, true, false)
 }
 
-func decodeAny(data []byte, compact bool) (any, error) {
+// DecodeAnyNumber is DecodeAny with every number held as a json.Number —
+// encoding/json's UseNumber — so a decimal survives exactly and an integer
+// past 2^53 is not rounded; DecodeAnyNumberCompact is its compact form.
+func DecodeAnyNumber(data []byte) (any, error) {
+	return decodeAny(data, false, true)
+}
+
+// DecodeAnyNumberCompact is DecodeAnyNumber for compact JSON.
+func DecodeAnyNumberCompact(data []byte) (any, error) {
+	return decodeAny(data, true, true)
+}
+
+func decodeAny(data []byte, compact, number bool) (any, error) {
 	i := unstable.SkipWS(data, 0)
 	var (
 		v   any
 		end int
 		err error
 	)
-	if compact {
+	switch {
+	case compact && number:
+		v, end, err = unstable.DecodeValueNumberCompact(data, i)
+	case number:
+		v, end, err = unstable.DecodeValueNumber(data, i)
+	case compact:
 		v, end, err = unstable.DecodeValueCompact(data, i)
-	} else {
+	default:
 		v, end, err = unstable.DecodeValue(data, i)
 	}
 	if err != nil {

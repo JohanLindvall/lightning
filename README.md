@@ -617,6 +617,24 @@ root — `"{\"id\":7} trailing garbage"` is an error, not an `{"id":7}` with the
 rest ignored. Whitespace around the value is fine, and a body that is empty or
 all whitespace still leaves the field at its zero value without an error.
 
+## The `number` tag option
+
+An `any` field decodes a JSON number to a `float64`, as `encoding/json` does by
+default. Add `number` to the field's json tag and every number inside it — at
+any depth of the value's objects and arrays — is a `json.Number` holding its
+literal instead, which is what `encoding/json`'s `UseNumber` gives: `0.95`
+survives as written, and an integer past 2^53 is not rounded.
+
+```go
+type Param struct {
+    Default any `json:"default,omitempty,number"` // 0.95 stays "0.95"
+}
+```
+
+It applies to a field that IS `any` (or `interface{}`); on any other field it
+warns and is ignored. The toolkit has the same mode as `DecodeAnyNumber` (and
+`DecodeAnyNumberCompact`).
+
 ## Comment directives
 
 Some behavior is selected with a `//lightning:<name>` comment on the struct type
