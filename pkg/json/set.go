@@ -410,6 +410,29 @@ func setObject(in, out []byte, i, depth int, active []int, paths [][]string, raw
 	lastValEnd := i + 1 // insertion point for created members: after the last value
 	matched := make([]bool, len(active))
 	nmatched := 0 // active paths matched so far, for the root all-matched early exit
+	// The two index sets this frame builds — the deeper paths a matched key
+	// routes into, and the absent paths to create at the close — share one small
+	// per-frame array, for the reason appendMembers' subbuf has one: grown from
+	// nil they are placed on the stack only while the compiler can see they
+	// neither escape nor outgrow the frame, and that is not a property of the
+	// source. A -race build, which instruments every access and so inlines
+	// differently, heap-allocates both and costs SetPaths its zero-allocation
+	// contract (measured: 2 allocs/op, one per path, attributed to exactly these
+	// two appends). Eight is past any real prefix-sharing fan-out; beyond it
+	// append reallocates as before.
+	//
+	// One array serves both because their lifetimes do not overlap — recurse is
+	// consumed within the member iteration that builds it (setObject only indexes
+	// paths through it during the call and appendMergedObject before returning,
+	// so neither retains it), and create is built after the loop has ended.
+	// recurse itself is hoisted out of the member loop and truncated per member
+	// rather than re-sliced from the array, which is the same set and one store
+	// instead of three: worth measuring because a frame that takes the root
+	// early exit pays this setup and never reaches the growth it avoids
+	// (SetPaths -4.4% instructions, SetPathsEarlyExit +0.8%; re-slicing per
+	// member instead was -2.9% and +2.3%).
+	var idxbuf [8]int
+	recurse := idxbuf[:0]
 	for uint(p) < uint(len(in)) && in[p] != '}' {
 		// Key read with the no-escape fast path inline; see setSpan.
 		var k string
@@ -434,7 +457,7 @@ func setObject(in, out []byte, i, depth int, active []int, paths [][]string, raw
 		vs := q
 
 		ending := -1 // an active path ending at this key (replace its value)
-		var recurse []int
+		recurse = recurse[:0]
 		// An already-matched path is skipped rather than re-applied, so a key that
 		// occurs twice in one object is edited at its first occurrence only — the
 		// rule Set and SetMany already follow. Without the matched[m] test every
@@ -515,7 +538,7 @@ func setObject(in, out []byte, i, depth int, active []int, paths [][]string, raw
 	// Copy through to the insertion point, create any absent paths (grouped by key
 	// so prefix-sharing paths become one member), then copy the closing brace.
 	out = append(out, in[prev:lastValEnd]...)
-	var create []int
+	create := idxbuf[:0]
 	for m, a := range active {
 		if !matched[m] {
 			create = append(create, a)

@@ -1222,7 +1222,27 @@ byte-identical when adding cold paths; push new logic out-of-line.
   `create`, and `idx` locals on the stack (verified by alloc profile: `sub` was
   the *only* heap set), so the threading replaced free allocations with real
   bookkeeping and a 256-byte stackbuf memclr per call. Don't re-port it; check
-  the alloc profile before assuming a `make` in this file is heap. **(4)** Both
+  the alloc profile before assuming a `make` in this file is heap.
+  **(3b) `setObject`'s own `recurse` and `create` took the same `[8]int`
+  treatment on 2026-09-08, and the negative result above still stands** — the
+  difference is that this is ONE array in the frame that builds the sets, not a
+  scratch threaded through the recursion. What forced it was
+  `TestSetPathsFirstOccurrenceWins`' zero-allocation assertion failing under
+  **`-race`** (2 allocs/op) while passing without it: the two nil-start appends
+  are stack-placed only while the compiler can see they neither escape nor
+  outgrow the frame, which is a property of the BUILD, not of the source, and
+  the race instrumentation changes it. So the contract the test asserts was only
+  accidentally true. The fix makes it structural and is faster besides —
+  **SetPaths −5.1% wall clock, −4.4% instructions** (the growth call goes), at
+  **SetPathsEarlyExit +2.1% / +0.8% instructions**, the frame that takes the root
+  early exit paying setup for growth it never reaches. One array serves both
+  sets because their lifetimes do not overlap (recurse is consumed inside the
+  member iteration that builds it, create after the loop), and `recurse` is
+  hoisted out of the member loop and truncated per member rather than re-sliced
+  from the array — one store instead of three, worth 1.5 points of the
+  early-exit cost. The alloc-profile advice above is what found this too: the
+  allocating lines were `recurse = append(...)` and `create = append(...)`, NOT
+  the `make([]bool, len(active))` that looks like the culprit. **(4)** Both
   walkers used to scan every on-path container **twice**: `setSpan` pre-skipped
   each member's value (`skipValueOrEnd`) *before* the key test and then descended
   into that same value on a match, and `setObject`'s recurse branch *discarded*
@@ -5311,6 +5331,18 @@ and left alone. What the checking found is the part worth keeping.
   instructions; `ArrayEachIndex` reads −36% while executing 15% fewer. The rule
   the file already states — take the instruction count first — paid for itself
   four times in one afternoon.
+- **An allocation assertion that only holds in the default build is not a
+  contract, it is a coincidence, and `-race` is the cheapest way to find out.**
+  `TestSetPathsFirstOccurrenceWins` asserts SetPaths is zero-alloc with a reused
+  `out`; under `-race` it reported 2 allocs/op, one per path. Escape analysis was
+  identical between the two builds (`-gcflags=-m` agrees line for line) — what
+  differs is that the race instrumentation changes inlining, and the two
+  nil-start `append`s in `setObject` are stack-placed only while the compiler can
+  see the growth is bounded. Backing them with the file's own `[8]int` idiom made
+  the contract structural AND took SetPaths −5.1%. The general form: when an
+  alloc assertion fails only under a build flag, ask whether the code or the
+  assertion is wrong before reaching for a skip — here the code was one line from
+  making the promise true.
 - **`git checkout <file>` is not an undo for a scratch edit.** Sabotage-testing a
   guard by patching a file and then restoring it with `git checkout` reverts the
   session's work on that file too, silently, because the file is dirty for a

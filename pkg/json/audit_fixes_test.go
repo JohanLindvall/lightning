@@ -234,6 +234,13 @@ func TestSetPathsFirstOccurrenceWins(t *testing.T) {
 	}
 
 	// The fix must not cost SetPaths its zero-allocation contract (a reused out).
+	// This runs under -race too, and used to fail there with 2 allocs/op while
+	// passing without it: setObject's recurse/create grew from nil, and a
+	// nil-start append is stack-placed only while the compiler can see the growth
+	// is bounded — which the race instrumentation's effect on inlining changes.
+	// They are backed by a per-frame array now (see setObject), so the contract
+	// is a property of the code rather than of the build; if this ever fails
+	// under one build and not another, that is the thing to look at first.
 	out := make([]byte, 0, 256)
 	in := []byte(`{"o":{"k":1,"k":2},"other":[1,2,3]}`)
 	paths := [][]string{{"o", "k"}, {"zz"}}
