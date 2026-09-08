@@ -4387,8 +4387,12 @@ found:
   loose root gets two decoders, and `unknownKey()` is what `keyDispatch`
   emits for a member no field answers to — `skipUnknown`, or `return i,
   unstable.ErrUnknownKey` (new sentinel, re-exported by pkg/json). Maps
-  are untouched. The position reported is the value's; the key is not in
-  the error, which stays a sentinel like every other.
+  are untouched. The position reported is the value's. The error is an
+  `*UnknownKeyError` naming the key (copied out of the input, since an
+  error outlives the decode) that matches `ErrUnknownKey` under `errors.Is`
+  — a sentinel alone was the first cut, and the first caller (Hugin's
+  loaders, whose "unknown setting X" message is a test-pinned promise)
+  needed the name back.
 - **A field type's own `UnmarshalJSON` was not called.** The generator
   decoded every named struct structurally, where encoding/json hands an
   Unmarshaler the value; Hugin's spec types (`Spark`, `DashStyle`, `Param`,

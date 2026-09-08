@@ -613,8 +613,9 @@ where a misspelled key must be an error rather than a silently zero field —
 at every object the root reaches, nested types included (a nested type
 shared with a non-strict root gets a decoder of each kind, as it does for
 the other directives). Maps are unaffected: every member of a map is a key.
-The error is a sentinel like every other and does not carry the name; a
-caller that wants it reads the document with `ObjectEach`.
+The error is an `*UnknownKeyError` naming the member (`Key`), and it
+matches `ErrUnknownKey` under `errors.Is` for a caller that only asks
+whether the refusal was that.
 
 ```go
 //lightning:strict

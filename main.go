@@ -1441,13 +1441,14 @@ const skipUnknown = `end, err := unstable.SkipValue(data, i)
 		i = end`
 
 // unknownKey is what a member no field answers to does: skipped, or under a
-// //lightning:strict root refused. The refusal reports the VALUE's position
-// (i), the key having been read; the key itself is not carried in the error,
-// which is a sentinel like every other, so a caller wanting the name reads
-// the document with the toolkit's ObjectEach.
+// //lightning:strict root refused with an *UnknownKeyError naming the key
+// (errors.Is(err, ErrUnknownKey) still holds). The position reported is the
+// VALUE's, the key having been read.
 func (g *gen) unknownKey() string {
 	if g.strict {
-		return "return i, unstable.ErrUnknownKey"
+		// The key travels in the error, copied: it aliases the input (or a
+		// nocopy buffer), and an error outlives the decode that made it.
+		return "return i, &unstable.UnknownKeyError{Key: string([]byte(key))}"
 	}
 	return skipUnknown
 }
