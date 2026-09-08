@@ -2895,6 +2895,21 @@ no regressions.)
 - **Skipping a clean string inside `SkipValue` without the `SkipString` frame**,
   re-measured on Meteor Lake: flat on every case (geomean −0.3%), the same
   verdict as the M2 and N2 entries above. Three microarchitectures now agree.
+- **Carving the UNQUOTED unescape paths from the same chunk**
+  (`UnescapeString`, `UnescapeStringScan`, `UnescapeStringCopy`, 2026-09-08).
+  Each makes a buffer per escaped body and hands it out as the string, which is
+  exactly the shape `decodeStringEscaped` was fixed in — and it loses:
+  `UnescapeString/mostly_clean_one_escape` **+36%**, `prose_with_quotes` +21%,
+  `UnescapeCopyShapes/long_late_escape` +27%, `StringShapes/escaped` +9.6%,
+  geomean +2.0% over the string micros. The reason is the arithmetic of the
+  thing: a carve is 25 ns of which ~9 is the `sync.Pool` round trip, and it
+  replaces one `make` per body — for a 40-byte body out of a 1 KiB chunk that is
+  25 pool round trips plus one chunk allocation against 25 small `make`s of ~9 ns
+  each, which is a wash at best. `decodeStringEscaped` wins (gsoc_2018 −16%)
+  because a decode does THOUSANDS of them, so what it removes is not the malloc
+  fast path but the collector work those objects pace; a one-shot toolkit entry
+  point has no such rate. **Carve where the caller is the decoder, not where it
+  is a public one-value function.**
 - **Masking the `pow10exact` index to remove Clinger's two bounds checks**
   (2026-09-08, N2). The prove pass will not remove them — it tracks neither the
   negation nor the unsigned range test that guards the lookups — and padding the
@@ -5040,12 +5055,21 @@ as on the other three cores.
 The escaped-string chunk allocator, the generator's unknown-field dispatch,
 `SkipString`'s peel and the `VMOVI` splats all landed here; each has its own
 entry above. Cumulative over the 30-case corpus against the session's starting
-commit (interleaved ABBA, n=8, pinned, both sides `-funcalign=64`):
-**gsoc_2018 −16.0%, twitterescaped −10.6%, string_unicode −2.8%,
-cloudflare −1.4%, twitter_status −1.4%, cloudflare-nocopy −0.5%**, everything
-else flat, skip-heavy **+0.2%**, geomean **−1.55%**; the `pkg/json` toolkit
-suite is flat (geomean −0.10%) with `ArrayEachStrings` −5.5%,
-`ArrayEachIndex` −5.4% and `ArrayEachIndexShapes/strings` −3.2%.
+commit (interleaved ABBA, n=8, pinned, both sides `-funcalign=64`, two
+independent runs): **gsoc_2018 −16.0/−16.2%, twitterescaped −10.6/−10.4%,
+string_unicode −2.8/−2.8%, update_center −1.3/−1.8%, twitter_status −1.4/−1.6%,
+cloudflare −1.4/−1.2%, cloudflare-compact −0.6/−0.7%, cloudflare-nocopy
+−0.5/−0.5%, pretty −0.2/−0.4%**, geomean **−1.55/−1.56%**; skip-heavy
+**+0.2%** in both (one unknown member, a huge array: it pays the dispatch and
+gains nothing). Everything else is flat, including `mesh`, which reads +1.1%
+(p=0.002) in the second run and executes the SAME instructions to within the
+noise in three repeats — the layout lottery, and the reason a case that moves in
+one run and not the other gets its instruction count taken before anything else.
+The `pkg/json` toolkit suite is flat (geomean −0.10%) with `ArrayEachStrings`
+−5.5%, `ArrayEachIndex` −5.4% and `ArrayEachIndexShapes/strings` −3.2%; its four
+apparent regressions (`Set/overwrite_nonobject` +3.5%, `StripDefaultsPretty`
++1.6%, `SetPaths` +0.8%, `ArrayEachIndexShapes/records` +2.4%) all execute
+identical or fewer instructions — `StripDefaultsPretty` identical to the digit.
 
 - **The prize was where the profile said and NOT where the model said.**
   `pprof -peek` put `makeslice` under `decodeStringEscaped` at 22% of gsoc_2018,
