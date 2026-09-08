@@ -60,6 +60,83 @@ type genCase struct {
 
 var genCases = []genCase{
 	{
+		// A defined scalar type — the enum idiom, `type Severity string` with
+		// constants — was "unknown type": the field switch knew the built-in
+		// kinds by name and nothing else, so a schema that names its
+		// severities, its states or its levels could not be generated for
+		// at all. Each such type now decodes as its underlying kind and
+		// converts, in every position a scalar can stand: a field, an
+		// element, a map value, a pointee, and through a chain of
+		// definitions in either declaration order. The probe decodes the
+		// same document through the methodless twin so every value is
+		// encoding/json's.
+		name: "defined_scalar_types_decode_as_their_kind",
+		schema: `package main
+
+type Chain Sev
+type Sev string
+type Level int32
+type Ratio float64
+type Flag bool
+
+type Root struct {
+	S  Sev              "json:\"s\""
+	L  Level            "json:\"l\""
+	R  Ratio            "json:\"r\""
+	F  Flag             "json:\"f\""
+	C  Chain            "json:\"c\""
+	Ss []Sev            "json:\"ss\""
+	M  map[string]Level "json:\"m\""
+	P  *Sev             "json:\"p\""
+	NC Sev              "json:\"nc,nocopy\""
+	N  Sev              "json:\"n\""
+}
+
+type rootStd Root
+`,
+		probe: `package main
+
+import (
+	"encoding/json"
+	"fmt"
+)
+
+const doc = "{\"s\":\"critical\",\"l\":7,\"r\":1.5,\"f\":true,\"c\":\"chained\",\"ss\":[\"a\",\"b\"],\"m\":{\"k\":3},\"p\":\"pointee\",\"nc\":\"esc\\\"aped\",\"n\":null}"
+
+func main() {
+	var v Root
+	if err := v.UnmarshalJSON([]byte(doc)); err != nil {
+		panic(err)
+	}
+	var s rootStd
+	if err := json.Unmarshal([]byte(doc), &s); err != nil {
+		panic(err)
+	}
+	fmt.Printf("lightning %q %d %v %v %q %q %v %q %q %q\n", v.S, v.L, v.R, v.F, v.C, v.Ss, v.M, *v.P, v.NC, v.N)
+	fmt.Printf("stdlib    %q %d %v %v %q %q %v %q %q %q\n", s.S, s.L, s.R, s.F, s.C, s.Ss, s.M, *s.P, s.NC, s.N)
+}
+`,
+		want: `lightning "critical" 7 1.5 true "chained" ["a" "b"] map[k:3] "pointee" "esc\"aped" ""
+stdlib    "critical" 7 1.5 true "chained" ["a" "b"] map[k:3] "pointee" "esc\"aped" ""
+`,
+	},
+	{
+		// A directive on a defined scalar type has nothing to govern; it is
+		// reported the way a directive on any other method-less declaration
+		// is, and the type still resolves where it is used.
+		name: "defined_scalar_type_directive_warns",
+		schema: `package main
+
+//lightning:compact
+type Sev string
+
+type Root struct {
+	S Sev "json:\"s\""
+}
+`,
+		wantWarn: []string{"a defined scalar type gets no UnmarshalJSON"},
+	},
+	{
 		// G1. namedStruct reserved its decoder name by writing g.used directly
 		// while every other emitter goes through g.uniq, so the anonymous struct
 		// behind the "item" field — reached second, and renamed by uniq only if

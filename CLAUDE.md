@@ -4324,6 +4324,28 @@ the v1 set, which is the wider one — every name it flags diverges on at least
 one supported toolchain. Read a fresh failure in one of these three as the
 stdlib moving again, not as a decoder bug.
 
+## Session 2026-09-08: the generator meets a real schema (Hugin's)
+
+Hugin (github.com/CombinationAB/Hugin) took v0.0.86's toolkit readers and
+then tried the generator on its record types, and each thing the generator
+could not take is a PR here, in the order Hugin needs them. What each one
+found:
+
+- **Defined scalar types were "unknown type".** `type Severity string` with
+  constants is the enum idiom, and a struct carrying one could not be
+  generated for at all — the field switch knew the built-in kinds by name.
+  Now `g.scalarTypes` registers every `type X <scalar>` (and `type X Y` over
+  one; `declaresScalar` resolves a forward reference at collection time,
+  `scalarKind` follows the chain at use), and `field` reads such a type
+  with the kind's own reader and stores through a conversion
+  (`scalarAs`, which `scalar` now wraps with an empty conversion). The
+  reader being the kind's own is what keeps the null rule (store the zero)
+  and the `nocopy` rule identical to the plain scalar's, which the probe
+  case pins against the methodless twin. The type gets no method — a
+  directive on it warns like any other method-less declaration — and it
+  is deliberately NOT counted by `isFlatScalarStringStruct`: that is a
+  presize heuristic, and a miscount there costs a resize, never a value.
+
 ## Session 2026-09-07: six toolkit PRs merged, then optimized
 
 Six PRs adding readers to `pkg/json` were merged and each one benchmarked and
