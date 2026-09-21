@@ -1,6 +1,6 @@
 # lightning main-module benchmarks
 
-- generated 2026-09-08T16:42:04Z
+- generated 2026-09-21T08:06:01Z
 - go version go1.26.8 linux/arm64
 - cpu: unknown (4 cores)
 
@@ -12,7 +12,7 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| — | 200.1 | — | 0 | 0 |
+| — | 198.0 | — | 0 | 0 |
 
 ## EscapeString
 
@@ -20,19 +20,19 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| short_clean | 30.1 | 531.86 MB/s | 16 | 1 |
-| sentence_clean | 37.8 | 1163.70 MB/s | 48 | 1 |
-| url_clean | 41.7 | 1246.14 MB/s | 64 | 1 |
-| log_line_clean | 122.7 | 2738.65 MB/s | 352 | 1 |
-| path_with_backslash | 118.6 | 311.92 MB/s | 56 | 2 |
-| json_in_json | 157.5 | 266.70 MB/s | 72 | 2 |
-| prose_with_quotes | 96.1 | 395.58 MB/s | 64 | 2 |
-| control_bytes | 116.6 | 205.78 MB/s | 56 | 2 |
-| mostly_clean_one_quote | 140.6 | 2169.43 MB/s | 320 | 1 |
-| unicode_clean | 278.0 | 848.91 MB/s | 240 | 1 |
-| unicode_with_quotes | 167.4 | 376.25 MB/s | 88 | 2 |
-| invalid_utf8_one_byte | 150.6 | 2025.60 MB/s | 320 | 1 |
-| invalid_utf8_dense | 650.3 | 184.54 MB/s | 456 | 3 |
+| short_clean | 29.9 | 535.59 MB/s | 16 | 1 |
+| sentence_clean | 37.8 | 1164.23 MB/s | 48 | 1 |
+| url_clean | 41.3 | 1257.95 MB/s | 64 | 1 |
+| log_line_clean | 119.9 | 2801.78 MB/s | 352 | 1 |
+| path_with_backslash | 114.0 | 324.69 MB/s | 56 | 2 |
+| json_in_json | 151.1 | 277.98 MB/s | 72 | 2 |
+| prose_with_quotes | 92.4 | 411.16 MB/s | 64 | 2 |
+| control_bytes | 110.0 | 218.28 MB/s | 56 | 2 |
+| mostly_clean_one_quote | 139.4 | 2187.95 MB/s | 320 | 1 |
+| unicode_clean | 273.4 | 863.09 MB/s | 240 | 1 |
+| unicode_with_quotes | 160.1 | 393.44 MB/s | 88 | 2 |
+| invalid_utf8_one_byte | 148.4 | 2054.57 MB/s | 320 | 1 |
+| invalid_utf8_dense | 621.3 | 193.15 MB/s | 456 | 3 |
 
 ## EscapeStringInto
 
@@ -40,19 +40,51 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| short_clean | 8.0 | 2009.78 MB/s | 0 | 0 |
-| sentence_clean | 15.2 | 2905.03 MB/s | 0 | 0 |
-| url_clean | 10.5 | 4947.24 MB/s | 0 | 0 |
-| log_line_clean | 33.1 | 10162.77 MB/s | 0 | 0 |
-| path_with_backslash | 52.0 | 712.04 MB/s | 0 | 0 |
-| json_in_json | 83.6 | 502.15 MB/s | 0 | 0 |
-| prose_with_quotes | 30.8 | 1234.98 MB/s | 0 | 0 |
-| control_bytes | 47.3 | 507.88 MB/s | 0 | 0 |
-| mostly_clean_one_quote | 35.1 | 8687.20 MB/s | 0 | 0 |
-| unicode_clean | 224.3 | 1052.07 MB/s | 0 | 0 |
-| unicode_with_quotes | 86.2 | 731.07 MB/s | 0 | 0 |
-| invalid_utf8_one_byte | 49.9 | 6111.21 MB/s | 0 | 0 |
-| invalid_utf8_dense | 438.5 | 273.65 MB/s | 0 | 0 |
+| short_clean | 7.5 | 2123.72 MB/s | 0 | 0 |
+| sentence_clean | 15.1 | 2924.05 MB/s | 0 | 0 |
+| url_clean | 10.6 | 4900.97 MB/s | 0 | 0 |
+| log_line_clean | 33.6 | 10010.88 MB/s | 0 | 0 |
+| path_with_backslash | 53.1 | 696.71 MB/s | 0 | 0 |
+| json_in_json | 84.2 | 498.72 MB/s | 0 | 0 |
+| prose_with_quotes | 31.2 | 1217.09 MB/s | 0 | 0 |
+| control_bytes | 45.4 | 528.12 MB/s | 0 | 0 |
+| mostly_clean_one_quote | 34.9 | 8730.85 MB/s | 0 | 0 |
+| unicode_clean | 224.9 | 1049.25 MB/s | 0 | 0 |
+| unicode_with_quotes | 86.2 | 730.58 MB/s | 0 | 0 |
+| invalid_utf8_one_byte | 49.9 | 6111.89 MB/s | 0 | 0 |
+| invalid_utf8_dense | 432.5 | 277.48 MB/s | 0 | 0 |
+
+## ValidEscapedStrings
+
+`github.com/JohanLindvall/lightning/pkg/json`
+
+| Case | ns/op | Throughput | B/op | allocs/op |
+|---|--:|--:|--:|--:|
+| clean/value | 47.2 | 19005.05 MB/s | 0 | 0 |
+| clean/key | 53.2 | 17007.65 MB/s | 0 | 0 |
+| single/value | 369.5 | 1390.90 MB/s | 0 | 0 |
+| single/key | 374.3 | 1391.94 MB/s | 0 | 0 |
+| unicode/value | 366.4 | 2101.65 MB/s | 0 | 0 |
+| unicode/key | 371.0 | 2094.44 MB/s | 0 | 0 |
+| surrogates/value | 366.5 | 2101.13 MB/s | 0 | 0 |
+| surrogates/key | 370.9 | 2095.00 MB/s | 0 | 0 |
+| mixed/value | 568.2 | 1298.79 MB/s | 0 | 0 |
+| mixed/key | 588.5 | 1265.93 MB/s | 0 | 0 |
+| sparse/value | 54.3 | 16627.63 MB/s | 0 | 0 |
+| sparse/key | 59.3 | 15336.03 MB/s | 0 | 0 |
+
+## DecodeAnyEscapedStrings
+
+`github.com/JohanLindvall/lightning/pkg/json`
+
+| Case | ns/op | Throughput | B/op | allocs/op |
+|---|--:|--:|--:|--:|
+| clean | 280.9 | 3197.06 MB/s | 912 | 2 |
+| single | 887.7 | 578.99 MB/s | 357 | 1 |
+| unicode | 966.0 | 797.07 MB/s | 1040 | 2 |
+| surrogates | 903.7 | 852.02 MB/s | 528 | 1 |
+| mixed | 1138.0 | 648.71 MB/s | 1040 | 2 |
+| sparse | 386.1 | 2339.00 MB/s | 1040 | 2 |
 
 ## GetManyPretty
 
@@ -60,7 +92,7 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| — | 2716.0 | 3697.49 MB/s | 0 | 0 |
+| — | 2709.0 | 3706.96 MB/s | 0 | 0 |
 
 ## GetPretty
 
@@ -68,7 +100,7 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| — | 2703.0 | 3714.49 MB/s | 0 | 0 |
+| — | 2698.0 | 3722.31 MB/s | 0 | 0 |
 
 ## ObjectEachPretty
 
@@ -76,7 +108,7 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| — | 2685.0 | 3739.03 MB/s | 0 | 0 |
+| — | 2696.0 | 3724.35 MB/s | 0 | 0 |
 
 ## StripDefaultsPretty
 
@@ -84,7 +116,7 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| — | 10524.0 | 954.08 MB/s | 0 | 0 |
+| — | 10341.0 | 970.98 MB/s | 0 | 0 |
 
 ## GetManyWithSkip
 
@@ -92,7 +124,7 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| — | 732.5 | 2472.26 MB/s | 0 | 0 |
+| — | 742.4 | 2439.25 MB/s | 0 | 0 |
 
 ## GetPathsWithSkip
 
@@ -100,7 +132,7 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| — | 1033.0 | 1753.54 MB/s | 0 | 0 |
+| — | 1059.0 | 1710.30 MB/s | 0 | 0 |
 
 ## UnescapeString
 
@@ -108,16 +140,16 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| short_clean | 2.7 | 5865.31 MB/s | 0 | 0 |
-| sentence_clean | 4.7 | 9324.54 MB/s | 0 | 0 |
-| url_clean | 4.7 | 11019.15 MB/s | 0 | 0 |
-| log_line_clean | 10.6 | 31642.93 MB/s | 0 | 0 |
-| path_escaped | 83.3 | 516.29 MB/s | 48 | 1 |
-| json_in_json | 109.3 | 494.24 MB/s | 64 | 1 |
-| prose_with_quotes | 70.1 | 584.65 MB/s | 48 | 1 |
-| unicode_heavy | 3.4 | 8816.31 MB/s | 0 | 0 |
-| unicode_escaped_dense | 295.8 | 649.10 MB/s | 192 | 1 |
-| mostly_clean_one_escape | 127.2 | 2405.71 MB/s | 320 | 1 |
+| short_clean | 2.6 | 6254.12 MB/s | 0 | 0 |
+| sentence_clean | 4.7 | 9284.59 MB/s | 0 | 0 |
+| url_clean | 4.7 | 10972.84 MB/s | 0 | 0 |
+| log_line_clean | 10.5 | 31960.45 MB/s | 0 | 0 |
+| path_escaped | 79.8 | 538.63 MB/s | 48 | 1 |
+| json_in_json | 106.9 | 505.30 MB/s | 64 | 1 |
+| prose_with_quotes | 66.8 | 614.04 MB/s | 48 | 1 |
+| unicode_heavy | 3.3 | 9225.94 MB/s | 0 | 0 |
+| unicode_escaped_dense | 294.6 | 651.63 MB/s | 192 | 1 |
+| mostly_clean_one_escape | 125.3 | 2441.60 MB/s | 320 | 1 |
 
 ## UnescapeStringInto
 
@@ -125,16 +157,16 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| short_clean | 3.2 | 4933.83 MB/s | 0 | 0 |
-| sentence_clean | 5.3 | 8290.23 MB/s | 0 | 0 |
-| url_clean | 5.3 | 9798.04 MB/s | 0 | 0 |
-| log_line_clean | 11.1 | 30373.56 MB/s | 0 | 0 |
-| path_escaped | 42.7 | 1007.86 MB/s | 0 | 0 |
-| json_in_json | 66.8 | 808.80 MB/s | 0 | 0 |
-| prose_with_quotes | 31.7 | 1293.94 MB/s | 0 | 0 |
-| unicode_heavy | 3.8 | 7823.08 MB/s | 0 | 0 |
-| unicode_escaped_dense | 221.0 | 868.74 MB/s | 0 | 0 |
-| mostly_clean_one_escape | 24.4 | 12531.00 MB/s | 0 | 0 |
+| short_clean | 3.1 | 5156.05 MB/s | 0 | 0 |
+| sentence_clean | 5.3 | 8290.78 MB/s | 0 | 0 |
+| url_clean | 5.3 | 9798.49 MB/s | 0 | 0 |
+| log_line_clean | 11.1 | 30367.80 MB/s | 0 | 0 |
+| path_escaped | 43.9 | 978.78 MB/s | 0 | 0 |
+| json_in_json | 68.4 | 789.39 MB/s | 0 | 0 |
+| prose_with_quotes | 32.7 | 1254.11 MB/s | 0 | 0 |
+| unicode_heavy | 3.8 | 7827.08 MB/s | 0 | 0 |
+| unicode_escaped_dense | 220.9 | 869.31 MB/s | 0 | 0 |
+| mostly_clean_one_escape | 24.4 | 12564.37 MB/s | 0 | 0 |
 
 ## ParseIntShapes
 
@@ -145,9 +177,9 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 | 1digit | 2.9 | — | 0 | 0 |
 | 3digit | 3.6 | — | 0 | 0 |
 | 5digit | 4.0 | — | 0 | 0 |
-| 10digit | 5.1 | — | 0 | 0 |
-| 13digit | 5.1 | — | 0 | 0 |
-| 16digit | 5.1 | — | 0 | 0 |
+| 10digit | 5.0 | — | 0 | 0 |
+| 13digit | 5.0 | — | 0 | 0 |
+| 16digit | 5.0 | — | 0 | 0 |
 | 19digit | 6.7 | — | 0 | 0 |
 | neg10digit | 5.0 | — | 0 | 0 |
 | 20digit_overflow | 6.7 | — | 0 | 0 |
@@ -170,12 +202,12 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| empty | 2.3 | — | 0 | 0 |
+| empty | 2.4 | — | 0 | 0 |
 | short | 3.4 | — | 0 | 0 |
 | medium | 4.1 | — | 0 | 0 |
 | long | 8.6 | — | 0 | 0 |
-| escaped | 37.5 | — | 8 | 1 |
-| notastring | 2.0 | — | 0 | 0 |
+| escaped | 37.8 | — | 8 | 1 |
+| notastring | 2.1 | — | 0 | 0 |
 
 ## BoolShapes
 
@@ -185,7 +217,7 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 |---|--:|--:|--:|--:|
 | true | 0.9 | — | 0 | 0 |
 | false | 1.1 | — | 0 | 0 |
-| null | 1.0 | — | 0 | 0 |
+| null | 0.9 | — | 0 | 0 |
 
 ## KindOfShapes
 
@@ -197,7 +229,7 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 | number | 1.8 | — | 0 | 0 |
 | object | 1.8 | — | 0 | 0 |
 | array | 1.8 | — | 0 | 0 |
-| null | 2.5 | — | 0 | 0 |
+| null | 2.6 | — | 0 | 0 |
 | true | 2.6 | — | 0 | 0 |
 | invalid | 2.1 | — | 0 | 0 |
 | ws_number | 2.7 | — | 0 | 0 |
@@ -208,11 +240,11 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| short | 15.8 | — | 8 | 1 |
-| medium | 28.9 | — | 32 | 1 |
-| long | 52.7 | — | 128 | 1 |
-| escaped | 34.9 | — | 8 | 1 |
-| long_late_escape | 102.5 | — | 144 | 1 |
+| short | 16.8 | — | 8 | 1 |
+| medium | 28.6 | — | 32 | 1 |
+| long | 50.8 | — | 128 | 1 |
+| escaped | 35.8 | — | 8 | 1 |
+| long_late_escape | 102.0 | — | 144 | 1 |
 
 ## ArrayEachIndexVsEach
 
@@ -220,8 +252,8 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| each | 1661.0 | 1325.38 MB/s | 0 | 0 |
-| index | 1720.0 | 1279.74 MB/s | 0 | 0 |
+| each | 1665.0 | 1321.74 MB/s | 0 | 0 |
+| index | 1786.0 | 1232.63 MB/s | 0 | 0 |
 
 ## ArrayEachIndexShapes
 
@@ -229,9 +261,9 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| scalars | 1720.0 | 1279.37 MB/s | 0 | 0 |
-| strings | 1047.0 | 2198.16 MB/s | 0 | 0 |
-| records | 991.4 | 2792.91 MB/s | 0 | 0 |
+| scalars | 1783.0 | 1234.58 MB/s | 0 | 0 |
+| strings | 1018.0 | 2261.37 MB/s | 0 | 0 |
+| records | 984.6 | 2812.25 MB/s | 0 | 0 |
 
 ## ErrStop
 
@@ -239,7 +271,7 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| — | 13.1 | — | 0 | 0 |
+| — | 13.3 | — | 0 | 0 |
 
 ## ParseInt
 
@@ -249,13 +281,57 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 |---|--:|--:|--:|--:|
 | — | 5.1 | — | 0 | 0 |
 
+## DecodeAnyArrays
+
+`github.com/JohanLindvall/lightning/pkg/json`
+
+| Case | ns/op | Throughput | B/op | allocs/op |
+|---|--:|--:|--:|--:|
+| numbers/0 | 6.5 | 308.29 MB/s | 0 | 0 |
+| numbers/1 | 103.9 | 86.59 MB/s | 48 | 3 |
+| numbers/4 | 240.6 | 137.13 MB/s | 120 | 6 |
+| numbers/16 | 653.1 | 197.52 MB/s | 408 | 18 |
+| numbers/17 | 730.4 | 187.56 MB/s | 672 | 19 |
+| numbers/256 | 9292.0 | 220.52 MB/s | 10904 | 261 |
+| numbers/4096 | 159470.0 | 205.49 MB/s | 272281 | 4107 |
+| strings/0 | 6.5 | 308.29 MB/s | 0 | 0 |
+| strings/1 | 132.9 | 135.42 MB/s | 72 | 4 |
+| strings/4 | 347.6 | 198.52 MB/s | 216 | 10 |
+| strings/16 | 1078.0 | 253.19 MB/s | 792 | 34 |
+| strings/17 | 1203.0 | 240.99 MB/s | 1080 | 36 |
+| strings/256 | 16719.0 | 260.36 MB/s | 17048 | 517 |
+| strings/4096 | 276299.0 | 252.02 MB/s | 370584 | 8203 |
+| records/0 | 6.5 | 308.28 MB/s | 0 | 0 |
+| records/1 | 592.7 | 72.55 MB/s | 488 | 12 |
+| records/4 | 2155.0 | 78.43 MB/s | 1880 | 42 |
+| records/16 | 8334.0 | 80.75 MB/s | 7448 | 162 |
+| records/17 | 8826.0 | 81.01 MB/s | 8152 | 172 |
+| records/256 | 130517.0 | 82.39 MB/s | 123544 | 2565 |
+| records/4096 | 2383313.0 | 72.18 MB/s | 2074534 | 40971 |
+
+## ValidShapes
+
+`github.com/JohanLindvall/lightning/pkg/json`
+
+| Case | ns/op | Throughput | B/op | allocs/op |
+|---|--:|--:|--:|--:|
+| scalar | 35.6 | 196.65 MB/s | 0 | 0 |
+| empty_object | 24.7 | 81.07 MB/s | 0 | 0 |
+| record | 923.1 | 1961.78 MB/s | 0 | 0 |
+| pretty_record | 1023.0 | 2011.37 MB/s | 0 | 0 |
+| records | 2218.0 | 1248.45 MB/s | 0 | 0 |
+| strings | 847.0 | 2716.67 MB/s | 0 | 0 |
+| numbers | 3654.0 | 602.33 MB/s | 0 | 0 |
+| escapes | 2351.0 | 1446.33 MB/s | 0 | 0 |
+| deep | 533.8 | 481.49 MB/s | 0 | 0 |
+
 ## String
 
 `github.com/JohanLindvall/lightning/pkg/json`
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| — | 3.9 | — | 0 | 0 |
+| — | 4.0 | — | 0 | 0 |
 
 ## Set
 
@@ -263,11 +339,11 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| append | 63.2 | — | 0 | 0 |
-| append_empty | 18.2 | — | 0 | 0 |
-| replace | 47.4 | — | 0 | 0 |
-| create_nested | 41.2 | — | 0 | 0 |
-| overwrite_nonobject | 48.7 | — | 0 | 0 |
+| append | 63.1 | — | 0 | 0 |
+| append_empty | 18.0 | — | 0 | 0 |
+| replace | 47.0 | — | 0 | 0 |
+| create_nested | 41.4 | — | 0 | 0 |
+| overwrite_nonobject | 49.8 | — | 0 | 0 |
 
 ## SetMany
 
@@ -275,7 +351,7 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| — | 109.2 | — | 0 | 0 |
+| — | 108.3 | — | 0 | 0 |
 
 ## SetPaths
 
@@ -283,7 +359,7 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| — | 284.7 | — | 0 | 0 |
+| — | 281.8 | — | 0 | 0 |
 
 ## SetManyEarlyExit
 
@@ -291,7 +367,7 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| — | 98.7 | — | 0 | 0 |
+| — | 104.9 | — | 0 | 0 |
 
 ## SetPathsEarlyExit
 
@@ -299,7 +375,7 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| — | 131.8 | — | 0 | 0 |
+| — | 138.2 | — | 0 | 0 |
 
 ## StreamMatrix
 
@@ -307,10 +383,10 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| readall+walk | 482256.0 | 2293.93 MB/s | 2293536 | 25 |
-| stream | 237182.0 | 4664.19 MB/s | 67136 | 5 |
-| stream_reused | 199986.0 | 5531.69 MB/s | 35 | 1 |
-| stream_points | 1418113.0 | 780.09 MB/s | 67136 | 5 |
+| readall+walk | 454417.0 | 2434.47 MB/s | 2293536 | 25 |
+| stream | 231773.0 | 4773.05 MB/s | 67136 | 5 |
+| stream_reused | 202917.0 | 5451.79 MB/s | 35 | 1 |
+| stream_points | 1406521.0 | 786.52 MB/s | 67136 | 5 |
 
 ## StreamShapes
 
@@ -318,15 +394,15 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| scalars/inmemory | 17042.0 | 1291.02 MB/s | 0 | 0 |
-| scalars/stream | 27129.0 | 810.99 MB/s | 67120 | 4 |
-| scalars/stream_reused | 18546.0 | 1186.26 MB/s | 32 | 1 |
-| strings/inmemory | 10394.0 | 2212.92 MB/s | 0 | 0 |
-| strings/stream | 20645.0 | 1114.10 MB/s | 67120 | 4 |
-| strings/stream_reused | 12216.0 | 1882.80 MB/s | 32 | 1 |
-| records/inmemory | 9828.0 | 2869.29 MB/s | 0 | 0 |
-| records/stream | 19825.0 | 1422.34 MB/s | 67120 | 4 |
-| records/stream_reused | 10990.0 | 2565.74 MB/s | 32 | 1 |
+| strings/inmemory | 10471.0 | 2196.66 MB/s | 0 | 0 |
+| strings/stream | 20115.0 | 1143.48 MB/s | 67120 | 4 |
+| strings/stream_reused | 12213.0 | 1883.36 MB/s | 32 | 1 |
+| records/inmemory | 9906.0 | 2846.65 MB/s | 0 | 0 |
+| records/stream | 19945.0 | 1413.78 MB/s | 67120 | 4 |
+| records/stream_reused | 11013.0 | 2560.36 MB/s | 32 | 1 |
+| scalars/inmemory | 17113.0 | 1285.65 MB/s | 0 | 0 |
+| scalars/stream | 28160.0 | 781.28 MB/s | 67120 | 4 |
+| scalars/stream_reused | 19642.0 | 1120.12 MB/s | 32 | 1 |
 
 ## StreamSkipToKey
 
@@ -334,7 +410,7 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| — | 199038.0 | 4415.86 MB/s | 67136 | 5 |
+| — | 199218.0 | 4411.88 MB/s | 67136 | 5 |
 
 ## StreamObjectEach
 
@@ -342,8 +418,8 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| stream | 989.0 | 1320.46 MB/s | 32 | 1 |
-| inmemory | 794.2 | 1644.47 MB/s | 0 | 0 |
+| stream | 986.7 | 1323.57 MB/s | 32 | 1 |
+| inmemory | 799.1 | 1634.34 MB/s | 0 | 0 |
 
 ## StreamDescent
 
@@ -351,9 +427,9 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| get | 2086.0 | 1729.52 MB/s | 32 | 1 |
-| arrayeach | 2102.0 | 1715.60 MB/s | 32 | 1 |
-| inmemory | 1587.0 | 2272.66 MB/s | 0 | 0 |
+| get | 2129.0 | 1694.60 MB/s | 32 | 1 |
+| arrayeach | 2102.0 | 1716.01 MB/s | 32 | 1 |
+| inmemory | 1594.0 | 2262.98 MB/s | 0 | 0 |
 
 ## StreamLargeElements
 
@@ -361,7 +437,7 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| — | 291924.0 | 4080.73 MB/s | 69 | 1 |
+| — | 291296.0 | 4089.53 MB/s | 69 | 1 |
 
 ## StripDefaults
 
@@ -369,7 +445,7 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| — | 1955.0 | 1415.09 MB/s | 0 | 0 |
+| — | 1986.0 | 1393.04 MB/s | 0 | 0 |
 
 ## StripDefaultsCompact
 
@@ -377,7 +453,7 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| — | 1878.0 | 1472.54 MB/s | 0 | 0 |
+| — | 1912.0 | 1446.88 MB/s | 0 | 0 |
 
 ## UnescapeStringCopy
 
@@ -385,7 +461,7 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| — | 28.4 | — | 32 | 1 |
+| — | 27.9 | — | 32 | 1 |
 
 ## Valid
 
@@ -393,7 +469,7 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| — | 222.8 | 834.73 MB/s | 0 | 0 |
+| — | 209.7 | 886.96 MB/s | 0 | 0 |
 
 ## ArrayEachStrings
 
@@ -401,7 +477,7 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| — | 1033.0 | 2226.58 MB/s | 0 | 0 |
+| — | 1019.0 | 2258.81 MB/s | 0 | 0 |
 
 ## ObjectEachRecord
 
@@ -409,7 +485,7 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| — | 814.7 | 2222.96 MB/s | 0 | 0 |
+| — | 818.5 | 2212.68 MB/s | 0 | 0 |
 
 ## ObjectEachRecordCompact
 
@@ -417,7 +493,7 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| — | 808.4 | 2240.09 MB/s | 0 | 0 |
+| — | 822.8 | 2201.07 MB/s | 0 | 0 |
 
 ## ObjectEachNested
 
@@ -425,7 +501,7 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| — | 822.9 | 2200.64 MB/s | 0 | 0 |
+| — | 821.0 | 2205.96 MB/s | 0 | 0 |
 
 ## ArrayEachRecords
 
@@ -433,7 +509,7 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| — | 987.3 | 2804.65 MB/s | 0 | 0 |
+| — | 990.9 | 2794.35 MB/s | 0 | 0 |
 
 ## ArrayEachScalars
 
@@ -441,7 +517,7 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| — | 1660.0 | 1325.63 MB/s | 0 | 0 |
+| — | 1661.0 | 1324.94 MB/s | 0 | 0 |
 
 ## ArrayEachSeries
 
@@ -449,7 +525,7 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| — | 2752.0 | 481.49 MB/s | 0 | 0 |
+| — | 2674.0 | 495.52 MB/s | 0 | 0 |
 
 ## DecodeSmallSlices
 
@@ -457,8 +533,8 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| plain | 88.2 | — | 24 | 1 |
-| arena | 79.8 | — | 24 | 0 |
+| plain | 87.9 | — | 24 | 1 |
+| arena | 78.8 | — | 24 | 0 |
 
 ## EscapeScratch
 
@@ -467,7 +543,7 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
 | carve | 23.8 | — | 64 | 0 |
-| make | 47.4 | — | 64 | 1 |
+| make | 46.2 | — | 64 | 1 |
 
 ## DecodeIntSliceRun
 
@@ -475,11 +551,11 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| scalar/sep"," | 23014.0 | 853.05 MB/s | 0 | 0 |
-| kernel/sep"," | 8042.0 | 2441.14 MB/s | 0 | 0 |
-| scalar/sep",_" | 25375.0 | 931.28 MB/s | 0 | 0 |
-| kernel/sep",_" | 11096.0 | 2129.67 MB/s | 0 | 0 |
-| kernel-only | 8031.0 | 2444.57 MB/s | 0 | 0 |
+| scalar/sep"," | 23700.0 | 828.37 MB/s | 0 | 0 |
+| kernel/sep"," | 8539.0 | 2299.23 MB/s | 0 | 0 |
+| scalar/sep",_" | 25908.0 | 912.12 MB/s | 0 | 0 |
+| kernel/sep",_" | 11020.0 | 2144.35 MB/s | 0 | 0 |
+| kernel-only | 8571.0 | 2290.46 MB/s | 0 | 0 |
 
 ## ParseIntRunShapes
 
@@ -487,13 +563,13 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| "1," | 6995.0 | 1155.04 MB/s | 0 | 0 |
-| "12," | 6551.0 | 1843.90 MB/s | 0 | 0 |
-| "123," | 6912.0 | 2326.33 MB/s | 0 | 0 |
-| "1234," | 8119.0 | 2473.20 MB/s | 0 | 0 |
-| "123456," | 8463.0 | 3317.86 MB/s | 0 | 0 |
-| "1234567," | 8270.0 | 3878.95 MB/s | 0 | 0 |
-| "1234,_" | 10694.0 | 2251.63 MB/s | 0 | 0 |
+| "1," | 7582.0 | 1065.71 MB/s | 0 | 0 |
+| "12," | 7222.0 | 1672.61 MB/s | 0 | 0 |
+| "123," | 7537.0 | 2133.44 MB/s | 0 | 0 |
+| "1234," | 8169.0 | 2458.06 MB/s | 0 | 0 |
+| "123456," | 8698.0 | 3228.31 MB/s | 0 | 0 |
+| "1234567," | 8528.0 | 3761.82 MB/s | 0 | 0 |
+| "1234,_" | 10788.0 | 2232.06 MB/s | 0 | 0 |
 
 ## ParseIntUnstable
 
@@ -505,9 +581,9 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 | d03 | 3.5 | — | 0 | 0 |
 | d05 | 3.9 | — | 0 | 0 |
 | d08 | 3.9 | — | 0 | 0 |
-| d10 | 5.0 | — | 0 | 0 |
-| d13 | 5.0 | — | 0 | 0 |
-| d16 | 5.0 | — | 0 | 0 |
+| d10 | 5.1 | — | 0 | 0 |
+| d13 | 5.1 | — | 0 | 0 |
+| d16 | 5.1 | — | 0 | 0 |
 | d19 | 6.7 | — | 0 | 0 |
 | d20 | 7.1 | — | 0 | 0 |
 
@@ -517,12 +593,12 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| numbers/whole | 191.9 | 43796.01 MB/s | 0 | 0 |
-| numbers/4k | 219.3 | 38317.42 MB/s | 0 | 0 |
-| records/whole | 12209.0 | 754.26 MB/s | 0 | 0 |
-| records/4k | 12239.0 | 752.45 MB/s | 0 | 0 |
-| strings/whole | 5221.0 | 2146.05 MB/s | 0 | 0 |
-| strings/4k | 5249.0 | 2134.54 MB/s | 0 | 0 |
+| records/whole | 12183.0 | 755.87 MB/s | 0 | 0 |
+| records/4k | 12219.0 | 753.64 MB/s | 0 | 0 |
+| strings/whole | 5303.0 | 2112.84 MB/s | 0 | 0 |
+| strings/4k | 5316.0 | 2107.74 MB/s | 0 | 0 |
+| numbers/whole | 192.3 | 43696.39 MB/s | 0 | 0 |
+| numbers/4k | 219.5 | 38274.42 MB/s | 0 | 0 |
 
 ## ScanFloatShapes
 
@@ -530,10 +606,10 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| slow | 428.8 | — | 0 | 0 |
-| canada | 312.1 | — | 0 | 0 |
-| mesh | 271.5 | — | 0 | 0 |
-| array | 223.7 | — | 0 | 0 |
+| slow | 460.1 | — | 0 | 0 |
+| canada | 333.9 | — | 0 | 0 |
+| mesh | 272.0 | — | 0 | 0 |
+| array | 223.5 | — | 0 | 0 |
 
 ## ScanFloatSlowShapes
 
@@ -541,10 +617,10 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| slow | 499.1 | — | 0 | 0 |
-| canada | 410.2 | — | 0 | 0 |
-| mesh | 291.5 | — | 0 | 0 |
-| array | 262.6 | — | 0 | 0 |
+| slow | 459.3 | — | 0 | 0 |
+| canada | 409.7 | — | 0 | 0 |
+| mesh | 292.5 | — | 0 | 0 |
+| array | 261.4 | — | 0 | 0 |
 
 ## SkipBlocksVariant
 
@@ -552,12 +628,12 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| stringObj/goloop | 4304.0 | 5575.42 MB/s | 0 | 0 |
-| numberObj/goloop | 1776.0 | 5740.69 MB/s | 0 | 0 |
-| nestedMixed/goloop | 2379.0 | 4539.86 MB/s | 0 | 0 |
-| stringObj/neon | 2819.0 | 8511.61 MB/s | 0 | 0 |
-| numberObj/neon | 1195.0 | 8532.00 MB/s | 0 | 0 |
-| nestedMixed/neon | 1596.0 | 6768.67 MB/s | 0 | 0 |
+| stringObj/goloop | 4267.0 | 5623.57 MB/s | 0 | 0 |
+| numberObj/goloop | 1776.0 | 5740.96 MB/s | 0 | 0 |
+| nestedMixed/goloop | 2405.0 | 4491.49 MB/s | 0 | 0 |
+| stringObj/neon | 2821.0 | 8507.17 MB/s | 0 | 0 |
+| numberObj/neon | 1195.0 | 8533.34 MB/s | 0 | 0 |
+| nestedMixed/neon | 1588.0 | 6802.17 MB/s | 0 | 0 |
 
 ## SkipContainer
 
@@ -565,14 +641,14 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| stringObj/current | 11940.0 | 2009.84 MB/s | 0 | 0 |
-| stringObj/dispatch | 2820.0 | 8510.41 MB/s | 0 | 0 |
-| numberObj/current | 4456.0 | 2288.62 MB/s | 0 | 0 |
-| numberObj/dispatch | 1196.0 | 8526.73 MB/s | 0 | 0 |
-| numberArr/current | 150.5 | 43847.37 MB/s | 0 | 0 |
-| numberArr/dispatch | 156.2 | 42273.12 MB/s | 0 | 0 |
-| nestedMixed/current | 16065.0 | 672.33 MB/s | 0 | 0 |
-| nestedMixed/dispatch | 1597.0 | 6762.20 MB/s | 0 | 0 |
+| stringObj/current | 11961.0 | 2006.36 MB/s | 0 | 0 |
+| stringObj/dispatch | 2821.0 | 8505.77 MB/s | 0 | 0 |
+| numberObj/current | 4419.0 | 2307.74 MB/s | 0 | 0 |
+| numberObj/dispatch | 1196.0 | 8528.00 MB/s | 0 | 0 |
+| numberArr/current | 150.8 | 43776.55 MB/s | 0 | 0 |
+| numberArr/dispatch | 156.7 | 42135.60 MB/s | 0 | 0 |
+| nestedMixed/current | 15956.0 | 676.91 MB/s | 0 | 0 |
+| nestedMixed/dispatch | 1591.0 | 6790.76 MB/s | 0 | 0 |
 
 ## SkipSmall
 
@@ -580,10 +656,10 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| pair | 18.5 | 973.58 MB/s | 0 | 0 |
-| record | 13.6 | 3979.25 MB/s | 0 | 0 |
-| tiny | 13.6 | 515.66 MB/s | 0 | 0 |
-| twoBlock | 21.0 | 4182.89 MB/s | 0 | 0 |
+| pair | 18.2 | 987.88 MB/s | 0 | 0 |
+| record | 13.6 | 3966.39 MB/s | 0 | 0 |
+| tiny | 13.6 | 515.59 MB/s | 0 | 0 |
+| twoBlock | 21.0 | 4181.79 MB/s | 0 | 0 |
 
 ## SkipSmallScalar
 
@@ -591,7 +667,7 @@ The Benchmark* functions in the lightning module itself (`pkg/json`, `pkg/unstab
 
 | Case | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| pair | 16.3 | 1106.09 MB/s | 0 | 0 |
-| record | 43.8 | 1233.33 MB/s | 0 | 0 |
-| tiny | 13.3 | 527.93 MB/s | 0 | 0 |
-| twoBlock | 25.1 | 3506.24 MB/s | 0 | 0 |
+| pair | 16.2 | 1112.53 MB/s | 0 | 0 |
+| record | 43.5 | 1240.17 MB/s | 0 | 0 |
+| tiny | 13.3 | 527.75 MB/s | 0 | 0 |
+| twoBlock | 25.3 | 3477.52 MB/s | 0 | 0 |
