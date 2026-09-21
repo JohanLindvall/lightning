@@ -5,6 +5,11 @@ import (
 	"strconv"
 )
 
+// An empty array has no mutable backing. Reusing its boxed slice header avoids
+// a heap allocation per [] while preserving a non-nil []any with zero capacity;
+// appending to a returned slice always allocates its own backing.
+var emptyAnyArray any = []any{}
+
 // DecodeValue decodes an arbitrary JSON value at data[i] into the standard Go
 // representation (nil, bool, float64, string, []any, map[string]any).
 //
@@ -187,44 +192,55 @@ func decodeAnyArray(data []byte, i int, compact, number bool, depth int) (any, i
 		return nil, i, ErrMaxDepth
 	}
 	// data[i] == '['
-	i++
-	a := []any{}
-	// Trailing commas ([1,]) are rejected by the first-iteration flag, as in
-	// decodeAnyObject.
-	for first := true; ; first = false {
-		i = SkipWSCompact(data, i, compact)
-		if uint(i) >= uint(len(data)) {
-			return nil, i, ErrTruncated
-		}
-		if data[i] == ']' {
-			if first {
-				return a, i + 1, nil
-			}
-			return nil, i, ErrInvalidJSON
-		}
+	i = SkipWSCompact(data, i+1, compact)
+	if uint(i) >= uint(len(data)) {
+		return nil, i, ErrTruncated
+	}
+	if data[i] == ']' {
+		return emptyAnyArray, i + 1, nil
+	}
+	// Buffer the first few elements on the stack so short arrays get an exact
+	// backing instead of retaining the 16-element growth hint. Keep this buffer
+	// separate from a: returning a slice of it would move the buffer to the heap,
+	// adding an allocation even to long arrays.
+	var small [16]any
+	var a []any
+	nsmall := 0
+	for {
 		val, end, err := decodeValue(data, i, compact, number, depth)
 		if err != nil {
 			return nil, end, err
 		}
-		if cap(a) == 0 {
-			// First element: the same ~256-byte static first-append capacity
-			// hint the generated decoders use for un-presized slices (16-byte
-			// `any` elements → 16), instead of append growing 1→2→4→…. `[]`
-			// never reaches this point, so it still returns the non-nil empty
-			// slice above; a longer array regrows exactly as before.
-			a = make([]any, 0, 16)
+		if len(a) != 0 {
+			a = append(a, val)
+		} else if nsmall < len(small) {
+			small[nsmall] = val
+			nsmall++
+		} else {
+			a = make([]any, len(small)+1, 2*len(small))
+			copy(a, small[:])
+			a[len(small)] = val
 		}
-		a = append(a, val)
 		i = SkipWSCompact(data, end, compact)
 		if uint(i) >= uint(len(data)) {
 			return nil, i, ErrTruncated
 		}
 		if data[i] == ']' {
+			if len(a) == 0 {
+				a = make([]any, nsmall)
+				copy(a, small[:nsmall])
+			}
 			return a, i + 1, nil
 		}
 		if data[i] != ',' {
 			return nil, i, ErrInvalidJSON
 		}
-		i++
+		i = SkipWSCompact(data, i+1, compact)
+		if uint(i) >= uint(len(data)) {
+			return nil, i, ErrTruncated
+		}
+		if data[i] == ']' {
+			return nil, i, ErrInvalidJSON // trailing comma
+		}
 	}
 }

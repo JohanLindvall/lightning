@@ -5553,3 +5553,32 @@ golang_source −4.57%, payload_small −2.96%, citm_catalog −2.02%, twitteres
   and **−1.37%** at the default alignment, and `mesh` — which has no string
   field at all — moves 1.6% between the two. Take `perf stat` N/3N differencing
   first; it is one command and it is the only number that survives a rebuild.
+
+## Neoverse N2 dynamic-array and validation pass (2026-09-21)
+
+Full measurements, reproduction commands, and retained tradeoffs are in
+[`bench/performance_2026-09-21.md`](bench/performance_2026-09-21.md).
+
+- **Dynamic short arrays now use stack scratch before allocating.** The old
+  `decodeAnyArray` 16-element first-append hint reserved 256 bytes even for a
+  two-number coordinate. The reader buffers up to 16 values in a local `[16]any`,
+  copies into an exactly sized backing at the close, and transfers to capacity
+  32 on element 17. Keep the scratch separate from the returned slice so it
+  cannot escape. Pinned interleaved n=8: dynamic canada -29.6% time / -64.8%
+  B/op, large-json -14.4% / -38.7%, marine_ik -11.4% / -24.0%, citm -7.2% /
+  -9.5%. An exactly 16-number micro pays +5.3% time without saving bytes; this
+  tradeoff is measured and recorded, not a universal speedup claim.
+- **An empty dynamic array needs no allocation.** `emptyAnyArray` is a shared
+  boxed non-nil slice with zero capacity. The caller can only append into a new
+  backing, so this preserves ownership while removing the 24-byte box per `[]`.
+  Keep the empty return before scratch initialization. The array loop checks
+  for a trailing comma after the comma; its old first-iteration flag is gone.
+  This loop change was measured on the dynamic reader, not the generated loops
+  whose rotation was rejected above. All four dynamic-reader modes, truncated
+  inputs, ownership, scratch boundaries, and trailing commas have regression tests.
+- **Validation scans clean keys and strings in its own frame.** Only an escape
+  calls `strictStringEscaped`, resuming at the first backslash without rescanning
+  the prefix. Record checks improve 6-11%, still zero allocation; the flat-record
+  counter drops 15.5% in instructions. Pure-string timing changes sign with
+  function alignment, so it is not a throughput claim. Caching the current
+  container kind was tried and removed: deep validation slowed 25%.

@@ -38,7 +38,7 @@ const strictStackWords = MaxDepth/64 + 1
 // parallel reimplementation: numbers go through ReadFloat64OrNull (the exact
 // tier chain decodeValue uses, overflow behavior included). Strings are the
 // exception — the decoder's reader unescapes, and so allocates — and are checked
-// by strictString.
+// by an inline scan and strictStringEscaped.
 //
 // The three labels are the parser's states: scanValue wants a value, scanKey
 // wants a member's "key": prefix, and scanAfter has just finished a value and
@@ -89,7 +89,15 @@ scanValue:
 		}
 		goto scanValue
 	case '"':
-		if i, err = strictString(data, i); err != nil {
+		// Keep the common clean-string scan in this frame. Only an escape
+		// needs the validating loop, which resumes at the backslash.
+		i = indexCloseOrEscapeAt(data, i+1)
+		if uint(i) >= uint(n) {
+			return i, ErrTruncated
+		}
+		if data[i] == '"' {
+			i++
+		} else if i, err = strictStringEscaped(data, i); err != nil {
 			return i, err
 		}
 	case 't':
@@ -172,7 +180,13 @@ scanKey:
 	if data[i] != '"' {
 		return i, ErrInvalidJSON
 	}
-	if i, err = strictString(data, i); err != nil {
+	i = indexCloseOrEscapeAt(data, i+1)
+	if uint(i) >= uint(n) {
+		return i, ErrTruncated
+	}
+	if data[i] == '"' {
+		i++
+	} else if i, err = strictStringEscaped(data, i); err != nil {
 		return i, err
 	}
 	i = SkipWS(data, i)
@@ -188,8 +202,9 @@ func hasLiteral(data []byte, i int, lit string) bool {
 	return i+len(lit) <= len(data) && string(data[i:i+len(lit)]) == lit
 }
 
-// strictString checks the quoted string starting at data[i] (which is '"') and
-// returns the offset just past its closing quote.
+// strictStringEscaped checks a string from its first backslash at data[i] and
+// returns the offset just past its closing quote. The caller has already scanned
+// the clean prefix, so escaped strings do not pay to scan that prefix again.
 //
 // It mirrors what the decoder's string readers accept without unescaping (and so
 // without their scratch allocation): the literal runs are crossed with the same
@@ -198,16 +213,8 @@ func hasLiteral(data []byte, i int, lit string) bool {
 // escape is checked against the set decodeEscaped decodes: the eight single-byte
 // forms and \u with four hex digits. Surrogate pairing is not checked, matching
 // the decoder, which maps an unpaired half to U+FFFD instead of failing.
-func strictString(data []byte, i int) (int, error) {
-	i++ // opening quote
+func strictStringEscaped(data []byte, i int) (int, error) {
 	for {
-		i = indexCloseOrEscapeAt(data, i)
-		if uint(i) >= uint(len(data)) {
-			return i, ErrTruncated // unterminated: ran out before a closing quote
-		}
-		if data[i] == '"' {
-			return i + 1, nil
-		}
 		// data[i] == '\\'
 		i++
 		if uint(i) >= uint(len(data)) {
@@ -229,6 +236,13 @@ func strictString(data []byte, i int) (int, error) {
 			i += 5
 		default:
 			return i, ErrBadEscape // unknown escape
+		}
+		i = indexCloseOrEscapeAt(data, i)
+		if uint(i) >= uint(len(data)) {
+			return i, ErrTruncated // unterminated: ran out before a closing quote
+		}
+		if data[i] == '"' {
+			return i + 1, nil
 		}
 	}
 }
