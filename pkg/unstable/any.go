@@ -65,14 +65,17 @@ func decodeValue(data []byte, i int, compact, number bool, depth int) (any, int,
 		// body is free, while the common clean string skips the non-inlined
 		// ReadStringOrNull call — only the SIMD scan itself remains
 		// (indexCloseOrEscape inlines here). The any path always copies, so
-		// string(data[i+1:e]) builds the same value; an escaped or truncated
-		// string falls back to ReadStringOrNull, whose error identities and
-		// positions are unchanged (it re-checks data[i] == '"' and takes its
-		// existing escaped/truncated paths).
-		if e := indexCloseOrEscapeAt(data, i+1); uint(e) < uint(len(data)) && data[e] == '"' {
+		// string(data[i+1:e]) builds the same value. An escape continues at
+		// the position already found rather than rescanning the clean prefix
+		// inside ReadStringOrNull.
+		e := indexCloseOrEscapeAt(data, i+1)
+		if uint(e) >= uint(len(data)) {
+			return "", len(data), ErrTruncated
+		}
+		if data[e] == '"' {
 			return string(data[i+1 : e]), e + 1, nil
 		}
-		s, end, err := ReadStringOrNull(data, i)
+		s, end, err := decodeStringEscaped(data, i+1, e)
 		return s, end, err
 	case '{':
 		return decodeAnyObject(data, i, compact, number, depth+1)

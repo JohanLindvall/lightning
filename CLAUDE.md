@@ -5582,3 +5582,16 @@ Full measurements, reproduction commands, and retained tradeoffs are in
   counter drops 15.5% in instructions. Pure-string timing changes sign with
   function alignment, so it is not a throughput claim. Caching the current
   container kind was tried and removed: deep validation slowed 25%.
+
+## Meteor Lake escape-validation pass (2026-09-21)
+
+See [`bench/performance_2026-09-21_amd64.md`](bench/performance_2026-09-21_amd64.md)
+for the profiles, measurements and correctness checks. `strictStringEscaped`
+shares the decoder's escape tables and skips the literal-run scan when already
+at a backslash or quote. The hex check ORs four `hexNibble` entries: validation
+needs the bit-16 invalid marker, not a decoded code point. Preserve its error
+offset at the `u`, including truncated escapes; `readUnicodeEscape` reports a
+different offset. A scalar differential oracle and fuzz test lock this behavior.
+`decodeValue` also continues from the first escape directly instead of rescanning
+the clean prefix through `ReadStringOrNull`. Corpus generated/dynamic decoder
+timings remain flat; the large gain is in escape-heavy validation.

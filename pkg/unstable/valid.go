@@ -220,24 +220,27 @@ func strictStringEscaped(data []byte, i int) (int, error) {
 		if uint(i) >= uint(len(data)) {
 			return i, ErrTruncated
 		}
-		switch data[i] {
-		case '"', '\\', '/', 'b', 'f', 'n', 'r', 't':
+		if unescByte[data[i]] != 0 {
 			i++
-		case 'u':
+		} else if data[i] == 'u' {
 			hex := data[i+1:]
 			if len(hex) < 4 {
 				return i, ErrTruncated
 			}
-			for _, c := range hex[:4] {
-				if !isHexDigit(c) {
-					return i, ErrBadUnicode
-				}
+			// Only validity matters here: OR the decoder's nibble entries
+			// without assembling a code point. Any non-hex byte sets bit 16.
+			if hexNibble[hex[0]]|hexNibble[hex[1]]|hexNibble[hex[2]]|hexNibble[hex[3]] >= 1<<16 {
+				return i, ErrBadUnicode
 			}
 			i += 5
-		default:
+		} else {
 			return i, ErrBadEscape // unknown escape
 		}
-		i = indexCloseOrEscapeAt(data, i)
+		// Consecutive escapes and the closing quote have no literal run.
+		// Avoid entering the scanner just to find the byte already at i.
+		if uint(i) < uint(len(data)) && data[i] != '\\' && data[i] != '"' {
+			i = indexCloseOrEscapeAt(data, i)
+		}
 		if uint(i) >= uint(len(data)) {
 			return i, ErrTruncated // unterminated: ran out before a closing quote
 		}
@@ -245,8 +248,4 @@ func strictStringEscaped(data []byte, i int) (int, error) {
 			return i + 1, nil
 		}
 	}
-}
-
-func isHexDigit(c byte) bool {
-	return c-'0' < 10 || (c|0x20)-'a' < 6
 }
