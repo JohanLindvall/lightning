@@ -287,7 +287,7 @@ func TestStdlibTwinsAreReflectionOnly(t *testing.T) {
 		compactDocStd{}, compactPlainStd{}, rawNullDocStd{},
 		arenaDocStd{}, ptrReuseStd{}, byteSliceDocStd{},
 		nullDocStd{}, nullLaxDocStd{}, pointListStd{}, scoreMapStd{},
-		noCopyListStd{}, byteBlobStd{},
+		noCopyListStd{}, byteBlobStd{}, geoDocStd{}, pointRingStd{},
 	}
 	unmarshaler := reflect.TypeOf((*json.Unmarshaler)(nil)).Elem()
 	stdlibOwned := map[reflect.Type]bool{

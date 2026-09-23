@@ -12,7 +12,7 @@ import (
 func indexQuoteOrBackslashSSE2(b []byte, i int) int
 
 //go:noescape
-func indexStructuralAVX2(b []byte) int
+func indexStructuralAVX2(b []byte, i int) int
 
 //go:noescape
 func indexEscapeSSE2(b []byte) int
@@ -21,6 +21,13 @@ func indexEscapeSSE2(b []byte) int
 func indexEscapeNonASCIISSE2(b []byte) int
 
 var useAVX2 = cpu.X86.HasAVX2
+
+// useStructural512 selects indexStructuralAVX2's AVX-512 VBMI body: VPERMB is
+// what lets one table lookup and one compare classify all five structural
+// bytes exactly (see structPerm in simd_amd64.s), and BW supplies the byte
+// compare into a mask register and the masked tail load. The gate is read in
+// the assembly, so the Go dispatch stays a single call.
+var useStructural512 = useAVX2 && cpu.X86.HasAVX512F && cpu.X86.HasAVX512BW && cpu.X86.HasAVX512VBMI && cpu.X86.HasBMI2
 
 // indexEscape returns the index of the first byte that JSON string encoding must
 // escape — a control byte < 0x20, '"' or '\\' — or len(b) if none. It is a single
@@ -99,17 +106,29 @@ func indexStructural(b []byte) int { return indexStructuralAt(b, 0) }
 // one reslice left is on the path where the first structuralPrescan bytes hold
 // no structural byte at all, where an assembly call is about to be paid anyway.
 func indexStructuralAt(b []byte, i int) int {
-	if !useAVX2 || len(b)-i < 32 {
+	if !useAVX2 {
 		return i + indexStructuralScalar(b[i:])
 	}
 	// The prescan is two SWAR words rather than sixteen byte compares; see
-	// structuralMask. Both loads are unchecked because the guard above has
-	// already established structuralPrescan+16 bytes past i.
-	if m := structuralMask(load64(b, i)); m != 0 {
-		return i + bits.TrailingZeros64(m)>>3
+	// structuralMask. Both loads are unchecked because the guard has already
+	// established structuralPrescan bytes past i. The assembly takes any
+	// remainder after it — its tails are an overlapping block (AVX2) or a
+	// masked load (VBMI) — where this used to fall back to the byte loop below
+	// 32 bytes, at five compares a byte: a 40-byte scan cost 21 ns and now
+	// costs 6. Under structuralPrescan bytes only the masked load beats the
+	// byte loop; the AVX2 body would load four splats and pay a VZEROUPPER to
+	// classify at most fifteen bytes.
+	if uint(i)+structuralPrescan <= uint(len(b)) {
+		if m := structuralMask(load64(b, i)); m != 0 {
+			return i + bits.TrailingZeros64(m)>>3
+		}
+		if m := structuralMask(load64(b, i+8)); m != 0 {
+			return i + 8 + bits.TrailingZeros64(m)>>3
+		}
+		return indexStructuralAVX2(b, i+structuralPrescan)
 	}
-	if m := structuralMask(load64(b, i+8)); m != 0 {
-		return i + 8 + bits.TrailingZeros64(m)>>3
+	if useStructural512 {
+		return indexStructuralAVX2(b, i)
 	}
-	return i + structuralPrescan + indexStructuralAVX2(b[i+structuralPrescan:])
+	return i + indexStructuralScalar(b[i:])
 }

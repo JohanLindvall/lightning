@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -328,5 +329,105 @@ func BenchmarkParseIntRunShapes(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+// TestIntRunWindows drives the kernel through long uniform arrays of every
+// separator style and element length, starting at every alignment of the
+// amd64 kernel's 64-byte window and 48-byte step (and of arm64's), so that an
+// element's comma, its whitespace and the array's ']' each land at every lane
+// of a window, a step happens at every cursor position in the last 16 bytes,
+// and the region-too-long-for-the-stride restart runs for the separators whose
+// elements are longer than 16 bytes. Each array is held to the scalar loop
+// through every integer kind, and the kernel alone must take all of it: a
+// kernel that stopped early would be invisible to the differential, the
+// scalar loop reading the rest correctly and only slower (amd64 only: see
+// the note in the loop).
+func TestIntRunWindows(t *testing.T) {
+	if !useIntRun {
+		t.Skip("no SIMD integer-run kernel on this machine")
+	}
+	defer func(v bool) { useIntRun = v }(useIntRun)
+	seps := []string{",", ", ", " ,", " , ", ",\n", ",\n        ", ",\n                        ", ",\t"}
+	for _, sep := range seps {
+		for l := 1; l <= 8; l++ {
+			var b strings.Builder
+			b.WriteByte('[')
+			const count = 200
+			for k := 0; k < count; k++ {
+				if k > 0 {
+					b.WriteString(sep)
+				}
+				v := (k*7919 + 13) % pow10i(l)
+				fmt.Fprintf(&b, "%0*d", l, v)
+			}
+			b.WriteString("]")
+			arr := b.String()
+			for lead := 0; lead < 64; lead += 1 + lead/8 {
+				// Half the arrays are followed by more of the document in the
+				// same window, as they are inside an object: the comma after
+				// the ']' is not the last element's, and the kernel must
+				// still close the array itself.
+				tail := strings.Repeat(" ", 80)
+				if lead%2 == 1 {
+					tail = `, "next": [1, 2], "x": 3}` + tail
+				}
+				data := []byte(strings.Repeat(" ", lead) + arr + tail)
+				checkIntRunKinds(t, data, lead)
+				if runtime.GOARCH != "amd64" {
+					// arm64's kernel hands an element region longer than its
+					// 16 lanes of slack back to the scalar loop, which the
+					// differential above covers; amd64's restarts its window
+					// at such an element and so must take every one.
+					continue
+				}
+				useIntRun = true
+				out := make([]int64, count)
+				n, p, closed := parseIntRun(data, lead+1, out)
+				if n != count || closed != 1 || data[p] != ']' {
+					t.Fatalf("sep %q l=%d lead %d: kernel took n=%d p=%d closed=%d, want all %d closed at ']'", sep, l, lead, n, p, closed, count)
+				}
+			}
+		}
+	}
+}
+
+// BenchmarkDecodeIntSliceShort decodes a short integer array — the shape of
+// twitter_status's two-element indices and marine_ik's eleven-element keys —
+// into a fresh (presized) target with the SIMD run kernel on and off. It is
+// what intRunMinSlots is derived from: below the break-even the kernel's
+// per-call cost is not repaid.
+func BenchmarkDecodeIntSliceShort(b *testing.B) {
+	for _, n := range []int{2, 3, 4, 6, 8, 12} {
+		var sb strings.Builder
+		sb.WriteByte('[')
+		for k := 0; k < n; k++ {
+			if k > 0 {
+				sb.WriteByte(',')
+			}
+			sb.WriteString(strconv.Itoa((k*7919 + 13) % 1000))
+		}
+		sb.WriteString("]")
+		data := []byte(sb.String() + strings.Repeat(" ", 128))
+		modes := []bool{false}
+		if useIntRun {
+			modes = append(modes, true)
+		}
+		for _, kernel := range modes {
+			name := "scalar"
+			if kernel {
+				name = "kernel"
+			}
+			b.Run(strconv.Itoa(n)+"/"+name, func(b *testing.B) {
+				defer func(v bool) { useIntRun = v }(useIntRun)
+				useIntRun = kernel
+				for i := 0; i < b.N; i++ {
+					var s []int64
+					if _, err := DecodeIntSlice(&s, data, 0); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
 	}
 }

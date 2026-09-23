@@ -278,12 +278,19 @@ func (s *ValueScanner) containerFast(chunk []byte, i int, final bool) (int, bool
 		pos = end
 	}
 	if useSkipBlocks && pos+64 <= len(chunk) {
-		end, d, pe, pis := skipBlocks(chunk, pos, s.depth, s.isArray)
+		// Cut at the last full block: this scan may have to resume in the next
+		// chunk, so it takes the full blocks only and carries their state out,
+		// and the bytes after the cut go through the loop below — a skipBlocks
+		// that also took the tail (see skipBlocksTakesTail) would read it as an
+		// overlapping block whose pending-escape bit is not the carry out of
+		// the chunk's last byte.
+		full := pos + (len(chunk)-pos)&^63
+		end, d, pe, pis := skipBlocks(chunk[:full], pos, s.depth, s.isArray)
 		if end >= 0 {
 			s.state = scanDone
 			return end, true, nil
 		}
-		pos += (len(chunk) - pos) &^ 63
+		pos = full
 		s.depth, s.inString, s.escaped = d, pis != 0, pe != 0
 	}
 	open, close := byte('{'), byte('}')

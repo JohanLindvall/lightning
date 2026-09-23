@@ -36,7 +36,11 @@ const strictStackWords = MaxDepth/64 + 1
 // The scalar cases delegate to the decoder's own readers wherever a reader
 // exists that does not allocate, so the two agree by construction rather than by
 // parallel reimplementation: numbers go through ReadFloat64OrNull (the exact
-// tier chain decodeValue uses, overflow behavior included). Strings are the
+// tier chain decodeValue uses, overflow behavior included) — all but the plain
+// decimals of an array of numbers or of coordinate points, which the SIMD
+// walks at the '[' case pass over unconverted; they take only numbers that
+// reader accepts and hand everything else back to it, so the agreement is
+// unchanged (TestValidNumberRunMatchesScalar). Strings are the
 // exception — the decoder's reader unescapes, and so allocates — and are checked
 // by an inline scan and strictStringEscaped.
 //
@@ -46,10 +50,11 @@ const strictStackWords = MaxDepth/64 + 1
 // front because Go forbids a goto that jumps over a declaration.
 func SkipValueStrict(data []byte, i int) (int, error) {
 	var (
-		stack [strictStackWords]uint64
-		depth int
-		isObj bool
-		err   error
+		stack  [strictStackWords]uint64
+		depth  int
+		isObj  bool
+		err    error
+		closed int
 	)
 	n := len(data)
 
@@ -86,6 +91,35 @@ scanValue:
 			i++
 			depth--
 			goto scanAfter
+		}
+		// An array of numbers: the SIMD walk passes over its plain decimals
+		// (and closes it, when they are all it holds) without converting one.
+		// It takes only numbers the reader below accepts and hands back at
+		// anything else, so acceptance is unchanged. An array of arrays of
+		// numbers — a coordinate ring — has a walk of its own, one level down
+		// (hence the depth test), which hands back any point it does not take
+		// whole. The first element's first byte picks between them, so each
+		// kind of array pays for its own test only.
+		if uint(i) < uint(n) {
+			if c := data[i]; c-'0' <= 9 || c == '-' {
+				if useValidRun {
+					if i, closed = validNumberRun(data, i); closed != 0 {
+						i++
+						depth--
+						goto scanAfter
+					}
+					i = SkipWS(data, i)
+				}
+			} else if c == '[' && useValidRun512 && depth < MaxDepth && uint(i+1) < uint(n) {
+				if c = data[i+1]; c-'0' <= 9 || c == '-' || c <= ' ' {
+					if i, closed = validPointsRun512(data, i); closed != 0 {
+						i++
+						depth--
+						goto scanAfter
+					}
+					i = SkipWS(data, i)
+				}
+			}
 		}
 		goto scanValue
 	case '"':

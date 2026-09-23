@@ -118,13 +118,14 @@ func skipContainerFast(data []byte, i int, open byte) (int, error) {
 	// false), so the common path reads one flag rather than two. That is worth
 	// the pair of instructions because this runs once per container skipped.
 	pos := i + 1
-	if useSkipBlocks && pos+64 <= len(data) {
-		// amd64: the whole block loop runs in assembly (skipBlocks) — splats
-		// loaded once, depth/escape/in-string state carried in registers, the
-		// prefix XOR done with one carryless multiply — eliminating the
-		// per-block maskBlock call/marshaling that dominated the Go loop. It
-		// consumes every full 64-byte block: either it finds the close (end >=
-		// 0) or it hands the carried state to the shared scalar tail below.
+	if useSkipBlocks && (skipBlocksTakesTail && len(data) >= 64 || pos+64 <= len(data)) {
+		// The whole block loop runs in assembly (skipBlocks) — splats loaded
+		// once, depth/escape/in-string state carried in registers, the prefix
+		// XOR done with one carryless multiply — eliminating the per-block
+		// maskBlock call/marshaling that dominated the Go loop. On amd64 it
+		// also takes the final < 64 bytes (skipBlocksTakesTail), so end < 0
+		// means the input ended inside the container; elsewhere it consumes
+		// the full blocks and hands the carried state to the Go continuation.
 		//
 		// Everything that follows the call is out of line — skipContainerBlocks
 		// holds the Go block loop and the byte tail — and that is not tidiness.
@@ -138,6 +139,9 @@ func skipContainerFast(data []byte, i int, open byte) (int, error) {
 		end, d, pe, pis := skipBlocks(data, pos, 1, open == '[')
 		if end >= 0 {
 			return end, nil
+		}
+		if skipBlocksTakesTail {
+			return len(data), ErrTruncated
 		}
 		return skipContainerBlocks(data, pos+((len(data)-pos)&^63), open, d, pe, pis)
 	}

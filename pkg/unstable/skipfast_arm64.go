@@ -62,3 +62,8 @@ var useSkipBlocks = true
 //
 //go:noescape
 func skipBlocks(data []byte, pos, depth int, isArray bool) (end, ndepth int, prevEscaped, prevInString uint64)
+
+// skipBlocksTakesTail is false here: this skipBlocks scans full 64-byte blocks
+// only, and the caller finishes the < 64 bytes after them in Go (see the amd64
+// declaration for the form that does not).
+const skipBlocksTakesTail = false

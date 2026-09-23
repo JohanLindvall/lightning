@@ -101,6 +101,10 @@ func decodeFloat64Slice(out *[]float64, data []byte, i int, a *Arena[float64]) (
 			}
 		}
 	}
+	// The SIMD run kernel's state, as in decodeIntSlice: run is cleared by an
+	// unproductive call, so an array it cannot help costs one call, and hold
+	// gives the element a productive call stopped at to the scalar code.
+	run, hold := true, false
 	i++
 	for first := true; ; first = false {
 		// Inter-token whitespace, in the shape the generator inlines: 0-1 bytes
@@ -123,6 +127,35 @@ func decodeFloat64Slice(out *[]float64, data []byte, i int, a *Arena[float64]) (
 			}
 			return i, ErrInvalidJSON // trailing comma
 		}
+		// An element that starts with a digit or a '-' is where the SIMD
+		// decimal-run kernel takes over (useFloatRun): it writes every following
+		// element of at most 15 digits and no exponent straight into the
+		// slice's spare capacity — each one Clinger's exact fast path, so the
+		// value scanFloat and strconv give — and hands back at the first element
+		// it does not convert, which the scalar code below then reads exactly as
+		// it always has. The spare capacity is the array's remaining length when
+		// the target was presized from its comma count.
+		if useFloatRun && run && !hold && (data[i]-'0' <= 9 || data[i] == '-') && cap(s) > len(s) {
+			n, p, closed := parseFloatRun(data, i, s[len(s):cap(s)])
+			if n > 0 {
+				s = s[:len(s)+n]
+				i = p
+				if closed != 0 {
+					*out = s
+					return i + 1, nil
+				}
+				// The kernel stopped at an element it does not convert (or
+				// ran out of room or input): that element is the scalar
+				// code's, and offering it straight back would only make the
+				// call unproductive and switch the kernel off for the rest of
+				// the array — one 16-digit value in a 10,000-element array
+				// did exactly that.
+				hold = true
+				continue
+			}
+			run = false
+		}
+		hold = false
 		var f float64
 		if data[i] == 'n' {
 			end, err := ExpectNull(data, i)
@@ -230,7 +263,7 @@ func decodeIntSlice[T intKind](out *[]T, data []byte, i int, a *Arena[T]) (int, 
 	// The SIMD run kernel's state: run is cleared by an unproductive call, so
 	// an array it cannot help costs one call; tmp receives its values for
 	// the element kinds it cannot write directly (narrower than 8 bytes).
-	run := true
+	run, hold := true, false
 	var tmp [32]int64
 	i++
 	for first := true; ; first = false {
@@ -267,7 +300,7 @@ func decodeIntSlice[T intKind](out *[]T, data []byte, i int, a *Arena[T]) (int, 
 		// a per-call cost of its own (arm64's classifies a 64-byte block)
 		// is not worth calling for the two-element arrays of a schema like
 		// twitter_status's indices.
-		if useIntRun && run && data[i]-'0' <= 9 && cap(s)-len(s) >= intRunMinSlots {
+		if useIntRun && run && !hold && data[i]-'0' <= 9 && cap(s)-len(s) >= intRunMinSlots {
 			var n, p, closed int
 			if unsafe.Sizeof(T(0)) == 8 {
 				dst := unsafe.Slice((*int64)(unsafe.Pointer(unsafe.SliceData(s))), cap(s))[len(s):]
@@ -285,10 +318,15 @@ func decodeIntSlice[T intKind](out *[]T, data []byte, i int, a *Arena[T]) (int, 
 					*out = s
 					return i + 1, nil
 				}
+				// The element the kernel stopped at is the scalar code's
+				// (see decodeFloat64Slice): offering it straight back would
+				// switch the kernel off for the rest of the array.
+				hold = true
 				continue
 			}
 			run = false
 		}
+		hold = false
 		var n int64
 		if data[i] == 'n' {
 			end, err := ExpectNull(data, i)
@@ -437,7 +475,7 @@ func decodeUintSlice[T uintKind](out *[]T, data []byte, i int, a *Arena[T]) (int
 	// The SIMD run kernel's state: run is cleared by an unproductive call, so
 	// an array it cannot help costs one call; tmp receives its values for
 	// the element kinds it cannot write directly (narrower than 8 bytes).
-	run := true
+	run, hold := true, false
 	var tmp [32]int64
 	i++
 	for first := true; ; first = false {
@@ -462,7 +500,7 @@ func decodeUintSlice[T uintKind](out *[]T, data []byte, i int, a *Arena[T]) (int
 			return i, ErrInvalidJSON // trailing comma
 		}
 		// The SIMD run kernel, as in decodeIntSlice.
-		if useIntRun && run && data[i]-'0' <= 9 && cap(s)-len(s) >= intRunMinSlots {
+		if useIntRun && run && !hold && data[i]-'0' <= 9 && cap(s)-len(s) >= intRunMinSlots {
 			var n, p, closed int
 			if unsafe.Sizeof(T(0)) == 8 {
 				dst := unsafe.Slice((*int64)(unsafe.Pointer(unsafe.SliceData(s))), cap(s))[len(s):]
@@ -480,10 +518,14 @@ func decodeUintSlice[T uintKind](out *[]T, data []byte, i int, a *Arena[T]) (int
 					*out = s
 					return i + 1, nil
 				}
+				// The element the kernel stopped at is the scalar code's
+				// (see decodeFloat64Slice).
+				hold = true
 				continue
 			}
 			run = false
 		}
+		hold = false
 		var n uint64
 		if data[i] == 'n' {
 			end, err := ExpectNull(data, i)
@@ -578,7 +620,25 @@ func DecodeFloat64Array(out []float64, data []byte, i int) (int, error) {
 	if data[i] != '[' {
 		return i, ErrExpectArray
 	}
+	// A coordinate point ([2]float64, [3]float64) is the whole array in one
+	// call of the SIMD decimal-run kernel, closed at its ']': when it fills
+	// every slot and closes the array, that is the answer, and the clear and
+	// the loop below — a memclr call per point, 3.7% of canada once the
+	// conversions got cheap — are not needed. Anything else (a shorter or
+	// longer array, an element the kernel hands back) starts again below,
+	// where the kernel's partial writes are cleared.
+	//
+	// Only the kernel's VBMI body is used here: coordinates are 16- and
+	// 17-digit numbers (canada, large-json), which only that body converts,
+	// and on a two-slot array the AVX2 body's refusal cost a call per point —
+	// canada +19%.
+	if useFloatRunVBMI && len(out) > 0 {
+		if n, p, closed := parseFloatRunV(data, i+1, out); closed != 0 && n == len(out) {
+			return p + 1, nil
+		}
+	}
 	clear(out)
+	run, hold := useFloatRunVBMI, false
 	i++
 	idx := 0
 	for first := true; ; first = false {
@@ -600,6 +660,20 @@ func DecodeFloat64Array(out []float64, data []byte, i int) (int, error) {
 			}
 			return i, ErrInvalidJSON // trailing comma
 		}
+		if run && !hold && idx < len(out) && (data[i]-'0' <= 9 || data[i] == '-') {
+			n, p, closed := parseFloatRunV(data, i, out[idx:])
+			if n > 0 {
+				idx += n
+				i = p
+				if closed != 0 {
+					return i + 1, nil
+				}
+				hold = true // the element it stopped at is the scalar code's
+				continue
+			}
+			run = false
+		}
+		hold = false
 		if idx < len(out) {
 			if data[i] == 'n' {
 				end, err := ExpectNull(data, i)

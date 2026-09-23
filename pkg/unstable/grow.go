@@ -198,10 +198,13 @@ func GrowSliceSpan[T any](s []T, data []byte, start, i, end int) ([]T, int) {
 // answer, which is the honest bound on what is left and only ever sizes a
 // backing.
 func arrayEndAt(data []byte, i int) int {
-	if useSkipBlocks && i+64 <= len(data) {
+	if useSkipBlocks && (skipBlocksTakesTail && len(data) >= 64 || i+64 <= len(data)) {
 		end, d, pe, pis := skipBlocks(data, i, 1, true)
 		if end >= 0 {
 			return end
+		}
+		if skipBlocksTakesTail {
+			return len(data)
 		}
 		tail := i + ((len(data) - i) &^ 63)
 		if end, err := skipContainerBlocks(data, tail, '[', d, pe, pis); err == nil {

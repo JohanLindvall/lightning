@@ -44,6 +44,31 @@ func BenchmarkSkipSmall(b *testing.B) {
 	}
 }
 
+// BenchmarkSkipSmallAtEnd is the same shapes at the END of their buffer, the
+// way the last element of every array and the last unknown member of every
+// document sits: 96 bytes of whitespace in front (so the buffer holds a block)
+// and nothing after. The close is then in the buffer's final < 64 bytes, which
+// the padded form above never reaches — it is what skipBlocksTakesTail is
+// about.
+func BenchmarkSkipSmallAtEnd(b *testing.B) {
+	lead := bytes.Repeat([]byte(" "), 96)
+	for _, s := range smallShapes() {
+		s := s
+		v := s.data[:len(s.data)-128]
+		data := append(append([]byte(nil), lead...), v...)
+		b.Run(s.name, func(b *testing.B) {
+			b.SetBytes(int64(len(v)))
+			for i := 0; i < b.N; i++ {
+				e, err := SkipValue(data, len(lead))
+				if err != nil {
+					b.Fatal(err)
+				}
+				skipSmallSink += e
+			}
+		})
+	}
+}
+
 // BenchmarkSkipSmallScalar is the same shapes through the scalar bracket
 // balance (skipObject/skipArray), the path SkipValue's probe declines to use
 // for them, so the two can be compared at the same document.

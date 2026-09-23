@@ -119,6 +119,23 @@ type PointList []struct {
 	Tag string `json:"tag"`
 }
 
+// GeoDoc holds coordinate rings: slices of [N]float64, which the generator
+// routes to unstable.DecodeFloat64Points — the reader whose SIMD points walk
+// converts runs of points in one call. Polygon nests them as the GeoJSON
+// documents of the benchmark corpus do, Lax pairs the reader with the lax
+// option, and PointRing is the same reader at a named root. Exercised by
+// TestFloat64PointsMatchStdlib.
+type GeoDoc struct {
+	Ring2   [][2]float64   `json:"ring2"`
+	Ring3   [][3]float64   `json:"ring3"`
+	Polygon [][][2]float64 `json:"polygon"`
+	Lax     [][2]float64   `json:"lax,lax"`
+	Tail    int            `json:"tail"`
+}
+
+// PointRing is a named slice root of coordinate points (see GeoDoc).
+type PointRing [][2]float64
+
 // ScoreMap is a named map root type: the generator emits UnmarshalJSON on it
 // directly (object-root JSON that's a data map). Exercised by TestMapRoot.
 type ScoreMap map[string]int

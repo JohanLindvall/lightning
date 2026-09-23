@@ -42,3 +42,8 @@ func maskBlock(b []byte, isArray bool) (quote, bslash, open, close uint64) {
 	}
 	return
 }
+
+// skipBlocksTakesTail is false here: this skipBlocks scans full 64-byte blocks
+// only, and the caller finishes the < 64 bytes after them in Go (see the amd64
+// declaration for the form that does not).
+const skipBlocksTakesTail = false

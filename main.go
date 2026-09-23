@@ -2673,6 +2673,21 @@ func batchSliceFn(elt ast.Expr) string {
 	return ""
 }
 
+// isFloatPoint reports whether elt is a fixed-size array of float64, [N]float64
+// with N a literal: the element of a coordinate ring, which DecodeFloat64Points
+// decodes.
+func isFloatPoint(elt ast.Expr) bool {
+	t, ok := unparen(elt).(*ast.ArrayType)
+	if !ok || t.Len == nil {
+		return false
+	}
+	if _, ok := t.Len.(*ast.BasicLit); !ok {
+		return false
+	}
+	id, ok := unparen(t.Elt).(*ast.Ident)
+	return ok && id.Name == "float64"
+}
+
 // batchArrayFn is batchSliceFn for a fixed-size array element ([N]float64
 // coordinate points and the like); the reader takes the array as a slice
 // (dest[:]) and zeroes/fills/skips exactly as the generated fixed-array
@@ -2709,6 +2724,15 @@ func batchArrayFn(elt ast.Expr) string {
 // file as "%!(MISSING)", which is why the measurement note above is here and not
 // in the generated comment.
 func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax, root bool) string {
+	if isFloatPoint(elt) && !g.arena {
+		// A slice of [N]float64 — a ring of coordinate points — has a batch
+		// reader of its own that is this function's output element for element
+		// and hands runs of points to the SIMD kernel in one call; see
+		// DecodeFloat64Points. (Under //lightning:arena the generated loop
+		// stays: that directive threads an arena argument through every
+		// slice decoder, which this reader does not take.)
+		return "unstable.DecodeFloat64Points"
+	}
 	if fn := batchSliceFn(elt); fn != "" {
 		if g.arena {
 			// The ...Arena twin carves the presized backing from the decode's

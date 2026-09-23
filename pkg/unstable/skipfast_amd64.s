@@ -77,8 +77,10 @@ GLOBL mbBslashB<>(SB), RODATA|NOPTR, $1
 // findEscaped; no unescaped quote: in-string state unchanged; popcount bulk
 // depth update whenever the block cannot cross depth 0). Expanded once per
 // TEXT symbol, so its labels stay function-scoped. Falls through to nextBlock
-// (advance and loop) or exits at foundEnd.
+// (advance and loop) or exits at foundEnd; blockMath is its entry, which the
+// tail block jumps to once it has built the four bitmaps its own way.
 #define BLOCKTAIL \
+blockMath:                      \
 	MOVQ  R12, AX               \ // escaped: skip the add-carry chain when no
 	ORQ   R9, AX                \ // backslash in the block and none pending
 	JNE   computeEscaped        \
@@ -228,7 +230,7 @@ TEXT ·skipBlocks(SB), NOSPLIT, $0-80
 	VPBROADCASTB 2(BX)(AX*1), Y13
 blockLoop:
 	CMPQ    DX, CX
-	JGT     exhausted
+	JGT     tailBlock
 	VMOVDQU (SI)(DX*1), Y0
 	VMOVDQU 32(SI)(DX*1), Y1
 	// quote bitmap -> R11: compare both halves, fold the two 32-bit movemasks.
@@ -260,6 +262,51 @@ blockLoop:
 	SHLQ    $32, AX
 	ORQ     AX, R14
 	BLOCKTAIL
+tailBlock:
+	// Fewer than 64 bytes are left from DX. Classify the buffer's LAST 64 —
+	// the caller guarantees it holds that many — and shift every bitmap right
+	// by the lanes before DX, so bit 0 is DX again: the shift drops the bytes
+	// the loop already accounted for and brings in zeros above the end, and a
+	// zero byte is not a quote, a backslash or a bracket. The block math then
+	// runs unchanged, and after it DX+64 is past the end, so the next trip
+	// lands in exhausted. This is the block the Go continuation used to build
+	// through a maskBlock call; see skipContainerBlocks.
+	LEAQ    64(CX), AX
+	CMPQ    DX, AX
+	JGE     exhausted
+	VMOVDQU (SI)(CX*1), Y0
+	VMOVDQU 32(SI)(CX*1), Y1
+	VPCMPEQB Y10, Y0, Y2
+	VPMOVMSKB Y2, R11
+	VPCMPEQB Y10, Y1, Y3
+	VPMOVMSKB Y3, AX
+	SHLQ    $32, AX
+	ORQ     AX, R11
+	VPCMPEQB Y11, Y0, Y2
+	VPMOVMSKB Y2, R12
+	VPCMPEQB Y11, Y1, Y3
+	VPMOVMSKB Y3, AX
+	SHLQ    $32, AX
+	ORQ     AX, R12
+	VPCMPEQB Y12, Y0, Y2
+	VPMOVMSKB Y2, R13
+	VPCMPEQB Y12, Y1, Y3
+	VPMOVMSKB Y3, AX
+	SHLQ    $32, AX
+	ORQ     AX, R13
+	VPCMPEQB Y13, Y0, Y2
+	VPMOVMSKB Y2, R14
+	VPCMPEQB Y13, Y1, Y3
+	VPMOVMSKB Y3, AX
+	SHLQ    $32, AX
+	ORQ     AX, R14
+	MOVQ    DX, AX
+	SUBQ    CX, AX              // lanes already accounted for: DX - (len-64)
+	SHRXQ   AX, R11, R11
+	SHRXQ   AX, R12, R12
+	SHRXQ   AX, R13, R13
+	SHRXQ   AX, R14, R14
+	JMP     blockMath
 exhausted:
 	MOVQ    $-1, end+48(FP)
 	MOVQ    R8, ndepth+56(FP)
@@ -296,8 +343,9 @@ TEXT ·skipBlocksAVX512(SB), NOSPLIT, $0-80
 	VPBROADCASTB 2(BX)(AX*1), Z13
 blockLoop:
 	CMPQ    DX, CX
-	JGT     exhausted
+	JGT     tailBlock
 	VMOVDQU64 (SI)(DX*1), Z0
+classify:
 	VPCMPEQB Z10, Z0, K1
 	KMOVQ   K1, R11
 	VPCMPEQB Z11, Z0, K2
@@ -307,6 +355,20 @@ blockLoop:
 	VPCMPEQB Z13, Z0, K4
 	KMOVQ   K4, R14
 	BLOCKTAIL
+tailBlock:
+	// Fewer than 64 bytes are left from DX: a masked load reads exactly them,
+	// zeroing the lanes past the end (a zero byte is inert, and a masked-off
+	// lane cannot fault), so this body needs neither an overlapping block nor
+	// a shift, nor a buffer of any minimum length. After the block DX+64 is
+	// past the end and the next trip lands in exhausted.
+	LEAQ    64(CX), BX
+	SUBQ    DX, BX              // n = len - DX
+	JLE     exhausted
+	MOVQ    $-1, AX
+	BZHIQ   BX, AX, AX
+	KMOVQ   AX, K5
+	VMOVDQU8.Z (SI)(DX*1), K5, Z0
+	JMP     classify
 exhausted:
 	MOVQ    $-1, end+48(FP)
 	MOVQ    R8, ndepth+56(FP)

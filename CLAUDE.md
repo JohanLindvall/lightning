@@ -29,7 +29,12 @@ allocation-light `json.Unmarshaler` implementations.
   sentinels). This is where almost all performance work happens. Split into topical
   files: `read.go` (the `Read*` readers), `batch.go` (the batched scalar-array
   readers), `skip.go`, `skipfast.go` (+ `skipfast_{amd64,arm64,noasm}`,
-  the SIMD container skip), `count.go` (slice-presize counters), `numeric.go` (`scanFloat`
+  the SIMD container skip), `count.go` (slice-presize counters; their one-pass
+  kernel is `count_amd64.s`, with a Go twin in `count_other.go`), `intrun_*` and
+  `floatrun_*` (the integer- and decimal-array kernels the batch readers call;
+  `floatrun_amd64.s` also holds the points walk), `points.go`
+  (`DecodeFloat64Points`, the reader the generator routes every `[][N]float64`
+  coordinate ring to), `numeric.go` (`scanFloat`
   + Eisel-Lemire), `string.go` (unescape/`Unwrap`) and `escbuf.go` (the chunk the
   buffers escaped strings decode into — and alias — are carved from),
   `date.go`/`time.go`, `any.go` (the
@@ -192,7 +197,9 @@ byte-identical when adding cold paths; push new logic out-of-line.
   per-step comparison could see.
 - **Batched scalar-array readers** (`batch.go`: `DecodeFloat64Slice`, the generic
   `DecodeIntSlice`/`DecodeUintSlice`, and the fixed-size `DecodeFloat64Array`/
-  `DecodeIntArray`/`DecodeUintArray`). The generated per-element loop paid a non-inlinable reader
+  `DecodeIntArray`/`DecodeUintArray`; since 2026-09-23 the float loops hand
+  runs of numbers to a SIMD kernel first, and `[][N]float64` rings go to
+  `DecodeFloat64Points` — see the Zen 4 native-path pass). The generated per-element loop paid a non-inlinable reader
   call per number — two frames for floats (`ReadFloat64OrNull` → `scanFloat`) —
   plus its own append/branch machinery; ~18% of the canada profile was that
   dispatch. The generator (`batchSliceFn`/`batchArrayFn` in `main.go`) now routes
@@ -890,7 +897,11 @@ byte-identical when adding cold paths; push new logic out-of-line.
 - **The container skip's last bytes are a block, not a byte walk, and its
   prologue costs nine instructions less** (`skipContainerBlocks` in `skipfast.go`,
   the two `skipBlocks` bodies in `skipfast_amd64.s`, `foundEnd` in both arches'
-  assembly; 2026-09-08, Zen 4). Three changes, one of them the interesting one.
+  assembly; 2026-09-08, Zen 4). **On amd64 the tail block has since moved into
+  the assembly itself** (`skipBlocksTakesTail`, 2026-09-23 — see the Zen 4
+  native-path pass): the Go continuation's `maskBlock` call per last element
+  is gone there; arm64 and the no-asm build still take the path described here.
+  Three changes, one of them the interesting one.
   **(1) The final < 64 bytes are ONE MORE BLOCK, overlapping.** The block loop
   covered full blocks and handed whatever was left to a byte-by-byte state
   machine — ~7 instructions and a mispredictable branch per byte — and that walk
@@ -1848,7 +1859,11 @@ byte-identical when adding cold paths; push new logic out-of-line.
 - **Arrays of short integers are parsed by a SIMD kernel** (`parseIntRunSSE`
   in `intrun_amd64.s`, `useIntRun` = AVX && BMI2; called from
   `decodeIntSlice`/`decodeUintSlice` whenever an element starts with a
-  digit; 2026-09-02, Zen 4). The kernel walks 16-byte blocks: four VEX.128
+  digit; 2026-09-02, Zen 4). **Superseded on amd64 by `parseIntRunAVX2`
+  (2026-09-23; see the Zen 4 native-path pass at the end of this file)**: a
+  16-byte block reclassified wherever an element straddled it put every
+  block's load on the cursor's chain. The account below stays for its counter
+  lessons. The kernel walks 16-byte blocks: four VEX.128
   compares classify digits, commas, `]` and whitespace (`<= 0x20`, SkipWS's
   rule) into bitmasks, and each `ws* digits{1..8} ws* ,` group becomes one
   `PSHUFB` (an 8-byte control from a 128-entry table indexed `s*8+L`, which
@@ -2448,7 +2463,10 @@ byte-identical when adding cold paths; push new logic out-of-line.
   regressions. The arm64 side is the same rename with no flag to read.
 - **The structural scanner takes the scan START as an argument, and its prescan
   is SWAR** (`indexStructuralAt(b, i)` and `structuralMask` in
-  `structural.go`, 2026-09-08). All three callers — `skipObjectDepth`,
+  `structural.go`, 2026-09-08). (The amd64 bodies behind it were rebuilt on
+  2026-09-23 — a compare-classified AVX2 body, a `VPERMB` VBMI body, and the
+  assembly taking any remainder after the prescan; see the Zen 4 native-path
+  pass.) All three callers — `skipObjectDepth`,
   `skipArrayDepth` and the resumable scanner's container balance — wrote
   `i += indexStructural(data[i:])`, which is the seven-instruction reslice the
   `IndexCloseOrEscapeAt` entry above records, once per structural jump. Worse,
@@ -2796,6 +2814,11 @@ no regressions.)
   is ~12–20 cycles × N points" predicted −4…−7%; the *attributed* profile says
   ~1%. Size a candidate with `pprof -peek`, not with cycle arithmetic.
 - **Replacing `CountArrayScalars`' two vectorized calls with a fused inline scan.**
+  (**Superseded, 2026-09-23**: what these Go loops could not do, one AVX2 pass
+  in assembly does — `countKernel` finds the `]` and counts in the same pass,
+  and moving the clamp into it made `CountArrayScalars` inlinable; marine_ik
+  −3.7%, mesh −2.7%. The lesson below — a fused Go loop does not beat two
+  vectorized runtime calls — stands.)
   A marine_ik CPU profile puts `CountArrayScalars` at **9.5% cum** (`bytes.Count`
   4.95% + `indexbytebody` 2.80%), and the reason looks damning: for the 3- and
   4-element `[]float64` coordinate arrays that dominate that document (`Pos`/`Rot`/
@@ -5595,3 +5618,423 @@ different offset. A scalar differential oracle and fuzz test lock this behavior.
 `decodeValue` also continues from the first escape directly instead of rescanning
 the clean prefix through `ReadStringOrNull`. Corpus generated/dynamic decoder
 timings remain flat; the large gain is in escape-heavy validation.
+
+## Zen 4 native-path pass (2026-09-23)
+
+A pass over every amd64 assembly routine on the Ryzen 7 8840HS (Zen 4, AVX-512
+with VBMI), each change decided on per-op hardware counters (`perf stat` at N
+and 3N iterations, differenced) and, where a routine's shape was in question, on
+small assembly labs that time one instruction mix in isolation. Two routines
+were rewritten (the structural scanner and the integer-array kernel), the
+container skip took its tail block into assembly, and five kernels are new: the
+presize counters' single pass, the decimal-array kernel (an AVX2 and a VBMI
+body), the coordinate-ring walk behind the new `DecodeFloat64Points` reader —
+which the generator now routes every `[][N]float64` to — and the validation
+walks behind `Valid`. arm64 was not touched: no arm64 hardware was available to
+measure on, and its shared Go paths keep their behavior through per-architecture
+constants and stubs (`skipBlocksTakesTail`, `useFloatRun`, `useValidRun`, …),
+verified under qemu.
+
+Full corpus, interleaved ABBA, n=8, pinned, both sides `-funcalign=64`, baseline
+= the session's starting commit:
+
+| case | before | after | change |
+|---|---:|---:|---:|
+| numbers | 128.34µ | 39.42µ | -69.28% |
+| skip-heavy | 396.0n | 163.1n | -58.81% |
+| mesh | 744.4µ | 390.7µ | -47.51% |
+| canada_geometry | 275.1µ | 145.8µ | -47.01% |
+| canada | 2.176m | 1.218m | -44.01% |
+| float-array | 255.8n | 155.6n | -39.15% |
+| marine_ik | 3.519m | 2.472m | -29.75% |
+| mesh_pretty | 1031.9µ | 740.6µ | -28.22% |
+| large-json | 6.889m | 5.730m | -16.82% |
+| synthea_fhir | 1.533m | 1.486m | -3.06% |
+| update_center | 412.6µ | 400.6µ | -2.92% |
+| random | 274.1µ | 266.7µ | -2.70% |
+| payload_large | 17.24µ | 16.90µ | -1.98% |
+| cloudflare-nocopy | 485.7n | 476.6n | -1.89% |
+| twitter_status | 294.5µ | 290.4µ | -1.40% |
+| golang_source | 1.613m | 1.597m | -1.01% |
+| cloudflare | 617.2n | 611.0n | -1.00% |
+| cloudflare-compact | 457.9n | 454.3n | -0.78% |
+| instruments | 102.7µ | 101.9µ | -0.77% |
+| apache_builds | 56.23µ | 55.54µ | flat (p=0.083) |
+| citm_catalog | 634.7µ | 631.5µ | flat (p=0.442) |
+| github_events | 33.56µ | 33.46µ | flat (p=0.523) |
+| gsoc_2018 | 983.3µ | 980.2µ | flat (p=0.382) |
+| payload_medium | 936.0n | 926.2n | flat (p=0.105) |
+| payload_small | 99.60n | 99.23n | flat (p=0.442) |
+| pretty | 635.9n | 634.0n | flat (p=0.130) |
+| string_unicode | 1.243µ | 1.242µ | flat (p=0.898) |
+| time-array | 524.2n | 520.4n | flat (p=0.065) |
+| twitterescaped | 455.3µ | 460.9µ | flat (p=0.505) |
+| float-array-slow | 412.5n | 418.9n | +1.54% |
+| **geomean** | 35.19µ | 29.31µ | **-16.73%** |
+
+float-array-slow is the one regression: every one of its numbers has an
+exponent, which the kernel hands back, so each array pays for one refused call
+before the kernel switches itself off for the rest of it.
+
+- **`indexStructural`: an AVX-512 VBMI body and a compare-classified AVX2 body**
+  (`indexStructuralAVX2(b, i)` in `simd_amd64.s`, `useStructural512`).
+  skip-heavy is this loop and nothing else, and the counters put the old one at
+  **5.8 ops a cycle — Zen 4's dispatch limit** — at 15 ops per 32 bytes: two
+  `VPSHUFB`, a shift, three ANDs, a compare, a movemask and a NOT to classify,
+  plus a top-tested loop. The currency was ops per byte. **VBMI**: one `VPERMB`
+  looks each byte up in a 64-entry table indexed by its low six bits — the five
+  structural bytes have distinct low six bits (0x22, 0x1b, 0x1d, 0x3b, 0x3d), so
+  entry k holds the structural byte with those bits or `k^1`, which nothing can
+  equal — and one `VPCMPEQB` into a mask register keeps the lanes whose byte
+  came back unchanged: 2 ops per 64 bytes. `VPERMB zmm` issues once per two
+  cycles on Zen 4 and a zmm load not 64-byte aligned always spans two lines
+  (+45% on a load-only loop), so the first block is read where the scan starts
+  and the bulk from the next 64-byte boundary, two blocks a step; the tail is a
+  masked load (`VMOVDQU8.Z`, fault-suppressed), so there is no byte loop. It
+  uses only Z16-Z31, which no SSE/VEX instruction reaches, so it needs no
+  `VZEROUPPER`. **AVX2**: `(c|0x20) == '{'` and `== '}'` fold the bracket pairs
+  onto two compares (they differ only in bit 5), the quote is compared unfolded
+  (0x22|0x20 is also 0x02|0x20), 64 bytes a step with the loop test at the
+  bottom, and the final < 32 bytes are the buffer's last 32 with the lanes
+  before the cursor shifted out. The Go side now hands the assembly any
+  remainder after the two-word prescan (it used to fall back to a
+  five-compares-a-byte loop below 32 bytes; a 40-byte scan cost 21 ns and now
+  5.6). Micro (`BenchmarkIndexStructural`): 20 KB 378 → 140 ns (143 GB/s, ~2.2
+  cycles per 64 B), 4 KB 94 → 32 ns, 40-136 B 21-22 → 5.6-6.2 ns; the AVX2 body
+  alone 20 KB 245 ns. **skip-heavy −59%.** Locked by `TestIndexStructuralBodies`
+  (both bodies, every byte value at every position, every length × start to 330,
+  20k random) and the guard-page test below; sabotage-verified (one table byte,
+  the tail shift, an unmasked tail).
+- **The container skip's final < 64 bytes are a block in the assembly, not a
+  `maskBlock` call** (`skipBlocksTakesTail`, `tailBlock` in both bodies of
+  `skipfast_amd64.s`). The Go continuation built that block with a `maskBlock`
+  call and the bit math in Go — a frame, a call, four results through memory —
+  on every container whose close is in the buffer's last 64 bytes: the last
+  element of every array, the last unknown member of every document. The AVX2
+  body reads the buffer's last 64 bytes and shifts every bitmap right by the
+  lanes before the cursor (a zero byte is inert); the AVX-512 body uses a masked
+  load. Both are held to buffers of at least 64 bytes so the two bodies agree on
+  every input (under one block the byte walk decides, and reads a stray
+  backslash differently — `TestSkipBackslashLengthCliff`). The streaming
+  `ValueScanner` passes a buffer cut at its last full block, so that its carried
+  state is exact for the next chunk. `BenchmarkSkipSmallAtEnd` (new): **−31…−46%
+  instructions, −27…−43% cycles**; padded skips −2…−3%; cloudflare family −0.8%
+  instructions. Locked by `testSkipTailSweep` (every body, every padding to 80,
+  seven start offsets) and the guard-page test; sabotage-verified.
+- **The string and escape scanners take their splats as memory operands**
+  (`indexQuoteOrBackslashSSE2`, `indexEscapeSSE2`, `indexEscapeNonASCIISSE2`):
+  legacy SSE requires a 16-byte aligned memory operand, which a 32-byte RODATA
+  symbol has (the linker aligns a symbol to the power of two covering its size,
+  up to 32), so the up-front `MOVOU` loads go. −2 instructions a call,
+  −0.4…−1.8% instructions over the string cases; wall time flat (the scanner is
+  latency-bound per call — see the lab notes below). Kept as a strict reduction.
+- **The presize counters are one assembly pass** (`countKernel` in
+  `count_amd64.s`; `countBeforeClose`, and `CountArrayScalars` = `countKernel(…,
+  hint=true)`). `CountArrayScalars` and `CountArrayObjects` made two runtime
+  calls over the same bytes (`IndexByte` for the `]`, `Count` for the
+  separators) — 11% of marine_ik, 9% of mesh, with their dispatch. The kernel
+  finds the `]` and counts the separator bytes before it in one AVX2 pass
+  (`BZHI` keeps the lanes below the close; the tail is an overlapping block),
+  and in hint mode also finishes the count (commas + 1 clamped to (rb+1)/2, or
+  1/0 for a comma-free span by whether it holds a byte above 0x20). That last
+  part is what makes `CountArrayScalars` a single call and **inlinable (cost
+  72)** into the batch readers. One semantic tidy-up rides along: a blank span
+  is judged by the library's `<= 0x20` whitespace rule, where it used to test
+  the four JSON whitespace bytes, so `[\x01]` no longer presizes one slot for an
+  array the decoder reads as empty. marine_ik −3.7%, mesh −2.7%, mesh_pretty
+  −3.9%, numbers −3.1% cycles (one pass over its 150 KB array instead of two),
+  instruments −3.2%. Locked by `TestCountBeforeCloseBodies` (both bodies, every
+  length × start × close position, the hint mode over blank and control-byte
+  spans, 50k random); sabotage-verified.
+- **The integer-array kernel walks 64-byte windows at a fixed 48-byte stride**
+  (`parseIntRunAVX2`, replacing `parseIntRunSSE`; now `useIntRun` = AVX2 &&
+  BMI2). The old kernel reclassified a 16-byte block at whatever element
+  straddled its end, which put every block's load on the cursor's dependency
+  chain: **14.5 cycles an element for mesh's `", "`-separated four-digit
+  indices**, and mesh_pretty's newline-and-indent elements straddled on every
+  element. The new one is the arm64 kernel's shape: the next window's address is
+  a fixed stride, elements are consumed while their comma is in the window
+  (commas walked with `TZCNT`/`BLSR`, whose zero flag also closes the loop), a
+  window whose last consumed comma is in its final 16 bytes steps by 48, and an
+  element region longer than that slack restarts the window at it. The fold
+  loads the element's 8 bytes from memory at its first digit and right-aligns
+  them with a length-indexed `PSHUFB` control whose upper half zeroes, so the
+  last fold's low quadword IS the int64 and is stored with one `VMOVQ`. Per
+  element (`BenchmarkParseIntRunShapes`, cycles): `1,` 6.1 → 5.1, `1234,` 9.3 →
+  6.1, `123456,` 11.5 → 6.7, `1234, ` 14.5 → 6.3. Whitespace is skipped
+  branch-free (`SHRX`/`TZCNT`/`ADD`) — worth −9% on `", "` and costing compact
+  +2…+6%, net positive on the corpus. Beats the scalar loop from two elements up
+  (`BenchmarkDecodeIntSliceShort`), so `intRunMinSlots` stays 1. Two traps it
+  hit: **`SHRX` sets no flags** (a `JZ` after it read a stale ZF), and **the
+  comma after an array's `]` is the enclosing container's** — measuring the last
+  element against it found the `]` where whitespace had to be and handed the
+  element back, which on marine_ik's eleven-element arrays was a tenth of them;
+  `closedBefore` now takes a `]` as the last element's delimiter where it is
+  found, rather than computing a `]` mask for every window (which cost up to 0.7
+  cycles an element). Locked by `TestIntRunWindows` (every separator × element
+  length × window alignment, arrays followed by more document, and on amd64 that
+  the kernel takes the WHOLE array — a kernel that stopped early is invisible to
+  a differential) plus the standing `TestIntRunMatchesScalar` /
+  `TestParseIntRunDirect`; stride, restart and step sabotages all caught.
+- **Arrays of decimal numbers have a SIMD kernel** (`parseFloatRunAVX2` and
+  `parseFloatRunVBMI` in `floatrun_amd64.s`, `floatRunTab` in
+  `floatrun_amd64.go`; called from `decodeFloat64Slice` and
+  `DecodeFloat64Array`). The int kernel's window walk, per element: whitespace,
+  an optional `-`, L1 integer digits, an optional `.` and L2 fraction digits,
+  whitespace, the delimiter. **AVX2 body (L1+L2 <= 15)**: 16 bytes at the first
+  digit, a per-(L1, L2) `PSHUFB` control that right-aligns the digits and drops
+  the `.`, the three multiply-add folds to two 8-digit dwords, `VCVTDQ2PD`, and
+  `hi·1e8 + lo` in doubles — exact, since the top half is below 1e7 with at most
+  15 digits — then ONE `VDIVSD` by an exact ±10^L2: Clinger's fast path,
+  correctly rounded, so exactly strconv's value; the divisor carries the sign so
+  `-0` comes out as `-0`. **VBMI body (up to 19 digits)**: the same for L1+L2 <=
+  15; for 16-19 digits one ymm `VPERMI2B` gathers the digits from the 32 bytes
+  at the first digit and a register of `'0'` (a per-(L1, L2) template,
+  independent of position), the folds give three 8-digit groups, the mantissa is
+  combined in a general register (below 10^19 < 2^64), and then Clinger when it
+  is below 2^53, or **Eisel-Lemire in assembly** — `eiselLemire64` transcribed,
+  and declining (the element goes to the scalar loop, which runs `eiselLemire64`
+  and strconv) exactly where `eiselLemire64` would refine with the power's low
+  word (xHi's low nine bits all ones AND xLo + man wrapping) or decline itself
+  (an exact halfway value). Everything the kernel writes is therefore the value
+  strconv returns. Per element (`BenchmarkFloatRunShapes`, cycles /
+  instructions, as first built → final): 15-digit decimals 16.3 / 64 → 14.1 /
+  59, `", "`-separated 16.6 → 16.0, 6-digit 14.0 → 12.4, 16-digit (Clinger) 21.9
+  / 81 → 20.2 / 78, 17-digit (Eisel-Lemire) 38.1 / 114 → 28.6 / 97; against ~42
+  cycles per float through `scanFloat` on mesh and marine_ik.
+
+  **The Eisel-Lemire tail is shorter than the Go it transcribes, and each cut is
+  an argument about this body's domain.** The table holds the exponent estimate
+  less 2, so eiselLemire64's `retExp2 -= 1 ^ msb` becomes one add of `msb` and
+  the result is already the `retExp2 - 1` the assembly wants; rounding is `SHR
+  $1; ADC $0` ((m >> 1) + (m & 1) is (m + (m & 1)) >> 1); the float is assembled
+  as `mantissa + (retExp2 - 1) << 52`, the mantissa's own bit 52 supplying the
+  exponent's last 1 — so a mantissa that rounds up to 2^53 carries into the
+  exponent field and needs no test of its own; and the two range tests are gone,
+  because a mantissa of 2^53 or more over at most 10^18 is above 2^-7 and below
+  10^19 < 2^64, a biased exponent of ~1016-1087, far from 0 and 2047. The table
+  is two qword arrays rather than 16-byte entries (no shift for the index). The
+  exponent, rounding and assembly changes were **−4.7% instructions and −5.5%
+  cycles on the canada decode**; dropping the range tests, the points walk's
+  parking store and VPARSE's span test (below) took **another 7.1% of
+  instructions and 7.4% of cycles off a canada point**.
+  `TestFloatRunRoundsIntoExponent` pins the carry with values just under powers
+  of two that the kernel must convert itself.
+
+  **The sign comes from a mask, because it was on the latency chain.** VPARSE
+  read it with a byte compare at the cursor, and the cursor after the sign is
+  what the gather, the fold and the conversion all wait on: five cycles of load
+  latency per number on a kernel that is latency-bound (a point's ~220
+  instructions fill most of the reorder buffer, so each point's chains are not
+  hidden behind the next). A per-window `'-'` mask and `BT`/`SETC`/`ADC` take it
+  to two cycles, at two more instructions a window: canada −5.7%, citylots
+  −5.5%, flat-walk shapes −5.5% cycles with instructions flat. (A branch on the
+  sign measured a little better on the micro, whose signs are periodic, and is a
+  coin toss on real data; the mask is the same everywhere.) The flat walk's
+  output bound moved to memory to free the register.
+
+  **The exact refine test must test the rare half first.** Declining on the
+  low-bits pattern alone (the first form) handed back numbers eiselLemire64
+  converts; making it exact added the wrap test — and, written first, that is a
+  coin toss per Eisel-Lemire number: **canada −23% instructions and +11%
+  cycles**, mispredicts 16k → 47k a decode. With the one-in-512 pattern tested
+  first they are back to 16k. `ex_ret_brn_misp` beside `instructions` is what
+  shows it; either alone looks like a win or a mystery.
+
+  **Where the declines fall is not uniform, and the tests had assumed it was.**
+  A value exactly representable in binary (a fraction of .5, .25, .125, …) is
+  undershot by the truncated power of ten by less than the product's low bits
+  resolve, which leaves them all ones — so a 1-digit fraction declines 9% of the
+  time, 2 digits 2.5%, 3 digits 0.6%, and a 15-digit canada coordinate 0.13%.
+  `TestFloatRunEiselLemire` used to require a 97% floor; it now walks each array
+  with the kernel alone, resuming after every refusal, and requires every
+  refused element to satisfy `kernelDeclines` — the assembly's conditions
+  restated in Go — with the floor kept only as a check on that helper.
+
+  Three structural decisions, each from a measurement: (1) **the VBMI body
+  converts short numbers exactly as the AVX2 body does** — the gather for all of
+  them cost mesh +10%, numbers +21%; (2) **the gather reads memory, not the
+  window register** — adding the element's lane to the template needs a
+  broadcast from a general register on the chain and a 64-lane permute (canada
+  −3.2%, large-json −4.1% for the memory form); (3) **a stop after the sign must
+  back up over it** — a stop with the cursor past a `-` (the output full, say)
+  handed the scalar loop the digits alone and a negative number came back
+  positive; the flat walk parks the element's first byte in its not-yet-written
+  output slot before a long conversion, which clobbers the registers. VPARSE
+  bounds neither the digit count nor the span: the number lies between its
+  region start and its delimiter, a non-digit below lane 64, so the only limit
+  that matters — 19 digits for the template — is tested on the long path. **The
+  fixed-array reader** calls the VBMI body directly (`parseFloatRunV`) and
+  returns at once when it fills every slot and closes the array — the `clear` it
+  no longer needs was a memclr call per point, 3.7% of canada — and uses no
+  kernel at all without VBMI (the AVX2 body's refusal of a 17-digit coordinate
+  cost a call per point: canada +19%). Locked by `TestFloatRunMatchesScalar`
+  (5000 generated arrays of every shape and separator, both bodies, fresh and
+  reused targets, bit-for-bit), `TestFloatRunShapes` (every (L1, L2) split at
+  every lane, signed and not, against strconv), `TestFloatRunWindows` (and
+  "takes the whole array"), `TestFloatRunRandomValues`,
+  `TestFloatRunEiselLemire`, `TestFloatRunRoundsIntoExponent`,
+  `TestFloatRunStopsAtSign` and `TestFloatRunFixedArrays`; sabotaged: the
+  refine-decline removed (a one-ulp error), the wrap test inverted, the rounding
+  step, the leading-zero count, and the sign back-up — all caught.
+- **Coordinate rings are walked point by point in one call**
+  (`DecodeFloat64Points` in `points.go`, `parseFloatPointsVBMI` in
+  `floatrun_amd64.s`; the generator's `sliceDecoder` routes every `[][N]float64`
+  with a literal N there via `isFloatPoint`, except under `//lightning:arena`,
+  whose slice decoders take an arena argument). Once the numbers were cheap,
+  what was left of canada was the generated ring loop around them: a Go
+  iteration, an append, a `DecodeFloat64Array` call and a kernel call **per
+  point**, for two numbers. The reader is that loop element for element — the
+  same reset, first-append hint, growth, errors and partial result — with one
+  addition: where a point begins, the walk converts as many points as it can
+  straight into the slice's spare slots, and a point it does not take (a null, a
+  wrong length, a number it hands back) is decoded by the per-point path and the
+  walk resumes after it (a first call that takes nothing turns the walk off for
+  the ring, as in the flat readers). Interleaved A/B (n=8) against the per-point
+  path it replaced: the walk alone **canada −15.5%, canada_geometry −20.0%**,
+  large-json flat; with the pretty-ring separator search, the per-point
+  restructure below and the kernel changes above, **canada −27.5%,
+  canada_geometry −26.8%, large-json −8.1%**, numbers −8.8%, mesh −3.5%,
+  mesh_pretty −2.5%, marine_ik −1.7%, nothing worse. The walk reads one 64-byte
+  window per point, at the point, and validates the point before converting
+  anything: the first byte that is not whitespace must be its `[`, the window's
+  first `]` is its `]` (nothing before `[` can be a bracket), and the commas
+  below that are counted with `BZHI`/`POPCNT` and must be n−1 — so the
+  per-number loop runs on the comma mask alone (`TZCNT`'s carry says the last
+  number is next, `BLSR`'s that it is done). A point counts only once the
+  separator after it is seen, and that is looked for across the following
+  windows while they are whitespace, so a pretty-printed ring's last point — its
+  `]` a line below — is taken too (large-json's 10,000 rings each handed their
+  last point back before that: a 6-point ring cost 129 ns, now 105). Per point,
+  ring of 1000 (`BenchmarkFloat64Points`, cycles / instructions): canada's
+  compact 17-digit pairs 69.7 / 221, canada_geometry's shortest forms 53.9 /
+  171, large-json's pretty-printed triples 66.2 / 237 — from 80.7 / 253, 60.2 /
+  196 and 74.6 / 277 for the walk's first correct version. A point that does not
+  fit behind its leading whitespace gets one more window, at its `[`, before it
+  is handed back. **The bug the differential found**: the first hand-back path
+  rounded the count down to whole points — but a point whose numbers are all
+  written and whose separator fails IS whole, so it was counted and handed back
+  both, and decoded twice (`TestFloat64PointsMatchesPerPoint`, on a point of
+  exactly 64 bytes, whose `]` was its window's last byte and whose separator was
+  therefore in the next). The hand-back now restores the count saved at the
+  point's start. Locked by `TestFloat64PointsMatchesPerPoint` (the reader with
+  the walk against itself without, over 1500 generated rings of every separator,
+  whitespace up to 150 bytes before a ring's `]` and between points, nulls,
+  wrong lengths, trailing commas, truncation), `TestFloat64PointsMatchesStdlib`
+  (encoding/json's values, and the walk alone must take every point but those
+  holding a `kernelDeclines` number), conformance `TestFloat64PointsMatchStdlib`
+  (the generated decoder in a field, a nested polygon, under `lax`, at a named
+  root, fresh and reused, and agreeing on malformed documents), and a one-off
+  dual-generator differential (the same schema generated by the old and the new
+  generator, two seeds: 80k whole rings — 46% of them malformed — 2.8M
+  truncations of them, and 40k structs with polygons, fresh and reused:
+  identical end offsets, error identities and partial results). Sabotaged: the
+  cross-window step (a byte skipped) is caught by both unit tests.
+- **`Valid` passes over arrays of numbers without converting them**
+  (`validNumberRun`, its AVX-512 body `validNumberRun512`, and the ring walk
+  `validPointsRun512`, all in `floatrun_amd64.s`; the dispatch is at
+  `SkipValueStrict`'s `[`). `Valid` checked every number through
+  `ReadFloat64OrNull` — the full conversion — because agreeing with the
+  decoder's acceptance is its contract, and on a number-heavy document that
+  conversion was nearly the whole cost. The walks are the decimal-array kernel's
+  window walk minus the conversion: a flat one (AVX2, CLASSIFY's 26 instructions
+  a window; the AVX-512 body classifies into mask registers in 8), and a ring
+  walk that takes a coordinate ring's points in one call — the points walk minus
+  its conversions and minus its fixed count, since any count of numbers is
+  valid. **Acceptance is unchanged by construction**: they take only
+  `-?digits(.digits)?` bounded by its delimiter inside one 64-byte window —
+  fewer than 64 digits, which cannot overflow a float64, and a string the reader
+  accepts — and hand everything else back (an exponent, `+`, `.5`, `5.`, `--5`,
+  strings, containers, a point too long for a window), where the scalar walk
+  decides exactly as before; a stop backs up over a `-` so that `--5` cannot be
+  read as `-5`. The ring walk runs only below `MaxDepth` (its points are a level
+  deeper than the ring), and the first element's first byte picks the walk, so
+  each array pays for one test — a first draft that tested for a ring before the
+  flat case cost every flat array 7 instructions. `BenchmarkValidCorpus`
+  (interleaved, n=8): **canada −79.8%, mesh −58.6%, numbers −58.2%, large-json
+  −48.5%, marine_ik −47.5%**, citm −2.6%, geomean −30.2%; gsoc_2018 +2.2%
+  executes the identical instruction count (layout), synthea_fhir +1.4% at
+  +0.09% instructions (a byte test at each of its 5,046 arrays), time-array
+  +0.8% (+8 instructions a call). Of canada's −79.8%, the flat walk alone (a
+  call per point) was −67.4%, and the ring walk took a point from 222
+  instructions to 87. Locked by `TestValidNumberRunMatchesScalar`
+  (`SkipValueStrict` with the walks against itself without them, both bodies,
+  24k generated documents of every number shape and separator, rings compact,
+  pretty and odd, nesting at `MaxDepth`, truncations),
+  `TestValidNumberRunTakesArrays` and `TestValidPointsRunTakesRings` (on clean
+  input the walks must reach the `]` themselves; the only point the ring walk
+  may hand back is one longer than a window), and the guard test. Sabotaged: the
+  no-digit test (a lone `-` accepted), the AVX-512 body's whitespace-to-comma
+  test and the ring walk's delimiter test — each caught. **The last one first
+  looked caught for the wrong reason**: the differential's "scalar" reference
+  run cleared `useValidRun` but not `useValidRun512`, which gates the ring walk
+  on its own, so the reference was using the walk under test; a sabotage report
+  that names the wrong side as wrong is the tell.
+- **The batch loops give the element a kernel stopped at to the scalar code**
+  (`hold` in `decodeFloat64Slice`, `decodeIntSlice`, `decodeUintSlice`,
+  `DecodeFloat64Array`). After a productive call that stopped at an element it
+  does not convert, the loop offered that same element straight back; the call
+  was then unproductive and switched the kernel off for the rest of the array.
+  One 16-digit value 354 elements into mesh's 10,800 `positions` did that, and
+  the other 10,400 went through `scanFloat`. Now the refused element is parsed
+  by the scalar code first. (Both kernels had this; the int one had simply never
+  met an array where it mattered in the corpus.)
+- **A guard-page test for every amd64 body** (`TestAssemblyStaysInBounds`,
+  `guard_linux_amd64_test.go`): buffers flush against a `PROT_NONE` page at
+  their end and at their start, every length to 300, every body of the string,
+  escape, structural, skip and count routines; `TestNumberKernelsStayInBounds`
+  does the same for the integer and float kernels, the points walk and the
+  validation walks, from every start position within reach of the end. It is
+  what proves the masked tails' fault suppression and the overlapping tails'
+  bounds — claims a normal allocation, always followed by more heap, cannot
+  falsify; sabotaging a masked load to an unmasked one faults at once.
+- **Every dispatch arm runs under qemu's CPU models**: `qemu-x86_64-static -cpu
+  Haswell` (AVX2, no AVX-512), `-cpu Nehalem` (SSE4.2, no AVX) and `-cpu qemu64`
+  (SSE2) run the unstable, json and conformance suites on the arms this host
+  never takes; all pass. It found a test that forced a kernel flag on regardless
+  of the CPU (a SIGILL on Nehalem), which is the class of bug to look for
+  whenever a test flips a `use…` flag — and, at the end of the session, a
+  forgotten scratch test calling the VBMI walk unguarded, which nothing on this
+  host could have caught.
+
+**Measured and rejected** (each built and measured; the numbers are why):
+
+- *Breaking `BLOCKTAIL`'s escape-carry recurrence.* The carry into the next
+  block equals the parity of the block's trailing backslash run, computable with
+  `NOT`/`BSR` from the raw bitmap alone (the incoming carry only matters when
+  all 64 bytes are backslashes). Built, exact, and stringObj went **+4%
+  cycles**: the recurrence was not what bounds the block.
+- *What does bound it* (lab): on Zen 4, `VPCMPEQB zmm→k` issues once a cycle and
+  `KMOVQ k→r` once a cycle **on the same resource**, and `VPMOVMSKB ymm`
+  competes for it too — four 64-bit class masks cost ~8 cycles per 64-byte block
+  however they are split between mask and movemask paths (mixed forms 8.3-9.0
+  against 8.1). That is the floor of the four-class skip on this core.
+- *The string scanner's first block in other forms* (dependent-chain lab, cycles
+  per call): current SSE2 16.8, SSSE3 `PSHUFB` classification 18.6, EVEX ymm16+
+  32-byte block with a k-mask (no `VZEROUPPER`) 21.0 — the mask round trip lands
+  on the latency chain. Long strings (200-300 B): an AVX2 64-byte `VPSHUFB` loop
+  −5%, but +3% at 40-120 B; AVX-512 `VPSHUFB`+k loops +12…+18%.
+- *The VBMI float body for every number*, *a first-element peek choosing the
+  body* (per call, and a point is a call: canada −9% against −15%), and *the
+  window reloaded as a zmm per long element* — see the float kernel entry.
+- *`BSF` vs `TZCNT`*: both one op with one-cycle latency on Zen 4; `BSF`'s
+  throughput is higher. Nothing to change.
+- *A branch on the sign instead of the `'-'` mask*: 1-2 cycles a point better on
+  the micro-benchmark, whose signs repeat, and a coin toss on real data; the
+  mask costs the same on any input.
+
+**Sized and not built**:
+
+- *Refining Eisel-Lemire in the kernel* (the low-word multiply eiselLemire64
+  does when the product's low bits are all ones): the declines it would remove
+  are 0.13% of canada's numbers, each costing a hand-back — an estimated ~0.3%
+  of the decode — against a second table and a second multiply in the macro.
+- *Accepting exponents in the validation walks*: `|e| <= 99` cannot overflow a
+  number of under 64 digits, so it would be sound, but the corpus's number
+  arrays hold few (622 in marine_ik, 5 in mesh, 1 in numbers, none in canada or
+  large-json), and a hand-back costs only the rest of that array.
+
+**Zen 4 facts from the labs**: `VPERMB zmm` throughput one per 2 cycles;
+unaligned zmm loads cost ~45% over aligned on a load-bound loop; the
+GP→XMM→`VPCLMULQDQ`→GP round trip is ~10 cycles of latency; a legacy-SSE memory
+operand on a 32-byte `DATA` symbol is always aligned.

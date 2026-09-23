@@ -2,7 +2,10 @@
 
 package unstable
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // TestSkipBlocksVariants differentially tests every skip implementation this
 // machine has — the AVX-512 loop, the AVX2 loop, and the Go maskBlock loop —
@@ -30,6 +33,32 @@ func TestSkipBlocksVariants(t *testing.T) {
 	for _, va := range variants {
 		useSkipBlocks, useSkipBlocks512 = va.blocks, va.b512
 		testSkipVariantCorpus(t, va.name)
+		testSkipTailSweep(t, va.name)
+	}
+}
+
+// testSkipTailSweep runs the boundary corpus through the live skip variant
+// with the container starting at several offsets and followed by every
+// padding up to 80 bytes. The assembly bodies take the final < 64 bytes of the
+// buffer themselves (skipBlocksTakesTail) — the AVX2 one as the buffer's last
+// 64 bytes shifted by the lanes before the cursor, the AVX-512 one with a
+// masked load of exactly the remainder — so the close landing at every
+// distance from the END of the buffer is a separate case of each, and so is
+// every cursor position the shift is computed from.
+func testSkipTailSweep(t *testing.T, name string) {
+	t.Helper()
+	for _, c := range boundaryDocs() {
+		for _, lead := range []int{0, 1, 7, 33, 63, 64, 65} {
+			for pad := 0; pad <= 80; pad++ {
+				data := []byte(strings.Repeat(" ", lead) + c + strings.Repeat(" ", pad))
+				want, werr := refSkip(data, lead)
+				got, gerr := skipContainerFast(data, lead, data[lead])
+				if got != want || (werr == nil) != (gerr == nil) {
+					t.Fatalf("%s: lead %d pad %d %q: fast=(%d,%v) ref=(%d,%v)",
+						name, lead, pad, c, got, gerr, want, werr)
+				}
+			}
+		}
 	}
 }
 

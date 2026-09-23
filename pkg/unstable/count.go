@@ -113,36 +113,35 @@ func CountArrayElements(data []byte, i int) int {
 // cheaper than CountArrayElements but valid only when the element type is known
 // (by the generator) to be a scalar. It returns 0 for an empty array.
 func CountArrayScalars(data []byte, i int) int {
-	rb := bytes.IndexByte(data[i+1:], ']')
-	if rb < 0 {
-		return 0
-	}
-	seg := data[i+1 : i+1+rb]
-	for _, c := range seg {
-		if c != ' ' && c != '\t' && c != '\n' && c != '\r' {
-			n := bytes.Count(seg, commaByte) + 1
-			// Clamp to the element count seg can structurally hold: n elements
-			// need n-1 separating commas plus at least one byte each, so
-			// len(seg) >= 2n-1, i.e. n <= (len(seg)+1)/2. Exact at the densest
-			// legal packing ([1,2,3]), so no honest count is ever clipped —
-			// this only bounds a comma count inflated by commas that are not
-			// separators. The element type is vouched scalar by the generator,
-			// but []time.Time is in that set, and its quoted values can carry
-			// arbitrary bytes on hostile input; the count becomes a make()
-			// capacity, so an unbounded comma count is an unbounded allocation.
-			// One compare on an already-computed length, never taken on real
-			// input.
-			if lim := (rb + 1) / 2; n > lim {
-				n = lim
-			}
-			return n
-		}
-	}
-	return 0 // empty (whitespace-only) array
+	// One pass finds the ']' and counts the elements before it — the commas
+	// plus one, or for a comma-free span one element unless it is blank — in
+	// one call (countKernel; on amd64 a single assembly scan where this
+	// used to make two library calls over the same bytes and walk the span for
+	// a non-whitespace byte itself). It is that call and nothing else so that
+	// it inlines into the batch readers, which is why the clamp lives in the
+	// scan too: n elements need n-1 separating commas plus at least one byte
+	// each, so a span of rb bytes holds at most (rb+1)/2. That is exact at the
+	// densest legal packing ([1,2,3]), so no honest count is ever clipped — it
+	// only bounds a comma count inflated by commas that are not separators.
+	// The element type is vouched scalar by the generator, but []time.Time is
+	// in that set, and its quoted values can carry arbitrary bytes on hostile
+	// input; the count becomes a make() capacity, so an unbounded comma count
+	// is an unbounded allocation.
+	//
+	// A blank span is judged by this library's whitespace rule, every byte
+	// <= 0x20, which is what SkipWS applies between the tokens the decoder then
+	// reads; the four JSON whitespace bytes it used to test instead made
+	// [\x01] presize one element for an array the decoder reads as empty.
+	_, n := countKernel(data, i+1, ',', true)
+	return n
 }
 
-var commaByte = []byte{','}
-var openBraceByte = []byte{'{'}
+// countBeforeClose scans data[i:] for the first ']' and returns its offset
+// from i together with the number of c bytes before it; rb is -1 when there is
+// no ']'.
+func countBeforeClose(data []byte, i int, c byte) (rb, n int) {
+	return countKernel(data, i, c, false)
+}
 
 // CountArrayObjects counts the elements of a JSON array of "bracket-free" objects
 // beginning at data[i] (data[i] must be '['). A bracket-free object has only
@@ -159,11 +158,10 @@ func CountArrayObjects(data []byte, i int) int {
 	if uint(i) >= uint(len(data)) {
 		return 0
 	}
-	rb := bytes.IndexByte(data[i+1:], ']')
+	rb, n := countBeforeClose(data, i+1, '{')
 	if rb < 0 {
 		return 0
 	}
-	n := bytes.Count(data[i+1:i+1+rb], openBraceByte)
 	// Clamp to the element count the span can structurally hold: an object
 	// element is at least '{}' (2 bytes) and n of them need n-1 separating
 	// commas, so rb >= 3n-1, i.e. n <= (rb+1)/3. Exact at the densest legal

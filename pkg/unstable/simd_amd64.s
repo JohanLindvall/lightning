@@ -22,29 +22,49 @@ DATA ctrlMask<>+16(SB)/8, $0x1f1f1f1f1f1f1f1f
 DATA ctrlMask<>+24(SB)/8, $0x1f1f1f1f1f1f1f1f
 GLOBL ctrlMask<>(SB), RODATA|NOPTR, $32
 
-// Shuffle-classification tables for indexStructuralAVX2 (the simdjson
-// find_structurals trick). A byte is one of '{' '}' '[' ']' '"' iff
-// structLoTable[lowNibble] & structHiTable[highNibble] != 0. The two bits encode
-// the two nibble groups — '"' (lo 0x2, hi 0x2) and the brackets/braces (lo 0xB/0xD,
-// hi 0x5/0x7) — so cross combinations like 0x52 'R' classify as non-structural.
-// Each 16-byte table is duplicated across both AVX2 lanes (VPSHUFB is per-lane).
-DATA structLoTable<>+0(SB)/8, $0x0000000000010000
-DATA structLoTable<>+8(SB)/8, $0x0000020002000000
-DATA structLoTable<>+16(SB)/8, $0x0000000000010000
-DATA structLoTable<>+24(SB)/8, $0x0000020002000000
-GLOBL structLoTable<>(SB), RODATA|NOPTR, $32
+// Splats for indexStructuralAVX2's AVX2 body. A byte is structural iff
+// (c|0x20) == '{' (which holds for exactly '{' and '['), (c|0x20) == '}'
+// (exactly '}' and ']'), or c == '"': the two bracket pairs differ only in bit
+// 0x20, so ORing it in folds each pair onto one compare, and the quote is
+// compared unfolded because 0x22|0x20 is also 0x02|0x20. Three compares and one
+// OR per vector, with no shuffle — the nibble-table classification this
+// replaced spent two VPSHUFB, a shift and three ANDs, and needed the mask
+// inverted afterwards.
+DATA stBit5<>+0(SB)/8, $0x2020202020202020
+DATA stBit5<>+8(SB)/8, $0x2020202020202020
+DATA stBit5<>+16(SB)/8, $0x2020202020202020
+DATA stBit5<>+24(SB)/8, $0x2020202020202020
+GLOBL stBit5<>(SB), RODATA|NOPTR, $32
 
-DATA structHiTable<>+0(SB)/8, $0x0200020000010000
-DATA structHiTable<>+8(SB)/8, $0x0000000000000000
-DATA structHiTable<>+16(SB)/8, $0x0200020000010000
-DATA structHiTable<>+24(SB)/8, $0x0000000000000000
-GLOBL structHiTable<>(SB), RODATA|NOPTR, $32
+DATA stOpen<>+0(SB)/8, $0x7b7b7b7b7b7b7b7b
+DATA stOpen<>+8(SB)/8, $0x7b7b7b7b7b7b7b7b
+DATA stOpen<>+16(SB)/8, $0x7b7b7b7b7b7b7b7b
+DATA stOpen<>+24(SB)/8, $0x7b7b7b7b7b7b7b7b
+GLOBL stOpen<>(SB), RODATA|NOPTR, $32
 
-DATA nibbleMask<>+0(SB)/8, $0x0f0f0f0f0f0f0f0f
-DATA nibbleMask<>+8(SB)/8, $0x0f0f0f0f0f0f0f0f
-DATA nibbleMask<>+16(SB)/8, $0x0f0f0f0f0f0f0f0f
-DATA nibbleMask<>+24(SB)/8, $0x0f0f0f0f0f0f0f0f
-GLOBL nibbleMask<>(SB), RODATA|NOPTR, $32
+DATA stClose<>+0(SB)/8, $0x7d7d7d7d7d7d7d7d
+DATA stClose<>+8(SB)/8, $0x7d7d7d7d7d7d7d7d
+DATA stClose<>+16(SB)/8, $0x7d7d7d7d7d7d7d7d
+DATA stClose<>+24(SB)/8, $0x7d7d7d7d7d7d7d7d
+GLOBL stClose<>(SB), RODATA|NOPTR, $32
+
+// The AVX-512 VBMI body's classification table, one VPERMB and one compare per
+// 64 bytes. VPERMB indexes a 64-byte table with the low six bits of each input
+// byte, and the five structural bytes have distinct low six bits (0x22, 0x1b,
+// 0x1d, 0x3b, 0x3d), so entry k holds the structural byte whose low six bits are
+// k and every other entry holds k^1 — a byte whose low six bits are NOT k, which
+// no input c with c&63 == k can equal. So table[c&63] == c holds for exactly the
+// five structural bytes. Entry 0 is 0x01, so a zeroed lane of a masked load
+// never matches either.
+DATA structPerm<>+0(SB)/8, $0x0607040502030001
+DATA structPerm<>+8(SB)/8, $0x0e0f0c0d0a0b0809
+DATA structPerm<>+16(SB)/8, $0x1617141512131011
+DATA structPerm<>+24(SB)/8, $0x1e1f5d1d5b1b1819
+DATA structPerm<>+32(SB)/8, $0x2627242522222021
+DATA structPerm<>+40(SB)/8, $0x2e2f2c2d2a2b2829
+DATA structPerm<>+48(SB)/8, $0x3637343532333031
+DATA structPerm<>+56(SB)/8, $0x3e3f7d3d7b3b3839
+GLOBL structPerm<>(SB), RODATA|NOPTR, $64
 
 // func indexQuoteOrBackslashSSE2(b []byte) int
 //
@@ -57,30 +77,37 @@ GLOBL nibbleMask<>(SB), RODATA|NOPTR, $32
 // finishes in one iteration) without the VZEROUPPER, and the second 16-byte load
 // is skipped entirely when the match lands in the first half. A 16-byte loop
 // then handles a final 16-31 byte span before the scalar tail.
+//
+// The two splats are not loaded into registers up front: every compare takes
+// its splat as a memory operand instead. Legacy SSE requires a 16-byte aligned
+// memory operand, which these 32-byte RODATA symbols have (the linker aligns a
+// symbol to the power of two covering its size, up to 32). Almost every call
+// is one block, so the two up-front loads were two instructions of eight in
+// front of the first compare, on the call that runs once per object key and
+// once per string value; folded, the loads issue with the compares they feed
+// and the call is two instructions shorter.
 TEXT ·indexQuoteOrBackslashSSE2(SB), NOSPLIT, $0-40
 	MOVQ b_base+0(FP), SI
 	MOVQ b_len+8(FP), CX
 	MOVQ i+24(FP), DI            // scan offset; DI stays the absolute index
 	SUBQ DI, CX                  // CX = bytes left from i
 	JS   sse_notfound            // i past the end: no bytes, answer len(b)
-	MOVOU quoteMask<>(SB), X0    // low 16 bytes of the splat: '"' x16
-	MOVOU bslashMask<>(SB), X1   // '\\' x16
 
 sse_loop32:
 	CMPQ CX, $32
 	JL   sse_loop16
 	MOVOU (SI)(DI*1), X2         // first 16 bytes
 	MOVOU X2, X3
-	PCMPEQB X0, X2
-	PCMPEQB X1, X3
+	PCMPEQB quoteMask<>(SB), X2  // the splats are memory operands: see above
+	PCMPEQB bslashMask<>(SB), X3
 	POR     X3, X2
 	PMOVMSKB X2, AX
 	TESTL    AX, AX
 	JNZ      sse_found
 	MOVOU 16(SI)(DI*1), X4       // second 16 bytes (only if first had no match)
 	MOVOU X4, X5
-	PCMPEQB X0, X4
-	PCMPEQB X1, X5
+	PCMPEQB quoteMask<>(SB), X4
+	PCMPEQB bslashMask<>(SB), X5
 	POR     X5, X4
 	PMOVMSKB X4, AX
 	TESTL    AX, AX
@@ -123,15 +150,15 @@ qb_avx_found:
 
 qb_avx_done:
 	VZEROUPPER
-	// <32 bytes remain; the X-register splats survive VZEROUPPER, so finish in SSE.
+	// <32 bytes remain; finish in SSE.
 
 sse_loop16:
 	CMPQ CX, $16
 	JL   sse_tail
 	MOVOU (SI)(DI*1), X2
 	MOVOU X2, X3
-	PCMPEQB X0, X2
-	PCMPEQB X1, X3
+	PCMPEQB quoteMask<>(SB), X2
+	PCMPEQB bslashMask<>(SB), X3
 	POR     X3, X2
 	PMOVMSKB X2, AX
 	TESTL    AX, AX
@@ -172,75 +199,233 @@ sse_tfound:
 	MOVQ DI, ret+32(FP)
 	RET
 
-// func indexStructuralAVX2(b []byte) int
+// func indexStructuralAVX2(b []byte, i int) int
 //
-// Returns the index of the first '{', '}', '[', ']' or '"' byte in b, or
-// len(b) if none is present.
-TEXT ·indexStructuralAVX2(SB), NOSPLIT, $0-32
-	MOVQ b_base+0(FP), SI
+// Returns the index of the first '{', '}', '[', ']' or '"' byte in b at or
+// after i, or len(b) if none is present. Two bodies, selected here rather than
+// in Go for the reason the string scanner gives: ·useStructural512 (AVX-512
+// VBMI) takes one VPERMB and one VPCMPEQB into a mask register per 64 bytes and
+// ends in a masked load, so it has no scalar tail at all; otherwise AVX2 scans
+// 64 bytes per iteration with the compare classification above and finishes on
+// an OVERLAPPING 32-byte block (the buffer's last 32 bytes, the lanes before
+// the cursor shifted out of the mask) instead of a byte loop.
+//
+// Both loops advance a pointer rather than an index so that every load has a
+// base-only address (an indexed VEX operand splits into two uops on Intel),
+// and both test the loop condition at the bottom, which leaves one taken branch
+// per iteration. The skip-heavy case is this loop and nothing else, and on Zen 4
+// the loop it replaced ran at 5.8 ops a cycle — the dispatch limit — so the
+// currency was ops per byte: 15 per 32 bytes before, 17 per 64 on AVX2 and 5 per
+// 64 on VBMI.
+//
+// The VBMI body uses only Z16-Z31, which no SSE or VEX instruction can reach,
+// so it needs no VZEROUPPER (the glibc EVEX string functions' reason for the
+// same choice).
+TEXT ·indexStructuralAVX2(SB), NOSPLIT, $0-40
+	MOVQ b_base+0(FP), DX           // DX = base
 	MOVQ b_len+8(FP), CX
-	XORQ DI, DI
-	VMOVDQU structLoTable<>(SB), Y0
-	VMOVDQU structHiTable<>(SB), Y1
-	VMOVDQU nibbleMask<>(SB), Y2
-	VPXOR   Y3, Y3, Y3
+	MOVQ i+24(FP), SI
+	LEAQ (DX)(CX*1), R9             // R9 = end
+	CMPQ SI, CX
+	JGE  st_notfound
+	LEAQ (DX)(SI*1), SI             // SI = p
+	MOVBLZX ·useStructural512(SB), AX
+	TESTL   AX, AX
+	JNZ     st_vbmi
 
-loops:
+	// AVX2: 64 bytes a step while a full step remains. A buffer under 32 bytes
+	// holds no block at all, so it is walked before any vector state is touched.
 	CMPQ CX, $32
-	JL   tails
-	VMOVDQU  (SI)(DI*1), Y5
-	VPAND    Y2, Y5, Y6  // low nibbles
-	VPSHUFB  Y6, Y0, Y6  // structLoTable[lowNibble]
-	VPSRLW   $4, Y5, Y7
-	VPAND    Y2, Y7, Y7  // high nibbles
-	VPSHUFB  Y7, Y1, Y7  // structHiTable[highNibble]
-	VPAND    Y7, Y6, Y6  // nonzero where structural
-	VPCMPEQB Y3, Y6, Y6  // 0xFF where NOT structural
-	VPMOVMSKB Y6, AX     // 1-bits mark non-structural bytes
-	NOTL     AX          // ... so invert to mark structural bytes
+	JLT  st_bytes
+	VMOVDQU stBit5<>(SB), Y10
+	VMOVDQU stOpen<>(SB), Y11
+	VMOVDQU stClose<>(SB), Y12
+	VMOVDQU quoteMask<>(SB), Y13
+	LEAQ -64(R9), R8                // last start of a full 64-byte step
+	CMPQ SI, R8
+	JHI  st_avx_32
+st_avx_loop:
+	VMOVDQU  (SI), Y0
+	VMOVDQU  32(SI), Y3
+	VPOR     Y10, Y0, Y1            // t = c | 0x20
+	VPCMPEQB Y13, Y0, Y0            // c == '"'
+	VPCMPEQB Y11, Y1, Y2            // t == '{'  ('{' or '[')
+	VPCMPEQB Y12, Y1, Y1            // t == '}'  ('}' or ']')
+	VPOR     Y2, Y0, Y0
+	VPOR     Y1, Y0, Y0
+	VPOR     Y10, Y3, Y4
+	VPCMPEQB Y13, Y3, Y3
+	VPCMPEQB Y11, Y4, Y5
+	VPCMPEQB Y12, Y4, Y4
+	VPOR     Y5, Y3, Y3
+	VPOR     Y4, Y3, Y3
+	VPOR     Y3, Y0, Y5
+	VPMOVMSKB Y5, AX
 	TESTL    AX, AX
-	JNZ      founds
-	ADDQ     $32, DI
-	SUBQ     $32, CX
-	JMP      loops
+	JNZ      st_avx_found64
+	ADDQ     $64, SI
+	CMPQ     SI, R8
+	JLS      st_avx_loop
 
-founds:
-	BSFL AX, AX
-	ADDQ DI, AX
-	MOVQ AX, ret+24(FP)
+st_avx_32:
+	// < 64 bytes left: one 32-byte block if it fits, then the overlapping tail.
+	LEAQ -32(R9), R8                // last start of a full 32-byte block
+	CMPQ SI, R8
+	JHI  st_avx_tail
+	VMOVDQU  (SI), Y0
+	VPOR     Y10, Y0, Y1
+	VPCMPEQB Y13, Y0, Y0
+	VPCMPEQB Y11, Y1, Y2
+	VPCMPEQB Y12, Y1, Y1
+	VPOR     Y2, Y0, Y0
+	VPOR     Y1, Y0, Y0
+	VPMOVMSKB Y0, AX
+	TESTL    AX, AX
+	JNZ      st_avx_found
+	ADDQ     $32, SI
+
+st_avx_tail:
+	// < 32 bytes left from SI. The buffer holds at least 32 (checked on entry),
+	// so classify its LAST 32 — they end at R9 and include everything from SI
+	// on — and shift the lanes before SI out of the mask.
+	CMPQ SI, R9
+	JEQ  st_avx_notfound
+	VMOVDQU  -32(R9), Y0
+	VPOR     Y10, Y0, Y1
+	VPCMPEQB Y13, Y0, Y0
+	VPCMPEQB Y11, Y1, Y2
+	VPCMPEQB Y12, Y1, Y1
+	VPOR     Y2, Y0, Y0
+	VPOR     Y1, Y0, Y0
+	VPMOVMSKB Y0, AX
 	VZEROUPPER
+	MOVQ     SI, BX
+	SUBQ     R8, BX                 // lanes already covered: SI - (end-32)
+	SHRXQ    BX, AX, AX
+	TESTL    AX, AX
+	JZ       st_notfound
+	TZCNTL   AX, AX
+	SUBQ     DX, SI
+	ADDQ     SI, AX
+	MOVQ     AX, ret+32(FP)
 	RET
 
-tails:
-	TESTQ CX, CX
-	JZ    notfounds
+st_avx_found64:
+	VPMOVMSKB Y0, BX                // the first half's lanes
+	TESTL    BX, BX
+	JNZ      st_avx_found64lo
+	ADDQ     $32, SI                // the match is in the second half
+	JMP      st_avx_found
+st_avx_found64lo:
+	MOVL     BX, AX
+st_avx_found:
+	VZEROUPPER
+	TZCNTL   AX, AX
+	SUBQ     DX, SI
+	ADDQ     SI, AX
+	MOVQ     AX, ret+32(FP)
+	RET
 
-tailsloop:
-	MOVBLZX (SI)(DI*1), AX
+st_bytes:
+	MOVBLZX (SI), AX
 	CMPL    AX, $0x7b
-	JE      tfs
+	JE      st_bytefound
 	CMPL    AX, $0x7d
-	JE      tfs
+	JE      st_bytefound
 	CMPL    AX, $0x5b
-	JE      tfs
+	JE      st_bytefound
 	CMPL    AX, $0x5d
-	JE      tfs
+	JE      st_bytefound
 	CMPL    AX, $0x22
-	JE      tfs
-	INCQ    DI
-	DECQ    CX
-	JNZ     tailsloop
-
-notfounds:
-	MOVQ b_len+8(FP), AX
-	MOVQ AX, ret+24(FP)
-	VZEROUPPER
+	JE      st_bytefound
+	INCQ    SI
+	CMPQ    SI, R9
+	JNE     st_bytes
+	JMP     st_notfound
+st_bytefound:
+	SUBQ    DX, SI
+	MOVQ    SI, ret+32(FP)
 	RET
 
-tfs:
-	MOVQ DI, ret+24(FP)
+st_avx_notfound:
 	VZEROUPPER
+st_notfound:
+	MOVQ CX, ret+32(FP)
 	RET
+
+st_vbmi:
+	// AVX-512 VBMI: VPERMB looks every byte up in structPerm and the compare
+	// keeps the lanes whose byte came back unchanged (see the table). VPERMB on
+	// a zmm register issues once every two cycles on Zen 4, and a zmm load that
+	// is not 64-byte aligned always spans two cache lines, which measured 45%
+	// slower on a load-only loop; so the first block is read where the scan
+	// starts, and the bulk from the next 64-byte boundary on, two blocks a step.
+	VMOVDQU64 structPerm<>(SB), Z16
+	LEAQ -64(R9), R8
+	CMPQ SI, R8
+	JHI  st_vbmi_tail
+	VMOVDQU64 (SI), Z17
+	VPERMB    Z16, Z17, Z18
+	VPCMPEQB  Z17, Z18, K1
+	KORTESTQ  K1, K1
+	JNZ       st_vbmi_found
+	ADDQ      $64, SI
+	ANDQ      $-64, SI              // re-scanning up to 63 clean bytes is free
+	LEAQ      -128(R9), R8
+	CMPQ      SI, R8
+	JHI       st_vbmi_one
+st_vbmi_loop:
+	VMOVDQU64 (SI), Z17
+	VMOVDQU64 64(SI), Z19
+	VPERMB    Z16, Z17, Z18
+	VPERMB    Z16, Z19, Z20
+	VPCMPEQB  Z17, Z18, K1
+	VPCMPEQB  Z19, Z20, K2
+	KORTESTQ  K1, K2
+	JNZ       st_vbmi_found2
+	SUBQ      $-128, SI
+	CMPQ      SI, R8
+	JLS       st_vbmi_loop
+st_vbmi_one:
+	// < 128 bytes left: one more full block if 64 of them remain.
+	LEAQ      -64(R9), R8
+	CMPQ      SI, R8
+	JHI       st_vbmi_tail
+	VMOVDQU64 (SI), Z17
+	VPERMB    Z16, Z17, Z18
+	VPCMPEQB  Z17, Z18, K1
+	KORTESTQ  K1, K1
+	JNZ       st_vbmi_found
+	ADDQ      $64, SI
+st_vbmi_tail:
+	// < 64 bytes left: a masked load reads exactly them (masked-off lanes are
+	// zeroed and cannot fault), so there is no byte loop and no overlap.
+	MOVQ      R9, BX
+	SUBQ      SI, BX                // n = end - p, 0..63
+	JZ        st_notfound
+	MOVQ      $-1, AX
+	BZHIQ     BX, AX, AX
+	KMOVQ     AX, K2
+	VMOVDQU8.Z (SI), K2, Z17
+	VPERMB    Z16, Z17, Z18
+	VPCMPEQB  Z17, Z18, K1
+	KORTESTQ  K1, K1
+	JZ        st_notfound
+st_vbmi_found:
+	KMOVQ     K1, AX
+st_vbmi_foundAX:
+	TZCNTQ    AX, AX
+	SUBQ      DX, SI
+	ADDQ      SI, AX
+	MOVQ      AX, ret+32(FP)
+	RET
+st_vbmi_found2:
+	KMOVQ     K1, AX
+	TESTQ     AX, AX
+	JNZ       st_vbmi_foundAX
+	KMOVQ     K2, AX
+	ADDQ      $64, SI
+	JMP       st_vbmi_foundAX
 
 // func indexEscapeSSE2(b []byte) int
 //
@@ -249,31 +434,28 @@ tfs:
 // indexQuoteOrBackslashSSE2's structure (SSE2 first 32 bytes with no VZEROUPPER,
 // switch to AVX2 only for a long clean run, then a 16-byte SSE loop and a scalar
 // tail) and adds, per block, a PMINUB(v, 0x1f) == v test that marks control bytes:
-// min(c, 0x1f) equals c exactly when c <= 0x1f. X0/Y0 = '"' splat, X1/Y1 = '\\'
-// splat, X6/Y6 = 0x1f splat; X7/Y4 are per-block scratch.
+// min(c, 0x1f) equals c exactly when c <= 0x1f. The SSE blocks take the three
+// splats as aligned memory operands, as indexQuoteOrBackslashSSE2 does; the AVX2
+// loop holds them in Y0 ('"'), Y1 ('\\') and Y6 (0x1f). X7/Y4 are per-block
+// scratch.
 TEXT ·indexEscapeSSE2(SB), NOSPLIT, $0-32
 	MOVQ b_base+0(FP), SI
 	MOVQ b_len+8(FP), CX
 	XORQ DI, DI
-	// Short buffers (fewer than one vector block) skip the three splat loads and go
-	// straight to the scalar tail, which needs no splats.
 	CMPQ CX, $16
 	JL   esc_tail
-	MOVOU quoteMask<>(SB), X0
-	MOVOU bslashMask<>(SB), X1
-	MOVOU ctrlMask<>(SB), X6
 
 esc_loop32:
 	CMPQ CX, $32
 	JL   esc_loop16
 	MOVOU (SI)(DI*1), X2         // first 16 bytes
 	MOVOU X2, X3
-	PCMPEQB X0, X3              // == '"'
+	PCMPEQB quoteMask<>(SB), X3              // == '"'
 	MOVOU X2, X7
-	PCMPEQB X1, X7             // == '\\'
+	PCMPEQB bslashMask<>(SB), X7             // == '\\'
 	POR     X7, X3
 	MOVOU X2, X7
-	PMINUB X6, X7              // min(v, 0x1f)
+	PMINUB ctrlMask<>(SB), X7              // min(v, 0x1f)
 	PCMPEQB X2, X7            // == v  -> control byte
 	POR     X7, X3
 	PMOVMSKB X3, AX
@@ -281,12 +463,12 @@ esc_loop32:
 	JNZ      esc_found
 	MOVOU 16(SI)(DI*1), X4      // second 16 bytes
 	MOVOU X4, X5
-	PCMPEQB X0, X5
+	PCMPEQB quoteMask<>(SB), X5
 	MOVOU X4, X7
-	PCMPEQB X1, X7
+	PCMPEQB bslashMask<>(SB), X7
 	POR     X7, X5
 	MOVOU X4, X7
-	PMINUB X6, X7
+	PMINUB ctrlMask<>(SB), X7
 	PCMPEQB X4, X7
 	POR     X7, X5
 	PMOVMSKB X5, AX
@@ -336,12 +518,12 @@ esc_loop16:
 	JL   esc_tail
 	MOVOU (SI)(DI*1), X2
 	MOVOU X2, X3
-	PCMPEQB X0, X3
+	PCMPEQB quoteMask<>(SB), X3
 	MOVOU X2, X7
-	PCMPEQB X1, X7
+	PCMPEQB bslashMask<>(SB), X7
 	POR     X7, X3
 	MOVOU X2, X7
-	PMINUB X6, X7
+	PMINUB ctrlMask<>(SB), X7
 	PCMPEQB X2, X7
 	POR     X7, X3
 	PMOVMSKB X3, AX
@@ -401,21 +583,18 @@ TEXT ·indexEscapeNonASCIISSE2(SB), NOSPLIT, $0-32
 	XORQ DI, DI
 	CMPQ CX, $16
 	JL   escu_tail
-	MOVOU quoteMask<>(SB), X0
-	MOVOU bslashMask<>(SB), X1
-	MOVOU ctrlMask<>(SB), X6
 
 escu_loop32:
 	CMPQ CX, $32
 	JL   escu_loop16
 	MOVOU (SI)(DI*1), X2         // first 16 bytes
 	MOVOU X2, X3
-	PCMPEQB X0, X3              // == '"'
+	PCMPEQB quoteMask<>(SB), X3              // == '"'
 	MOVOU X2, X7
-	PCMPEQB X1, X7             // == '\\'
+	PCMPEQB bslashMask<>(SB), X7             // == '\\'
 	POR     X7, X3
 	MOVOU X2, X7
-	PMINUB X6, X7              // min(v, 0x1f)
+	PMINUB ctrlMask<>(SB), X7              // min(v, 0x1f)
 	PCMPEQB X2, X7            // == v  -> control byte
 	POR     X7, X3
 	POR     X2, X3             // raw sign bits -> non-ASCII lanes
@@ -424,12 +603,12 @@ escu_loop32:
 	JNZ      escu_found
 	MOVOU 16(SI)(DI*1), X4      // second 16 bytes
 	MOVOU X4, X5
-	PCMPEQB X0, X5
+	PCMPEQB quoteMask<>(SB), X5
 	MOVOU X4, X7
-	PCMPEQB X1, X7
+	PCMPEQB bslashMask<>(SB), X7
 	POR     X7, X5
 	MOVOU X4, X7
-	PMINUB X6, X7
+	PMINUB ctrlMask<>(SB), X7
 	PCMPEQB X4, X7
 	POR     X7, X5
 	POR     X4, X5             // raw sign bits -> non-ASCII lanes
@@ -481,12 +660,12 @@ escu_loop16:
 	JL   escu_tail
 	MOVOU (SI)(DI*1), X2
 	MOVOU X2, X3
-	PCMPEQB X0, X3
+	PCMPEQB quoteMask<>(SB), X3
 	MOVOU X2, X7
-	PCMPEQB X1, X7
+	PCMPEQB bslashMask<>(SB), X7
 	POR     X7, X3
 	MOVOU X2, X7
-	PMINUB X6, X7
+	PMINUB ctrlMask<>(SB), X7
 	PCMPEQB X2, X7
 	POR     X7, X3
 	POR     X2, X3             // raw sign bits -> non-ASCII lanes
