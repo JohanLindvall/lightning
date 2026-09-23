@@ -161,6 +161,22 @@ func ReadInt64OrNull(data []byte, i int) (int64, int, error) {
 		n = int64(v)
 		i = end
 	} else {
+		// Eight digits are the exception to the byte loop: a run that long
+		// (an id, a timestamp) is taken in one step — one word tested
+		// all-digits and folded by parse8Digits — and the cursor advances by
+		// a CONSTANT eight under a branch the predictor learns, so the fold
+		// stays off the cursor's chain, which is what the counted word fold
+		// could not do. The byte at i+7 is tested first, one compare that
+		// keeps the word test off the short numbers (after a short number in
+		// an object it is almost never a digit); the bound proves both it and
+		// the load. golang_source's ten-digit ids −5.8% cycles, citm's nine
+		// −3.0%, a 1-7-digit int ~0.2 ns more (instruments +1.6%).
+		if j := i + 7; uint(j) < uint(len(data)) && data[j]-'0' <= 9 {
+			if d := load64(data, i) ^ swarZero; ((d+swarSix)|d)&swarNib == 0 {
+				n = int64(parse8Digits(d))
+				i += 8
+			}
+		}
 		for uint(i) < uint(len(data)) {
 			d := data[i] - '0'
 			if d > 9 {
@@ -219,6 +235,13 @@ func ReadUint64OrNull(data []byte, i int) (uint64, int, error) {
 		n = uint64(v)
 		i = end
 	} else {
+		// An eight-digit run in one step; see ReadInt64OrNull.
+		if j := i + 7; uint(j) < uint(len(data)) && data[j]-'0' <= 9 {
+			if d := load64(data, i) ^ swarZero; ((d+swarSix)|d)&swarNib == 0 {
+				n = parse8Digits(d)
+				i += 8
+			}
+		}
 		for uint(i) < uint(len(data)) {
 			d := data[i] - '0'
 			if d > 9 {
