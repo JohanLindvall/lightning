@@ -50,8 +50,15 @@ TEXT ·countKernel(SB), NOSPLIT, $0-56
 	CMPQ    CX, $32
 	JLT     cbc_bytes
 	VMOVDQU cbcClose<>(SB), Y0
-	MOVQ    R11, X1
-	VPBROADCASTB X1, Y1
+	// c is broadcast straight from the frame. It was MOVQ R11, X1 and a
+	// broadcast from X1, and MOVQ to an X register is a LEGACY SSE
+	// instruction: executed after the load above has made the upper halves
+	// of the vector registers dirty, it takes an SSE/AVX transition assist on
+	// Intel cores (assists.sse_avx_mix) — once per call, which is once per
+	// presized array: 2,600 a decode on update_center, +31% cycles on
+	// Meteor Lake. AMD does not penalise the mix, so it measured clean on
+	// Zen 4. Nothing in this function may be a non-VEX vector instruction.
+	VPBROADCASTB c+32(FP), Y1
 	LEAQ    -32(R9), BX             // the last start of a full block
 	CMPQ    R8, BX
 	JHI     cbc_tail
