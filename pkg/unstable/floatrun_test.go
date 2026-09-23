@@ -672,16 +672,24 @@ func BenchmarkFloatRunShapes(b *testing.B) {
 	if !useFloatRun {
 		b.Skip("no SIMD decimal-run kernel on this machine")
 	}
-	for _, sh := range []struct{ name, num, sep string }{
-		{"short", "0.0636837780476", ","},
-		{"short_space", "-0.0636837780476", ", "},
-		{"digits6", "0.270354", ","},
-		{"long17", "-65.613616999999977", ","},
-		{"long16", "37.80848009696725", ","},
+	for _, sh := range []struct {
+		name, num, sep string
+		long           bool // 16-19 digits, which only a useFloatRunLong body takes
+	}{
+		{"short", "0.0636837780476", ",", false},
+		{"short_space", "-0.0636837780476", ", ", false},
+		{"digits6", "0.270354", ",", false},
+		{"long17", "-65.613616999999977", ",", true},
+		{"long16", "37.80848009696725", ",", true},
 	} {
 		data := []byte("[" + strings.Repeat(sh.num+sh.sep, 3999) + sh.num + "]" + strings.Repeat(" ", 96))
 		out := make([]float64, 4000)
 		b.Run(sh.name, func(b *testing.B) {
+			if sh.long && !useFloatRunLong {
+				// amd64 without AVX-512 VBMI (a Zen 3 CI runner, say): the AVX2
+				// body hands these back, so there is no kernel to measure.
+				b.Skip("no body for 16-19-digit numbers on this machine")
+			}
 			b.SetBytes(int64(len(data)))
 			for i := 0; i < b.N; i++ {
 				if n, _, _ := parseFloatRun(data, 1, out); n != 4000 {
