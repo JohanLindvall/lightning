@@ -67,22 +67,25 @@ func checkPoints2(t *testing.T, data []byte, i int) {
 		end int
 		err error
 	}
-	run := func(kernel bool) res {
-		defer func(v bool) { useFloatRunLong = v }(useFloatRunLong)
-		useFloatRunLong = kernel && floatRunLongHost
+	defer restoreKernels()
+	run := func(use func()) res {
+		use()
 		var v [][2]float64
 		end, err := DecodeFloat64Points(&v, data, i)
 		return res{v, end, err}
 	}
-	a, b := run(false), run(true)
-	same := a.end == b.end && errors.Is(a.err, b.err) && errors.Is(b.err, a.err) && len(a.v) == len(b.v) && (a.v == nil) == (b.v == nil)
-	for k := 0; same && k < len(a.v); k++ {
-		for j := 0; j < 2; j++ {
-			same = same && math.Float64bits(a.v[k][j]) == math.Float64bits(b.v[k][j])
+	a := run(floatRunOff)
+	for _, body := range floatRunBodies() {
+		b := run(body.use)
+		same := a.end == b.end && errors.Is(a.err, b.err) && errors.Is(b.err, a.err) && len(a.v) == len(b.v) && (a.v == nil) == (b.v == nil)
+		for k := 0; same && k < len(a.v); k++ {
+			for j := 0; j < 2; j++ {
+				same = same && math.Float64bits(a.v[k][j]) == math.Float64bits(b.v[k][j])
+			}
 		}
-	}
-	if !same {
-		t.Fatalf("points walk differs on %q at %d:\n off: end=%d err=%v %v\n on:  end=%d err=%v %v", data, i, a.end, a.err, a.v, b.end, b.err, b.v)
+		if !same {
+			t.Fatalf("%s points walk differs on %q at %d:\n off: end=%d err=%v %v\n on:  end=%d err=%v %v", body.name, data, i, a.end, a.err, a.v, b.end, b.err, b.v)
+		}
 	}
 }
 
@@ -93,22 +96,25 @@ func checkPoints3(t *testing.T, data []byte, i int) {
 		end int
 		err error
 	}
-	run := func(kernel bool) res {
-		defer func(v bool) { useFloatRunLong = v }(useFloatRunLong)
-		useFloatRunLong = kernel && floatRunLongHost
+	defer restoreKernels()
+	run := func(use func()) res {
+		use()
 		var v [][3]float64
 		end, err := DecodeFloat64Points(&v, data, i)
 		return res{v, end, err}
 	}
-	a, b := run(false), run(true)
-	same := a.end == b.end && errors.Is(a.err, b.err) && errors.Is(b.err, a.err) && len(a.v) == len(b.v) && (a.v == nil) == (b.v == nil)
-	for k := 0; same && k < len(a.v); k++ {
-		for j := 0; j < 3; j++ {
-			same = same && math.Float64bits(a.v[k][j]) == math.Float64bits(b.v[k][j])
+	a := run(floatRunOff)
+	for _, body := range floatRunBodies() {
+		b := run(body.use)
+		same := a.end == b.end && errors.Is(a.err, b.err) && errors.Is(b.err, a.err) && len(a.v) == len(b.v) && (a.v == nil) == (b.v == nil)
+		for k := 0; same && k < len(a.v); k++ {
+			for j := 0; j < 3; j++ {
+				same = same && math.Float64bits(a.v[k][j]) == math.Float64bits(b.v[k][j])
+			}
 		}
-	}
-	if !same {
-		t.Fatalf("points walk differs on %q at %d:\n off: end=%d err=%v %v\n on:  end=%d err=%v %v", data, i, a.end, a.err, a.v, b.end, b.err, b.v)
+		if !same {
+			t.Fatalf("%s points walk differs on %q at %d:\n off: end=%d err=%v %v\n on:  end=%d err=%v %v", body.name, data, i, a.end, a.err, a.v, b.end, b.err, b.v)
+		}
 	}
 }
 
@@ -155,12 +161,21 @@ func TestFloat64PointsMatchesPerPoint(t *testing.T) {
 
 // TestFloat64PointsMatchesStdlib decodes rings of regular points with the
 // walk on and compares with encoding/json — the premise the per-point
-// differential rests on — and then walks each ring with the kernel alone
-// (on a host with the VBMI body), resuming after each point it hands back:
-// every value it writes must be encoding/json's, and every point it hands back
-// must hold a number it declines by design (kernelDeclines). A walk that handed
-// every point back would pass the differential.
+// differential rests on — and then walks each ring with each body of the
+// kernel alone, resuming after each point it hands back: every value it writes
+// must be encoding/json's, and every point it hands back must hold a number it
+// declines by design (kernelDeclines). A walk that handed every point back
+// would pass the differential.
 func TestFloat64PointsMatchesStdlib(t *testing.T) {
+	defer restoreKernels()
+	for _, body := range append([]kernelBody{{"host", false, restoreKernels}}, floatRunBodies()...) {
+		t.Run(body.name, func(t *testing.T) { testFloat64PointsMatchesStdlib(t, body) })
+	}
+}
+
+func testFloat64PointsMatchesStdlib(t *testing.T, body kernelBody) {
+	body.use()
+	walk := body.name != "host" // the host's flags: the stdlib comparison alone
 	rng := rand.New(rand.NewSource(22))
 	var took, total int
 	for it := 0; it < 300; it++ {
@@ -182,7 +197,7 @@ func TestFloat64PointsMatchesStdlib(t *testing.T) {
 				}
 			}
 		}
-		if !floatRunLongHost {
+		if !walk {
 			continue
 		}
 		flat := make([]float64, 2*len(want))
@@ -209,7 +224,7 @@ func TestFloat64PointsMatchesStdlib(t *testing.T) {
 			}
 			declined := false
 			for _, num := range strings.Split(string(data[q+1:e-1]), ",") {
-				declined = declined || kernelDeclines(strings.TrimSpace(num))
+				declined = declined || kernelDeclines(strings.TrimSpace(num), body.refines)
 			}
 			if !declined {
 				t.Fatalf("%q: the walk handed back point %d, %s, which it converts", ring, k, data[q:e])
@@ -223,7 +238,7 @@ func TestFloat64PointsMatchesStdlib(t *testing.T) {
 		}
 		total += len(want)
 	}
-	if floatRunLongHost && took < total*99/100 {
+	if walk && took < total*99/100 {
 		t.Fatalf("the walk took %d of %d points; hand-backs should be rare", took, total)
 	}
 }

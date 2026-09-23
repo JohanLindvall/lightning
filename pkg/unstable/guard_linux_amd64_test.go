@@ -95,21 +95,33 @@ func TestAssemblyStaysInBounds(t *testing.T) {
 }
 
 // TestNumberKernelsStayInBounds runs the integer- and float-array kernels —
-// both float bodies, the points walk and the validation walk — over arrays flush against a guard
-// page at their end (unterminated, so each walk runs until its window check
-// stops it) and at their start, from every start position within reach of the
-// end. The kernels read whole windows of 64 to 96 bytes and gather 32 bytes at
-// any lane of one, so each is a claim that the window check covers the
-// farthest byte its body touches.
+// every float body, both points walks and both validation walks, flat and
+// ring — over arrays flush against a guard page at their end (unterminated,
+// so each walk runs until its window check stops it) and at their start, from
+// every start position within reach of the end. The kernels read whole windows
+// of 64 to 96 bytes and load sixteen or 32 bytes at any lane of one, so each
+// is a claim that the window check covers the farthest byte its body touches.
 func TestNumberKernelsStayInBounds(t *testing.T) {
 	page := guardedPage(t)
-	savedV := useFloatRunLong
-	defer func() { useFloatRunLong = savedV }()
+	defer restoreKernels()
 	patterns := []string{
 		"1234,-5,67890123,0,",
 		"1.25,-3.5, 17.123456789012345,-0.000123 ,",
+		"-65.613616999999977,43.420273000000009,1234567890.123456789,",
 		"[-65.613616999999977,43.420273000000009],[1.5, 2],",
 		"[1.5,-2.25]" + strings.Repeat(" ", 70) + ",", // a separator windows away
+		// A number late in its window behind whitespace, and one that closes
+		// the array: the elements the 80-byte bound exists for — a sixteen-byte
+		// load at a first digit near lane 63 — and a long number whose loads
+		// end at its delimiter near lane 63.
+		"1.5," + strings.Repeat(" ", 45) + "-2.25," + strings.Repeat("\n", 57) + "3]",
+		strings.Repeat(" ", 58) + "12345678.9012345,",
+		strings.Repeat(" ", 44) + "-12345678.90123456789,",
+		"[" + strings.Repeat(" ", 40) + "-65.613616999999977, 43.420273000000009]" + strings.Repeat(" ", 20) + ",",
+		// The same for a point: a short number starting late in the point's
+		// window, whose sixteen-byte load is what needs 80 bytes.
+		"[" + strings.Repeat(" ", 50) + "1.5,2],",
+		"[1.5," + strings.Repeat(" ", 48) + "-2.25],",
 	}
 	ints := make([]int64, 1024)
 	floats := make([]float64, 1024)
@@ -132,23 +144,18 @@ func TestNumberKernelsStayInBounds(t *testing.T) {
 					if useIntRun {
 						_, _, _ = parseIntRunAVX2(b, i, ints)
 					}
-					if useValidRun {
-						for _, b512 := range validRunBodies() {
-							useValidPoints = b512
-							_, _ = validNumberRun(b, i)
-						}
-						useValidPoints = validPointsHost
+					for _, body := range validRunBodies() {
+						body.use()
+						_, _ = validNumberRun(b, i)
+						_, _ = validPointsRun(b, i)
 					}
-					if floatRunHost {
-						useFloatRunLong = false
-						_, _, _ = parseFloatRunAVX2(b, i, floats)
-						useFloatRunLong = savedV
-					}
-					if savedV {
-						_, _, _ = parseFloatRunVBMI(b, i, floats)
+					for _, body := range floatRunBodies() {
+						body.use()
+						_, _, _ = parseFloatRun(b, i, floats)
 						_, _, _ = parseFloatPoints(b, i, floats, 2)
 						_, _, _ = parseFloatPoints(b, i, floats, 3)
 					}
+					restoreKernels()
 				}
 			}
 		}

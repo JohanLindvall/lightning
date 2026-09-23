@@ -8,17 +8,13 @@ import (
 )
 
 // validRunHost and validPointsHost are the host's useValidRun and
-// useValidPoints, which the tests flip to run the scalar walk and both bodies
-// — never turning on one the CPU lacks.
+// useValidPoints, which the tests flip to run the scalar walk and every body —
+// never turning on one the CPU lacks (validRunBodies lists them).
 var validRunHost, validPointsHost = useValidRun, useValidPoints
 
-// validRunBodies lists the bodies this host can run.
-func validRunBodies() []bool {
-	if validPointsHost {
-		return []bool{false, true}
-	}
-	return []bool{false}
-}
+// validRunOff turns both validation walks off, flat and ring, for a reference
+// run of the scalar walk.
+func validRunOff() { useValidRun, useValidPoints = false, false }
 
 // validNumbers draws array elements from both sides of validNumberRun's line:
 // plain decimals it passes over, and everything it must hand back to the
@@ -71,21 +67,20 @@ func genValidArray(rng *rand.Rand, count int, bad bool) string {
 // objects and in arrays, followed by more document, and truncated at every
 // length for a share of them. The offset and the error must agree exactly.
 func TestValidNumberRunMatchesScalar(t *testing.T) {
-	if !validRunHost {
+	if len(validRunBodies()) == 0 {
 		t.Skip("no numeric-array validation kernel on this machine")
 	}
-	defer func() { useValidRun, useValidPoints = validRunHost, validPointsHost }()
+	defer restoreKernels()
 	check := func(doc string) {
 		data := []byte(doc)
 		i := SkipWS(data, 0)
-		useValidRun, useValidPoints = false, false // the ring walk is gated on the 512 flag alone
+		validRunOff()
 		we, werr := SkipValueStrict(data, i)
-		useValidRun = true
-		for _, b512 := range validRunBodies() {
-			useValidPoints = b512
+		for _, body := range validRunBodies() {
+			body.use()
 			ge, gerr := SkipValueStrict(data, i)
 			if ge != we || !errors.Is(gerr, werr) || !errors.Is(werr, gerr) {
-				t.Fatalf("kernel (512=%v) (%d, %v), scalar (%d, %v) on %q", b512, ge, gerr, we, werr, doc)
+				t.Fatalf("%s kernel (%d, %v), scalar (%d, %v) on %q", body.name, ge, gerr, we, werr, doc)
 			}
 		}
 	}
@@ -177,10 +172,10 @@ func BenchmarkValidNumbers(b *testing.B) {
 // must pass over every element and close the array — a walk that handed every
 // element back would pass TestValidNumberRunMatchesScalar untouched.
 func TestValidNumberRunTakesArrays(t *testing.T) {
-	if !validRunHost {
+	if len(validRunBodies()) == 0 {
 		t.Skip("no numeric-array validation kernel on this machine")
 	}
-	defer func() { useValidPoints = validPointsHost }()
+	defer restoreKernels()
 	rng := rand.New(rand.NewSource(9))
 	for it := 0; it < 3000; it++ {
 		arr := genValidArray(rng, 1+rng.Intn(200), false)
@@ -189,11 +184,11 @@ func TestValidNumberRunTakesArrays(t *testing.T) {
 		if data[i] != '-' && data[i]-'0' > 9 {
 			continue // opens with a control byte the generator uses as whitespace
 		}
-		for _, b512 := range validRunBodies() {
-			useValidPoints = b512
+		for _, body := range validRunBodies() {
+			body.use()
 			p, closed := validNumberRun(data, i)
 			if closed != 1 || p != len(arr)-1 {
-				t.Fatalf("512=%v %q: p=%d closed=%d, want the ']' at %d", b512, arr, p, closed, len(arr)-1)
+				t.Fatalf("%s %q: p=%d closed=%d, want the ']' at %d", body.name, arr, p, closed, len(arr)-1)
 			}
 		}
 	}
@@ -205,9 +200,17 @@ func TestValidNumberRunTakesArrays(t *testing.T) {
 // a window from its '[' — resuming after any that does not, which is the only
 // point it may hand back — and reach the ring's ']' itself.
 func TestValidPointsRunTakesRings(t *testing.T) {
-	if !validPointsHost {
-		t.Skip("no AVX-512 validation walk on this machine")
+	if len(validRunBodies()) == 0 {
+		t.Skip("no coordinate-ring validation walk on this machine")
 	}
+	defer restoreKernels()
+	for _, body := range validRunBodies() {
+		body.use()
+		t.Run(body.name, testValidPointsRunTakesRings)
+	}
+}
+
+func testValidPointsRunTakesRings(t *testing.T) {
 	rng := rand.New(rand.NewSource(10))
 	rings := []string{string(pointRing("canada", 500)), string(pointRing("geometry", 500)), string(pointRing("citylots", 500))}
 	for it := 0; it < 2000; it++ {

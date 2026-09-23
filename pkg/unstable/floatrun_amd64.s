@@ -93,16 +93,18 @@ GLOBL frJoin<>(SB), RODATA|NOPTR, $16
 	SHLQ      $32, AX      \
 	ORQ       AX, BX
 
-// PARSE measures the number whose region starts at window lane CX and ends
+// LPARSE measures the number whose region starts at window lane CX and ends
 // at a delimiter lane (a comma or the ']', in BX): CX = s, its first digit
 // (whitespace and a '-' before it skipped, DI = 1 for the '-'), AX = L1
 // integer digits, R14 = L2 fraction digits (0 without a '.'), DX = e, the lane
 // after the number. The delimiter is neither whitespace nor a digit, so every
 // lane this measures is at or below it — below 64 — which is what keeps the
-// shift counts and the byte loads in the window. Anything this kernel does not
-// convert jumps to bad: no integer digit, more than 15 digits in all, a '.'
-// with no digit after it.
-#define PARSE(bad, nofrac, parsed) \
+// shift counts and the byte loads in the window. It rejects only what no body
+// converts, jumping to bad: no integer digit, or a '.' with no digit after it.
+// The digit count is the caller's to test: at most 15 is CONVERT's, 16-19 the
+// long conversion's, and anything longer is handed back. (TZCNT sets ZF from
+// its result, so a zero-length digit run needs no test of its own.)
+#define LPARSE(bad, nofrac, parsed) \
 	SHRXQ   CX, R13, AX           \
 	TZCNTQ  AX, AX                \
 	ADDQ    AX, CX                \
@@ -112,9 +114,7 @@ GLOBL frJoin<>(SB), RODATA|NOPTR, $16
 	ADDQ    DI, CX                \
 	SHRXQ   CX, R11, AX           \
 	TZCNTQ  AX, AX                \
-	LEAQ    -1(AX), DX            \
-	CMPQ    DX, $14               \
-	JA      bad                   \
+	JZ      bad                   \
 	LEAQ    (CX)(AX*1), DX        \
 	XORL    R14, R14              \
 	CMPB    (SI)(DX*1), $0x2e     \
@@ -122,14 +122,9 @@ GLOBL frJoin<>(SB), RODATA|NOPTR, $16
 	LEAQ    1(DX), R14            \
 	SHRXQ   R14, R11, R14         \
 	TZCNTQ  R14, R14              \
-	TESTQ   R14, R14              \
 	JZ      bad                   \
 	LEAQ    1(DX)(R14*1), DX      \
 nofrac:                           \
-	SUBQ    CX, DX                \
-	CMPQ    DX, $16               \
-	JA      bad                   \
-	ADDQ    CX, DX                \
 parsed:
 
 // CONVERT folds the digits PARSE measured and stores ±mantissa / 10^L2 at
@@ -162,40 +157,168 @@ parsed:
 	VMOVSD     X2, (R8)(R10*8)      \
 	INCQ       R10
 
+// LONGFOLD folds a long number's digits, right-aligned into lanes 0-23 of Y12
+// (lanes 24-31 zero), into its mantissa in CX: the three multiply-add folds
+// leave the eight-digit groups hi8 and mid8 in the low lane's first two dwords
+// and lo8 in the high lane's first, and at most 19 digits join in a general
+// register below 10^19 < 2^64. AX and DX are clobbered, and X13.
+#define LONGFOLD \
+	VPMADDUBSW Y8, Y12, Y12 \
+	VPMADDWD Y9, Y12, Y12 \
+	VPACKUSDW Y12, Y12, Y12 \
+	VPMADDWD Y10, Y12, Y12 \ // dwords: hi8, mid8 | lo8
+	VMOVQ   X12, AX \
+	VEXTRACTI128 $1, Y12, X13 \
+	VMOVD   X13, DX \ // lo8
+	MOVL    AX, CX \ // hi8
+	SHRQ    $32, AX \ // mid8
+	IMUL3Q  $100000000, CX, CX \
+	ADDQ    AX, CX \
+	IMUL3Q  $100000000, CX, CX \
+	ADDQ    DX, CX // the mantissa, below 10^19
+
+// LONGGATHER2 is the AVX2 body's digit gather for a number of 16 to 19 digits
+// (AX = L1, R9 = L1+L2, CX = s, DX = e): into lanes 0-23 of Y12, right-aligned
+// with zeros in front and the '.' dropped, the layout LONGFOLD takes. There is
+// no two-register byte permute below AVX-512 VBMI, and VPSHUFB cannot cross
+// the ymm's two lanes, but the layout does not need either: output lanes 0-15
+// hold the number's first digits — at most eleven bytes from its first digit —
+// and lanes 16-23 its last eight, at most nine bytes from its end. So the low
+// lane is loaded with the sixteen bytes at the first digit and the high lane
+// with the sixteen ending at the number's end, and one VPSHUFB under a
+// per-(L1, L2) control gathers the lot. Both loads lie between the first digit
+// and the delimiter, inside the window's 80 bytes.
+#define LONGGATHER2 \
+	LEAQ    (R9)(AX*4), AX \
+	SHLQ    $5, AX \ // the control: 32 bytes at 24928+32*(4*L1+L1+L2)
+	VMOVDQU (SI)(CX*1), X13 \ // the sixteen bytes at the first digit
+	VINSERTI128 $1, -16(SI)(DX*1), Y13, Y13 \ // the sixteen ending at the number's end
+	VPSUBB  Y4, Y13, Y13 \
+	VPSHUFB 24928(R15)(AX*1), Y13, Y12
+
+// LONGTAIL2 converts the mantissa LONGFOLD left in CX and stores it at
+// out[R10], R10 incremented, falling through when done: R14 = L2, DI = the
+// sign, out[R10] in bounds. It is LONGCONV's conversion with the one piece
+// LONGCONV leaves out: where eiselLemire64 refines the product with the low
+// word of the power of ten (the high product's low nine bits all ones and
+// xLo + man wrapping — one canada coordinate in 259), this refines as it does,
+// and declines only where eiselLemire64 declines (still ambiguous after
+// refining, or an exact halfway value). A decline costs the reader a
+// hand-back, a scalar parse and a fresh call, so it is worth not paying for
+// numbers that are merely close. The refinement is out of line, ahead of the
+// Eisel-Lemire path, so that the common path falls through to done; it borrows
+// X14 and X15 to keep xLo and xHi across its second multiply. R9 carries the
+// exponent (R14 is L2, which the refinement indexes the low words with), and
+// AX, CX, DX and X13 are clobbered.
+#define LONGTAIL2(el, norefine, round, refine, refine0, decline, done) \
+	MOVQ    CX, AX \
+	SHRQ    $53, AX \
+	JNZ     el \
+	VCVTSI2SDQ CX, X13, X13 \ // below 2^53: Clinger, as in LONGCONV
+	SHLQ    $5, DI \
+	ADDQ    R14, DI \
+	VDIVSD  4096(R15)(DI*8), X13, X13 \
+	VMOVSD  X13, (R8)(R10*8) \
+	INCQ    R10 \
+	JMP     done \
+refine: \
+	BTL     $8, DX \
+	JCC     norefine \ // the low byte is all ones, bit 8 is not
+	VMOVQ   AX, X14 \
+	ADDQ    CX, AX \ // CF: xLo + man wraps
+	JCC     refine0 \
+	VMOVQ   DX, X15 \
+	MOVQ    25408(R15)(R14*8), AX \ // the low word of 10^-L2
+	MULQ    CX \ // DX:AX = yHi:yLo
+	ADDQ    CX, AX \ // CF: yLo + man wraps
+	SETCS   R14 \
+	VMOVQ   X14, AX \
+	ADDQ    DX, AX \ // mergedLo = xLo + yHi
+	VMOVQ   X15, DX \
+	ADCQ    $0, DX \ // mergedHi
+	CMPB    DX, $0xFF \
+	JNE     norefine \
+	BTL     $8, DX \
+	JCC     norefine \
+	CMPQ    AX, $-1 \
+	JNE     norefine \
+	TESTB   R14, R14 \
+	JNZ     decline \ // still ambiguous: eiselLemire64 declines too
+	JMP     norefine \
+refine0: \
+	VMOVQ   X14, AX \
+	JMP     norefine \
+el: \
+	BSRQ    CX, AX \
+	XORQ    $63, AX \ // leading zeros
+	SHLXQ   AX, CX, CX \ // normalized: the top bit set
+	MOVQ    25248(R15)(R14*8), R9 \ // the biased binary exponent estimate, less 2
+	SUBQ    AX, R9 \
+	MOVQ    25088(R15)(R14*8), AX \ // the high word of 10^-L2
+	MULQ    CX \ // DX:AX = xHi:xLo
+	CMPB    DX, $0xFF \
+	JEQ     refine \ // the low nine bits of xHi may all be ones: one product in 256
+norefine: \
+	MOVQ    DX, CX \
+	SHRQ    $63, CX \ // msb
+	ADDQ    CX, R9 \ // eiselLemire64's retExp2, after its -= 1^msb, less 1
+	ADDQ    $9, CX \
+	SHRXQ   CX, DX, CX \ // retMantissa = xHi >> (msb + 9): 54 bits
+	TESTQ   AX, AX \
+	JNZ     round \
+	TESTL   $0x1FF, DX \
+	JNZ     round \
+	MOVL    CX, AX \
+	ANDL    $3, AX \
+	CMPL    AX, $1 \
+	JEQ     decline \ // exactly halfway
+round: \
+	SHRQ    $1, CX \
+	ADCQ    $0, CX \ // round to 53 bits
+	SHLQ    $52, R9 \
+	ADDQ    R9, CX \ // the mantissa's bit 52 (or a rounding carry) completes the exponent
+	SHLQ    $63, DI \
+	ORQ     DI, CX \
+	MOVQ    CX, (R8)(R10*8) \
+	INCQ    R10
+
 // func parseFloatRunAVX2(data []byte, i int, out []float64) (n, p, closed int)
 //
 // parseIntRunAVX2's walk for arrays of decimal numbers: parses as many
 // "ws* -? digits (. digits)? ws* ','" groups as it can from data[i:] — at most
-// 15 digits in all, no exponent — one float64 per group into out, and also the
+// 19 digits in all, no exponent — one float64 per group into out, and also the
 // array's last element when it is terminated by ']' (closed = 1, p at the
 // ']'). Stops, with p at the start of the unconsumed element's region (or
 // part-way into its whitespace) or right after the last consumed comma, when
-// fewer than 80 bytes remain from the
-// window (the fold loads 16 bytes at any lane of a 64-byte window), out is
-// full, or an element is anything else: an exponent, 16+ digits, a '+', null,
-// a '.' without digits after it. Every stop position is a state the scalar
-// loop resumes from, and every value the kernel does write is Clinger's exact
-// fast path, so it is the value strconv returns.
+// fewer than 80 bytes remain from the window (the conversions load 16 bytes
+// at any lane of a 64-byte window), out is full, or an element is anything
+// else: an exponent, 20+ digits, a '+', null, a '.' without digits after it,
+// or a long number Eisel-Lemire cannot round. Every stop position is a state
+// the scalar loop resumes from, and every value the kernel does write is the
+// value strconv returns: Clinger's exact fast path for a mantissa below 2^53
+// (CONVERT for at most 15 digits, LONGTAIL2 above), Eisel-Lemire for the rest.
 //
 // The window walk is parseIntRunAVX2's (64-byte windows at a fixed 48-byte
 // stride, commas walked with TZCNT/BLSR); see intrun_amd64.s. The array's last
 // element, which has no comma, is finished in place when its ']' is in the
-// window and otherwise handed back.
+// window and otherwise handed back. The structure is parseFloatRunVBMI's,
+// label for label; what differs is the classification (two ymm halves), the
+// sign (a byte compare at the cursor), and the long numbers' gather
+// (LONGGATHER2, where VBMI uses VPERMI2B) and conversion (LONGTAIL2, which
+// refines where LONGCONV declines).
 //
-// Registers: SI the window, CX the cursor, R8/R9 out base/len, R10 values
-// written, R11/R12/R13 the window masks, R15 floatRunTab (the shuffle controls,
-// then ±10^k at +4096; the VBMI body's tables follow), BX the comma, and
-// AX/DX/DI/R14 the element's measures.
-// The data base and the window limit are reloaded from the frame when needed.
-// Y4-Y7 and X8-X11 hold the constants.
+// Registers: SI the window, CX the cursor, R8 out, R10 values written,
+// R11/R12/R13 the window masks, R15 floatRunTab, BX the delimiter,
+// AX/DX/DI/R14 the element's measures, R9 L1+L2 and then the exponent. The
+// data base, its length and out's length are read from the frame when needed.
+// Y4-Y10 and X11 hold the constants.
 TEXT ·parseFloatRunAVX2(SB), NOSPLIT, $0-80
-	MOVBLZX ·useFloatRunLong(SB), AX
+	MOVBLZX ·useFloatRunVBMI(SB), AX
 	TESTL   AX, AX
 	JNZ     toVBMI
 	MOVQ    data_base+0(FP), SI
 	MOVQ    i+24(FP), CX
 	MOVQ    out_base+32(FP), R8
-	MOVQ    out_len+40(FP), R9
 	XORQ    R10, R10
 	ADDQ    CX, SI
 	XORL    CX, CX
@@ -203,9 +326,9 @@ TEXT ·parseFloatRunAVX2(SB), NOSPLIT, $0-80
 	VMOVDQU frNine<>(SB), Y5
 	VMOVDQU frComma<>(SB), Y6
 	VMOVDQU frSpace<>(SB), Y7
-	VMOVDQU frW10<>(SB), X8
-	VMOVDQU frW100<>(SB), X9
-	VMOVDQU frW1e4<>(SB), X10
+	VBROADCASTI128 frW10<>(SB), Y8
+	VBROADCASTI128 frW100<>(SB), Y9
+	VBROADCASTI128 frW1e4<>(SB), Y10
 	VMOVDQU frJoin<>(SB), X11
 	LEAQ    ·floatRunTab(SB), R15
 
@@ -225,12 +348,16 @@ window:
 
 elem:
 	TZCNTQ  R12, BX                 // c: this element's comma
-	PARSE(stopElem, elemNoFrac, elemParsed)
+	LPARSE(stopElem, elemNoFrac, elemParsed)
 	CMPQ    DX, BX
 	JNE     wsBeforeComma
 fold:
-	CMPQ    R10, R9
+	// AX = L1, R14 = L2, CX = s, DX = e, DI = the sign, BX = the element's comma.
+	CMPQ    R10, out_len+40(FP)
 	JAE     stopElem                // out is full: leave this element to the caller
+	LEAQ    (AX)(R14*1), R9         // L1 + L2
+	CMPQ    R9, $15
+	JA      long
 	CONVERT
 	LEAQ    1(BX), CX               // b: just past the comma
 	BLSRQ   R12, R12                // the comma is consumed; ZF: none left
@@ -240,7 +367,7 @@ noComma:
 	// No comma left in the window: step by 48 when the cursor is in the last
 	// 16 bytes. Otherwise this is the array's last element if the window
 	// holds a ']' after the cursor, and that ']' bounds it exactly as a comma
-	// bounds the others — every lane PARSE measures is then below it, so no
+	// bounds the others — every lane LPARSE measures is then below it, so no
 	// shift count reaches 64 and no load leaves the window. Without one the
 	// region runs past the window and the window restarts at it.
 	CMPQ     CX, $48
@@ -251,30 +378,34 @@ noComma:
 	ANDQ     AX, BX                 // the ']'s at or after b
 	JZ       restart
 	TZCNTQ   BX, BX                 // r: the ']'
-	PARSE(stopElem, lastNoFrac, lastParsed)
+	LPARSE(stopElem, lastNoFrac, lastParsed)
 	CMPQ     DX, BX
-	JNE      lastWs
+	JEQ      lastFold
+	SHRXQ    DX, R13, AX            // whitespace, then the ']'
+	TZCNTQ   AX, AX
+	ADDQ     DX, AX
+	CMPQ     AX, BX
+	JNE      stopElem
+	SHRXQ    CX, R11, AX            // L1 again
+	TZCNTQ   AX, AX
+
 lastFold:
-	CMPQ     R10, R9
-	JAE      stopElem
+	// The array's last element: BX = its ']'.
+	CMPQ    R10, out_len+40(FP)
+	JAE     stopElem
+	LEAQ    (AX)(R14*1), R9
+	CMPQ    R9, $15
+	JA      long
 	CONVERT
-	ADDQ     BX, SI
-	SUBQ     data_base+0(FP), SI
-	MOVQ     R10, n+56(FP)
-	MOVQ     SI, p+64(FP)
-	MOVQ     $1, closed+72(FP)
+
+closed:
+	ADDQ    BX, SI
+	SUBQ    data_base+0(FP), SI
+	MOVQ    R10, n+56(FP)
+	MOVQ    SI, p+64(FP)
+	MOVQ    $1, closed+72(FP)
 	VZEROUPPER
 	RET
-
-lastWs:
-	SHRXQ   DX, R13, AX
-	TZCNTQ  AX, AX
-	ADDQ    DX, AX
-	CMPQ    AX, BX
-	JNE     stopElem
-	SHRXQ   CX, R11, AX
-	TZCNTQ  AX, AX
-	JMP     lastFold
 
 wsBeforeComma:
 	// e < c: the bytes between must all be whitespace — or the first one that
@@ -286,17 +417,38 @@ wsBeforeComma:
 	TZCNTQ  AX, AX
 	ADDQ    DX, AX
 	CMPQ    AX, BX
-	JNE     closedBefore
+	JNE     wsClose
 	SHRXQ   CX, R11, AX
 	TZCNTQ  AX, AX
 	JMP     fold
-closedBefore:
+wsClose:
 	CMPB    (SI)(AX*1), $0x5d
 	JNE     stopElem
 	MOVQ    AX, BX                  // r: the ']'
 	SHRXQ   CX, R11, AX
 	TZCNTQ  AX, AX
 	JMP     lastFold
+
+long:
+	// Sixteen to nineteen digits. LONGFOLD clobbers the cursor, so the
+	// element's first digit is parked in its output slot, which the
+	// conversion overwrites and a decline reads back.
+	CMPQ    R9, $19
+	JA      stopElem                // 20 digits or more: the scalar loop's
+	MOVQ    CX, (R8)(R10*8)
+	LONGGATHER2
+	LONGFOLD
+	LONGTAIL2(el, norefine, round, refine, refine0, decline, converted)
+
+converted:
+	// After a long element the delimiter says whether the walk goes on (a
+	// comma) or the array has ended here (its ']').
+	CMPB    (SI)(BX*1), $0x2c
+	JNE     closed
+	LEAQ    1(BX), CX               // b: just past the comma
+	BLSRQ   R12, R12                // the comma is consumed; ZF: none left
+	JNZ     elem
+	JMP     noComma
 
 restart:
 	// Neither a comma nor a ']' after the cursor: the element region runs past
@@ -324,10 +476,16 @@ step:
 	SUBQ    $48, CX
 	JMP     window
 
+decline:
+	// Eisel-Lemire declined the element: hand it back from its first byte,
+	// the digit parked in its output slot less the '-' (DI is still the sign
+	// flag: only a converted number shifts it).
+	MOVQ    (R8)(R10*8), CX
+
 stopElem:
-	// A stop after PARSE: CX is past the element's '-', if it has one, and
+	// A stop after LPARSE: CX is past the element's '-', if it has one, and
 	// the scalar loop must see the sign — resuming at the digits would read
-	// a negative number as positive. DI is the sign flag PARSE set.
+	// a negative number as positive. DI is the sign flag LPARSE set.
 	SUBQ    DI, CX
 
 stop:
@@ -341,6 +499,7 @@ stop:
 
 toVBMI:
 	JMP     ·parseFloatRunVBMI(SB)
+
 
 // ---- The same walk as a check, for SkipValueStrict ------------------------------
 
@@ -391,7 +550,7 @@ checked:
 // tables: SI the window, CX the cursor, R11/R12/R13 the window masks, BX the
 // delimiter, AX/DX/DI temporaries; Y4-Y7 the constants.
 TEXT ·validNumberRun(SB), NOSPLIT, $0-48
-	MOVBLZX ·useValidPoints(SB), AX
+	MOVBLZX ·useValid512(SB), AX
 	TESTL   AX, AX
 	JNZ     to512
 	MOVQ    data_base+0(FP), SI
@@ -628,7 +787,7 @@ dstop:
 	MOVQ    $0, closed+40(FP)
 	RET
 
-// func validPointsRun(data []byte, i int) (p, closed int)
+// func validPointsRun512(data []byte, i int) (p, closed int)
 //
 // The points walk (parseFloatPointsVBMI) as a check, for SkipValueStrict: i is
 // at a point's '[' in an array of flat numeric arrays — a coordinate ring —
@@ -647,7 +806,7 @@ dstop:
 //
 // Registers as in validNumberRun512, plus R8 the point's ']'; the frame holds
 // the point's start and the window limit.
-TEXT ·validPointsRun(SB), NOSPLIT, $16-48
+TEXT ·validPointsRun512(SB), NOSPLIT, $16-48
 	MOVQ    data_base+0(FP), SI
 	MOVQ    data_len+8(FP), AX
 	LEAQ    -64(SI)(AX*1), AX
@@ -764,6 +923,131 @@ qstop:
 	MOVQ    $0, closed+40(FP)
 	RET
 
+// func validPointsRunAVX2(data []byte, i int) (p, closed int)
+//
+// validPointsRun512 for CPUs with AVX2 and no AVX-512: the points walk as a
+// check, label for label, with the window classified over two ymm halves
+// (CLASSIFY, and the point's ']' found with CLOSES). Registers as in
+// validNumberRun, plus R8 the point's ']'; the frame holds the point's start
+// and the window limit.
+TEXT ·validPointsRunAVX2(SB), NOSPLIT, $16-48
+	MOVQ    data_base+0(FP), SI
+	MOVQ    data_len+8(FP), AX
+	LEAQ    -64(SI)(AX*1), AX
+	MOVQ    AX, qlimit-16(SP)       // the last window start with 64 bytes
+	ADDQ    i+24(FP), SI
+	VMOVDQU frZero<>(SB), Y4
+	VMOVDQU frNine<>(SB), Y5
+	VMOVDQU frComma<>(SB), Y6
+	VMOVDQU frSpace<>(SB), Y7
+
+qpoint:
+	MOVQ    SI, qstart-8(SP)        // where the point's region starts
+	CMPQ    SI, qlimit-16(SP)
+	JHI     qstop
+	VMOVDQU (SI), Y0
+	VMOVDQU 32(SI), Y1
+	CLASSIFY
+	TZCNTQ    R13, CX               // the first byte that is not whitespace
+	CMPQ      CX, $16
+	JAE       qrewindow             // far into the window: start one at it
+	CMPB      (SI)(CX*1), $0x5b
+	JNE       qstop                 // not a point ('[')
+	INCQ      CX                    // b: past the '['
+	// Everything before b is whitespace and the '[', so the window's first
+	// ']' is the point's (or a nested array's, which CHECK then refuses), and
+	// its commas are the ones below that.
+	CLOSES
+	TZCNTQ    BX, R8
+	JCS       qlong                 // the point's ']' is past the window
+	BZHIQ     R8, R12, R12
+
+qelem:
+	TZCNTQ  R12, BX                 // an inner number's delimiter: its comma
+	JCC     qcheck
+	MOVQ    R8, BX                  // the last number's: the point's ']'
+qcheck:
+	CHECK(qstop, qNoFrac, qChecked)
+	CMPQ    DX, BX
+	JEQ     qnext
+	SHRXQ   DX, R13, AX             // whitespace to the delimiter
+	TZCNTQ  AX, AX
+	ADDQ    DX, AX
+	CMPQ    AX, BX
+	JNE     qstop
+qnext:
+	LEAQ    1(BX), CX               // past the delimiter
+	BLSRQ   R12, R12                // the comma is consumed; CF: there was none
+	JCC     qelem                   // left, so that was the point's ']'
+
+	// The first byte after the point that is not whitespace must be the ','
+	// before the next point or the ring's ']'.
+	CMPQ    CX, $64
+	JEQ     qsep
+	SHRXQ   CX, R13, AX
+	TZCNTQ  AX, AX
+	JCS     qsep                    // the separator is past the window
+	ADDQ    CX, AX
+qsepAt:
+	CMPB    (SI)(AX*1), $0x2c
+	JEQ     qcomma
+	CMPB    (SI)(AX*1), $0x5d
+	JNE     qstop
+	ADDQ    AX, SI                  // the ring's ']': done, and closed
+	SUBQ    data_base+0(FP), SI
+	MOVQ    SI, p+32(FP)
+	MOVQ    $1, closed+40(FP)
+	VZEROUPPER
+	RET
+
+qcomma:
+	LEAQ    1(SI)(AX*1), SI         // the next point's region starts after the ','
+	JMP     qpoint
+
+qsep:
+	// The rest of the window is whitespace: look for the separator in the
+	// windows after it while they hold nothing else.
+	ADDQ    $64, SI
+	CMPQ    SI, qlimit-16(SP)
+	JHI     qstop
+	VMOVDQU (SI), Y0
+	VMOVDQU 32(SI), Y1
+	VPMINUB   Y7, Y0, Y3            // not whitespace, as CLASSIFY's R13
+	VPCMPEQB  Y0, Y3, Y3
+	VPMOVMSKB Y3, AX
+	VPMINUB   Y7, Y1, Y3
+	VPCMPEQB  Y1, Y3, Y3
+	VPMOVMSKB Y3, DX
+	SHLQ      $32, DX
+	ORQ       DX, AX
+	NOTQ      AX
+	TZCNTQ    AX, AX
+	JCS       qsep                  // all of it whitespace
+	JMP       qsepAt
+
+qlong:
+	// As in the conversion walk: a point that did not fit behind whitespace
+	// gets one more window, at its '['.
+	CMPQ    CX, $1
+	JEQ     qstop
+	DECQ    CX
+
+qrewindow:
+	// Sixteen or more bytes of whitespace before the point, or a point that
+	// did not fit behind less: start the next window at the first byte that
+	// is not whitespace.
+	ADDQ    CX, SI
+	JMP     qpoint
+
+qstop:
+	// Hand back the point being checked, whole, from its region's start.
+	VZEROUPPER
+	MOVQ    qstart-8(SP), SI
+	SUBQ    data_base+0(FP), SI
+	MOVQ    SI, p+32(FP)
+	MOVQ    $0, closed+40(FP)
+	RET
+
 // ---- The AVX-512 VBMI body: up to 19 digits, and Eisel-Lemire ----------------
 
 DATA fvZero<>+0(SB)/1, $0x30
@@ -842,19 +1126,7 @@ parsed:
 	VMOVDQU 4608(R15)(AX*1), Y12 \
 	VPERMI2B Y4, Y13, Y12 \ // the digits, right-aligned, from those or '0'
 	VPSUBB  Y4, Y12, Y12 \
-	VPMADDUBSW Y8, Y12, Y12 \
-	VPMADDWD Y9, Y12, Y12 \
-	VPACKUSDW Y12, Y12, Y12 \
-	VPMADDWD Y10, Y12, Y12 \ // dwords: hi8, mid8 | lo8
-	VMOVQ   X12, AX \
-	VEXTRACTI128 $1, Y12, X13 \
-	VMOVD   X13, DX \ // lo8
-	MOVL    AX, CX \ // hi8
-	SHRQ    $32, AX \ // mid8
-	IMUL3Q  $100000000, CX, CX \
-	ADDQ    AX, CX \
-	IMUL3Q  $100000000, CX, CX \
-	ADDQ    DX, CX \ // the mantissa, below 10^19
+	LONGFOLD \
 	MOVQ    CX, AX \
 	SHRQ    $53, AX \
 	JNZ     el \
@@ -1285,6 +1557,189 @@ psep:
 	VMOVDQU64 (SI), Z0
 	VPCMPUB   $6, Z7, Z0, K3        // not whitespace
 	KMOVQ     K3, AX
+	TZCNTQ    AX, AX
+	JCS       psep                  // all of it whitespace
+	JMP       psepAt
+
+plong2:
+	// The point's ']' is past the window: when whitespace before its '['
+	// took some of the window, start one at the '[' and try once more (at
+	// lane 0 there is nothing left to gain, and the point is handed back).
+	CMPQ    CX, $1
+	JEQ     pback
+	DECQ    CX
+
+prewindow:
+	// Sixteen or more bytes of whitespace before the point (64: all of the
+	// window), or a point that did not fit behind less: start the next window
+	// at the first byte that is not whitespace.
+	ADDQ    CX, SI
+	JMP     ppoint
+
+pback:
+	// The point cannot be taken here: forget its numbers already written —
+	// all n of them when it is its separator that failed — and hand it back
+	// from its start.
+	MOVQ    pr10-32(SP), R10
+
+pstop:
+	VZEROUPPER
+	MOVQ    pstart-8(SP), SI
+	SUBQ    data_base+0(FP), SI
+	MOVQ    R10, AX
+	XORQ    DX, DX
+	DIVQ    n+56(FP)
+	MOVQ    AX, np+64(FP)
+	MOVQ    SI, p+72(FP)
+	MOVQ    $0, closed+80(FP)
+	RET
+
+// func parseFloatPointsAVX2(data []byte, i int, out []float64, n int) (np, p, closed int)
+//
+// parseFloatPointsVBMI for CPUs with AVX2 and no AVX-512 VBMI — the whole of
+// Intel's client line since Alder Lake, and AMD before Zen 4 — whose rings
+// otherwise went point by point through DecodeFloat64Array and scanFloat, the
+// kernel having no conversion for a 16- or 17-digit coordinate. The contract,
+// the walk and the labels are the VBMI walk's; what differs is the window's
+// classification (CLASSIFY over two ymm halves, and the point's ']' found with
+// CLOSES), the sign (a byte compare), and the long conversion (LONGGATHER2 and
+// LONGTAIL2, which refines where the VBMI body declines). The conversions read
+// sixteen bytes at any lane, so a point's window needs 80 bytes.
+//
+// Registers as in parseFloatRunAVX2; the frame holds the numbers left in the
+// point, the point's start and ']', and the limits.
+TEXT ·parseFloatPointsAVX2(SB), NOSPLIT, $32-88
+	MOVQ    data_base+0(FP), SI
+	MOVQ    data_len+8(FP), AX
+	LEAQ    -80(SI)(AX*1), AX       // the last window start with 80 bytes
+	MOVQ    AX, plimit-24(SP)
+	ADDQ    i+24(FP), SI
+	MOVQ    out_base+32(FP), R8
+	MOVQ    out_len+40(FP), DX
+	SUBQ    n+56(FP), DX
+	MOVQ    DX, proom-16(SP)        // the last slot a whole point can start at
+	XORQ    R10, R10
+	VMOVDQU frZero<>(SB), Y4
+	VMOVDQU frNine<>(SB), Y5
+	VMOVDQU frComma<>(SB), Y6
+	VMOVDQU frSpace<>(SB), Y7
+	VBROADCASTI128 frW10<>(SB), Y8
+	VBROADCASTI128 frW100<>(SB), Y9
+	VBROADCASTI128 frW1e4<>(SB), Y10
+	VMOVDQU frJoin<>(SB), X11
+	LEAQ    ·floatRunTab(SB), R15
+
+ppoint:
+	MOVQ    SI, pstart-8(SP)        // where the point's region starts
+	MOVQ    R10, pr10-32(SP)        // and what was written before it
+	CMPQ    SI, plimit-24(SP)
+	JHI     pstop
+	CMPQ    R10, proom-16(SP)
+	JGT     pstop                   // no room for a whole point
+	VMOVDQU (SI), Y0
+	VMOVDQU 32(SI), Y1
+	CLASSIFY
+	TZCNTQ    R13, CX               // the first byte that is not whitespace
+	CMPQ      CX, $16
+	JAE       prewindow             // far into the window: start one at it
+	CMPB      (SI)(CX*1), $0x5b
+	JNE       pstop                 // not a point ('[')
+	INCQ      CX                    // b: past the '['
+	// Everything before b is whitespace and the '[', so the window's first
+	// ']' is the point's, and its commas are the ones below that. The ']'
+	// joins them in R12 as the last number's delimiter, so every number's
+	// delimiter is its lowest bit (the VBMI walk keeps the ']' in the frame,
+	// and reloading it was a store-forward on the chain from one point to
+	// the next).
+	CLOSES
+	TZCNTQ    BX, BX
+	JCS       plong2                // the point's ']' is past the window
+	BZHIQ     BX, R12, R12          // the point's commas
+	BTSQ      BX, R12               // and its ']'
+	POPCNTQ   R12, AX
+	CMPQ      AX, n+56(FP)
+	JNE       pback                 // not n numbers (or not a flat point)
+
+pelem:
+	TZCNTQ  R12, BX                 // the number's delimiter: a comma, or the point's ']'
+	LPARSE(pback, pNoFrac, pParsed)
+	CMPQ    DX, BX
+	JEQ     pfold
+	SHRXQ   DX, R13, AX             // whitespace to the delimiter
+	TZCNTQ  AX, AX
+	ADDQ    DX, AX
+	CMPQ    AX, BX
+	JNE     pback
+	SHRXQ   CX, R11, AX             // L1 again
+	TZCNTQ  AX, AX
+pfold:
+	LEAQ    (AX)(R14*1), R9
+	CMPQ    R9, $15
+	JA      plong
+	CONVERT
+	JMP     pconverted
+plong:
+	CMPQ    R9, $19
+	JA      pback                   // 20 digits or more: the reader's
+	LONGGATHER2
+	LONGFOLD
+	LONGTAIL2(pel, pNoRefine, pRound, pRefine, pRefine0, pback, pconverted)
+
+pconverted:
+	LEAQ    1(BX), CX               // past the delimiter
+	BLSRQ   R12, R12                // the delimiter is consumed; ZF: that was
+	JNZ     pelem                   // the point's ']'
+
+	// The point's ']' is at BX. The first byte after it that is not
+	// whitespace must be the ',' before the next point or the ring's ']'.
+	CMPQ    CX, $64
+	JEQ     psep
+	SHRXQ   CX, R13, AX
+	TZCNTQ  AX, AX
+	JCS     psep                    // the separator is past the window
+	ADDQ    CX, AX
+psepAt:
+	CMPB    (SI)(AX*1), $0x2c
+	JEQ     pnext
+	CMPB    (SI)(AX*1), $0x5d
+	JNE     pback
+	// The ring's ']': done, and closed.
+	ADDQ    AX, SI
+	SUBQ    data_base+0(FP), SI
+	MOVQ    R10, AX
+	XORQ    DX, DX
+	DIVQ    n+56(FP)
+	MOVQ    AX, np+64(FP)
+	MOVQ    SI, p+72(FP)
+	MOVQ    $1, closed+80(FP)
+	VZEROUPPER
+	RET
+
+pnext:
+	LEAQ    1(SI)(AX*1), SI         // the next point's region starts after the ','
+	JMP     ppoint
+
+psep:
+	// The rest of the window is whitespace — in a pretty-printed ring, the
+	// last point's ']' is on the next line — so the separator is looked for
+	// in the next window, and the one after that while they hold nothing
+	// else. The point stays uncounted until it is found (pback forgets it).
+	ADDQ    $64, SI
+	MOVQ    plimit-24(SP), AX
+	ADDQ    $16, AX                 // a window read whole: 64 bytes, not 80
+	CMPQ    SI, AX
+	JHI     pback
+	VMOVDQU (SI), Y0
+	VMOVDQU 32(SI), Y1
+	VPMINUB   Y7, Y0, Y3            // not whitespace, as CLASSIFY's R13
+	VPCMPEQB  Y0, Y3, Y3
+	VPMOVMSKB Y3, AX
+	VPMINUB   Y7, Y1, Y3
+	VPCMPEQB  Y1, Y3, Y3
+	VPMOVMSKB Y3, DX
+	SHLQ      $32, DX
+	ORQ       DX, AX
+	NOTQ      AX
 	TZCNTQ    AX, AX
 	JCS       psep                  // all of it whitespace
 	JMP       psepAt
