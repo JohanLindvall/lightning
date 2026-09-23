@@ -105,6 +105,10 @@ haveBrackets:
 // exactly the work maskBlock + the Go bit math did, minus the per-block call,
 // four results through memory, five splat builds and the isArray branch.
 //
+// Like the amd64 twin it takes the final < 64 bytes as one more block, the
+// buffer's last 64 with the lanes before the cursor shifted out (tailBlock), so
+// it consumes the whole buffer from pos (skipBlocksTakesTail).
+//
 // Unlike the amd64 twin there is no carryless-multiply prefix XOR: the mask is
 // in the GP domain (the escape math needs GP add-with-carry) and a
 // GP->SIMD->GP round trip for PMULL costs more on M-class cores than the
@@ -142,11 +146,12 @@ haveBrackets:
 
 blockLoop:
 	CMP  R1, R2
-	BGT  exhausted
+	BGT  tailBlock
 	VLD1 (R16), [V6.B16, V7.B16, V8.B16, V9.B16]
 	CLASS2(V0.B16, V1.B16, R10, R11)  // quote, bslash
 	CLASS2(V2.B16, V3.B16, R12, R13)  // open, close
 
+blockBody:
 	// escaped (R15): skip the add-carry chain when no backslash in the block
 	// and none pending from the previous one.
 	ORR  R4, R11, R7
@@ -218,6 +223,31 @@ nextBlock:
 	ADD  $64, R2
 	ADD  $64, R16
 	JMP  blockLoop
+
+tailBlock:
+	// Fewer than 64 bytes are left from pos. Classify the buffer's LAST 64 —
+	// the caller guarantees it holds that many — and shift every bitmap right
+	// by the lanes before pos, so bit 0 is pos again: the shift drops the
+	// bytes the loop already accounted for and brings in zeros above the end,
+	// and a zero byte is not a quote, a backslash or a bracket. The block math
+	// then runs unchanged, and after it pos+64 is past the end, so the next
+	// trip lands in exhausted. This is the block the Go continuation used to
+	// build through a maskBlock call (see skipContainerBlocks), which on the
+	// last element of every array and the last unknown member of every
+	// document was a frame, a call and four results through memory.
+	ADD  $64, R1, R7
+	CMP  R7, R2
+	BGE  exhausted
+	ADD  R0, R1, R7
+	VLD1 (R7), [V6.B16, V7.B16, V8.B16, V9.B16]
+	CLASS2(V0.B16, V1.B16, R10, R11)  // quote, bslash
+	CLASS2(V2.B16, V3.B16, R12, R13)  // open, close
+	SUB  R1, R2, R7                   // the lanes already walked: 1..63
+	LSR  R7, R10, R10
+	LSR  R7, R11, R11
+	LSR  R7, R12, R12
+	LSR  R7, R13, R13
+	JMP  blockBody
 
 foundEnd:
 	ADD  R2, R9, R7            // end = pos + j + 1

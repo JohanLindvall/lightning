@@ -15,6 +15,11 @@
 // that disagree (the default, the CI gate). Anything after a second "//" is
 // prose and is preserved untouched.
 //
+// Inside a #define the comment must be a block comment instead — a "//" would
+// swallow the line's continuation backslash — and that form is read too:
+//
+//	WORD $0x4e289ed6 /* mul v22.16b, v22.16b, v8.16b */ \
+//
 // Usage:
 //
 //	sveasm [-w] file.s...
@@ -47,6 +52,29 @@ import (
 // (every predicate operand is written "p1/z") and only a DOUBLE slash starts the
 // prose.
 var wordLine = regexp.MustCompile(`^(\s*WORD\s+\$0x)([0-9a-fA-F]{8})(\s*//\s*)(.*)$`)
+
+// macroWordLine matches the same instruction written inside a macro, where the
+// mnemonic sits in a block comment followed by the line continuation: groups
+// are the prefix, the constant, the comment opener, the mnemonic, and the
+// rest of the line from the comment's close.
+var macroWordLine = regexp.MustCompile(`^(\s*WORD\s+\$0x)([0-9a-fA-F]{8})(\s*/\*\s*)(.*?)(\s*\*/.*)$`)
+
+// parseWord splits a WORD line of either form into the text before the
+// constant, the constant, the text between it and the mnemonic, the mnemonic,
+// and everything after the mnemonic; ok is false for any other line.
+func parseWord(line string) (prefix, hex, mid, mnemonic, suffix string, ok bool) {
+	if m := wordLine.FindStringSubmatch(line); m != nil {
+		mn, prose := splitComment(m[4])
+		if prose != "" {
+			prose = " " + prose
+		}
+		return m[1], m[2], m[3], mn, prose, true
+	}
+	if m := macroWordLine.FindStringSubmatch(line); m != nil {
+		return m[1], m[2], m[3], strings.TrimSpace(m[4]), m[5], true
+	}
+	return "", "", "", "", "", false
+}
 
 // splitComment divides a WORD line's comment into the mnemonic and the trailing
 // prose, which begins at the first "//" — as opposed to the single slashes that
@@ -111,15 +139,14 @@ func process(path, as, objdump string, write bool) (int, error) {
 	}
 	var sites []site
 	for i, line := range lines {
-		m := wordLine.FindStringSubmatch(line)
-		if m == nil {
+		_, hex, _, mn, _, ok := parseWord(line)
+		if !ok {
 			continue
 		}
-		mn, _ := splitComment(m[4])
 		if mn == "" {
 			return 0, fmt.Errorf("line %d: WORD constant has no mnemonic in its comment", i+1)
 		}
-		sites = append(sites, site{line: i, hex: strings.ToLower(m[2]), mnemonic: mn})
+		sites = append(sites, site{line: i, hex: strings.ToLower(hex), mnemonic: mn})
 	}
 	if len(sites) == 0 {
 		fmt.Printf("%s: no WORD constants\n", path)
@@ -164,13 +191,8 @@ func process(path, as, objdump string, write bool) (int, error) {
 		}
 		bad++
 		if write {
-			m := wordLine.FindStringSubmatch(lines[s.line])
-			mn, prose := splitComment(m[4])
-			rest := mn
-			if prose != "" {
-				rest += " " + prose
-			}
-			lines[s.line] = m[1] + encs[i] + m[3] + rest
+			prefix, _, mid, mn, suffix, _ := parseWord(lines[s.line])
+			lines[s.line] = prefix + encs[i] + mid + mn + suffix
 			fmt.Printf("%s:%d: %s -> %s  (%s)\n", path, s.line+1, s.hex, encs[i], s.mnemonic)
 		} else {
 			actual := staleText[s.hex]

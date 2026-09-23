@@ -18,6 +18,7 @@ func TestSkipBlocksVariants(t *testing.T) {
 	} {
 		useSkipBlocks = v.on
 		testSkipVariantCorpus(t, v.name)
+		testSkipTailSweep(t, v.name)
 	}
 }
 

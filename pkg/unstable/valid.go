@@ -110,9 +110,9 @@ scanValue:
 					}
 					i = SkipWS(data, i)
 				}
-			} else if c == '[' && useValidRun512 && depth < MaxDepth && uint(i+1) < uint(n) {
+			} else if c == '[' && useValidPoints && depth < MaxDepth && uint(i+1) < uint(n) {
 				if c = data[i+1]; c-'0' <= 9 || c == '-' || c <= ' ' {
-					if i, closed = validPointsRun512(data, i); closed != 0 {
+					if i, closed = validPointsRun(data, i); closed != 0 {
 						i++
 						depth--
 						goto scanAfter

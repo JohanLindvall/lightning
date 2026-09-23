@@ -12,12 +12,15 @@ import (
 // decimal numbers: AVX2 for its classification and BMI2 for SHRX/SHLX.
 var useFloatRun = cpu.X86.HasAVX2 && cpu.X86.HasBMI2
 
-// useFloatRunVBMI selects the kernel's AVX-512 VBMI body (parseFloatRunVBMI),
-// which takes numbers of up to 19 digits: VPERMI2B is what gathers a number's
-// digits out of the 64-byte window register, and BW/VL supply the byte
-// compares into mask registers and the ymm broadcast from a general register.
-// The assembly reads the flag, so parseFloatRun stays a single call.
-var useFloatRunVBMI = useFloatRun && cpu.X86.HasAVX512F && cpu.X86.HasAVX512BW &&
+// useFloatRunLong says the kernel converts numbers of up to 19 digits (with
+// Eisel-Lemire) — the shape of a coordinate — which is what the points walk
+// and the fixed-array reader need; the shared readers read it under that name
+// on every architecture. Here it selects the AVX-512 VBMI body
+// (parseFloatRunVBMI), the one amd64 body that does: VPERMI2B is what gathers
+// a number's digits out of the 64-byte window register, and BW/VL supply the
+// byte compares into mask registers and the ymm broadcast from a general
+// register. The assembly reads the flag, so parseFloatRun stays a single call.
+var useFloatRunLong = useFloatRun && cpu.X86.HasAVX512F && cpu.X86.HasAVX512BW &&
 	cpu.X86.HasAVX512VL && cpu.X86.HasAVX512VBMI
 
 // parseFloatRunAVX2 parses a run of comma-separated decimal numbers of at
@@ -39,7 +42,7 @@ func parseFloatRun(data []byte, i int, out []float64) (n, p, closed int) {
 }
 
 // parseFloatRunV is parseFloatRun straight into the VBMI body, for a caller
-// that has already checked useFloatRunVBMI (the fixed-array reader), skipping
+// that has already checked useFloatRunLong (the fixed-array reader), skipping
 // the AVX2 body's flag test and tail jump.
 func parseFloatRunV(data []byte, i int, out []float64) (n, p, closed int) {
 	return parseFloatRunVBMI(data, i, out)
@@ -129,10 +132,12 @@ func init() {
 // BMI2 for SHRX (BMI1's TZCNT/BLSR come with it).
 var useValidRun = cpu.X86.HasAVX2 && cpu.X86.HasBMI2
 
-// useValidRun512 selects validNumberRun's AVX-512 body, which classifies each
-// window with compares into mask registers (BW for the byte compares). The
-// assembly reads the flag.
-var useValidRun512 = useValidRun && cpu.X86.HasAVX512F && cpu.X86.HasAVX512BW
+// useValidPoints gates validPointsRun, the coordinate-ring walk
+// SkipValueStrict hands an array of arrays of numbers (the shared name; the
+// ring walk is AVX-512 here). On amd64 the same flag also selects
+// validNumberRun's AVX-512 body, which classifies each window with compares
+// into mask registers (BW for the byte compares); the assembly reads it.
+var useValidPoints = useValidRun && cpu.X86.HasAVX512F && cpu.X86.HasAVX512BW
 
 // validNumberRun passes over the run of plain decimal numbers from data[i:] —
 // an array's elements — converting nothing, and returns where the scalar walk
@@ -141,13 +146,13 @@ var useValidRun512 = useValidRun && cpu.X86.HasAVX512F && cpu.X86.HasAVX512BW
 //go:noescape
 func validNumberRun(data []byte, i int) (p, closed int)
 
-// validPointsRun512 passes over a run of points — an array's elements that
+// validPointsRun passes over a run of points — an array's elements that
 // are themselves flat arrays of plain decimals, a coordinate ring — from the
 // point at data[i], converting nothing, and returns where the scalar walk
 // resumes, or closed = 1 with p at the ring's ']'. See floatrun_amd64.s.
 //
 //go:noescape
-func validPointsRun512(data []byte, i int) (p, closed int)
+func validPointsRun(data []byte, i int) (p, closed int)
 
 // validNumberRun512 is reached only by validNumberRun's tail jump; the
 // declaration is what asmdecl checks the frame against.

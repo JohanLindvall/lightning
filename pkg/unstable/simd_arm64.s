@@ -245,18 +245,25 @@ etfound:
 	MOVD R2, ret+24(FP)
 	RET
 
-// func indexStructuralNEON(b []byte) int
+// func indexStructuralNEON(b []byte, i int) int
 //
-// Returns the index of the first '{', '}', '[', ']' or '"' byte, or len(b).
-TEXT ·indexStructuralNEON(SB), NOSPLIT, $0-32
+// Returns the index of the first '{', '}', '[', ']' or '"' byte at or after i,
+// or len(b). The scan start is an argument for indexQuoteOrBackslashNEON's
+// reason — a b[i:] at the call site is a reslice — and so the Go side can hand
+// this any remainder, however short: a buffer of fewer than 16 bytes from i
+// goes straight to the scalar tail.
+TEXT ·indexStructuralNEON(SB), NOSPLIT, $0-40
 	MOVD b_base+0(FP), R0
 	MOVD b_len+8(FP), R1
+	MOVD i+24(FP), R2
 	MOVD $structTablesArm<>(SB), R3
 	VLD1 (R3), [V0.B16, V1.B16, V2.B16] // structLo, structHi, 0x0f mask
-	CMP  $16, R1
-	BLT  sshortInput
+	SUB  $16, R1, R12                    // the last offset holding a full block
+	CMP  R12, R2
+	BGT  stail
 
-	VLD1  (R0), [V5.B16]              // chunk
+	ADD   R0, R2, R8
+	VLD1  (R8), [V5.B16]              // the first block, peeled
 	VAND  V2.B16, V5.B16, V6.B16     // low nibbles
 	VTBL  V6.B16, [V0.B16], V6.B16   // structLo[lowNibble]
 	VUSHR $4, V5.B16, V7.B16         // high nibbles (per-byte shift)
@@ -264,11 +271,9 @@ TEXT ·indexStructuralNEON(SB), NOSPLIT, $0-32
 	VAND  V7.B16, V6.B16, V6.B16     // nonzero byte where structural
 	VMOV  V6.D[0], R9
 	VMOV  V6.D[1], R10
-	CBNZ  R9, sfirstLow8
-	CBNZ  R10, sfirstHigh8
-
-	MOVD  $16, R2
-	SUB   $16, R1, R12                // last offset holding a full block
+	CBNZ  R9, slow8
+	CBNZ  R10, shigh8
+	ADD   $16, R2
 
 sloop:
 	CMP  R12, R2
@@ -287,27 +292,12 @@ sloop:
 	ADD  $16, R2
 	B    sloop
 
-sfirstLow8:
-	RBIT R9, R11
-	CLZ  R11, R11
-	LSR  $3, R11, R11
-	MOVD R11, ret+24(FP)
-	RET
-
-sfirstHigh8:
-	RBIT R10, R11
-	CLZ  R11, R11
-	LSR  $3, R11, R11
-	ADD  $8, R11, R11
-	MOVD R11, ret+24(FP)
-	RET
-
 slow8:
 	RBIT R9, R11
 	CLZ  R11, R11
 	LSR  $3, R11, R11
 	ADD  R2, R11, R11
-	MOVD R11, ret+24(FP)
+	MOVD R11, ret+32(FP)
 	RET
 
 shigh8:
@@ -316,11 +306,8 @@ shigh8:
 	LSR  $3, R11, R11
 	ADD  $8, R11, R11
 	ADD  R2, R11, R11
-	MOVD R11, ret+24(FP)
+	MOVD R11, ret+32(FP)
 	RET
-
-sshortInput:
-	MOVD ZR, R2                       // buffer shorter than one block: scan from 0
 
 stail:
 	CMP  R1, R2
@@ -342,10 +329,10 @@ stloop:
 	CMP  R1, R2
 	BLT  stloop
 snone:
-	MOVD R1, ret+24(FP)
+	MOVD R1, ret+32(FP)
 	RET
 stf:
-	MOVD R2, ret+24(FP)
+	MOVD R2, ret+32(FP)
 	RET
 
 // func indexEscapeNonASCIINEON(b []byte) int
@@ -831,45 +818,49 @@ euFound:
 euNEON:
 	B ·indexEscapeNonASCIINEON(SB)
 
-// func indexStructuralSVE2(b []byte) int
+// func indexStructuralSVE2(b []byte, i int) int
 //
-// SVE2 twin of indexStructuralNEON: first '{', '}', '[', ']' or '"', or len(b).
-// All five bytes live in one MATCH. Unlike the three scanners above this one is
-// reached through a Go-level `if useSVE2` rather than an in-assembly gate: its
-// dispatcher (indexStructural) already carries a length test and a 16-byte
-// scalar prescan, so it is far past the inline budget either way and the branch
-// costs nothing there.
+// SVE2 twin of indexStructuralNEON: first '{', '}', '[', ']' or '"' at or after
+// i, or len(b). All five bytes live in one MATCH. Unlike the three scanners
+// above this one is reached through a Go-level `if useSVE2` rather than an
+// in-assembly gate: its dispatcher (indexStructuralAt) already carries a length
+// test and a 16-byte SWAR prescan, so it is far past the inline budget either
+// way and the branch costs nothing there.
 //
-// One predicate op per block like the quote scanner, so the same staged body —
-// and its callers (SkipValue's container walk, the presize counters) hand it
-// the rest of the document, where a long run with no structural byte is exactly
-// a long string value.
-TEXT ·indexStructuralSVE2(SB), NOSPLIT, $0-32
+// One predicate op per block like the quote scanner, and the same staged body
+// — two single blocks under PTRUE, a two-vector step, a four-vector loop, the
+// ragged end under WHILELO — so its callers (SkipValue's container walk, the
+// resumable scanner) can hand it the rest of the document from any offset,
+// however little of it is left: a remainder of under a vector is one WHILELO
+// block, where it used to be a byte loop in Go costing eleven instructions a
+// byte (a 24-byte scan was 284 instructions).
+TEXT ·indexStructuralSVE2(SB), NOSPLIT, $0-40
 	MOVD b_base+0(FP), R0
 	MOVD b_len+8(FP), R1
+	MOVD i+24(FP), R2
 	MOVD $sveStructSet<>(SB), R7
 	WORD $0x2518e3e1 // ptrue p1.b
 	WORD $0xa40024e1 // ld1rqb {z1.b}, p1/z, [x7] // 16 bytes -> every segment
-	MOVD ZR, R2
 	WORD $0x0420e3e3 // cntb x3
-	SUBS R3, R1, R4
-	BLO  stTail
-
-	WORD $0xa400a400 // ld1b {z0.b}, p1/z, [x0]
-	WORD $0x45218402 // match p2.b, p1/z, z0.b, z1.b
-	BNE  stFound
-	MOVD R3, R2
+	SUB  R3, R1, R4   // x4 = len-VL, the last offset a full vector may load from
 	CMP  R4, R2
 	BGT  stTail
 
 	WORD $0xa4024400 // ld1b {z0.b}, p1/z, [x0, x2]
 	WORD $0x45218402 // match p2.b, p1/z, z0.b, z1.b
 	BNE  stFound
-	LSL  $1, R3, R5
-	MOVD R5, R2
-	ADD  R0, R5, R6
+	WORD $0x0430e3e2 // incb x2
+	CMP  R4, R2
+	BGT  stTail
+
+	WORD $0xa4024400 // ld1b {z0.b}, p1/z, [x0, x2]
+	WORD $0x45218402 // match p2.b, p1/z, z0.b, z1.b
+	BNE  stFound
+	WORD $0x0430e3e2 // incb x2
+	LSL  $1, R3, R5   // x5 = 2*VL
+	ADD  R0, R2, R6   // x6 = the running pointer
 	ADD  R0, R1, R8
-	SUB  R5, R8, R8
+	SUB  R5, R8, R8   // x8 = the last pointer a two-vector step may load from
 
 	CMP  R8, R6
 	BGT  stSingle
@@ -880,8 +871,8 @@ TEXT ·indexStructuralSVE2(SB), NOSPLIT, $0-32
 	WORD $0x45218482 // match p2.b, p1/z, z4.b, z1.b
 	BNE  stHit1
 	ADD  R5, R6, R6
-	LSL  $1, R5, R9
-	SUB  R5, R8, R10
+	LSL  $1, R5, R9   // x9 = 4*VL
+	SUB  R5, R8, R10  // x10 = the last pointer a four-vector step may load from
 	CMP  R10, R6
 	BGT  stSinglePtr
 
@@ -915,14 +906,14 @@ stSingle:
 	B    stSingle
 
 stTail:
-	WORD $0x25211c41 // whilelo p1.b, x2, x1
-	BEQ  stNone
+	WORD $0x25211c41 // whilelo p1.b, x2, x1 // active lanes = min(VL, len-x2)
+	BEQ  stNone // b.none: the offset reached the end
 	WORD $0xa4024400 // ld1b {z0.b}, p1/z, [x0, x2]
 	WORD $0x45218402 // match p2.b, p1/z, z0.b, z1.b
 	BNE  stFound
 
 stNone:
-	MOVD R1, ret+24(FP)
+	MOVD R1, ret+32(FP)
 	RET
 
 stHit3:
@@ -938,7 +929,7 @@ stHit0:
 	SUB  R0, R6, R2
 
 stFound:
-	WORD $0x25904443 // brkb p3.b, p1/z, p2.b
-	WORD $0x252c8862 // incp x2, p3.b
-	MOVD R2, ret+24(FP)
+	WORD $0x25904443 // brkb p3.b, p1/z, p2.b // lanes before the first match
+	WORD $0x252c8862 // incp x2, p3.b // x2 += how many there were
+	MOVD R2, ret+32(FP)
 	RET

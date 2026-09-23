@@ -1549,6 +1549,15 @@ NEON/ASIMD, plus **SVE2** where the core has it):
   a 64-byte block with one load and a k-mask per class, and `skipBlocksNEON` on
   arm64. Measured against the per-block Go loop: −59…−67% on object-shaped
   containers (amd64), −29…−35% (Apple M2).
+- **arrays of numbers** — `[]int`/`[]uint`/`[]float64` fields and coordinate
+  rings (`[][N]float64`) are converted a run of elements per call by kernels in
+  `pkg/unstable/intrun_*.s` and `floatrun_*.s`, which classify 64 bytes at a
+  time and fold the digits in vector registers. Every value is the one
+  `strconv` returns (decimals of up to 19 digits take Clinger's fast path or
+  Eisel-Lemire; anything else, such as an exponent, goes to the scalar loop).
+  `Valid` passes over number arrays with the same walks, minus the conversion.
+  Measured on a Neoverse N2 against the scalar loops, the number-heavy benchmark
+  documents (numbers, canada, mesh, marine_ik) decode 22–54% faster.
 
 ### CPU requirements
 
@@ -1564,7 +1573,12 @@ each architecture's **baseline, mandatory** vector ISA — no runtime gate:
   into its callers.
 
 The **optional** features are runtime-detected via `golang.org/x/sys/cpu`. On
-arm64 there is one:
+arm64 there are two:
+
+- **DotProd** (`UDOT`; ARMv8.2, mandatory from ARMv8.4: Neoverse N1 and later,
+  Graviton2 and later, Apple M-series) gates the number-array kernels. A core
+  without it, such as the Cortex-A72 in Graviton1 or a Raspberry Pi 4, uses the
+  scalar loops.
 
 - **SVE2**, on cores that have it (Neoverse N2/V2, Graviton4 and later; not Apple
   M-series or Neoverse N1/V1), replaces the NEON body of all four scanners with a
@@ -1597,6 +1611,10 @@ And on amd64:
   structural-byte skip.
 - **AVX-512** (specifically AVX512BW), when present, selects the faster
   `skipBlocksAVX512` container-skip kernel.
+- **AVX2 and BMI2** gate the number-array kernels. **AVX-512 VBMI** (with the
+  AVX-512 base features it builds on) adds the decimal kernel's body for
+  16–19-digit numbers, the coordinate-ring walk, and the structural-byte
+  scanner's 64-byte body.
 - **PCLMULQDQ, BMI1 and POPCNT** gate the assembly skip loop, which uses a
   carryless multiply for the in-string prefix XOR. All three are universally
   present alongside AVX2; the gate is a correctness belt, not a real branch.

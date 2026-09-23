@@ -5,31 +5,7 @@ package unstable
 import (
 	"strings"
 	"testing"
-
-	"golang.org/x/sys/unix"
 )
-
-// guardedPage maps three pages with the outer two inaccessible and returns the
-// middle one: a slice placed flush against either end of it faults on any read
-// past that end, which is how the tests below prove that no assembly body reads
-// outside its buffer. The masked tail loads rely on fault suppression for the
-// lanes they switch off, and the overlapping tails on reading only inside the
-// slice; both are claims about memory that a normal Go allocation, always
-// followed by more heap, can never falsify.
-func guardedPage(t *testing.T) []byte {
-	t.Helper()
-	ps := unix.Getpagesize()
-	mem, err := unix.Mmap(-1, 0, 3*ps, unix.PROT_NONE, unix.MAP_PRIVATE|unix.MAP_ANON)
-	if err != nil {
-		t.Skipf("mmap: %v", err)
-	}
-	t.Cleanup(func() { _ = unix.Munmap(mem) })
-	mid := mem[ps : 2*ps : 2*ps]
-	if err := unix.Mprotect(mid, unix.PROT_READ|unix.PROT_WRITE); err != nil {
-		t.Skipf("mprotect: %v", err)
-	}
-	return mid
-}
 
 // TestAssemblyStaysInBounds runs every amd64 scanner body over buffers flush
 // against a guard page at their end and at their start, at every length up to
@@ -127,8 +103,8 @@ func TestAssemblyStaysInBounds(t *testing.T) {
 // farthest byte its body touches.
 func TestNumberKernelsStayInBounds(t *testing.T) {
 	page := guardedPage(t)
-	savedV := useFloatRunVBMI
-	defer func() { useFloatRunVBMI = savedV }()
+	savedV := useFloatRunLong
+	defer func() { useFloatRunLong = savedV }()
 	patterns := []string{
 		"1234,-5,67890123,0,",
 		"1.25,-3.5, 17.123456789012345,-0.000123 ,",
@@ -158,15 +134,15 @@ func TestNumberKernelsStayInBounds(t *testing.T) {
 					}
 					if useValidRun {
 						for _, b512 := range validRunBodies() {
-							useValidRun512 = b512
+							useValidPoints = b512
 							_, _ = validNumberRun(b, i)
 						}
-						useValidRun512 = validRun512Host
+						useValidPoints = validPointsHost
 					}
 					if floatRunHost {
-						useFloatRunVBMI = false
+						useFloatRunLong = false
 						_, _, _ = parseFloatRunAVX2(b, i, floats)
-						useFloatRunVBMI = savedV
+						useFloatRunLong = savedV
 					}
 					if savedV {
 						_, _, _ = parseFloatRunVBMI(b, i, floats)

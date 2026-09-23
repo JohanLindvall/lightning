@@ -55,7 +55,7 @@ var useSkipBlocks = true
 // work. amd64 makes its AVX2/AVX-512 choice inside the assembly for the same
 // reason; here there is only one body and nothing to choose.
 //
-// end is -1 when the close was not found in any full block, and only then are
+// end is -1 when the close was not found, and only then are
 // ndepth/prevEscaped/prevInString written: once the close is found they are
 // dead — skipContainerFast reads them under end < 0 and nowhere else — so
 // writing them cost three stores on the path every small container takes.
@@ -63,7 +63,10 @@ var useSkipBlocks = true
 //go:noescape
 func skipBlocks(data []byte, pos, depth int, isArray bool) (end, ndepth int, prevEscaped, prevInString uint64)
 
-// skipBlocksTakesTail is false here: this skipBlocks scans full 64-byte blocks
-// only, and the caller finishes the < 64 bytes after them in Go (see the amd64
-// declaration for the form that does not).
-const skipBlocksTakesTail = false
+// skipBlocksTakesTail reports that skipBlocks consumes the whole buffer from
+// pos, the final < 64 bytes included, read as the buffer's last 64 with the
+// lanes before pos shifted out of every bitmap — so a caller handed end < 0 has
+// hit the end of the input, and never reaches the Go continuation. The buffer
+// must hold at least 64 bytes for that block; see the amd64 declaration, whose
+// contract this is.
+const skipBlocksTakesTail = true

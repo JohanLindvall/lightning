@@ -1,4 +1,4 @@
-//go:build !amd64
+//go:build !amd64 && !arm64
 
 package unstable
 
@@ -6,8 +6,8 @@ package unstable
 // loop never calls parseFloatRun then.
 var useFloatRun = false
 
-// useFloatRunVBMI is false: there is no VBMI body here either.
-var useFloatRunVBMI = false
+// useFloatRunLong is false: there is no kernel to take long numbers either.
+var useFloatRunLong = false
 
 func parseFloatRun(data []byte, i int, out []float64) (n, p, closed int) {
 	return 0, i, 0
@@ -21,14 +21,14 @@ func parseFloatPoints(data []byte, i int, out []float64, n int) (np, p, closed i
 	return 0, i, 0
 }
 
-// useValidRun and useValidRun512 are false: SkipValueStrict checks every
+// useValidRun and useValidPoints are false: SkipValueStrict checks every
 // number itself.
-var useValidRun, useValidRun512 = false, false
+var useValidRun, useValidPoints = false, false
 
 func validNumberRun(data []byte, i int) (p, closed int) {
 	return i, 0
 }
 
-func validPointsRun512(data []byte, i int) (p, closed int) {
+func validPointsRun(data []byte, i int) (p, closed int) {
 	return i, 0
 }

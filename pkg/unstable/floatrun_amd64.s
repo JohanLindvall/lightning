@@ -189,7 +189,7 @@ parsed:
 // The data base and the window limit are reloaded from the frame when needed.
 // Y4-Y7 and X8-X11 hold the constants.
 TEXT ·parseFloatRunAVX2(SB), NOSPLIT, $0-80
-	MOVBLZX ·useFloatRunVBMI(SB), AX
+	MOVBLZX ·useFloatRunLong(SB), AX
 	TESTL   AX, AX
 	JNZ     toVBMI
 	MOVQ    data_base+0(FP), SI
@@ -391,7 +391,7 @@ checked:
 // tables: SI the window, CX the cursor, R11/R12/R13 the window masks, BX the
 // delimiter, AX/DX/DI temporaries; Y4-Y7 the constants.
 TEXT ·validNumberRun(SB), NOSPLIT, $0-48
-	MOVBLZX ·useValidRun512(SB), AX
+	MOVBLZX ·useValidPoints(SB), AX
 	TESTL   AX, AX
 	JNZ     to512
 	MOVQ    data_base+0(FP), SI
@@ -628,7 +628,7 @@ dstop:
 	MOVQ    $0, closed+40(FP)
 	RET
 
-// func validPointsRun512(data []byte, i int) (p, closed int)
+// func validPointsRun(data []byte, i int) (p, closed int)
 //
 // The points walk (parseFloatPointsVBMI) as a check, for SkipValueStrict: i is
 // at a point's '[' in an array of flat numeric arrays — a coordinate ring —
@@ -647,7 +647,7 @@ dstop:
 //
 // Registers as in validNumberRun512, plus R8 the point's ']'; the frame holds
 // the point's start and the window limit.
-TEXT ·validPointsRun512(SB), NOSPLIT, $16-48
+TEXT ·validPointsRun(SB), NOSPLIT, $16-48
 	MOVQ    data_base+0(FP), SI
 	MOVQ    data_len+8(FP), AX
 	LEAQ    -64(SI)(AX*1), AX

@@ -1,6 +1,7 @@
 package unstable
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"math"
@@ -35,7 +36,7 @@ func checkFloatRun(t *testing.T, data []byte, i int) {
 		return res{s, end, err}
 	}
 	for _, body := range floatRunBodies() {
-		useFloatRunVBMI = body.vbmi
+		useFloatRunLong = body.long
 		for _, reuse := range []bool{false, true} {
 			a, b := run(false, reuse), run(true, reuse)
 			same := a.end == b.end && errors.Is(a.err, b.err) && errors.Is(b.err, a.err) && len(a.vals) == len(b.vals)
@@ -48,33 +49,33 @@ func checkFloatRun(t *testing.T, data []byte, i int) {
 			}
 		}
 	}
-	useFloatRunVBMI = floatRunVBMIHost
+	useFloatRunLong = floatRunLongHost
 }
 
-// floatRunHost and floatRunVBMIHost are the host's useFloatRun and
-// useFloatRunVBMI, which the tests flip to run the scalar loop and both kernel
+// floatRunHost and floatRunLongHost are the host's useFloatRun and
+// useFloatRunLong, which the tests flip to run the scalar loop and both kernel
 // bodies — never turning on one the CPU lacks.
-var floatRunHost, floatRunVBMIHost = useFloatRun, useFloatRunVBMI
+var floatRunHost, floatRunLongHost = useFloatRun, useFloatRunLong
 
-// floatRunBodies lists the kernel bodies this host can run: the AVX2 one
-// (numbers of up to 15 digits) and, with AVX-512 VBMI, the VBMI one (up to 19,
-// with Eisel-Lemire).
-func floatRunBodies() []struct {
+// floatRunBody is one kernel body the tests can select: long says it takes
+// numbers of up to 19 digits (with Eisel-Lemire), and selecting it sets
+// useFloatRunLong to that — which on amd64 is also what picks the body.
+type floatRunBody struct {
 	name   string
-	vbmi   bool
+	long   bool
 	digits int
-} {
-	b := []struct {
-		name   string
-		vbmi   bool
-		digits int
-	}{{"avx2", false, 15}}
-	if floatRunVBMIHost {
-		b = append(b, struct {
-			name   string
-			vbmi   bool
-			digits int
-		}{"vbmi", true, 19})
+}
+
+// floatRunBodies lists the kernel bodies this host can run: on amd64 the AVX2
+// one (numbers of up to 15 digits) and, with AVX-512 VBMI, the VBMI one (up to
+// 19, with Eisel-Lemire); on arm64 the one NEON body, which takes up to 19.
+func floatRunBodies() []floatRunBody {
+	if runtime.GOARCH == "arm64" {
+		return []floatRunBody{{"neon", true, 19}}
+	}
+	b := []floatRunBody{{"avx2", false, 15}}
+	if floatRunLongHost {
+		b = append(b, floatRunBody{"vbmi", true, 19})
 	}
 	return b
 }
@@ -169,11 +170,11 @@ func TestFloatRunShapes(t *testing.T) {
 	if !useFloatRun {
 		t.Skip("no SIMD decimal-run kernel on this machine")
 	}
-	defer func() { useFloatRunVBMI = floatRunVBMIHost }()
+	defer func() { useFloatRunLong = floatRunLongHost }()
 	pad := strings.Repeat(" ", 96)
 	rng := rand.New(rand.NewSource(5))
 	for _, body := range floatRunBodies() {
-		useFloatRunVBMI = body.vbmi
+		useFloatRunLong = body.long
 		for l1 := 1; l1 <= body.digits; l1++ {
 			for l2 := 0; l1+l2 <= body.digits; l2++ {
 				for lane := 0; lane < 64; lane += 1 + rng.Intn(3) {
@@ -199,7 +200,7 @@ func TestFloatRunShapes(t *testing.T) {
 						data := []byte(strings.Repeat(" ", lane) + num + "," + pad)
 						out := make([]float64, 2)
 						n, p, closed := parseFloatRun(data, 0, out)
-						if n == 0 && body.vbmi && l1+l2 > 15 && p == lane {
+						if n == 0 && body.long && l1+l2 > 15 && p == lane {
 							continue // Eisel-Lemire declined it: the scalar loop's
 						}
 						if n != 1 || math.Float64bits(out[0]) != math.Float64bits(want) || closed != 0 || p <= lane+len(num) {
@@ -227,7 +228,7 @@ func TestFloatRunWindows(t *testing.T) {
 	if !useFloatRun {
 		t.Skip("no SIMD decimal-run kernel on this machine")
 	}
-	defer func() { useFloatRunVBMI = floatRunVBMIHost }()
+	defer func() { useFloatRunLong = floatRunLongHost }()
 	seps := []string{",", ", ", " ,", " , ", ",\n", ",\n        ", ",\n                        ", ",\t"}
 	shapes := []struct{ l1, l2 int }{{1, 0}, {1, 1}, {1, 12}, {2, 6}, {3, 3}, {1, 14}, {8, 7}, {15, 0}}
 	for _, sep := range seps {
@@ -263,11 +264,8 @@ func TestFloatRunWindows(t *testing.T) {
 				}
 				data := []byte(strings.Repeat(" ", lead) + arr + tail)
 				checkFloatRun(t, data, lead)
-				if runtime.GOARCH != "amd64" {
-					continue
-				}
 				for _, body := range floatRunBodies() {
-					useFloatRunVBMI = body.vbmi
+					useFloatRunLong = body.long
 					out := make([]float64, count)
 					n, p, closed := parseFloatRun(data, lead+1, out)
 					if n != count || closed != 1 || data[p] != ']' {
@@ -290,9 +288,9 @@ func TestFloatRunRandomValues(t *testing.T) {
 	if !useFloatRun {
 		t.Skip("no SIMD decimal-run kernel on this machine")
 	}
-	defer func() { useFloatRunVBMI = floatRunVBMIHost }()
+	defer func() { useFloatRunLong = floatRunLongHost }()
 	for _, body := range floatRunBodies() {
-		useFloatRunVBMI = body.vbmi
+		useFloatRunLong = body.long
 		t.Run(body.name, func(t *testing.T) { testFloatRunRandomValues(t) })
 	}
 }
@@ -357,9 +355,9 @@ func TestFloatRunStopsAtSign(t *testing.T) {
 	if !useFloatRun {
 		t.Skip("no SIMD decimal-run kernel on this machine")
 	}
-	defer func() { useFloatRunVBMI = floatRunVBMIHost }()
+	defer func() { useFloatRunLong = floatRunLongHost }()
 	for _, body := range floatRunBodies() {
-		useFloatRunVBMI = body.vbmi
+		useFloatRunLong = body.long
 		testFloatRunStopsAtSign(t)
 	}
 }
@@ -387,7 +385,17 @@ func testFloatRunStopsAtSign(t *testing.T) {
 		{"[1,-123456789012345678901]", 4, 1, 3, 0}, // 21 digits: past either body
 	} {
 		out := make([]float64, c.avail)
-		n, p, closed := parseFloatRun([]byte(c.in+pad), 1, out)
+		data := []byte(c.in + pad)
+		n, p, closed := parseFloatRun(data, 1, out)
+		// wantP is the element's first byte that is not whitespace, which is
+		// where a kernel that measured the element stops (amd64). One that
+		// stops at the element without measuring it (arm64, whose capacity
+		// bound is per block) returns the start of its region instead. Both
+		// are states the scalar loop resumes from, since it skips whitespace
+		// first; what must not happen is a p past the '-'.
+		if p < c.wantP && len(bytes.TrimLeft(data[p:c.wantP], " \t\n\r")) == 0 {
+			p = c.wantP
+		}
 		if n != c.wantN || p != c.wantP || closed != c.closed {
 			t.Errorf("%q (room %d): n=%d p=%d closed=%d, want n=%d p=%d closed=%d", c.in, c.avail, n, p, closed, c.wantN, c.wantP, c.closed)
 		}
@@ -405,7 +413,7 @@ func testFloatRunStopsAtSign(t *testing.T) {
 // assembly's own conditions (kernelDeclines) — a body that declined all it saw
 // would pass the comparison.
 func TestFloatRunEiselLemire(t *testing.T) {
-	if !floatRunVBMIHost {
+	if !floatRunLongHost {
 		t.Skip("no AVX-512 VBMI body on this machine")
 	}
 	rng := rand.New(rand.NewSource(1234))
@@ -502,12 +510,14 @@ func TestFloatRunEiselLemire(t *testing.T) {
 	}
 }
 
-// kernelDeclines reports whether the VBMI body's LONGCONV hands the number s
-// (of that body's shape: a sign, digits, a '.' and digits, 19 digits at most)
-// back to the scalar loop by design: a mantissa of 2^53 or more whose
-// Eisel-Lemire product is one eiselLemire64 would refine with the power's low
-// word (its low nine bits all ones and xLo + man wrapping), or an exact
-// halfway value. The conditions are the assembly's, restated.
+// kernelDeclines reports whether the kernel's long conversion (the amd64 VBMI
+// body's LONGCONV, the arm64 kernel's) hands the number s (of that shape: a
+// sign, digits, a '.' and digits, 19 digits at most) back to the scalar loop
+// by design. Both decline an exact halfway value. Where eiselLemire64 would
+// refine the product with the power's low word — its low nine bits all ones
+// and xLo + man wrapping — the amd64 body declines, and the arm64 one refines
+// as eiselLemire64 does and declines only a product still ambiguous after it.
+// The conditions are the assembly's, restated.
 func kernelDeclines(s string) bool {
 	s = strings.TrimPrefix(s, "-")
 	ip, fp, _ := strings.Cut(s, ".")
@@ -516,12 +526,87 @@ func kernelDeclines(s string) bool {
 		return false // not this body's shape, or Clinger's, which never declines
 	}
 	man <<= bits.LeadingZeros64(man)
-	xHi, xLo := bits.Mul64(man, detailedPowersOfTen[-len(fp)-detailedPowersOfTenMinExp10][1])
+	pow := detailedPowersOfTen[-len(fp)-detailedPowersOfTenMinExp10]
+	xHi, xLo := bits.Mul64(man, pow[1])
 	if xHi&0x1FF == 0x1FF && xLo+man < man {
-		return true
+		if runtime.GOARCH != "arm64" {
+			return true
+		}
+		yHi, yLo := bits.Mul64(man, pow[0])
+		mergedHi, mergedLo := xHi, xLo+yHi
+		if mergedLo < xLo {
+			mergedHi++
+		}
+		if mergedHi&0x1FF == 0x1FF && mergedLo+1 == 0 && yLo+man < man {
+			return true
+		}
+		xHi, xLo = mergedHi, mergedLo
 	}
 	msb := xHi >> 63
 	return xLo == 0 && xHi&0x1FF == 0 && (xHi>>(msb+9))&3 == 1
+}
+
+// needsRefine reports whether eiselLemire64 refines the number s's product
+// with the power's low word — the numbers the amd64 kernel declines.
+func needsRefine(s string) bool {
+	s = strings.TrimPrefix(s, "-")
+	ip, fp, _ := strings.Cut(s, ".")
+	man, err := strconv.ParseUint(ip+fp, 10, 64)
+	if err != nil || len(ip+fp) > 19 || man>>53 == 0 {
+		return false
+	}
+	man <<= bits.LeadingZeros64(man)
+	xHi, xLo := bits.Mul64(man, detailedPowersOfTen[-len(fp)-detailedPowersOfTenMinExp10][1])
+	return xHi&0x1FF == 0x1FF && xLo+man < man
+}
+
+// TestFloatRunRefines holds the arm64 kernel's Eisel-Lemire refinement to
+// strconv: numbers of the shape canada is full of — a six-decimal value printed
+// back to 17 digits, "46.851662000000033" — filtered to the ones whose product
+// needs the power's low word, each of which the kernel must convert itself, in
+// the flat walk and the points walk, bit for bit. A declined number would still
+// decode correctly, through the scalar loop, so what this pins is that the
+// kernel does not hand these back — for this shape the refinement only confirms
+// the high product. The refinement's arithmetic, where it changes the result,
+// is TestFloatRunEiselLemire's: dropping it, or never declining after it, each
+// put a 1-ulp error there.
+func TestFloatRunRefines(t *testing.T) {
+	if runtime.GOARCH != "arm64" || !useFloatRun {
+		t.Skip("the arm64 kernel refines; the amd64 one declines these")
+	}
+	rng := rand.New(rand.NewSource(46))
+	var nums []string
+	for tries := 0; len(nums) < 2000 && tries < 2000000; tries++ {
+		// A six-decimal coordinate stored as a double and printed back with
+		// fifteen fraction digits: canada's "43.420273000000009".
+		v, _ := strconv.ParseFloat(fmt.Sprintf("%d.%06d", rng.Intn(360)-180, rng.Intn(1000000)), 64)
+		num := strconv.FormatFloat(v, 'f', 15, 64)
+		if len(strings.Trim(strings.ReplaceAll(strings.TrimPrefix(num, "-"), ".", ""), "0")) > 19 {
+			continue
+		}
+		if needsRefine(num) && !kernelDeclines(num) {
+			nums = append(nums, num)
+		}
+	}
+	if len(nums) < 100 {
+		t.Fatalf("premise: only %d numbers need the refinement", len(nums))
+	}
+	pad := strings.Repeat(" ", 100)
+	out := make([]float64, 4)
+	for _, num := range nums {
+		want, err := strconv.ParseFloat(num, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n, _, closed := parseFloatRun([]byte("["+num+","+num+"]"+pad), 1, out)
+		if n != 2 || closed != 1 || math.Float64bits(out[0]) != math.Float64bits(want) || math.Float64bits(out[1]) != math.Float64bits(want) {
+			t.Fatalf("flat %s: n=%d closed=%d %v, want %v", num, n, closed, out[:n], want)
+		}
+		np, _, closed := parseFloatPoints([]byte("[["+num+","+num+"]]"+pad), 1, out, 2)
+		if np != 1 || closed != 1 || math.Float64bits(out[0]) != math.Float64bits(want) || math.Float64bits(out[1]) != math.Float64bits(want) {
+			t.Fatalf("points %s: np=%d closed=%d %v, want %v", num, np, closed, out[:2], want)
+		}
+	}
 }
 
 // TestFloatRunFixedArrays holds DecodeFloat64Array to itself with the kernel
@@ -531,7 +616,7 @@ func kernelDeclines(s string) bool {
 // kernel the array's remaining slots, and a coordinate point is one call
 // closed at its ']'.
 func TestFloatRunFixedArrays(t *testing.T) {
-	defer func() { useFloatRunVBMI = floatRunVBMIHost }()
+	defer func() { useFloatRunLong = floatRunLongHost }()
 	rng := rand.New(rand.NewSource(77))
 	elems := []string{"1", "-2.5", "0.000123", "-65.613616999999977", "43.420273000000009", "1e5", "null", "12345678901234567890", "-0.0", "3.14159265358979"}
 	for it := 0; it < 3000; it++ {
@@ -564,7 +649,7 @@ func TestFloatRunFixedArrays(t *testing.T) {
 				return res{out, end, err}
 			}
 			for _, body := range floatRunBodies() {
-				useFloatRunVBMI = body.vbmi
+				useFloatRunLong = body.long
 				a, c := run(false), run(true)
 				same := a.end == c.end && errors.Is(a.err, c.err) && errors.Is(c.err, a.err)
 				for k := 0; same && k < slots; k++ {
@@ -614,7 +699,7 @@ func BenchmarkFloatRunShapes(b *testing.B) {
 // be converted by the kernel itself, not handed back, or the carry path would
 // go untested; both walks, flat and points, are checked.
 func TestFloatRunRoundsIntoExponent(t *testing.T) {
-	if !floatRunVBMIHost {
+	if !floatRunLongHost {
 		t.Skip("no AVX-512 VBMI body on this machine")
 	}
 	nums := []string{

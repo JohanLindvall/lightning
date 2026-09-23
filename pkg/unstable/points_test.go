@@ -68,8 +68,8 @@ func checkPoints2(t *testing.T, data []byte, i int) {
 		err error
 	}
 	run := func(kernel bool) res {
-		defer func(v bool) { useFloatRunVBMI = v }(useFloatRunVBMI)
-		useFloatRunVBMI = kernel && floatRunVBMIHost
+		defer func(v bool) { useFloatRunLong = v }(useFloatRunLong)
+		useFloatRunLong = kernel && floatRunLongHost
 		var v [][2]float64
 		end, err := DecodeFloat64Points(&v, data, i)
 		return res{v, end, err}
@@ -94,8 +94,8 @@ func checkPoints3(t *testing.T, data []byte, i int) {
 		err error
 	}
 	run := func(kernel bool) res {
-		defer func(v bool) { useFloatRunVBMI = v }(useFloatRunVBMI)
-		useFloatRunVBMI = kernel && floatRunVBMIHost
+		defer func(v bool) { useFloatRunLong = v }(useFloatRunLong)
+		useFloatRunLong = kernel && floatRunLongHost
 		var v [][3]float64
 		end, err := DecodeFloat64Points(&v, data, i)
 		return res{v, end, err}
@@ -182,7 +182,7 @@ func TestFloat64PointsMatchesStdlib(t *testing.T) {
 				}
 			}
 		}
-		if !floatRunVBMIHost {
+		if !floatRunLongHost {
 			continue
 		}
 		flat := make([]float64, 2*len(want))
@@ -223,7 +223,7 @@ func TestFloat64PointsMatchesStdlib(t *testing.T) {
 		}
 		total += len(want)
 	}
-	if floatRunVBMIHost && took < total*99/100 {
+	if floatRunLongHost && took < total*99/100 {
 		t.Fatalf("the walk took %d of %d points; hand-backs should be rare", took, total)
 	}
 }

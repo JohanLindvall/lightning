@@ -7,14 +7,14 @@ import (
 	"testing"
 )
 
-// validRunHost and validRun512Host are the host's useValidRun and
-// useValidRun512, which the tests flip to run the scalar walk and both bodies
+// validRunHost and validPointsHost are the host's useValidRun and
+// useValidPoints, which the tests flip to run the scalar walk and both bodies
 // — never turning on one the CPU lacks.
-var validRunHost, validRun512Host = useValidRun, useValidRun512
+var validRunHost, validPointsHost = useValidRun, useValidPoints
 
 // validRunBodies lists the bodies this host can run.
 func validRunBodies() []bool {
-	if validRun512Host {
+	if validPointsHost {
 		return []bool{false, true}
 	}
 	return []bool{false}
@@ -74,15 +74,15 @@ func TestValidNumberRunMatchesScalar(t *testing.T) {
 	if !validRunHost {
 		t.Skip("no numeric-array validation kernel on this machine")
 	}
-	defer func() { useValidRun, useValidRun512 = validRunHost, validRun512Host }()
+	defer func() { useValidRun, useValidPoints = validRunHost, validPointsHost }()
 	check := func(doc string) {
 		data := []byte(doc)
 		i := SkipWS(data, 0)
-		useValidRun, useValidRun512 = false, false // the ring walk is gated on the 512 flag alone
+		useValidRun, useValidPoints = false, false // the ring walk is gated on the 512 flag alone
 		we, werr := SkipValueStrict(data, i)
 		useValidRun = true
 		for _, b512 := range validRunBodies() {
-			useValidRun512 = b512
+			useValidPoints = b512
 			ge, gerr := SkipValueStrict(data, i)
 			if ge != we || !errors.Is(gerr, werr) || !errors.Is(werr, gerr) {
 				t.Fatalf("kernel (512=%v) (%d, %v), scalar (%d, %v) on %q", b512, ge, gerr, we, werr, doc)
@@ -116,7 +116,7 @@ func TestValidNumberRunMatchesScalar(t *testing.T) {
 			}
 		}
 	}
-	// Coordinate rings, the shape validPointsRun512 walks: compact and
+	// Coordinate rings, the shape validPointsRun walks: compact and
 	// pretty-printed, regular and odd (nulls, wrong lengths, exponents,
 	// strays), nested in a polygon and followed by more document, and a ring
 	// whose points would sit one level past MaxDepth.
@@ -180,7 +180,7 @@ func TestValidNumberRunTakesArrays(t *testing.T) {
 	if !validRunHost {
 		t.Skip("no numeric-array validation kernel on this machine")
 	}
-	defer func() { useValidRun512 = validRun512Host }()
+	defer func() { useValidPoints = validPointsHost }()
 	rng := rand.New(rand.NewSource(9))
 	for it := 0; it < 3000; it++ {
 		arr := genValidArray(rng, 1+rng.Intn(200), false)
@@ -190,7 +190,7 @@ func TestValidNumberRunTakesArrays(t *testing.T) {
 			continue // opens with a control byte the generator uses as whitespace
 		}
 		for _, b512 := range validRunBodies() {
-			useValidRun512 = b512
+			useValidPoints = b512
 			p, closed := validNumberRun(data, i)
 			if closed != 1 || p != len(arr)-1 {
 				t.Fatalf("512=%v %q: p=%d closed=%d, want the ']' at %d", b512, arr, p, closed, len(arr)-1)
@@ -205,7 +205,7 @@ func TestValidNumberRunTakesArrays(t *testing.T) {
 // a window from its '[' — resuming after any that does not, which is the only
 // point it may hand back — and reach the ring's ']' itself.
 func TestValidPointsRunTakesRings(t *testing.T) {
-	if !validRun512Host {
+	if !validPointsHost {
 		t.Skip("no AVX-512 validation walk on this machine")
 	}
 	rng := rand.New(rand.NewSource(10))
@@ -218,7 +218,7 @@ func TestValidPointsRunTakesRings(t *testing.T) {
 		r = strings.TrimRight(r, " ")
 		data := []byte(r + strings.Repeat(" ", 64))
 		for i := SkipWS(data, 1); ; {
-			p, closed := validPointsRun512(data, i)
+			p, closed := validPointsRun(data, i)
 			if closed == 1 {
 				if p != len(r)-1 {
 					t.Fatalf("%.100q: closed at %d, want the ']' at %d", r, p, len(r)-1)

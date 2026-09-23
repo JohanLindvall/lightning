@@ -37,7 +37,18 @@ func DecodeFloat64Points[T any](out *[]T, data []byte, i int) (int, error) {
 	if len(*out) != 0 {
 		*out = (*out)[:0]
 	}
-	run, hold := useFloatRunVBMI, false
+	// hold gives the point a productive call stopped at to the per-point path,
+	// and run counts down to off on unproductive calls — 1 at first, 2 once
+	// the walk has taken something, the batch slice readers' rule — so the
+	// ring's first call, or the second in a row after the walk has taken
+	// something, switches it off. A ring the walk cannot take costs one call;
+	// a ring it has been taking survives a refusal at the first point of a
+	// later call, which on canada, before the kernel refined its Eisel-Lemire
+	// products, sent 8,573 of 55,563 points through the per-point path.
+	run, hold := 0, false
+	if useFloatRunLong {
+		run = 1
+	}
 	i++
 	for first := true; ; first = false {
 		if uint(i) < uint(len(data)) && data[i] <= ' ' {
@@ -55,7 +66,7 @@ func DecodeFloat64Points[T any](out *[]T, data []byte, i int) (int, error) {
 			}
 			return i, ErrInvalidJSON
 		}
-		if run && !hold && data[i] == '[' {
+		if run != 0 && !hold && data[i] == '[' {
 			s := *out
 			if s == nil {
 				s = make([]T, 0, max(4, 256/max(1, int(unsafe.Sizeof(zero)))))
@@ -72,10 +83,10 @@ func DecodeFloat64Points[T any](out *[]T, data []byte, i int) (int, error) {
 				}
 				// The walk stopped at a point it does not take: that point is
 				// decoded below, and the walk resumes after it.
-				hold = true
+				hold, run = true, 2
 				continue
 			}
-			run = false
+			run--
 		}
 		hold = false
 		if *out == nil {

@@ -26,7 +26,7 @@ import (
 func indexQuoteOrBackslashNEON(b []byte, i int) int
 
 //go:noescape
-func indexStructuralNEON(b []byte) int
+func indexStructuralNEON(b []byte, i int) int
 
 //nolint:unused // called from assembly; see above
 //go:noescape
@@ -50,7 +50,7 @@ func indexEscapeArm64(b []byte) int
 func indexEscapeNonASCIIArm64(b []byte) int
 
 //go:noescape
-func indexStructuralSVE2(b []byte) int
+func indexStructuralSVE2(b []byte, i int) int
 
 // useSVE2 selects the SVE2 body of each scanner (see the SVE2 section of
 // simd_arm64.s) on cores that implement SVE2 — Neoverse N2/V2, Graviton4 and
@@ -107,17 +107,16 @@ func indexEscapeNonASCII(b []byte) int {
 	return indexEscapeNonASCIIArm64(b)
 }
 
-// structuralPrescan is how many leading bytes indexStructural scans with the
-// scalar loop before falling back to the vector routine. Unlike indexCloseOrEscape
-// (which the decode hot path calls for every key and string value), indexStructural
-// is reached only while skipping a value (skipObject/skipArray), where the input
-// is typically token-dense JSON whose next structural byte is only a few bytes
-// away. A short scalar scan finds it without the per-call cost of the vector
-// routine (the Go→assembly boundary and, under NEON, the 48-byte nibble-table
-// load), which is not amortized when the routine early-exits after a single
-// 16-byte block. Only long runs survive the prescan and reach the SIMD pass. This
-// stays out of the decode path entirely, so it cannot regress the generated
-// unmarshalers.
+// structuralPrescan is how many leading bytes indexStructuralAt tests with SWAR
+// words before handing the rest to the vector routine. Unlike
+// indexCloseOrEscape (which the decode hot path calls for every key and string
+// value), indexStructural is reached only while skipping a value
+// (skipObject/skipArray), where the input is typically token-dense JSON whose
+// next structural byte is only a few bytes away. Two words find it without the
+// per-call cost of the vector routine (the Go→assembly boundary, the SVE2
+// PTRUE/LD1RQB setup), which is not amortized when the routine early-exits in
+// its first block. Only longer runs survive to the vector pass. This stays out
+// of the decode path entirely, so it cannot regress the generated unmarshalers.
 const structuralPrescan = 16
 
 // indexStructural returns the index of the first '{', '}', '[', ']' or '"' byte
@@ -125,29 +124,36 @@ const structuralPrescan = 16
 //
 // This is the one arm64 scanner whose SVE2 gate is an ordinary Go branch rather
 // than a load inside the assembly: the function already carries a length test
-// and the scalar prescan loop, so it is far past the inline budget either way
-// and the branch costs nothing. The three scanners the decode path calls per
-// key and per string value cannot afford that — see indexCloseOrEscape.
+// and the SWAR prescan, so it is far past the inline budget either way and the
+// branch costs nothing. The three scanners the decode path calls per key and
+// per string value cannot afford that — see indexCloseOrEscape.
 func indexStructural(b []byte) int { return indexStructuralAt(b, 0) }
 
 // indexStructuralAt is indexStructural starting at i, returning an absolute
 // index; see the amd64 file for why the offset is an argument rather than a
 // b[i:] at each of the three call sites.
+//
+// The prescan is two SWAR words rather than sixteen byte compares (see
+// structuralMask), and whatever it leaves — however short — is the vector
+// routine's, which takes the offset: the SVE2 body covers a remainder of
+// under a vector with one WHILELO-predicated block and the NEON body with its
+// scalar tail. What this replaced sent any remainder under 32 bytes to a Go
+// byte loop at eleven instructions a byte — 284 instructions for a 24-byte
+// scan, the shape of a small container near the end of its document.
 func indexStructuralAt(b []byte, i int) int {
-	if len(b)-i < structuralPrescan+16 {
-		return i + indexStructuralScalar(b[i:])
-	}
-	// The prescan is two SWAR words rather than sixteen byte compares; see
-	// structuralMask. Both loads are unchecked because the guard above has
-	// already established structuralPrescan+16 bytes past i.
-	if m := structuralMask(load64(b, i)); m != 0 {
-		return i + bits.TrailingZeros64(m)>>3
-	}
-	if m := structuralMask(load64(b, i+8)); m != 0 {
-		return i + 8 + bits.TrailingZeros64(m)>>3
+	if uint(i)+structuralPrescan <= uint(len(b)) {
+		// Both loads are unchecked: the test above has established
+		// structuralPrescan bytes past i.
+		if m := structuralMask(load64(b, i)); m != 0 {
+			return i + bits.TrailingZeros64(m)>>3
+		}
+		if m := structuralMask(load64(b, i+8)); m != 0 {
+			return i + 8 + bits.TrailingZeros64(m)>>3
+		}
+		i += structuralPrescan
 	}
 	if useSVE2 {
-		return i + structuralPrescan + indexStructuralSVE2(b[i+structuralPrescan:])
+		return indexStructuralSVE2(b, i)
 	}
-	return i + structuralPrescan + indexStructuralNEON(b[i+structuralPrescan:])
+	return indexStructuralNEON(b, i)
 }
