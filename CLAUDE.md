@@ -3712,6 +3712,38 @@ no regressions.)
   mnemonic becomes a `WORD` with its mnemonic comment (the `sveasm`
   mechanism is not SVE-specific), on its own line outside any macro, since a
   macro line cannot carry the comment.
+- **No legacy-SSE instruction may run while the upper halves of vector
+  registers 0-15 are dirty** — after an instruction writes a Y0-Y15 or Z0-Z15
+  register and before the next `VZEROUPPER` — and no amd64 body may return or
+  tail-jump in that state. On Intel it is an SSE/AVX transition assist
+  (`assists.sse_avx_mix`) per occurrence; AMD does not penalise it at all, so a
+  body measured only on Zen 4 passes every benchmark with the bug in place, and
+  `countKernel` did exactly that (see the Meteor Lake native-path pass). The
+  usual culprit is a GP→XMM `MOVQ`/`MOVL`, which the Go assembler encodes as
+  legacy SSE; spell it `VMOVQ`, or broadcast straight from memory.
+  `TestNoSSEAfterAVX` (`avxmix_test.go`) checks every `*_amd64.s` in program
+  order with macros expanded, and runs on any host because it reads the
+  source; registers 16-31 are exempt (legacy SSE cannot reach them). On an
+  Intel box the dynamic check is one command: `perf record -e
+  cpu_core/assists.sse_avx_mix/u` over the pkg/unstable test binary, which
+  must record nothing.
+- **Every dispatch arm can be run on one x86 box, and a change to any of them
+  must be.** Intel SDE (`~/tools/sde-external-*/sde64`, checksum-verified
+  download from intel.com) runs the AVX-512 bodies on a CPU without them:
+  `-skx` is AVX-512BW without VBMI (the 512 skip and validation bodies, the
+  AVX2 float body), `-spr` or `-icx` adds VBMI (the VBMI float and points
+  bodies, the VBMI structural scan). qemu-user (the `qemu-user` package) covers
+  the rest: `qemu-x86_64 -cpu Haswell-v4 / Nehalem / qemu64` for AVX2, SSE4.2
+  and baseline SSE2 (QEMU's TCG has no AVX-512 under any CPU model), and
+  `qemu-aarch64 -cpu cortex-a72 / neoverse-n1 / neoverse-n2 /
+  max,sve-default-vector-length=64` for NEON without DotProd, NEON with it,
+  SVE2, and SVE2 at 512 bits (the vector-length-agnostic claim), plus
+  `qemu-riscv64` and `qemu-s390x` for the pure-Go fallbacks little- and
+  big-endian. Build each package's test binary once (`go test -c`, with
+  `GOARCH` for the foreign ones) and run it from its package directory under
+  each; the whole matrix takes about half an hour. The first run of it found
+  a SIGILL (a test forcing the DotProd kernel on a core without it) that no
+  host in CI's pool could have.
 - **After touching any `WORD`-encoded instruction in the arm64 assembly, run
   `make sveasm`** (`SVEASM_FILES`: `simd_arm64.s`, `intrun_arm64.s`,
   `floatrun_arm64.s`, `count_arm64.s`). Those instructions are `WORD` constants
@@ -5648,7 +5680,14 @@ constants and stubs (`skipBlocksTakesTail`, `useFloatRun`, `useValidRun`, …),
 verified under qemu. (arm64 got its own pass the same day, on a Neoverse N2 —
 see "Neoverse N2 native-path pass" below — which also renamed two of this
 pass's flags: `useFloatRunVBMI` is `useFloatRunLong` and `useValidRun512` is
-`useValidPoints`, `validPointsRun512` is `validPointsRun`.)
+`useValidPoints`, `validPointsRun512` is `validPointsRun`.) (And the Meteor Lake
+pass the same evening moved them once more on amd64, when the AVX2 bodies
+learned what only the VBMI and AVX-512 bodies did here: `useFloatRunLong` and
+`useValidPoints` now mean "a body takes these", true on every AVX2 host, and the
+body is chosen by `useFloatRunVBMI` and `useValid512`. That pass also found this
+pass's `countKernel` taking an SSE/AVX transition assist on every Intel core —
+update_center +31.6%, synthea_fhir +24.4% on Meteor Lake — which Zen 4 does not
+penalise; read the table below as Zen 4's. See "Meteor Lake native-path pass".)
 
 Full corpus, interleaved ABBA, n=8, pinned, both sides `-funcalign=64`, baseline
 = the session's starting commit:
@@ -5745,7 +5784,11 @@ before the kernel switches itself off for the rest of it.
   latency-bound per call — see the lab notes below). Kept as a strict reduction.
 - **The presize counters are one assembly pass** (`countKernel` in
   `count_amd64.s`; `countBeforeClose`, and `CountArrayScalars` = `countKernel(…,
-  hint=true)`). `CountArrayScalars` and `CountArrayObjects` made two runtime
+  hint=true)`). (**As first written it took an SSE/AVX transition assist on
+  every call on Intel** — a legacy-SSE `MOVQ R11, X1` after a ymm load — which
+  Zen 4 does not penalise and Meteor Lake paid for at +31.6% on update_center;
+  fixed, and now guarded by a static test, in the Meteor Lake native-path pass.)
+  `CountArrayScalars` and `CountArrayObjects` made two runtime
   calls over the same bytes (`IndexByte` for the `]`, `Count` for the
   separators) — 11% of marine_ik, 9% of mesh, with their dispatch. The kernel
   finds the `]` and counts the separator bytes before it in one AVX2 pass
@@ -5794,7 +5837,10 @@ before the kernel switches itself off for the rest of it.
 - **Arrays of decimal numbers have a SIMD kernel** (`parseFloatRunAVX2` and
   `parseFloatRunVBMI` in `floatrun_amd64.s`, `floatRunTab` in
   `floatrun_amd64.go`; called from `decodeFloat64Slice` and
-  `DecodeFloat64Array`). The int kernel's window walk, per element: whitespace,
+  `DecodeFloat64Array`). (The AVX2 body described here took at most 15
+  digits; the Meteor Lake native-path pass rebuilt it on this entry's VBMI walk
+  so that it takes 16-19 as well, with a VPSHUFB gather in place of VPERMI2B and
+  the Eisel-Lemire refinement — see there. The VBMI body is unchanged.) The int kernel's window walk, per element: whitespace,
   an optional `-`, L1 integer digits, an optional `.` and L2 fraction digits,
   whitespace, the delimiter. **AVX2 body (L1+L2 <= 15)**: 16 bytes at the first
   digit, a per-(L1, L2) `PSHUFB` control that right-aligns the digits and drops
@@ -5896,7 +5942,9 @@ before the kernel switches itself off for the rest of it.
   (`DecodeFloat64Points` in `points.go`, `parseFloatPointsVBMI` in
   `floatrun_amd64.s`; the generator's `sliceDecoder` routes every `[][N]float64`
   with a literal N there via `isFloatPoint`, except under `//lightning:arena`,
-  whose slice decoders take an arena argument). Once the numbers were cheap,
+  whose slice decoders take an arena argument). (VBMI only as first written:
+  on an AVX2-only CPU every ring still went point by point. The Meteor Lake
+  native-path pass added `parseFloatPointsAVX2` — see there.) Once the numbers were cheap,
   what was left of canada was the generated ring loop around them: a Go
   iteration, an append, a `DecodeFloat64Array` call and a kernel call **per
   point**, for two numbers. The reader is that loop element for element — the
@@ -5948,7 +5996,8 @@ before the kernel switches itself off for the rest of it.
 - **`Valid` passes over arrays of numbers without converting them**
   (`validNumberRun`, its AVX-512 body `validNumberRun512`, and the ring walk
   `validPointsRun512`, all in `floatrun_amd64.s`; the dispatch is at
-  `SkipValueStrict`'s `[`). `Valid` checked every number through
+  `SkipValueStrict`'s `[`; the ring walk gained an AVX2 body,
+  `validPointsRunAVX2`, in the Meteor Lake native-path pass). `Valid` checked every number through
   `ReadFloat64OrNull` — the full conversion — because agreeing with the
   decoder's acceptance is its contract, and on a number-heavy document that
   conversion was nearly the whole cost. The walks are the decimal-array kernel's
@@ -6342,3 +6391,218 @@ twitterescaped −0.32%, the rest flat; geomean −24.86%.
 - *`ValidShapes/deep` +13%* (128 nested `[`) is the ring walk's probe:
   `SkipValueStrict` loads and tests the byte after every nested `[`, ~2
   cycles a level. amd64 pays the same where it has AVX-512. Accepted.
+
+## Meteor Lake native-path pass (2026-09-23)
+
+The Intel counterpart of the Zen 4 and N2 native-path passes above, run the
+same evening on the Core Ultra 9 185H (Meteor Lake; Redwood Cove P-cores with
+AVX2 and **no AVX-512**; `perf` 7.0 at `perf_event_paranoid=-1`). Two things
+drove it. The Zen 4 pass had put its biggest number-kernel wins behind VBMI —
+the long-number conversion, the points walk, the fixed-array reader, the
+validation ring walk — so on an AVX2-only CPU (every Intel client core since
+Alder Lake, AMD before Zen 4, and Skylake-SP/Cascade Lake Xeons, which have
+AVX-512 but not VBMI) none of it ran. And none of that day's amd64 code had
+been measured on an Intel core at all. Every dispatch arm was also exercised
+for the first time on one box (the emulator convention above), which found a
+test SIGILL on arm64 cores without DotProd.
+
+**Result** (interleaved ABBA, n=8, CPU 4 with its sibling idle, both sides
+`-funcalign=64`; HEAD = ba596b3, the end of the N2 pass):
+
+| case | before | after | change |
+|---|---:|---:|---:|
+| float-array | 259.6n | 161.3n | -37.87% |
+| canada_geometry | 252.2µ | 173.7µ | -31.10% |
+| canada | 1.839m | 1.290m | -29.87% |
+| mesh_pretty | 820.2µ | 591.9µ | -27.83% |
+| update_center | 547.5µ | 407.2µ | -25.62% |
+| synthea_fhir | 1.768m | 1.374m | -22.28% |
+| float-array-slow | 440.2n | 351.4n | -20.17% |
+| random | 413.6µ | 338.1µ | -18.25% |
+| time-array | 539.9n | 455.3n | -15.68% |
+| instruments | 117.5µ | 100.3µ | -14.61% |
+| large-json | 6.821m | 5.914m | -13.29% |
+| citm_catalog | 650.5µ | 567.7µ | -12.73% |
+| payload_medium | 1016.0n | 935.9n | -7.89% |
+| twitter_status | 312.7µ | 293.4µ | -6.19% |
+| twitterescaped | 423.7µ | 399.6µ | -5.69% |
+| golang_source | 1.423m | 1.354m | -4.87% |
+| marine_ik | 2.391m | 2.288m | -4.31% |
+| mesh | 406.4µ | 393.9µ | -3.06% |
+| numbers | 47.29µ | 46.83µ | -0.98% |
+| apache_builds | 56.02µ | 56.78µ | flat (p=0.195) |
+| cloudflare-compact | 476.8n | 475.8n | flat (p=0.742) |
+| cloudflare-nocopy | 494.8n | 488.6n | flat (p=0.328) |
+| cloudflare | 607.5n | 616.8n | flat (p=0.065) |
+| github_events | 35.00µ | 34.70µ | flat (p=0.161) |
+| gsoc_2018 | 987.3µ | 1003.4µ | flat (p=0.083) |
+| payload_large | 18.15µ | 18.08µ | flat (p=0.279) |
+| payload_small | 102.1n | 101.9n | flat (p=0.524) |
+| pretty | 673.4n | 658.4n | flat (p=0.161) |
+| skip-heavy | 340.1n | 340.4n | flat (p=0.594) |
+| string_unicode | 1.309µ | 1.292µ | flat (p=0.314) |
+| **geomean** | 33.68µ | 30.00µ | **-10.92%** |
+
+Where it comes from: the SSE/AVX fix is update_center, synthea_fhir, random,
+time-array, instruments, citm, payload_medium and twitter (every presized
+array paid an assist); the AVX2 long-number body, points walk and fixed-array
+path are canada, canada_geometry, mesh_pretty, large-json and the float
+arrays; the eight-digit integer step is most of golang_source and some of
+citm. Against the tree before the Zen 4 pass (479175c), which this CPU had
+measured at −0.8% geomean for HEAD, the day's three passes together come to
+roughly −11.6% here.
+
+- **The Zen 4 pass shipped an SSE/AVX transition, and on Intel it cost more
+  than the pass gained.** The first A/B of this session was the tree before the
+  Zen 4 pass (479175c) against HEAD, on this CPU: **update_center +31.6%,
+  float-array-slow +26.0%, synthea_fhir +24.4%, random +23.2%, instruments
+  +17.5%, time-array +16.9%, float-array +14.9%, citm_catalog +10.0%,
+  twitter_status +6.7%**, against the kernels' wins (numbers −54.0%, mesh
+  −37.2%, marine_ik −23.4%, skip-heavy −23.1%, mesh_pretty −14.6%) — geomean
+  −0.8%, i.e. nothing. A regression that broad, on cases the new kernels barely
+  touch, at about the same instruction counts, is the signature of a penalty
+  no instruction count shows, and `assists.sse_avx_mix` named it: **0 in every
+  pre-pass build, 400k-1.3M in HEAD** (update_center: ~2,600 assists a decode,
+  411M → 538M cycles for 200 decodes), and `perf record` on the event put 100%
+  of the samples in `countKernel`. Its prologue loaded `Y0` and then ran `MOVQ
+  R11, X1`, which the Go assembler encodes as LEGACY SSE — one transition per
+  call, and the kernel is called once per presized array. The fix broadcasts
+  `c` from the frame (`VPBROADCASTB c+32(FP), Y1`), and `TestNoSSEAfterAVX`
+  (see the convention) now fails on that exact line. It measured clean on Zen 4
+  because AMD does not penalise the mix; nothing short of an Intel run could
+  have shown it. With the fix alone, per-op counters are flat or better than
+  the pre-pass tree on every case that had regressed.
+- **The AVX2 float body takes 16-19 digits** (`parseFloatRunAVX2`, rewritten
+  on `parseFloatRunVBMI`'s walk, label for label). There is no two-register
+  byte permute below VBMI, and VPSHUFB cannot cross the ymm's lanes, but the
+  output layout does not need either: lanes 0-15 hold the number's first digits
+  (at most eleven bytes from its first digit) and lanes 16-23 its last eight (at
+  most nine bytes from its end). So `LONGGATHER2` loads the sixteen bytes at the
+  first digit into the low lane and the sixteen ending at the number's end into
+  the high lane (`VINSERTI128` from memory), and one VPSHUFB under a per-(L1,
+  L2) control (`floatRunTab` from 25568, indexed 32*(4*L1+L1+L2)) gathers them
+  into `LONGFOLD`'s layout — the fold now a macro shared, instruction for
+  instruction, with the VBMI body (verified by diffing its disassembly: 310 and
+  261 instructions, identical). Both loads lie inside the window, so the body
+  keeps its 80-byte bound. `LPARSE` is the VBMI measure with the sign read by a
+  byte compare (there is no free register for a '-' mask), and `LONGTAIL2` is
+  `LONGCONV`'s conversion WITH the refinement the arm64 kernel makes (the low
+  word of the power at 25408, xLo/xHi kept in X14/X15 across the second
+  multiply, placed out of line so the common path falls through): this body
+  declines only where `eiselLemire64` does. Per element (4000-element arrays,
+  CPU 2): 17-digit Eisel-Lemire 7.3 ns (none before: the scalar loop's), short
+  decimals 4.25 → 4.07 ns.
+- **The points walk and the validation ring walk have AVX2 bodies**
+  (`parseFloatPointsAVX2`, `validPointsRunAVX2`), the VBMI and AVX-512 walks
+  with the window classified over two ymm halves and the point's `]` found with
+  `CLOSES`. One change from the VBMI walk: the `]` joins the commas in R12 as
+  the last number's delimiter (`BTSQ`), so every number's delimiter is its
+  lowest bit — the VBMI walk keeps the `]` in the frame and reloads it, a
+  store-forward on the chain from one point to the next. That is worth cycles
+  −1.4% on canada rings, −0.9% on geometry, **−5.2% on citylots** (three
+  numbers a point, two reloads). Per point, rings of 1000 (HEAD's per-point
+  path → the walk): **canada 29.3 → 17.6 ns, canada_geometry 29.5 → 14.4 ns,
+  citylots 42.8 → 20.3 ns** (−40%, −51%, −52%). The walk takes whole
+  documents: canada's 55,562 points in 480 calls (one a ring), large-json's
+  67,128 in 10,003. `Valid` over the corpus (counters): **canada −31.8% cycles
+  / −53.6% instructions, large-json −10.9% / −19.4%, mesh −7.6% / −6.5%**.
+- **The fixed-array reader uses the kernel on every AVX2 host** — it gated on
+  `useFloatRunLong`, which was VBMI-only because the old AVX2 body refused a
+  coordinate's 17 digits and cost a call per point. With the refusal gone
+  (`BenchmarkDecodeFloat64Array`, kernel against scalar loop): **a [3]float64
+  of short decimals 29.3 → 15.8 ns, a 17-digit [2]float64 26.6 → 18.6 ns, a
+  pretty-printed [3]float64 36.4 → 16.6 ns**.
+- **Flags, once more.** amd64's `useFloatRunLong` is `useFloatRun` (both
+  bodies take long numbers) and `useValidPoints` is `useValidRun` (both walks
+  have AVX2 bodies); the body is chosen by `useFloatRunVBMI` (read by
+  `parseFloatRunAVX2`'s first instructions, and by `parseFloatPoints` in Go,
+  which is called once a ring) and `useValid512` (read by `validNumberRun`, and
+  by `validPointsRun` in Go). The arm64 names are unchanged. With the ring
+  walk on, AVX2 hosts now pay its probe on every nested `[` as AVX-512 and
+  arm64 hosts already did: `ValidShapes/deep` (128 levels) +10.4%, accepted for
+  the same reason as there.
+- **An eight-digit step in front of the amd64 integer readers' byte loop**
+  (`ReadInt64OrNull`/`ReadUint64OrNull`). The byte loop stays — `digitRun`'s
+  word fold re-measured on this CPU loses exactly as on Zen 4, **citm +4.0%,
+  golang_source +3.8% cycles** at fewer instructions (the cursor's load → mask
+  → count chain) — but a run of eight or more digits is now taken whole: one
+  load tested all-digits with the `swarNib` mask, `parse8Digits`, and the
+  cursor advanced by a CONSTANT eight under a branch the predictor learns, so
+  the fold stays off the cursor's chain, which is what sank the word fold. A
+  byte test at `i+7` (`uint(i+7) < uint(len(data))` proves it and the word load
+  in one compare) keeps the word test off short numbers. The value is the byte
+  loop's, wrap included (`TestIntReadersMatchByteLoop` holds both readers to a
+  plain reference over every run length 0-26, every tail, every truncation).
+  Counters: **golang_source −5.8% cycles, citm −3.0%**, instruments +1.6%
+  (1-7-digit integers pay the failed byte test), everything else within ±0.8%;
+  time (n=6) golang_source −4.3%, citm −2.2%, random +2.5% (+0.6% in cycles:
+  partly layout), payload_small +2.2%, geomean −0.3%. It is a bet that the
+  integers a document holds are ids and timestamps as often as small counts;
+  without the byte pre-test instruments was +2.2% and github_events +1.4%.
+  The standing micro is `BenchmarkReadIntShapes` (200 integers read back to
+  back through the cursor, as a decoder does): **9, 10, 13 and 18 digits
+  −27%, −28%, −25%, −24%; 1, 3 and 6 digits +6%** (~0.2 ns each).
+- **Test fixes the matrix and the rework turned up.** (1) On an arm64 core
+  without DotProd (qemu's cortex-a72: Graviton1, a Raspberry Pi 4) pkg/unstable
+  died with SIGILL: `floatRunBodies` listed the NEON body unconditionally and
+  `TestFloatRunFixedArrays` set `useFloatRunLong` from it. (2) That same test's
+  "scalar" reference cleared `useFloatRun` but not `useFloatRunLong`, which is
+  what the fixed-array reader gates on, so on a VBMI host it compared the kernel
+  with itself — the vacuous-reference trap CLAUDE.md already records once for
+  `useValidPoints`. `floatRunOff`/`validRunOff` now clear both flags, and the
+  bodies are listed per architecture (`kernels_{amd64,arm64,other}_test.go`) as
+  `kernelBody`s that select themselves, so every kernel test runs every body the
+  host has instead of whichever is the default. (3) `TestNumberKernelsStayInBounds`
+  never ran `validPointsRun` at all, and has late-lane point patterns now. (4)
+  The long-number tests (`TestFloatRunShapes` to 19 digits, `TestFloatRunWindows`
+  with long shapes, `TestFloatRunRandomValues` to 19 digits, `EiselLemire`,
+  `Refines`, `RoundsIntoExponent`) run for every body, and `walkFloatRun` holds a
+  kernel-alone walk to "every hand-back is a designed decline" for the body's
+  refinement rule. Sabotage-verified: the refinement dropped, the refinement
+  always declining, the end-anchored load off by one, a corrupted control table,
+  the points and flat windows cut from 80 to 64 bytes and the ring validation
+  window from 64 to 48 (each faults on the guard page), the integer step
+  advancing seven, its word test removed — every one caught. pkg/unstable
+  coverage 92.9% → 94.3%.
+
+**Measured and rejected:**
+
+- *The word-at-a-time integer fold on Meteor Lake* — above: citm +4.0%,
+  golang_source +3.8% cycles. amd64 keeps the byte loop on both Zen 4 and
+  Intel.
+- *Shortening the long number's chain to the gather.* A canada point is
+  latency-bound — 215 instructions in 83 cycles, IPC 2.6, 54% back-end bound
+  with only 2% memory bound, one or two ports busy in 49% of cycles — and the
+  obvious lever is that the high-lane load and the control index wait on the
+  fraction length when the delimiter's lane, known at once, is almost always
+  the number's end. Two probes bound it: taking the load from the delimiter,
+  canada −0.4%, citylots −0.7%, flat 17-digit arrays −1.7%; the load AND the
+  control index from the delimiter's span, −1.0%, −1.2% and −4.2% at +2-3%
+  instructions. Not worth a second copy of the conversion for the whitespace
+  case. (The `.` test looks like it is on the chain and is not: it feeds a
+  predicted branch.) The remaining gap to the VBMI body on Zen 4 — 34.6 against
+  28.6 cycles for a 17-digit number at ~97 instructions both — is Intel's
+  latencies (TZCNT 3, VPMADDUBSW/VPMADDWD 5, VPMOVMSKB 3), not work.
+- *The flat walk's sign from a '-' mask* (the VBMI body's −5.7% on Zen 4). A
+  probe borrowing R9 for the mask, short shapes only: cycles −2.8% on positive
+  short decimals, −0.1% on negative ones, −2.4% on six-digit ones, at +2-3%
+  instructions. Doing it for real needs a register the walk does not have
+  (a moving output pointer would free R10); not worth it for ~2%.
+- *Microbenchmark "regressions" with identical instructions.* Against HEAD,
+  `ValidEscapedStrings/clean/value` read +14.1% cycles at `-funcalign=64` and
+  −3.5% at the default alignment, `ArrayEachScalars` +5.5%/+4.3%,
+  `SkipContainer/stringObj` +6.5%, every one executing the same instruction
+  stream; the other direction happened too — `Valid` over `numbers` read −18%
+  with identical instructions because HEAD's build took **2,104 branch
+  mispredicts a validation and this one 48** (bad speculation 12.9% → 0.4%):
+  predictor aliasing from the new code's placement, not an improvement. Two
+  lotteries now, the uop cache and the branch predictor; the instruction count
+  decides.
+
+**Left on the table, sized.** marine_ik's float kernel is now 36.7% of the
+decode and most of it per-call: 70k arrays of three or four numbers, each paying
+the constant loads, a full 64-byte `CLASSIFY` and `VZEROUPPER` for ~35 bytes of
+numbers; a half-window classification for arrays that close in their first 32
+bytes would save ~13 of ~180 instructions an array, ~2.5% of marine_ik. And
+the string scanner is 13-21% of every object-heavy case, as on every core
+before it, with the same ABI0 floor.
