@@ -91,7 +91,7 @@ func TestKindString(t *testing.T) {
 // TestKindOfWhitespaceIsThePackagesOwn pins the rule KindOf tolerates at both
 // ends of a value: this package's whitespace is every byte <= 0x20, the
 // one-compare shortcut unstable.SkipWS takes and the decoder and Valid inherit
-// (CLAUDE.md's Valid entry records why it is deliberate). An earlier form
+// (AGENTS.md's Valid entry records why it is deliberate). An earlier form
 // skipped leading bytes by that rule and trailing ones by the grammar's
 // four-byte set, so it called `null` followed by a NUL invalid while Valid and
 // DecodeAny accepted the same document.

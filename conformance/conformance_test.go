@@ -1313,7 +1313,7 @@ func TestLaxSwallowsTypeMismatches(t *testing.T) {
 
 // The methodless twins for the embedded-Unmarshaler comparison. Stripping the
 // GENERATED UnmarshalJSON is what makes encoding/json decode these by reflection
-// instead of delegating to lightning (the trap CLAUDE.md records); the embedded
+// instead of delegating to lightning (the trap AGENTS.md records); the embedded
 // field's own method still promotes to the twin, which is the stdlib behavior
 // under test.
 type (

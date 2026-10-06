@@ -13,7 +13,7 @@ import (
 // Clinger's two lookups here keep a bounds check each, which the prove pass
 // will not remove: it tracks neither the negation nor the unsigned range test
 // that guards them. Padding the table to a power of two and masking the index
-// does remove them and is NOT worth it — see the rejected list in CLAUDE.md,
+// does remove them and is NOT worth it — see the rejected list in AGENTS.md,
 // where the 72 bytes of rodata it adds cost `numbers` more than the checks were
 // worth.
 var pow10exact = [...]float64{

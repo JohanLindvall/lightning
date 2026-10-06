@@ -24,7 +24,7 @@ import (
 // and gsoc_2018 flat — Zen 4 double-pumps zmm ops on a 256-bit datapath and the
 // loop is load-port-bound, so unlike skipBlocksAVX512 (which cut 7 instructions
 // per class to 2) the wide form removes almost nothing while the added code
-// shifts alignment. See CLAUDE.md's tried-and-rejected entry.
+// shifts alignment. See AGENTS.md's tried-and-rejected entry.
 func TestIndexVariantsFlip(t *testing.T) {
 	avx2 := useAVX2
 	defer func() { useAVX2 = avx2 }()

@@ -189,7 +189,7 @@ func TestReadNumberRejectsMalformed(t *testing.T) {
 // accepted — the float reader accepts it and so does json.Valid, so rejecting it
 // here would create a fresh Valid-vs-decoder disagreement in the opposite
 // direction (encoding/json rejects it; that divergence is pre-existing and
-// deliberate, see CLAUDE.md).
+// deliberate, see AGENTS.md).
 func TestReadNumberAcceptsOrdinary(t *testing.T) {
 	for _, in := range []string{
 		"0", "1", "-1", "01", "007", "-0",

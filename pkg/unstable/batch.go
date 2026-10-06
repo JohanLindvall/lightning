@@ -411,7 +411,7 @@ func decodeIntSlice[T intKind](out *[]T, data []byte, i int, a *Arena[T]) (int, 
 			// branch, so the next element's load issues ahead, while a word count
 			// puts that address on a load→mask→count data chain. Measured on a
 			// Neoverse N2: digitRun here was mesh +1.1% with fewer instructions,
-			// and two guarded hybrids were worse still (CLAUDE.md, 2026-09-02).
+			// and two guarded hybrids were worse still (AGENTS.md, 2026-09-02).
 			if uint(i)+4 <= uint(len(data)) {
 				if v, ok := tryParse4Digits(load32(data, i)); ok { // in bounds: the test above
 					n = int64(v)

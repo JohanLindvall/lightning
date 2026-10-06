@@ -529,7 +529,7 @@ eutfound:
 // useSVE2` in the Go dispatch wrapper, but that gives the wrapper two calls,
 // which costs 124 against the inliner's budget of 80 — indexCloseOrEscape stops
 // inlining into ReadKey/ReadStringOrNull/SkipString/decodeEscaped and every
-// generated decoder, the regression CLAUDE.md records as worth ~5% on cloudflare
+// generated decoder, the regression AGENTS.md records as worth ~5% on cloudflare
 // when it was fixed in the other direction. Reading the flag in assembly keeps
 // the Go side a single unconditional call (cost 61, still inlined) and costs the
 // SVE2 path three instructions: an ADRP+LDRB pair independent of the argument

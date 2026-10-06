@@ -43,7 +43,7 @@ func maskBlock(b []byte, isArray bool) (quote, bslash, open, close uint64)
 // four 2-byte stores feeding one 8-byte load: that cannot store-forward on any
 // core, and the stall would land directly on the loop-carried
 // depth/prevEscaped/prevInString chain. That is the same trade already rejected
-// for this loop's cross-domain VMOVs (see CLAUDE.md), so SVE2 would have to pay
+// for this loop's cross-domain VMOVs (see AGENTS.md), so SVE2 would have to pay
 // it four times over to remove them. Do not port this loop to SVE without a
 // predicate-to-GP move.
 var useSkipBlocks = true

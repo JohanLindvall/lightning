@@ -48,7 +48,7 @@ conformance/data_unmarshal.go: conformance/data.go main.go
 # assembly checked by nothing. `go test`'s built-in vet subset (atomic, bool,
 # buildtags, directive, errorsas, ifaceassert, nilfunc, printf, stringintconv,
 # tests) does not include asmdecl either, so running the tests is not a
-# substitute. The class of bug this catches is real and recorded in CLAUDE.md:
+# substitute. The class of bug this catches is real and recorded in AGENTS.md:
 # maskBlock's result offsets move because Go 8-aligns the result block after the
 # `isArray bool` argument, and a hand-written +28(FP) where +32(FP) is required
 # reads the wrong words at run time while assembling and testing cleanly on the

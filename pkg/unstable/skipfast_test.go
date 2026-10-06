@@ -219,7 +219,7 @@ func TestSkipContainerBoundaries(t *testing.T) {
 // oracle. The per-arch variant tests flip the flags and call this once per
 // implementation, which is what locks the assembly loops (and their FP result
 // offsets, which the asmdecl vet pass cannot check — see the maskBlock gotcha
-// in CLAUDE.md) to the tested Go bit math.
+// in AGENTS.md) to the tested Go bit math.
 func testSkipVariantCorpus(t *testing.T, name string) {
 	t.Helper()
 	docs := boundaryDocs()

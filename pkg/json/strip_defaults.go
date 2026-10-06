@@ -383,7 +383,7 @@ func (s *stripper) handle(read, write, depth int) (int, int) {
 		// mode, unminified) behind output that still looks like valid JSON. read is
 		// deliberately left where it was when the container is not empty: the member
 		// loop needs the leading whitespace to preserve it. (The skip is expanded
-		// here rather than factored into a helper for the reason CLAUDE.md records:
+		// here rather than factored into a helper for the reason AGENTS.md records:
 		// a helper wrapping the two-compare fast path plus SkipWSRun costs more than
 		// the inliner's budget, so it would cost a call frame per container.)
 		peekObj := read

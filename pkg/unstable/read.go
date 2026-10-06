@@ -272,7 +272,7 @@ func ReadUint64OrNull(data []byte, i int) (uint64, int, error) {
 // value.
 //
 // Written out rather than shared with ReadFloat64OrNull on purpose: that reader
-// is the hot float path (see CLAUDE.md's float tiers) and is left byte-identical,
+// is the hot float path (see AGENTS.md's float tiers) and is left byte-identical,
 // the same reason any.go inlines this fallback at its own call site instead of
 // routing through it. The mirror is not left to inspection — the accept sets are
 // compared over a generated corpus by TestReadNumberAcceptSetMatchesFloat64.

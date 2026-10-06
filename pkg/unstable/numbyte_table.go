@@ -25,7 +25,7 @@ package unstable
 // -24%, 1.5e-7 -24% / -30%, 0.000698752666567719 -8% / -9%; five- and
 // nineteen-digit tokens were timed but not counted, at -8% and -5%. No shape
 // is slower. On Zen 4 the same table
-// measured +9% and +13% on ten- and three-digit tokens (CLAUDE.md's rejected
+// measured +9% and +13% on ten- and three-digit tokens (AGENTS.md's rejected
 // list), which is why this is a build tag and not a rewrite.
 func isNumberByte(c byte) bool { return numberByte[c] }
 

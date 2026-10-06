@@ -107,7 +107,7 @@ var scanFloatShapes = []struct{ name, toks string }{
 // BenchmarkScanFloatShapes measures scanFloat's fast path per twenty tokens of
 // each shape, and BenchmarkScanFloatSlowShapes the loop form on the same
 // tokens; the pair is what sized the 2026-09 Zen 4 fast-path work (see
-// CLAUDE.md), where the fast path had been slower than the loop on "slow".
+// AGENTS.md), where the fast path had been slower than the loop on "slow".
 func BenchmarkScanFloatShapes(b *testing.B) {
 	for _, sh := range scanFloatShapes {
 		bufs := scanFloatShapeBufs(sh.toks)

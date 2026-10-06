@@ -216,7 +216,7 @@ func SkipNumber(data []byte, i int) (int, error) {
 // depth counts enclosing containers with the outermost at 1, exactly as
 // decodeAny* does, so MaxDepth levels are accepted and level MaxDepth+1 returns
 // ErrMaxDepth — the same input set encoding/json accepts depth-wise. Cost is one
-// compare per '{' or '[', which CLAUDE.md measured as flat (p=0.161) for the
+// compare per '{' or '[', which AGENTS.md measured as flat (p=0.161) for the
 // analogous DecodeAny bound. The two-argument entry points are kept so the
 // differential oracle and benchmarks spell them unchanged; they are trivially
 // inlinable, so the extra frame is compiled away.
