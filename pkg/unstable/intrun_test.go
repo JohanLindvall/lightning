@@ -261,7 +261,7 @@ func intRunArray(n int, sep string) []byte {
 // BenchmarkDecodeIntSliceRun measures DecodeIntSlice on a 4000-element array
 // of short integers, compact and ", "-separated, with the SIMD run kernel on
 // and (where it exists) off; the kernel-only row is the assembly alone. This
-// is the micro that sized the kernel (AGENTS.md, 2026-09-02).
+// is the micro that sized the kernel (AGENTS.md).
 func BenchmarkDecodeIntSliceRun(b *testing.B) {
 	for _, sep := range []string{",", ", "} {
 		data := intRunArray(4000, sep)
@@ -304,7 +304,7 @@ func BenchmarkDecodeIntSliceRun(b *testing.B) {
 
 // BenchmarkParseIntRunShapes is the kernel alone over arrays of one element
 // length each, 4000 elements a run: the instrument that shaped the arm64
-// kernel (AGENTS.md, 2026-09-02). Two elements a block that never straddled
+// kernel (AGENTS.md). Two elements a block that never straddled
 // a 16-byte block against two that always did exposed the block-to-block
 // address chain, and the per-element counts under perf stat then said what
 // the walk was bound by after each change. The scalar loop is not run here;

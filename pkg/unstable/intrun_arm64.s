@@ -107,8 +107,8 @@ GLOBL irConst<>(SB), RODATA|NOPTR, $48
 //
 // The arm64 twin of parseIntRunSSE (intrun_amd64.s): the same element walk,
 // stop positions and contract, over a different block shape. What the
-// counters said about the direct port of the 16-byte block (AGENTS.md,
-// 2026-09-02): the next block's address depended on where the walk left the
+// counters said about the direct port of the 16-byte block (AGENTS.md):
+// the next block's address depended on where the walk left the
 // previous one, so the whole load, compare, narrow, VMOV prologue sat on the
 // element chain (two elements a block ran 16.7 cycles each straddling and
 // 10.9 not); at 40 instructions an element the walk was issue-bound; and
