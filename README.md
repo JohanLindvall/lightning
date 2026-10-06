@@ -913,8 +913,11 @@ could kill the process rather than return an error.
 
 So the generator looks for cycles in the type graph before emitting anything. Types
 on a cycle (and those that can reach one, which must pass the counter down) get
-their decoders threaded with a recursion depth, and the struct decoders among them
-refuse to descend past `unstable.MaxDepth`, returning `ErrMaxDepth`:
+their decoders threaded with a recursion depth, and the decoders among them that
+count a level — every struct decoder, and each slice, array or map decoder whose
+elements are a named slice or map type on the cycle, so a cycle with no struct on
+it (`type List []List`) is bounded too — refuse to descend past
+`unstable.MaxDepth`, returning `ErrMaxDepth`:
 
 ```go
 // {"kids":[{"kids":[ … 4 million levels … ]}]}

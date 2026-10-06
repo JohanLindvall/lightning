@@ -1385,6 +1385,84 @@ type Ring2 struct {
 `,
 	},
 	{
+		// Cycles through named slice and map types, with no struct on them:
+		// the slice, array and map decoders that step into such a type count
+		// its levels (elemCountsLevel). The guard has to agree with every
+		// variant a root can select — the arena parameter, the compact,
+		// destructive and strict suffixes, a lax field's wrapper in between —
+		// so each one decodes a document far past unstable.MaxDepth here and
+		// must return ErrMaxDepth rather than recurse until the stack runs out.
+		name: "named_container_cycles_in_every_variant",
+		schema: `package main
+
+type List []List
+
+type Pairs [][2]Pairs
+
+//lightning:compact
+type CMap map[string]CMap
+
+//lightning:arena
+type AHolder struct {
+	L AList     "json:\"l\""
+	V []float64 "json:\"v\""
+}
+
+type AList []AList
+
+//lightning:destructive
+type DHolder struct {
+	L DList  "json:\"l\""
+	S string "json:\"s,nocopy\""
+}
+
+type DList []DList
+
+//lightning:strict
+type SHolder struct {
+	M SMap "json:\"m,lax\""
+}
+
+type SMap map[string]SMap
+`,
+		probe: `package main
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/JohanLindvall/lightning/pkg/unstable"
+)
+
+func main() {
+	const n = 100000
+	arrays := func(n int) []byte { return []byte(strings.Repeat("[", n) + strings.Repeat("]", n)) }
+	objects := func(n int) []byte {
+		return []byte(strings.Repeat("{\"k\":", n-1) + "{}" + strings.Repeat("}", n-1))
+	}
+	field := func(key string, v []byte) []byte {
+		return append(append([]byte("{\""+key+"\":"), v...), '}')
+	}
+	report := func(name string, err error) { fmt.Println(name, errors.Is(err, unstable.ErrMaxDepth)) }
+
+	var l List
+	report("List", l.UnmarshalJSON(arrays(n)))
+	var p Pairs
+	report("Pairs", p.UnmarshalJSON([]byte(strings.Repeat("[[", n)+"[]"+strings.Repeat(",[]]]", n))))
+	var c CMap
+	report("CMap", c.UnmarshalJSON(objects(n)))
+	var a AHolder
+	report("AHolder", a.UnmarshalJSON(field("l", arrays(n))))
+	var d DHolder
+	report("DHolder", d.UnmarshalJSON(field("l", arrays(n))))
+	var s SHolder
+	report("SHolder", s.UnmarshalJSON(field("m", objects(n))))
+}
+`,
+		want: "List true\nPairs true\nCMap true\nAHolder true\nDHolder true\nSHolder true\n",
+	},
+	{
 		// H2a. The collect loop switched on ts.Type and never looked at
 		// ts.TypeParams, so a generic declaration was collected like any other
 		// root: generator exits 0, then "cannot use generic type Root[T any]

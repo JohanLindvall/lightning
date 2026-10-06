@@ -854,18 +854,21 @@ one flag switches every walk.
 - **Generated recursion** is bounded only where a cycle exists. `computeDepthThreading`
   builds the named-type reference graph over `allNamed()` (siblings included;
   `namedRefs`, which unlike `markReferenced` keeps self-edges) and threads
-  `depth int` only through decoders of types that reach a cycle. Struct decoders hold
-  the guard and pass `depth+1`; composite helpers pass `depth` through. Call
-  `markDepthFn` before generating the body: like `g.memo[key]`, a recursive call
-  emitted mid-body must spell the same signature. Tests:
-  `TestRecursiveTypeDepthLimit`, `TestMutuallyRecursiveTypeDepthLimit`,
-  `TestNonRecursiveTypesTakeNoDepthParam` (fails to compile if `Doc` gains a depth
-  parameter). **Open bug:** named slice and map types can be fields, so a cycle can
-  avoid every struct. `type Root struct{ L List }; type List []List` decodes
-  20 000 levels with no error, and deeper input overflows the stack. The guard (and
-  the comment beside `depthGuard` claiming every cycle passes through a struct) must
-  extend to slice/map decoders on a cycle, with slice and map cycles added to the
-  depth tests.
+  `depth int` only through decoders of types that reach a cycle. A decoder that
+  counts a level carries `depthGuard` at its top and passes `depth+1`: every struct
+  decoder, plus each slice, array or map decoder whose element is a named slice or
+  map type on a cycle (`elemCountsLevel`); other composite helpers pass `depth`
+  through. That set bounds every cycle — a cycle runs through named types, and each
+  step into one is decoded inside a struct decoder or inside a container decoder
+  whose element is that type — including cycles with no struct on them at all
+  (`type List []List`). The rule depends only on the element type, which also keys
+  the decoder's memo entry, and leaves every schema without a named slice or map on
+  a cycle byte-identical. Call `markDepthFn` before generating the body: like
+  `g.memo[key]`, a recursive call emitted mid-body must spell the same signature.
+  Tests: `TestRecursiveTypeDepthLimit`, `TestMutuallyRecursiveTypeDepthLimit`,
+  `TestNamedContainerCycleDepthLimit` (each named slice/map shape exactly at the
+  bound), `TestNonRecursiveTypesTakeNoDepthParam` (fails to compile if `Doc` gains a
+  depth parameter).
 
 ### pkg/json toolkit
 
@@ -1252,8 +1255,6 @@ Rules:
 
 ## Open issues
 
-- **Depth-bound gap** for cycles through named slice/map types (see Generated
-  recursion).
 - **A one-block container skip has a flat fixed cost** — `SkipValue`'s frame,
   `skipContainerFast`, `skipBlocks`' ABI0 call — the largest known unclaimed cost.
   Size attempts against `BenchmarkSkipSmall`/`BenchmarkSkipSmallAtEnd`.

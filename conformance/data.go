@@ -221,6 +221,34 @@ type Ring2 struct {
 	Back  *Ring1 `json:"back"`
 }
 
+// NestList, NestMap and the ListOfMaps/MapOfLists pair are cycles that run
+// through no struct at all: a named slice or map type whose elements (or values)
+// lead back to itself. No struct decoder sits on such a cycle, so the slice and
+// map decoders are the frames that count its levels. Each is a root of its own.
+// Exercised by TestNamedContainerCycleDepthLimit.
+type NestList []NestList
+
+type NestMap map[string]NestMap
+
+type ListOfMaps []MapOfLists
+
+type MapOfLists map[string]ListOfMaps
+
+// PairList reaches itself through an anonymous fixed-size array, so the array
+// decoder is the frame that counts.
+type PairList [][2]PairList
+
+// CycleHolder reaches named-container cycles through its fields, the shape a
+// real schema has, so its own struct frame sits above theirs.
+type CycleHolder struct {
+	List HeldList `json:"list"`
+	Map  HeldMap  `json:"map"`
+}
+
+type HeldList []HeldList
+
+type HeldMap map[string]HeldMap
+
 // LongKeys exercises the `switch len(key)` dispatch the generator emits once a
 // struct has a JSON name longer than 16 bytes (cmd/compile's inline-comparison
 // limit), where names are matched in <=16-byte chunks so no comparison calls

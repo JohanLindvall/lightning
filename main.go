@@ -500,11 +500,13 @@ type gen struct {
 	// other in a loop, so a deeply nested document recurses once per level — and a
 	// Go stack overflow is fatal, beyond recover's reach. threadDepth marks the
 	// named types that can reach a cycle; every decoder generated for one of them
-	// takes an extra `depth int`, and the struct decoders among them refuse to
-	// descend past unstable.MaxDepth. A schema with no cycle (the overwhelmingly
-	// common case, and every benchmark) is unaffected: not one signature changes,
-	// so the hot paths are byte-identical. See computeDepthThreading.
+	// takes an extra `depth int`, and the decoders that count a level (see
+	// enterBody) refuse to descend past unstable.MaxDepth. A schema with no cycle
+	// (the overwhelmingly common case, and every benchmark) is unaffected: not one
+	// signature changes, so the hot paths are byte-identical. See
+	// computeDepthThreading.
 	threadDepth map[string]bool // named type -> its decoders carry depth
+	cyclic      map[string]bool // named type -> lies on a reference cycle
 	depthFns    map[string]bool // generated function name -> takes a depth param
 	depthArg    string          // what a call site inside the current body passes
 
@@ -2588,13 +2590,14 @@ func (g *gen) arrayDecoder(t *ast.ArrayType, hint string, nocopy, lax bool) stri
 		g.decoders = append(g.decoders, body)
 		return fn
 	}
-	prevDepth := g.enterBody(fn, false)
+	countsLevel := g.elemCountsLevel(t.Elt)
+	prevDepth := g.enterBody(fn, countsLevel)
 	elem := g.field("(*out)[idx]", t.Elt, hint, nocopy, lax)
 	g.depthArg = prevDepth
 	// Trailing commas are rejected by the first-iteration flag, as in
 	// genStructBody.
 	body := fmt.Sprintf(`func %[1]s(out *%[2]s, data []byte, i int%[5]s) (int, error) {
-	if uint(i) >= uint(len(data)) {
+	%[6]sif uint(i) >= uint(len(data)) {
 		return i, unstable.ErrTruncated
 	}
 	if data[i] == 'n' {
@@ -2639,7 +2642,7 @@ func (g *gen) arrayDecoder(t *ast.ArrayType, hint string, nocopy, lax bool) stri
 		}
 		i++
 	}
-}`, fn, arrType, g.skipWS("i", "i"), elem, g.depthParam(fn)+g.arenaParam())
+}`, fn, arrType, g.skipWS("i", "i"), elem, g.depthParam(fn)+g.arenaParam(), g.levelGuard(fn, countsLevel))
 	g.decoders = append(g.decoders, body)
 	return fn
 }
@@ -2770,7 +2773,8 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax, root bool) st
 	g.memo[key] = fn
 	g.markDepthFn(fn, g.exprThreadsDepth(elt))
 	eltStr := g.typeStr(elt)
-	prevDepth := g.enterBody(fn, false)
+	countsLevel := g.elemCountsLevel(elt)
+	prevDepth := g.enterBody(fn, countsLevel)
 	inner := g.field("(*out)[len(*out)-1]", elt, singular(hint)+"Entry", nocopy, lax)
 	g.depthArg = prevDepth
 	presize := g.slicePresize(elt, eltStr)
@@ -2857,7 +2861,7 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax, root bool) st
 	// (which would cost a heap allocation per element for slices of
 	// structs/pointers).
 	body := fmt.Sprintf(`func %[1]s(out *[]%[2]s, data []byte, i int%[7]s) (int, error) {
-	if uint(i) >= uint(len(data)) {
+	%[8]sif uint(i) >= uint(len(data)) {
 		return i, unstable.ErrTruncated
 	}
 	if data[i] == 'n' {
@@ -2900,7 +2904,7 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax, root bool) st
 		}
 		i++
 	}
-}`, fn, eltStr, inner, presize, g.skipWS("i", "i"), grow, g.depthParam(fn)+g.arenaParam())
+}`, fn, eltStr, inner, presize, g.skipWS("i", "i"), grow, g.depthParam(fn)+g.arenaParam(), g.levelGuard(fn, countsLevel))
 	g.decoders = append(g.decoders, body)
 	return fn
 }
@@ -3038,13 +3042,14 @@ func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy, lax boo
 	g.memo[key] = fn
 	g.markDepthFn(fn, g.exprThreadsDepth(valExpr))
 	valStr := g.typeStr(valExpr)
-	prevDepth := g.enterBody(fn, false)
+	countsLevel := g.elemCountsLevel(valExpr)
+	prevDepth := g.enterBody(fn, countsLevel)
 	inner := g.field("val", valExpr, hint+"Value", nocopy, lax)
 	g.depthArg = prevDepth
 	// Trailing commas are rejected by the first-iteration flag, as in
 	// genStructBody.
 	body := fmt.Sprintf(`func %[1]s(out *map[%[10]s]%[2]s, data []byte, i int%[9]s) (int, error) {
-	if uint(i) >= uint(len(data)) {
+	%[11]sif uint(i) >= uint(len(data)) {
 		return i, unstable.ErrTruncated
 	}
 	if data[i] == 'n' {
@@ -3100,7 +3105,7 @@ func (g *gen) mapDecoder(keyExpr, valExpr ast.Expr, hint string, nocopy, lax boo
 		}
 		i++
 	}
-}`, fn, valStr, inner, g.skipWS("i", "i"), g.skipWS("i", "ni"), g.skipWS("i", "i+1"), g.readKey(), keyAssign, g.depthParam(fn)+g.arenaParam(), keyStr)
+}`, fn, valStr, inner, g.skipWS("i", "i"), g.skipWS("i", "ni"), g.skipWS("i", "i+1"), g.readKey(), keyAssign, g.depthParam(fn)+g.arenaParam(), keyStr, g.levelGuard(fn, countsLevel))
 	g.decoders = append(g.decoders, body)
 	return fn
 }
@@ -3599,7 +3604,7 @@ func (g *gen) namedRefs(name string) map[string]bool {
 // computeDepthThreading fills g.threadDepth with the named types whose decoders
 // must carry a recursion depth: those lying on a reference cycle, plus those that
 // can reach one (they sit above it in the call chain and have to pass the counter
-// down).
+// down). g.cyclic keeps the first set, which elemCountsLevel reads.
 //
 // A cycle is found by asking, for each type, whether it can reach itself. The
 // graphs here are a single file's type declarations — a handful of nodes — so the
@@ -3641,6 +3646,7 @@ func (g *gen) computeDepthThreading() {
 			cyclic[n] = true
 		}
 	}
+	g.cyclic = cyclic
 	for _, n := range names {
 		if cyclic[n] {
 			g.threadDepth[n] = true
@@ -3714,16 +3720,18 @@ func (g *gen) depthArgFor(fn string) string {
 // returning the previous value for the caller to restore (bodies are generated
 // recursively, so this is a stack discipline).
 //
-// A struct decoder passes depth+1: its frame is the one that repeats as the
-// document nests, so it is where a level is counted. A composite helper (slice,
-// array, map, lax value wrapper) threads depth unchanged — it sits between two
-// struct frames rather than adding a level of its own.
-func (g *gen) enterBody(fn string, isStruct bool) string {
+// A decoder that counts a level passes depth+1 and carries depthGuard at its
+// top. Every struct decoder counts one: a struct frame repeats as the document
+// nests. A slice, array or map decoder counts one only when its element is a
+// named slice or map type on a cycle (elemCountsLevel); any other composite
+// helper — those, and the lax value wrapper — threads depth unchanged, sitting
+// between two counting frames rather than adding a level of its own.
+func (g *gen) enterBody(fn string, countsLevel bool) string {
 	prev := g.depthArg
 	switch {
 	case !g.depthFns[fn]:
 		g.depthArg = "0"
-	case isStruct:
+	case countsLevel:
 		g.depthArg = "depth+1"
 	default:
 		g.depthArg = "depth"
@@ -3731,10 +3739,40 @@ func (g *gen) enterBody(fn string, isStruct bool) string {
 	return prev
 }
 
-// depthGuard is the bound itself, emitted at the top of a depth-threading struct
-// decoder. Every cycle in a decodable schema runs through a named struct — a named
-// slice or map type is only decodable at the root, not as a field type — so
-// guarding the struct decoders bounds every cycle.
+// elemCountsLevel reports whether a slice, array or map decoder whose element (or
+// map value) type is elt counts a recursion level. It does when elt, through any
+// pointers, names a slice or map type on a reference cycle.
+//
+// That rule, together with every struct decoder counting, bounds every cycle a
+// schema can contain. A cycle runs through named types, and each step into the
+// next one happens inside one of two frames: a struct decoder (a named struct's
+// own, an anonymous struct's, or that of the struct holding the field — a lax
+// wrapper only ever sits inside one), or a slice, array or map decoder whose
+// element is that very type. A struct counts already; the container counts here
+// whenever the type it steps into is a named slice or map, the one case no
+// struct frame covers — `type List []List`, or `type Root struct{ L List }`
+// reaching it. Without it nothing counts on such a cycle, and deep enough input
+// overflows the stack.
+//
+// The decision depends only on elt, which is also what keys the decoder's memo
+// entry, so every caller of a memoized decoder sees the same body. And it leaves
+// a container whose element is anything else — a struct, a scalar, an anonymous
+// slice — exactly as before, which keeps every schema without a named slice or
+// map on a cycle byte-identical.
+func (g *gen) elemCountsLevel(elt ast.Expr) bool {
+	switch t := unparen(elt).(type) {
+	case *ast.StarExpr:
+		return g.elemCountsLevel(t.X)
+	case *ast.Ident:
+		return g.cyclic[t.Name] && (g.sliceTypes[t.Name] != nil || g.mapTypes[t.Name] != nil)
+	}
+	return false
+}
+
+// depthGuard is the bound itself, emitted at the top of a depth-threading decoder
+// that counts a level: every struct decoder, and the slice, array and map
+// decoders elemCountsLevel selects. See elemCountsLevel for why that set bounds
+// every cycle.
 func (g *gen) depthGuard(fn string) string {
 	if !g.depthFns[fn] {
 		return ""
@@ -3743,6 +3781,15 @@ func (g *gen) depthGuard(fn string) string {
 		return i, unstable.ErrMaxDepth
 	}
 	`
+}
+
+// levelGuard is depthGuard for a composite decoder: the guard when its element
+// counts a level, nothing otherwise.
+func (g *gen) levelGuard(fn string, countsLevel bool) string {
+	if !countsLevel {
+		return ""
+	}
+	return g.depthGuard(fn)
 }
 
 // markReferenced records, in ref, every top-level struct type named anywhere

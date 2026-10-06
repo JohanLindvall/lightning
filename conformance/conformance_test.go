@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 	"unsafe"
@@ -437,6 +438,120 @@ func TestMutuallyRecursiveTypeDepthLimit(t *testing.T) {
 	var deep RingRoot
 	if err := deep.UnmarshalJSON(nest(1_000_000)); !errors.Is(err, unstable.ErrMaxDepth) {
 		t.Errorf("1M rings: err = %v, want ErrMaxDepth", err)
+	}
+}
+
+// The builders below return a document nested n levels deep in their shape's own
+// unit, with an empty innermost container.
+
+// nestArrays is n nested arrays: [[[]]] for n = 3.
+func nestArrays(n int) []byte {
+	return []byte(strings.Repeat("[", n) + strings.Repeat("]", n))
+}
+
+// nestObjects is n nested objects under the key "k": {"k":{"k":{}}} for n = 3.
+func nestObjects(n int) []byte {
+	return []byte(strings.Repeat(`{"k":`, n-1) + "{}" + strings.Repeat("}", n-1))
+}
+
+// nestAlternating is n levels alternating an array and an object, array first:
+// [{"k":[]}] for n = 3.
+func nestAlternating(n int) []byte {
+	var b []byte
+	for d := 0; d < n-1; d++ {
+		if d%2 == 0 {
+			b = append(b, '[')
+		} else {
+			b = append(b, `{"k":`...)
+		}
+	}
+	if (n-1)%2 == 0 {
+		b = append(b, "[]"...)
+	} else {
+		b = append(b, "{}"...)
+	}
+	for d := n - 2; d >= 0; d-- {
+		if d%2 == 0 {
+			b = append(b, ']')
+		} else {
+			b = append(b, '}')
+		}
+	}
+	return b
+}
+
+// nestPairs is n nested PairList levels, each one pair whose first member is the
+// next level: [[[[],[]]],[]] for n = 2.
+func nestPairs(n int) []byte {
+	return []byte(strings.Repeat("[[", n) + "[]" + strings.Repeat(",[]]]", n))
+}
+
+// TestNamedContainerCycleDepthLimit covers cycles that run through no struct at
+// all — a named slice or map type whose elements lead back to itself — as a root
+// and reached through a struct field. Only slice, array and map decoders recurse
+// on such a cycle, so they are the frames that must count its levels; while they
+// did not, 20,000 levels decoded without error and deep enough input overflowed
+// the goroutine stack, the fatal error the depth bound exists to prevent.
+//
+// Each shape is checked right at the bound rather than only far past it: MaxDepth
+// of its levels decode and one more is ErrMaxDepth, which pins where the count
+// happens as well as that it happens.
+func TestNamedContainerCycleDepthLimit(t *testing.T) {
+	inField := func(key string, inner func(int) []byte) func(int) []byte {
+		return func(n int) []byte {
+			// The struct is the first level, so the field holds n-1.
+			return append(append([]byte(`{"`+key+`":`), inner(n-1)...), '}')
+		}
+	}
+	cases := []struct {
+		name   string
+		decode func([]byte) error
+		doc    func(n int) []byte
+	}{
+		{"NestList", func(b []byte) error { var v NestList; return v.UnmarshalJSON(b) }, nestArrays},
+		{"NestMap", func(b []byte) error { var v NestMap; return v.UnmarshalJSON(b) }, nestObjects},
+		{"ListOfMaps", func(b []byte) error { var v ListOfMaps; return v.UnmarshalJSON(b) }, nestAlternating},
+		{"PairList", func(b []byte) error { var v PairList; return v.UnmarshalJSON(b) }, nestPairs},
+		{"CycleHolder.list", func(b []byte) error { var v CycleHolder; return v.UnmarshalJSON(b) }, inField("list", nestArrays)},
+		{"CycleHolder.map", func(b []byte) error { var v CycleHolder; return v.UnmarshalJSON(b) }, inField("map", nestObjects)},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			for _, n := range []int{2, 100, unstable.MaxDepth} {
+				if err := c.decode(c.doc(n)); err != nil {
+					t.Errorf("%d levels: %v", n, err)
+				}
+			}
+			for _, n := range []int{unstable.MaxDepth + 1, 2_000_000} {
+				if err := c.decode(c.doc(n)); !errors.Is(err, unstable.ErrMaxDepth) {
+					t.Errorf("%d levels: err = %v, want ErrMaxDepth", n, err)
+				}
+			}
+		})
+	}
+
+	// The levels that decode are really decoded, all the way down.
+	var l NestList
+	if err := l.UnmarshalJSON(nestArrays(100)); err != nil {
+		t.Fatal(err)
+	}
+	depth := 1
+	for len(l) > 0 {
+		l, depth = l[0], depth+1
+	}
+	if depth != 100 {
+		t.Errorf("NestList decoded %d levels, want 100", depth)
+	}
+	var m NestMap
+	if err := m.UnmarshalJSON(nestObjects(100)); err != nil {
+		t.Fatal(err)
+	}
+	depth = 1
+	for len(m) > 0 {
+		m, depth = m["k"], depth+1
+	}
+	if depth != 100 {
+		t.Errorf("NestMap decoded %d levels, want 100", depth)
 	}
 }
 
