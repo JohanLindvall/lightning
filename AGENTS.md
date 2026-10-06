@@ -33,6 +33,11 @@ a hot path.
   table.
 - `conformance/` — end-to-end tests against a generated decoder (`data_unmarshal.go`;
   every `*_unmarshal.go` is gitignored, and `make generate`/`make test` rebuild it).
+- `example/` — the README's opening example and its live demo: the schema, the
+  generated decoder (the one committed `*_unmarshal.go`, so the package builds on
+  pkg.go.dev, where its `Example` functions run in the browser), and those
+  examples. `TestExampleDecoderIsCurrent` fails when the generator's output
+  changes; regenerate with `cd example && go generate`.
 - `internal/sveasm` — derives the `WORD`-encoded arm64 instructions from their
   comment mnemonics (see Conventions).
 - `pkg/unstable` — the runtime the generated decoders call, plus primitives
@@ -319,7 +324,8 @@ a VBMI body misses them.
   carry the temp path, which carries the test name). Every generator change owes a
   dual-generator diff (parent vs tree) over conformance and every bench schema, run
   inside each case's directory (the sibling scan reads the package's other files):
-  byte-identical except where intended, with identical diagnostics.
+  byte-identical except where intended, with identical diagnostics. A change that
+  does alter output also regenerates `example/event_unmarshal.go`.
 - **Prove a comment-only change** by comparing the normalized disassembly of a probe
   binary built before and after; raw binaries differ anyway (pclntab, DWARF lines).
 - **Sabotage-check new tests**: break the guarded code and watch them fail. Copy the

@@ -1,16 +1,44 @@
 # Lightning ⚡
 
-A Go code generator that turns your struct definitions into fast,
-allocation-light `json.Unmarshaler` implementations — plus
-[`pkg/json`](pkg/json), a toolkit for working with JSON documents without
-decoding them into a struct at all.
+[![CI](https://github.com/JohanLindvall/lightning/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/JohanLindvall/lightning/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/JohanLindvall/lightning.svg)](https://pkg.go.dev/github.com/JohanLindvall/lightning/pkg/json)
+[![Go version](https://img.shields.io/github/go-mod/go-version/JohanLindvall/lightning)](go.mod)
+[![Version](https://img.shields.io/github/v/tag/JohanLindvall/lightning?sort=semver&label=version)](https://github.com/JohanLindvall/lightning/tags)
+[![License: MIT](https://img.shields.io/github/license/JohanLindvall/lightning)](LICENSE)
+
+**lightning generates reflection-free `UnmarshalJSON` methods from your Go
+structs.** On the 30 real-world documents of its [benchmark corpus](#benchmarks)
+they decode at a median **17× (amd64) and 13× (arm64) the speed of
+`encoding/json`**, never under 6.8×, and **at least 1.6× faster than the
+fastest of sonic, easyjson, goccy/go-json and json/v2 on every document**. The
+scanners use SSE2/AVX2/AVX-512 and NEON/SVE2 with no build tags, and every
+behavioral difference from `encoding/json` is
+[listed and tested](#differences-from-encodingjson). [`pkg/json`](pkg/json)
+reads, edits and validates raw JSON in place, with no struct at all.
+
+```go
+//go:generate go run github.com/JohanLindvall/lightning@latest $GOFILE
+
+type Event struct {
+    ID   int64     `json:"id"`
+    Kind string    `json:"kind"`
+    At   time.Time `json:"at"`
+    Tags []string  `json:"tags"`
+}
+```
+
+`go generate` writes `event_unmarshal.go`. Decoding is then the call you already
+make: `json.Unmarshal(data, &e)` finds the generated method, and
+`e.UnmarshalJSON(data)` calls it without the reflection entry point.
+
+**▶ [Run it in your browser](https://pkg.go.dev/github.com/JohanLindvall/lightning/example#example-package)**
+on pkg.go.dev, with nothing to install: the example decodes a document and checks
+the result against `encoding/json`, and a second one counts the allocations.
 
 Where `encoding/json` walks your types with reflection at run time, lightning
 reads them once at build time and writes the decoder out: an index-based,
 single-pass scanner with no reflection, no intermediate representation, and no
-allocation on the common paths. Across the thirty documents of the
-[benchmark corpus](#benchmarks) that is **7.6× to 23× the standard library**
-(median ~12×), and 80–260× on the two whose schemas skip most of the input.
+allocation on the common paths.
 
 ## Features
 
@@ -104,33 +132,36 @@ into it — as its name says, it is not a stable API; don't import it directly.
 
 ## Quick start
 
-Put a `go:generate` line beside your structs:
+The opening example in full: a `go:generate` line beside your structs, in
+`event.go`,
 
 ```go
-package cloudflare
+package events
 
 import "time"
 
 //go:generate go run github.com/JohanLindvall/lightning@latest $GOFILE
 
-type Log struct {
-    RayID              string    `json:"RayID"`
-    EdgeResponseStatus int64     `json:"EdgeResponseStatus"`
-    EdgeStartTimestamp time.Time `json:"EdgeStartTimestamp"`
-    Tags               []string  `json:"Tags"`
+type Event struct {
+    ID   int64     `json:"id"`
+    Kind string    `json:"kind"`
+    At   time.Time `json:"at"`
+    Tags []string  `json:"tags"`
 }
 ```
 
-`go generate ./...` writes the decoder next to it, and decoding is then just:
+then `go generate ./...` writes `event_unmarshal.go` next to it (the module
+needs lightning as a dependency, see [Installation](#installation)), and
+decoding is just:
 
 ```go
-var v Log
-if err := v.UnmarshalJSON(data); err != nil {
+var e Event
+if err := e.UnmarshalJSON(data); err != nil {
     return err
 }
 ```
 
-Reuse `v` across documents and the decode is allocation-free for everything
+Reuse `e` across documents and the decode is allocation-free for everything
 whose backing already fits — see [Reusing a decode target](#reusing-a-decode-target).
 
 Add [`,nocopy`](#the-nocopy-tag-option) to a string field and it aliases the
@@ -1638,11 +1669,14 @@ close-dense blocks). Verified on amd64, on Apple M2, and on arm64 under qemu.
 
 ## Benchmarks
 
-The [`bench/`](bench) directory is a separate module (so its benchmark-only
-dependencies on [easyjson](https://github.com/mailru/easyjson) and
-[sonic](https://github.com/bytedance/sonic) stay out of the main module). It
-benchmarks the same payload decoded four ways — lightning, `encoding/json`,
-easyjson, and bytedance/sonic — across each `bench/<case>/` folder.
+The [`bench/`](bench) directory is a separate module, so its benchmark-only
+dependencies stay out of the main module. Each `bench/<case>/` folder decodes
+the same document with lightning (the default decoder, its
+`//lightning:destructive` and `//lightning:arena` variants, and
+`json.DecodeAny`), `encoding/json`, [easyjson](https://github.com/mailru/easyjson),
+[sonic](https://github.com/bytedance/sonic) (default and fastest configuration),
+[goccy/go-json](https://github.com/goccy/go-json) and
+[json/v2](https://github.com/go-json-experiment/json).
 
 **See the per-architecture results for the full, current numbers:
 [`bench/results_amd64.md`](bench/results_amd64.md) and
@@ -1659,15 +1693,19 @@ beside its `data.go`, and writes `bench/results.txt` and an architecture-specifi
 `bench/results_<goarch>.md` (so runs on different CPUs do not overwrite each
 other's committed results).
 
-Representative numbers for a 1.8 KB Cloudflare log (Go 1.26, amd64):
+Representative numbers for a 1.8 KB Cloudflare log, from the committed amd64
+table (AMD EPYC 9V74, Go 1.26.8). Those tables are single runs on a shared CI
+runner, so read the ratios rather than the nanoseconds:
 
 | Decoder | ns/op | B/op | allocs/op | vs stdlib |
 |---|--:|--:|--:|--:|
-| lightning (`nocopy`) | ~660 | 0 | 0 | ~13× |
-| lightning (default)  | ~800 | 144 | 10 | ~10× |
-| easyjson             | ~1600–1770 | 24–144 | 1–10 | ~5× |
-| sonic                | ~4600 | 3380 | 40 | ~1.9× |
-| `encoding/json`      | ~8250 | 920 | 17 | 1.0× |
+| lightning (`nocopy`) | 556 | 0 | 0 | 22.2× |
+| lightning (default)  | 703 | 144 | 10 | 17.4× |
+| easyjson             | 2376 | 144 | 10 | 5.1× |
+| goccy/go-json        | 2637 | 2600 | 5 | 4.6× |
+| sonic                | 5135 | 3366 | 40 | 2.4× |
+| json/v2              | 6247 | 632 | 7 | 2.0× |
+| `encoding/json`      | 12229 | 920 | 17 | 1.0× |
 
 ## Layout
 
@@ -1676,11 +1714,14 @@ Representative numbers for a 1.8 KB Cloudflare log (Go 1.26, amd64):
 | [`main.go`](main.go) | the generator (`package main`) |
 | [`pkg/unstable`](pkg/unstable) | the (unstable, do-not-import) runtime the generated decoders call into |
 | [`pkg/json`](pkg/json) | small public API over the scanner (`Get`/`Lookup`/`GetMany`/`GetPaths`/`ObjectEach`/`ArrayEach`/`ArrayEachIndex`, `NewReader` for a stream, `KindOf`, `String`/`Bool`, `Valid`, `DecodeAny`, `Escape`/`UnescapeString`/`UnescapeStringCopy`, `ParseFloat`/`ParseInt`/`ParseUint`, `StripDefaults`, `Set`/`SetMany`/`SetPaths` and their `…Checked` forms) |
+| [`example/`](example) | the opening example: its schema, the committed generated decoder, and the runnable examples [pkg.go.dev](https://pkg.go.dev/github.com/JohanLindvall/lightning/example) runs in the browser |
 | [`bench/`](bench) | benchmark module: hand-written `data.go` + `input.json` per case, plus the generated decoders, harness, and results |
 
 Generated files (`*_unmarshal.go`, `bench/*/bench_test.go`, `bench/*/ej/`, and
 the `bench/results.*` outputs) are reproducible and excluded from version
-control via [`.gitignore`](.gitignore).
+control via [`.gitignore`](.gitignore) — all but `example/event_unmarshal.go`,
+which is committed so the example builds and runs without a generate step (a
+test fails if it drifts from the generator's output).
 
 ## Limits and untrusted input
 
@@ -1754,8 +1795,8 @@ Several of the hot-path techniques are borrowed from prior art:
 - **[simdjson](https://github.com/simdjson/simdjson)** (Geoff Langdale and Daniel
   Lemire) and its Go port **[minio/simdjson-go](https://github.com/minio/simdjson-go)** —
   the SWAR "parse four digits at once" bit trick used in the float and integer
-  scanners, the two-`VPSHUFB` nibble-table classification that
-  `indexStructuralAVX2` uses to find structural bytes, and the branchless
+  scanners, the nibble-table shuffle classification that the arm64 NEON
+  `indexStructural` uses to find structural bytes, and the branchless
   escaped-quote detection + quote-mask prefix-XOR that builds the *inside-string*
   bitmask for the whole-container skip.
 - **[sonic-rs](https://github.com/cloudwego/sonic-rs)** (ByteDance/CloudWeGo) and

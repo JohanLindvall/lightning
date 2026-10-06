@@ -8,6 +8,10 @@
 # Covers the bench decoders (reproduced by bench/run_bench.sh) and
 # conformance/data_unmarshal.go (reproduced by `make check`, via its Makefile rule).
 *_unmarshal.go
+# The one exception: the README example's decoder is committed so the package
+# builds (and runs on pkg.go.dev) without a generate step. TestExampleDecoderIsCurrent
+# fails when it drifts from what the generator writes.
+!example/event_unmarshal.go
 
 # Benchmark harness written by bench/run_bench.sh (`// Code generated ... DO NOT EDIT`)
 bench/*/bench_test.go

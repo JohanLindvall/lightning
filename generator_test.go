@@ -22,6 +22,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -2340,4 +2341,49 @@ func goTool(dir string, args ...string) (string, error) {
 		return stdout.String() + stderr.String(), err
 	}
 	return stdout.String(), nil
+}
+
+// TestExampleDecoderIsCurrent keeps the committed example/event_unmarshal.go in
+// step with the generator. That file is the README's live demo — it runs on
+// pkg.go.dev, where nothing can be generated — so a generator change that alters
+// its output has to regenerate it: cd example && go generate.
+//
+// It is regenerated the way go generate runs it, from the package directory with
+// the input named event.go, into a copy of the package under the same module
+// path, so the header and the generated function names match byte for byte.
+func TestExampleDecoderIsCurrent(t *testing.T) {
+	goMod, err := os.ReadFile("go.mod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src, err := os.ReadFile(filepath.Join("example", "event.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := os.ReadFile(filepath.Join("example", "event_unmarshal.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	dir := filepath.Join(root, "example")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), goMod, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "event.go"), src, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	if err := generateTo("event.go", io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile("event_unmarshal.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("example/event_unmarshal.go no longer matches the generator's output; regenerate it with: cd example && go generate")
+	}
 }
