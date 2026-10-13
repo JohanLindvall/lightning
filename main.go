@@ -48,7 +48,8 @@
 // (alias string/[]byte leaves into the input instead of copying — the caller must
 // then keep the input alive and unchanged), `//lightning:destructive` (unescape
 // strings in place, mutating and destroying the input buffer; implies nocopy),
-// and `//lightning:arena` (batch small numeric-slice backings into per-decode
+// `//lightning:emptyslice` (keep empty arrays distinct from null), and
+// `//lightning:arena` (batch small numeric-slice backings into per-decode
 // arena chunks — a retained slice pins its chunk, so it is for decode-and-discard
 // use). See README.md for the full directive and struct-tag reference.
 //
@@ -127,6 +128,7 @@ func generateTo(inPath string, warn io.Writer) error {
 		destructiveTypes: map[string]bool{},
 		arenaTypes:       map[string]bool{},
 		strictTypes:      map[string]bool{},
+		emptySliceTypes:  map[string]bool{},
 		typeDirectives:   map[string][]string{},
 		depthFns:         map[string]bool{},
 	}
@@ -297,6 +299,9 @@ func generateTo(inPath string, warn io.Writer) error {
 			if hasDirective("lightning:strict", gd.Doc, ts.Doc) {
 				g.strictTypes[ts.Name.Name] = true
 			}
+			if hasDirective("lightning:emptyslice", gd.Doc, ts.Doc) {
+				g.emptySliceTypes[ts.Name.Name] = true
+			}
 			// nocopy is consumed only by slice/map roots (a struct's aliasing is
 			// governed per field by the ,nocopy tag), so on a struct root the
 			// bare directive silently did nothing.
@@ -410,6 +415,7 @@ func generateTo(inPath string, warn io.Writer) error {
 		g.nocopy = g.destructive || g.nocopyTypes[name]
 		g.arena = g.arenaTypes[name]
 		g.strict = g.strictTypes[name]
+		g.emptySlice = g.emptySliceTypes[name]
 		g.prefix = "lightning" + g.pathFrag + name
 		// Reset per root: the arena struct and its fields belong to this root
 		// alone, which is sound because g.prefix is per-root too, so no decoder
@@ -471,6 +477,7 @@ type gen struct {
 	destructiveTypes map[string]bool
 	arenaTypes       map[string]bool
 	strictTypes      map[string]bool
+	emptySliceTypes  map[string]bool
 	typeDirectives   map[string][]string // every directive a type carries, for misplacement warnings
 
 	// Working flags for the root type currently being generated, derived from the
@@ -480,6 +487,7 @@ type gen struct {
 	nocopy      bool // //lightning:nocopy root, or a destructive root (which aliases what it decodes)
 	arena       bool // //lightning:arena: thread the per-decode arena struct through the decoders
 	strict      bool // //lightning:strict: an unknown object key is ErrUnknownKey, not a skip
+	emptySlice  bool // //lightning:emptyslice: [] produces a non-nil slice, keeping reused backing
 	// An arena is typed (unstable.Arena[T] is github.com/JohanLindvall/arena's
 	// Arena[T], whose chunks are []T), so a root storing several element kinds
 	// needs one arena per kind. Rather than widen every decoder's signature by one
@@ -872,6 +880,7 @@ func (g *gen) uniq(base string) string {
 // knownDirectives is the set of //lightning:* directive names the generator
 // understands; anything else in the lightning: namespace is a typo and an error.
 var knownDirectives = map[string]bool{
+	"emptyslice":  true,
 	"compact":     true,
 	"nocopy":      true,
 	"destructive": true,
@@ -1112,6 +1121,9 @@ func (g *gen) cmark() string {
 	if g.strict {
 		m += "strict:"
 	}
+	if g.emptySlice {
+		m += "emptyslice:"
+	}
 	return m
 }
 
@@ -1128,6 +1140,9 @@ func (g *gen) csuf() string {
 	}
 	if g.strict {
 		s += "Strict"
+	}
+	if g.emptySlice {
+		s += "EmptySlice"
 	}
 	return s
 }
@@ -1360,16 +1375,17 @@ func (g *gen) anonStruct(t *ast.StructType, hint string) string {
 // name, and the pointer-embed allocation guards that must run before the lvalue
 // is usable.
 type fieldInfo struct {
-	keys   []string
-	dest   string
-	typ    ast.Expr
-	nocopy bool
-	lax    bool
-	unwrap bool
-	number bool
-	tagged bool
-	depth  int
-	allocs []string
+	keys    []string
+	dest    string
+	typ     ast.Expr
+	nocopy  bool
+	lax     bool
+	unwrap  bool
+	number  bool
+	readers []string
+	tagged  bool
+	depth   int
+	allocs  []string
 }
 
 // collectFields appends to out the decodable fields of st, flattening embedded
@@ -1399,7 +1415,7 @@ func (g *gen) collectFields(st *ast.StructType, prefix string, depth int, allocs
 				g.errs = append(g.errs, fmt.Errorf("unsupported embedded field %s", g.typeStr(f.Type)))
 				continue
 			}
-			if len(tagNames) == 0 {
+			if len(tagNames) == 0 && len(tag.readers) == 0 {
 				if est, pointee, isPtr, ok := g.embeddedStruct(f.Type); ok {
 					child := allocs
 					if isPtr {
@@ -1421,7 +1437,7 @@ func (g *gen) collectFields(st *ast.StructType, prefix string, depth int, allocs
 			// it may not have would turn a schema mistake into a compile
 			// error two steps away — the three foreign types the generator
 			// knows are the exception, decoding as that named field.
-			if sel, ok := unparen(f.Type).(*ast.SelectorExpr); ok && !g.isRaw(sel) && !g.isNumber(sel) && !g.isTime(sel) {
+			if sel, ok := unparen(f.Type).(*ast.SelectorExpr); ok && len(tag.readers) == 0 && !g.isRaw(sel) && !g.isNumber(sel) && !g.isTime(sel) {
 				g.errs = append(g.errs, fmt.Errorf("unsupported type %s: a type from another package cannot be embedded (name it as a field to delegate to its UnmarshalJSON)", g.typeStr(f.Type)))
 				continue
 			}
@@ -1430,7 +1446,7 @@ func (g *gen) collectFields(st *ast.StructType, prefix string, depth int, allocs
 				keys = []string{name}
 			}
 			*out = append(*out, fieldInfo{keys: keys, dest: prefix + name, typ: f.Type,
-				nocopy: nocopy, lax: lax, unwrap: unwrap, number: number, tagged: len(tagNames) > 0, depth: depth, allocs: allocs})
+				nocopy: nocopy, lax: lax, unwrap: unwrap, number: number, readers: tag.readers, tagged: len(tagNames) > 0, depth: depth, allocs: allocs})
 			continue
 		}
 		for _, nm := range f.Names {
@@ -1442,7 +1458,7 @@ func (g *gen) collectFields(st *ast.StructType, prefix string, depth int, allocs
 				keys = []string{nm.Name}
 			}
 			*out = append(*out, fieldInfo{keys: keys, dest: prefix + nm.Name, typ: f.Type,
-				nocopy: nocopy, lax: lax, unwrap: unwrap, number: number, tagged: len(tagNames) > 0, depth: depth, allocs: allocs})
+				nocopy: nocopy, lax: lax, unwrap: unwrap, number: number, readers: tag.readers, tagged: len(tagNames) > 0, depth: depth, allocs: allocs})
 		}
 	}
 }
@@ -1741,6 +1757,11 @@ func (g *gen) genStructBody(fn, paramType string, st *ast.StructType) {
 		hint := f.dest[strings.LastIndexByte(f.dest, '.')+1:]
 		var code string
 		switch {
+		case len(f.readers) > 0:
+			if f.nocopy || f.number {
+				g.errs = append(g.errs, fmt.Errorf("reader on %s cannot be combined with nocopy or number: the reader controls the value and its ownership", f.dest))
+			}
+			code = g.customReader(f.dest, f.readers, f.lax)
 		case f.number && g.isAny(f.typ):
 			// ,number: the dynamic decode keeps every number as a
 			// json.Number. Only a field that IS any takes it — inside a
@@ -2487,8 +2508,8 @@ func (g *gen) anyValueNumber(dest string) string {
 if err != nil {
 	return end, err
 }
-%s = val
-i = end`, decode, dest)
+%s
+i = end`, decode, assignValue(dest, "val"))
 }
 
 func (g *gen) anyValue(dest string) string {
@@ -2500,8 +2521,77 @@ func (g *gen) anyValue(dest string) string {
 if err != nil {
 	return end, err
 }
+%s
+i = end`, decode, assignValue(dest, "val"))
+}
+
+// A map's dynamic value is already named val. Its short declaration reuses
+// that local, so emitting val = val afterwards is redundant and fails go vet.
+func assignValue(dest, value string) string {
+	if dest == value {
+		return ""
+	}
+	return dest + " = " + value
+}
+
+// customReader calls a field's reader without measuring or copying its JSON
+// span first. Like the runtime readers it takes (data, i), returns a value and
+// an absolute end offset, and owns null handling and retention of the input.
+// Only a function name is accepted; arbitrary expressions in a tag are not Go
+// source to splice into a decoder. Signature checking belongs to the compiler,
+// just as it does for delegated UnmarshalJSON methods.
+func (g *gen) customReader(dest string, readers []string, lax bool) string {
+	if len(readers) != 1 {
+		return g.unsupportedf("multiple reader options on %s", dest)
+	}
+	reader := readers[0]
+	expr, err := parser.ParseExpr(reader)
+	valid := false
+	if err == nil {
+		switch e := expr.(type) {
+		case *ast.Ident:
+			valid = e.Name != "_" && !reservedIdents[e.Name] && e.Name != g.jsonQual && e.Name != g.timeQual && g.foreign[e.Name] == ""
+		case *ast.SelectorExpr:
+			if id, ok := e.X.(*ast.Ident); ok {
+				valid = e.Sel.Name != "_" && !reservedIdents[id.Name] &&
+					(id.Name == g.jsonQual || id.Name == g.timeQual || g.foreign[id.Name] != "")
+				if id.Name == "unstable" {
+					valid = e.Sel.Name != "_" && g.foreign[id.Name] == unstablePkg
+				}
+			}
+		}
+	}
+	if !valid {
+		return g.unsupportedf("invalid reader %q on %s: use a function name that is not reserved, optionally qualified by an imported package", reader, dest)
+	}
+	// Print the parsed name, not the tag's source text (which could contain
+	// comments). unstable is already imported by every generated file.
+	if sel, ok := expr.(*ast.SelectorExpr); ok && sel.X.(*ast.Ident).Name == "unstable" {
+		reader = "unstable." + sel.Sel.Name
+	} else {
+		reader = g.typeStr(expr)
+	}
+	if lax {
+		// The reader's error leaves the field alone, but malformed JSON must
+		// still fail, exactly as for an ordinary lax field. A successful null
+		// is committed too: the custom reader decides what null means.
+		return fmt.Sprintf(`val, end, err := %s(data, i)
+if err != nil {
+	end, err = unstable.SkipValueStrict(data, i)
+	if err != nil {
+		return end, err
+	}
+} else {
+	%s = val
+}
+i = end`, reader, dest)
+	}
+	return fmt.Sprintf(`val, end, err := %s(data, i)
+if err != nil {
+	return end, err
+}
 %s = val
-i = end`, decode, dest)
+i = end`, reader, dest)
 }
 
 func (g *gen) skipEmit() string {
@@ -2734,16 +2824,16 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax, root bool) st
 		// DecodeFloat64Points. (Under //lightning:arena the generated loop
 		// stays: that directive threads an arena argument through every
 		// slice decoder, which this reader does not take.)
-		return "unstable.DecodeFloat64Points"
+		return g.batchSliceDecoder(elt, "unstable.DecodeFloat64Points")
 	}
 	if fn := batchSliceFn(elt); fn != "" {
 		if g.arena {
 			// The ...Arena twin carves the presized backing from the decode's
 			// arena; callDecoder appends the `a` argument for every call under
 			// an arena root, which matches this reader's extra parameter.
-			return fn + "Arena"
+			return g.batchSliceDecoder(elt, fn+"Arena")
 		}
-		return fn
+		return g.batchSliceDecoder(elt, fn)
 	}
 	suffix := ""
 	if nocopy {
@@ -2860,6 +2950,12 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax, root bool) st
 	// into the freshly grown zero slot and never lives in an escaping local
 	// (which would cost a heap allocation per element for slices of
 	// structs/pointers).
+	empty := ""
+	if g.emptySlice {
+		// Only [] materializes a nil slice; absent fields and null retain
+		// their usual behavior, and a reused slice keeps its capacity.
+		empty = fmt.Sprintf("if *out == nil { *out = []%s{} }\n", eltStr)
+	}
 	body := fmt.Sprintf(`func %[1]s(out *[]%[2]s, data []byte, i int%[7]s) (int, error) {
 	%[8]sif uint(i) >= uint(len(data)) {
 		return i, unstable.ErrTruncated
@@ -2886,7 +2982,7 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax, root bool) st
 		}
 		if data[i] == ']' {
 			if first {
-				return i + 1, nil
+				%[9]sreturn i + 1, nil
 			}
 			return i, unstable.ErrInvalidJSON
 		}
@@ -2904,7 +3000,38 @@ func (g *gen) sliceDecoder(elt ast.Expr, hint string, nocopy, lax, root bool) st
 		}
 		i++
 	}
-}`, fn, eltStr, inner, presize, g.skipWS("i", "i"), grow, g.depthParam(fn)+g.arenaParam(), g.levelGuard(fn, countsLevel))
+}`, fn, eltStr, inner, presize, g.skipWS("i", "i"), grow, g.depthParam(fn)+g.arenaParam(), g.levelGuard(fn, countsLevel), empty)
+	g.decoders = append(g.decoders, body)
+	return fn
+}
+
+// batchSliceDecoder preserves the optimized reader, adding the emptyslice
+// contract only when requested. The wrapper takes the same typed arena as the
+// reader, so arenaArgForExpr and the named-root call keep their usual shape.
+// Ordinary roots still call the runtime directly, with byte-identical output.
+func (g *gen) batchSliceDecoder(elt ast.Expr, reader string) string {
+	if !g.emptySlice {
+		return reader
+	}
+	eltStr := g.typeStr(elt)
+	key := g.prefix + g.cmark() + "batchslice:" + eltStr
+	if fn, ok := g.memo[key]; ok {
+		return fn
+	}
+	fn := g.uniq(g.decFn("decode" + g.baseName(elt) + "Slice" + g.csuf()))
+	g.memo[key] = fn
+	param, arg := "", ""
+	if g.arena {
+		param = ", a *unstable.Arena[" + eltStr + "]"
+		arg = ", a"
+	}
+	body := fmt.Sprintf(`func %[1]s(out *[]%[2]s, data []byte, i int%[4]s) (int, error) {
+	end, err := %[3]s(out, data, i%[5]s)
+	if err == nil && *out == nil && data[i] == '[' {
+		*out = []%[2]s{}
+	}
+	return end, err
+}`, fn, eltStr, reader, param, arg)
 	g.decoders = append(g.decoders, body)
 	return fn
 }
@@ -3396,13 +3523,14 @@ type tagInfo struct {
 	lax     bool
 	unwrap  bool
 	number  bool     // an any field decodes its numbers as json.Number (UseNumber)
+	readers []string // reader=func; retain duplicates and empty names for errors
 	unknown []string // options the generator does not act on, for diagnostics
 }
 
 // jsonTag parses a field's `json:"..."` struct tag. The name may list several
 // pipe-separated names (`json:"Status|EdgeResponseStatus"`), each of which maps
 // the same field; any of them in the input fills it. Comma-separated options
-// follow the name, as in encoding/json. The generator acts on three:
+// follow the name, as in encoding/json:
 //
 //   - "nocopy": string and raw fields alias the input bytes instead of copying
 //     them, so the caller must keep the input alive and unchanged;
@@ -3410,6 +3538,8 @@ type tagInfo struct {
 //     skipped and the field left unset) rather than an error;
 //   - "unwrap": the value is a string whose contents are themselves the JSON to
 //     decode into the field.
+//   - "number": an any field preserves numbers as json.Number.
+//   - "reader=func": a custom reader supplies the whole field's value.
 //
 // "omitempty" is accepted in silence: it is encode-only, so it means nothing to
 // a decoder, and it is on real structs everywhere. Any other option is returned
@@ -3447,7 +3577,12 @@ func jsonTag(tag *ast.BasicLit) tagInfo {
 			// A trailing comma, and the stdlib's two encode-only options
 			// (omitzero since Go 1.24).
 		default:
-			t.unknown = append(t.unknown, o)
+			if strings.HasPrefix(o, "reader=") || o == "reader" {
+				_, reader, _ := strings.Cut(o, "=")
+				t.readers = append(t.readers, reader)
+			} else {
+				t.unknown = append(t.unknown, o)
+			}
 		}
 	}
 	for _, n := range strings.Split(parts[0], "|") {
@@ -3477,7 +3612,7 @@ func (g *gen) warnTagOptions(opts []string, field string) {
 			g.warnf("json tag option %q on %s is not implemented: the value is decoded with the field's declared Go type (for a whole JSON document embedded in a string, see the unwrap option)", o, field)
 			continue
 		}
-		g.warnf("unrecognized json tag option %q on %s; it is ignored (this generator understands nocopy, lax, unwrap and number)", o, field)
+		g.warnf("unrecognized json tag option %q on %s; it is ignored (this generator understands nocopy, lax, unwrap, number and reader=func)", o, field)
 	}
 }
 

@@ -426,11 +426,12 @@ is a plain named field rather than promoted.
 
 Two limits on that:
 
-- **A struct type from another package cannot be embedded.** Its fields aren't
+- **A struct type from another package cannot be promoted.** Its fields aren't
   visible to the generator, so there is nothing to promote, and generation
   *fails* — `type Root struct { strings.Builder; … }` reports `unsupported type
   strings.Builder` (name it as a field instead, and it is delegated to its own
-  `UnmarshalJSON`). Only the three foreign types the generator knows —
+  `UnmarshalJSON`, or give the embedded field a [custom reader](#the-reader-tag-option)).
+  Without a custom reader, only the three foreign types the generator knows —
   `time.Time`, `json.RawMessage` and `json.Number` — decode when embedded, and
   they decode as a single named field keyed by the type name (`"Time"`,
   `"RawMessage"`, `"Number"`), not flattened.
@@ -486,6 +487,11 @@ are *silent*.
   [reused target](#reusing-a-decode-target), to the *previous* document's values.
   If a source has unstable capitalization, list the spellings explicitly:
   `json:"items|Items|ITEMS"`.
+- **An empty JSON array can leave a nil slice nil.** By default, `[]` resets a
+  slice's length and keeps its backing array, so a fresh nil slice stays nil.
+  `encoding/json` produces a non-nil empty slice. Use
+  [`//lightning:emptyslice`](#lightningemptyslice) when the distinction matters;
+  it produces non-nil empty slices while preserving existing backing arrays.
 - **The `,string` tag option is not implemented.** `encoding/json` uses it to read
   a number or bool that the producer wrapped in a JSON string — `{"n":"7"}` into an
   `int` field tagged `json:"n,string"`. lightning ignores the option and decodes
@@ -815,10 +821,79 @@ It applies to a field that IS `any` (or `interface{}`); on any other field it
 warns and is ignored. The toolkit has the same mode as `DecodeAnyNumber` (and
 `DecodeAnyNumberCompact`).
 
+## The `reader` tag option
+
+Use `reader=readDate` to decode a field through a function you supply. This is
+useful for sharing repeated strings, handling an application-specific value,
+or using a reader without defining a new field type:
+
+```go
+type DayCost struct {
+    Date string  `json:"date,reader=readDate"`
+    Cost float64 `json:"cost"`
+}
+
+func readDate(data []byte, i int) (string, int, error) {
+    return unstable.ReadStringOrNull(data, i)
+}
+```
+
+The example uses `github.com/JohanLindvall/lightning/pkg/unstable`'s normal
+string reader; the function can instead look up an owned string in a bounded
+cache and avoid copying repeated values. The generator calls it directly,
+without first scanning or copying the value's span.
+
+The signature is `func([]byte, int) (T, int, error)`, with `T` assignable to
+the field. The input index is the first byte of the value, after whitespace.
+Return the absolute index immediately after the complete value, or the error
+position on failure. The reader is responsible for valid offsets, parsing the
+whole value, null handling, and copying any input it retains. The field is
+assigned only on success; an absent key never calls the reader. A reader for
+a pointer, slice, or struct returns that whole field's value, and takes
+precedence over the type's `UnmarshalJSON` method.
+
+The name can be a function in the same package or a qualified function from
+an imported package, such as `readers.ReadDate`. A tag alone does not count
+as a Go use of an import; a local wrapper is often convenient. Tagged fields
+in sibling types, nested records, and embedded structs work too. A reader
+on an embedded field decodes it under its type name (or explicit JSON name),
+instead of promoting its fields.
+
+`reader` composes with alternate names, `lax`, and `unwrap`: `lax` leaves the
+field unchanged on a reader error only if the value is valid JSON, and
+`unwrap` calls the reader on the unwrapped document. `nocopy` and `number`
+cannot be combined with `reader`; the function controls those choices itself,
+including under a `destructive` root. Duplicate reader options, invalid names,
+and names shadowed by generated locals are generation errors. The Go compiler
+checks the function's existence and signature.
+
 ## Comment directives
 
 Some behavior is selected with a `//lightning:<name>` comment on the struct type
 (or its declaration), separate from the per-field json tags above.
+
+### `//lightning:emptyslice`
+
+Preserve the distinction between an empty JSON array and null:
+
+```go
+//lightning:emptyslice
+type Export struct {
+    Days []DayCost `json:"days"`
+}
+```
+
+`{"days":[]}` produces a non-nil empty slice, `{"days":null}` sets it to
+nil, and `{}` leaves it unchanged. This applies throughout the root's generated
+decoders: nested structs, slice elements, map values, named slice roots, and
+batched numeric, byte, and coordinate slices. A reused slice keeps its backing
+array and capacity, including for `[]`. Populated arrays retain their usual
+allocation strategy. Custom readers and delegated `UnmarshalJSON` methods
+remain responsible for their own results.
+
+The directive composes with the other root directives. A shared nested type
+follows the directive of the root decoding it. Without it, a nil slice stays
+nil when decoded from `[]`.
 
 ### `//lightning:strict`
 

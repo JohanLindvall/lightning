@@ -24,10 +24,12 @@ a hot path.
   - `arena` — small scalar slices carve their backings from per-decode chunks.
   - `strict` — an unknown key fails with `*unstable.UnknownKeyError` instead of
     being skipped.
+  - `emptyslice` — an empty JSON array produces a non-nil slice, retaining reused
+    backing arrays. `batchSliceDecoder` wraps batched readers only in this mode.
   - `root` — asks for a method and nothing else.
 
   `g.cmark`/`g.csuf` keep variants apart in memo keys and function names
-  (`Compact`/`Destructive`/`Arena`/`Strict` suffixes); nocopy variants differ by
+  (`Compact`/`Destructive`/`Arena`/`Strict`/`EmptySlice` suffixes); nocopy variants differ by
   the `nocopy` decoder param / `NoCopy` suffix.
 - `generator_test.go` — generator tests; `TestGenerate` is the generate-then-compile
   table.
@@ -1145,6 +1147,11 @@ Rules:
 - **Tag options**: `,number` only on an `any` field (`anyValueNumber`; elsewhere it
   warns — threading it into slices or maps of `any` would touch every element
   decoder); `,omitempty`/`,omitzero` pass silently; `,string` warns as unimplemented.
+  `,reader=func` calls a custom `(data []byte, i int) (T, int, error)` reader for
+  the whole field, null included, assigning only on success; it composes with
+  `lax`/`unwrap` but conflicts with `nocopy`/`number`. Reader names are parsed,
+  validated against generated locals, and imports claimed at emission. An
+  embedded field with a reader is decoded as a named field, not promoted.
 - **Types and embedding.** Only the empty interface and its spellings
   (`interface{ any }`) decode as `any` (`isAnyInterface`; `ast.InterfaceType.Methods`
   also holds embedded elements and type-set terms). An embedded `time.Time`,

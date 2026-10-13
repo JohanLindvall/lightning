@@ -63,6 +63,8 @@ type genCase struct {
 	// wantMethods, when set, is exactly the set of receiver types the
 	// generated file declares UnmarshalJSON on.
 	wantMethods []string
+	// vet catches diagnostics that compilation alone accepts, such as self-assignments.
+	vet bool
 }
 
 var genCases = []genCase{
@@ -2085,7 +2087,7 @@ func TestGenerate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, c := range genCases {
+	for _, c := range append(slices.Clone(genCases), genOverrideCases...) {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
 			dir := t.TempDir()
@@ -2140,6 +2142,11 @@ func TestGenerate(t *testing.T) {
 				}
 			}
 
+			if c.vet {
+				if out, err := goTool(dir, "vet", "./..."); err != nil {
+					t.Fatalf("generated package fails go vet: %v\n%s", err, out)
+				}
+			}
 			if c.probe == "" {
 				if out, err := goTool(dir, "build", "-o", os.DevNull, "."); err != nil {
 					t.Fatalf("generated package does not compile: %v\n%s\n--- generated ---\n%s",
