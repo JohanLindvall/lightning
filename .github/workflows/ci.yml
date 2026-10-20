@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  pull_request:
   push:
     branches: ['**'] # every branch; tag pushes don't trigger (so the tags this
     # workflow creates don't re-run CI)
